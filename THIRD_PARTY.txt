@@ -1,0 +1,15 @@
+Original project material is GPL-3.0-only; see LICENSE.
+
+The project organization, ownership rules and JIT design were adapted from the
+local cpu12 and dsp56300 projects. LICENSE, .clang-format and .clang-tidy were
+copied from cpu12 (revision 717346a); its notices/license are preserved. No guest
+decoder, execution engine or JIT implementation was copied from another project.
+
+Manufacturer manuals are copyright Arm Limited, Analog Devices, Inc., or Texas
+Instruments Incorporated as identified in each file. They are untracked local
+reference material, are not redistributed here and are not covered by this GPL.
+doc/reference-manifest.json records their exact origins and identities.
+
+LLVM 19 is the intended future native-code-generation dependency. No LLVM source
+is vendored in this documentation seed. Record its license and any later native
+dependencies when implementation introduces them.

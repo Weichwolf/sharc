@@ -1,0 +1,47 @@
+{
+  "project": "sharc",
+  "local_directory": "doc/local",
+  "references_are_build_inputs": false,
+  "documents": [
+    {
+      "title": "SHARC Processor Programming Reference",
+      "file": "sharc-programming.pdf",
+      "official_url": "https://www.analog.com/media/en/dsp-documentation/processor-manuals/ADSP-2136x_2137x_214xx_pgr_rev2.4.pdf",
+      "source_url": "https://docs.ampnuts.ru/analog.com.datasheet/adsp-21363/related_data/ADSP-2136x_2137x_214xx_pgr_rev2.4.pdf",
+      "revision": "2.4, April 2013",
+      "document": "82-000500-01",
+      "bytes": 5516505,
+      "sha256": "0b40637d05c7f33bc8e39235ee8a9d2c734b12c0372aff1eeac56a7554895869",
+      "pages": 694,
+      "scope": "Core programmer model, instructions, ISA/VISA, numerical modes, DAG and SIMD",
+      "redistributed": false,
+      "local_origin": "Verified copy of the existing local manufacturer reference",
+      "provenance": "Analysis-only copy of manufacturer documentation. Cover/revision/page count and sampled content agree with the official parsed document. Direct official byte identity has not been verified. This is not a build input."
+    },
+    {
+      "title": "ADSP-214xx SHARC Processor Hardware Reference",
+      "file": "sharc-hardware-mirror.pdf",
+      "official_url": "https://www.analog.com/media/en/dsp-documentation/processor-manuals/adsp-214xx_hwr_rev1.1.pdf",
+      "source_url": "https://docs.ampnuts.ru/analog.com.datasheet/adsp-21489/related_data/ADSP-214xx_hwr_rev1.1.pdf",
+      "revision": "1.1, April 2013",
+      "document": "82-000469-01",
+      "bytes": 18156850,
+      "sha256": "a9534d75e8946af83d5c9e250bb7e212224786b56977d6fec90d88e178f034dc",
+      "pages": 1304,
+      "scope": "Memory views, interrupts and integration boundaries; peripherals remain consumer-owned",
+      "redistributed": false,
+      "local_origin": "Verified copy of the existing local manufacturer reference",
+      "provenance": "Analysis-only copy of manufacturer documentation. Cover title/revision/part number and document metadata identify the manufacturer manual; title/revision agree with the indexed official URL. Direct official download timed out, so exact official byte identity has not been verified. Register addresses/names were read from Appendix B; the PDF is not a source-build input."
+    }
+  ],
+  "online_references": [
+    {
+      "title": "ADSP-21483/21486/21487/21488/21489 SHARC Processor Datasheet",
+      "revision": "I, February 2024",
+      "official_url": "https://www.analog.com/media/en/technical-documentation/data-sheets/ADSP-21483_21486_21487_21488_21489.pdf",
+      "scope": "ADSP-2148x derivative features, memory capacities and packages",
+      "availability": "Official indexed PDF inspected online; direct download timed out. Not included in the verified local PDF inventory.",
+      "redistributed": false
+    }
+  ]
+}
