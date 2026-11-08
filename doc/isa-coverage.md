@@ -10,6 +10,8 @@ evidence before marking an instruction or mode implemented.
 | Classic 48-bit ISA | Every documented instruction class, condition, legal operand and parallel form | Unimplemented |
 | VISA 16/32/48 | All compact encodings, fetch boundaries, PC units and mode transitions | Unimplemented |
 | Arithmetic and SIMD | PEx/PEy, fixed point, 32-/40-bit float, rounding, modes, flags and exceptions | Unimplemented |
+| Strict numerical mode (default) | Exact guest 32-/40-bit behavior, RND32, conversion exceptions and native-path identity | Unimplemented |
+| FastFP32 numerical mode (opt-in) | Independent approximation expectations, rounding/flags, unchanged raw moves/integer behavior, separate translations | Unimplemented |
 | Parallel operations | Old operands, memory aliases, register exchanges and ordered partial effects | Unimplemented |
 | Address generation and memory | Both DAGs, modulo/reverse addressing, PM/DM and physical view aliases | Unimplemented |
 | Sequencer and control | Delayed flow, DO/loop endpoints, LR, stacks, reset and interrupts | Unimplemented |

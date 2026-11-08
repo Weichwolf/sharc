@@ -15,6 +15,15 @@ public Core API, CMake library target or performance result is implemented yet.
 All execution coverage is explicitly unimplemented in
 [doc/isa-coverage.md](doc/isa-coverage.md).
 
+## Planned numerical modes
+
+Strict will preserve SHARC 32-/40-bit behavior and remain the default. The
+explicit opt-in FastFP32 mode will limit floating computations to binary32 for
+consumers that accept precision differences. It preserves raw storage, integer
+semantics and instruction order, and does not enable unrestricted compiler
+fast-math. Both modes are planned; neither is implemented yet. See the
+[numerical contracts](doc/architecture.md#floating-point-execution-modes).
+
 ## Reference material
 
 Read [doc/references.md](doc/references.md). Manufacturer PDFs and extracted text

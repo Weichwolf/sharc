@@ -21,6 +21,13 @@
 - Preserve original guest arithmetic, architectural quirks, faults and ordering.
   Every line must be understood and pleasantly readable. Byte similarity to one
   firmware does not prove core correctness or complete ISA coverage.
+- Strict is the default execution mode. Also implement the user-requested,
+  explicitly selected FastFP32 mode specified in doc/architecture.md. Limit its
+  approximation to floating-point operand/result precision; preserve raw storage,
+  integer semantics and instruction ordering. Do not turn on compiler fast-math.
+- Keep execution modes fixed for a Core lifetime and separate translation
+  identities, coverage and performance results. FastFP32 is not bit-exact SHARC
+  execution and must never substitute for Strict acceptance.
 
 ## Working rules
 
@@ -39,8 +46,9 @@
   compare matched host ASM work. Report cold translation, warm throughput, code
   size, boundary costs and every slow scenario. >=70% realistic warm host-ASM
   throughput is a reference, not proof of instrument real time. No invented MHz.
-- Host SIMD and batching require proof of guest dependencies, numerical identity
-  and measured benefit. Preserve exact feedback and observable partial exits.
+- Host SIMD and batching require proof of guest dependencies, the selected mode's
+  numerical contract and measured benefit. Preserve feedback and observable
+  partial exits; FastFP32 does not authorize reassociation or FMA contraction.
 - Telemetry is runtime-selectable and off by default; no hot-path statistics.
 - README describes what exists; OBJECTIVE defines acceptance; doc/architecture.md
   is the single target design. Keep doc/isa-coverage.md honest. No diaries or
@@ -57,7 +65,7 @@
   dependency notices. Do not import GPL-2.0-only code or another emulator's core.
 - Keep canonical main current; commit reviewed increments. Push only an already
   configured origin/main when authorized. No --all/--mirror or backup branches.
-  No remote is configured by this initial local project setup.
+  The authorized GitHub destination is private Weichwolf/sharc; preserve privacy.
 - Coordinate with the Lead A1 consumer only through private Weichwolf/lead-a1-src
   issue #1 when explicitly authorized. Do not copy private reconstruction material
   into public projects. No routine issue-status spam or hardware flashing.

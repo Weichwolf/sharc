@@ -32,9 +32,22 @@ long and instruction/extended-precision views. Keep ISA and VISA PC/address unit
 distinct. Host floating-point evaluation, FMA contraction, host denormal settings
 or converting every 40-bit operation to ordinary float must not change results.
 Implement defined NaN, rounding, saturation, exceptional and parallel-lane behavior.
+These exactness requirements define Strict, the default execution mode.
 SHARC+ and older derivative profiles are not automatically covered by ADSP-214xx.
 Separate SRU, SPORT, SPI, DMA, external accelerators and board clocks from the core;
 provide the architectural memory/I/O/interrupt boundary needed by consumers.
+
+Also implement an explicit opt-in FastFP32 mode for consumers that accept reduced
+internal floating-point precision. It rounds computational floating operands and
+results to binary32, including operations that Strict performs at 40-bit precision.
+Keep raw register/memory transfers, formats, integer semantics, guest mode-register
+readback, addressing and instruction order intact. Floating results, derived flags
+and subsequent control flow may differ from Strict; audio equivalence is not
+guaranteed. This mode is not permission for FMA contraction, reassociation or other
+compiler fast-math changes. Define and verify its independent numerical contract
+and report its coverage/performance separately. It does not replace complete,
+correct Strict execution. Both modes are required project deliverables; neither
+is implemented by this documentation change.
 
 Provide reproducible independently authored ISA fixtures and independent expected
 results. Verify state, flags, numerical edge cases, memory access/order, faults,
