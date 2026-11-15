@@ -1,5 +1,10 @@
 # sharc
 
+- Follow doc/core-contract.md, the contract shared by all cores (cpu12, dsp56300,
+  armv5, sharc). It wins over this file, OBJECTIVE.md and doc/architecture.md;
+  change it only together with the other cores. In particular: declared code
+  images lowered through LLVM only, no hand-written per-host emitter, and
+  complete state save/restore is part of the public interface.
 - Build an independent complete SIMD SHARC ISA/VISA native JIT. Read OBJECTIVE.md and
   doc/architecture.md before changing scope or claiming completion.
 - Initial hardware profile: ADSP-214xx, initially ADSP-21489. A profile defines architectural behavior;
@@ -14,7 +19,7 @@
   Unsupported legal forms, host limitations and failed accesses remain explicit.
 - Compile natural control-flow regions, retain immutable translations and link
   native successors. No instruction-count translation caps, budget-specific
-  recompilation, per-instruction dispatch, checkpoint API or public effect tickets.
+  recompilation, per-instruction dispatch or public effect tickets.
 - Keep native registers live and RAM direct. Code/mapping writes and aliases must
   invalidate affected translations correctly; this is mandatory for arbitrary
   consumer programs. No per-instruction hashes or fabricated retirement.
