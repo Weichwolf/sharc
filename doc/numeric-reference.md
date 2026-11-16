@@ -28,6 +28,8 @@ S2 remains in progress; this does not establish Strict execution coverage.
 | Scalar shifter | Logical/arithmetic shifts, rotation, bit clear/set/toggle/test, field deposit/extract with sign extension and deposit OR, leading zero/one counts and normal/extended exponent extraction |
 | Bit FIFO | 64-bit raw storage, seven-bit pointer read/write, append, extract and no-update query; defined scalar results and status, explicit refusal of undefined data/pointer results |
 | Short float unpack | All 65,536 short encodings, including gradual underflow, signed zero and maximum finite magnitude; exact binary32 results independent of ALU modes |
+| Short float pack values | Exact finite fields, source-exponent clipping and signed-zero fields; 16-bit values only, inexact rounding and full register/status effects remain unqualified |
+| Seed special cases | RECIPS/RSQRTS zeros, flushed denormals, infinities and qualified 40-bit invalid results; RECIPS large-exponent zero; ordinary ROM entries explicitly refused |
 | Dual ALU | ADD/SUB from common old inputs, OR of the new ALU status bits, sticky union; fixed saturation and qualified 32-/40-bit floating results |
 | Multifunction arithmetic | Fixed product/MAC/MSUB with ALU, floating product with ALU/conversions, multiply plus dual ALU; disjoint flag ownership and old 80-bit accumulator |
 | SIMD numeric expectations | Authored paired PEx/PEy values with distinct carry/overflow, saturation, floating exceptions and old flag/sticky inputs; no cross-lane flag union |
@@ -55,7 +57,7 @@ architecture; the introductory default-mode sentence on 3-37 is inconsistent.
 python3 test/support/generate_expectations.py --output build/local/strict-expectations.json
 ```
 
-The generator checks 237 independently authored numeric/conversion/accumulator/shifter
+The generator checks 269 independently authored numeric/conversion/accumulator/shifter
 anchors and 48,768 positions between neighboring normal encodings. The latter
 span both precisions, both signs, all 254 normal exponents, six fraction patterns, four
 quarter-ULP positions and both rounding directions. Expected neighbors are formed
@@ -88,11 +90,18 @@ products/accumulations and the exact floating wire-value codebook. Authored
 multifunction records map old R0/R4/R8/R12 inputs to overlapping destination
 registers, supplying expectations for later installed-image dependency checks.
 Paired lane records give independent complete scalar effects for each PE.
+Another 133,832 PACK field checks construct IEEE inputs with bit strings from all
+65,536 short encodings and exercise exponent clipping; 260 inexact inputs require
+explicit refusal. A further 896 seed special cases check both precisions, both
+rounding settings where qualified, signs, denormals and old status/sticky bits.
 The output contains fixed and qualified FIX/TRUNC result/flag records and floating
 value-only or complete qualified effect records, distinguished by record kind. Shifter
 records include raw outputs, flags and FIFO effects where relevant. Raw 80-bit
 accumulators and 64-bit FIFOs use fixed-width hexadecimal strings so a JSON reader
 cannot silently round them.
+`pack-value` records contain only `expected.short`, not a raw 40-bit result or
+status. They cannot be consumed as complete instruction expectations. `seed`
+records do contain complete qualified raw/status/sticky effects.
 Output is deterministic and declares `isa_execution_coverage: false`.
 
 These are checks of the expectation generator, not a new CTest layer and not a
@@ -124,14 +133,16 @@ Currently explicit refusals include:
 - Unordered floating compare, LOGB's NaN sentinel, and MANT with RND32 selected
   and nonzero extension input. MANT's exact-output wording and the general input
   precision rule need stronger evidence to resolve that input boundary.
+- Inexact FPACK rounding, its complete upper result storage and status effects;
+  ordinary RECIPS/RSQRTS ROM entries and RECIPS AN for a negative NaN input.
 - SZ for a negative BTST position and sign extension of a zero-length field.
 - FIFO operations with a prohibited length, overfull/invalid pointer, or insufficient
   capacity/data. The manual defines SV but leaves the resulting data/pointer
   undefined; no invented full-result expectation is emitted.
 - Operations outside the currently implemented numerical functions.
 
-Still required: the unqualified floating and conversion status above, FP
-operations and seed ROM expectations, OR-shift status and FPACK expectations, and
+Still required: the unqualified floating, conversion, packing and seed details
+above, OR-shift status, and
 parallel memory/write priority, conditional SIMD execution and mode/register-bank
 composition. Qualified arithmetic composition does not close those architectural gaps.
 The explicit FIX/TRUNC distinction on 11-37 must not be replaced by a shared host
@@ -240,6 +251,28 @@ FUNPACK uses all four exponent bits as finite short-format exponents, supports
 the short format's gradual underflow, and clears SZ/SV/SS even for signed zero.
 It ignores unrelated upper input bits and clears the result's extension byte.
 The exact format equations and independently authored anchors follow appendix C.
+
+## Packing fields and seed special cases
+
+FPACK's source is the IEEE32 field, independently of the raw extension byte.
+The description on 11-84 and table C-2 specify clipping to the largest short magnitude above source
+biased exponent 135 and a signed-zero field below exponent 110. Within that range
+the value model emits only exactly representable short fields; it refuses any
+discarded nonzero bit instead of guessing the rounding rule. Source exponent 255
+uses the table's clipping branch for the value field; no floating exception or
+complete shifter-status expectation is inferred from it. The exact-input checks
+do not assume a rule for upper destination bits or prove inexact packing.
+
+Chapters 11-41 through 11-44 specify seed exceptions separately from ordinary
+ROM lookup. Both operations map computational signed zero, including a flushed
+denormal, to signed infinity with AV/AVS. RECIPS maps large finite exponents and
+infinities to signed zero and updates AZ/AUS, with AN from its input. RSQRTS maps
+positive infinity to positive zero with AZ but preserves AUS; negative nonzero
+inputs and NaNs return the qualified all-ones 40-bit NaN with AI/AIS and AN clear.
+Its AN rule explicitly names negative-zero input, so those seed cases can be
+qualified without guessing the general ALU AN rule for a negative-zero result.
+RND32 canonical NaNs and every ordinary ROM seed remain refused. No mathematical
+reciprocal or square-root approximation substitutes for a hardware seed.
 
 ## Fixed multiplier details
 

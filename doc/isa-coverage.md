@@ -59,7 +59,7 @@ No native execution, complete ISA, real-time or benchmark claim.
 ## S2 independent expectations (in progress)
 
 `test/support/reference.py` supplies a separate exact integer/rational numeric
-model. `generate_expectations.py` checks 237 numeric/conversion/accumulator/shifter
+model. `generate_expectations.py` checks 269 numeric/conversion/accumulator/shifter
 anchors, 48,768 normal-range rounding positions and 27,648 limb-based multiplier
 cases and can emit deterministic machine-readable expectations without loading
 production code. Fixed ALU records include complete
@@ -80,10 +80,15 @@ multiplier flags, old operands and accumulator effects. Authored paired-lane
 records include different old status/sticky bits and independent exceptions.
 Register-overlap maps are numerical expectation data for future installed-image
 fixtures; no instruction execution, memory ordering or SIMD control is claimed.
+Another 133,832 FPACK field-only checks and 896 complete seed-special-case checks
+cover exact short values, exponent clipping, signed zeros, infinities and qualified
+invalid seed inputs. The 260 refused inexact PACK inputs, complete FPACK storage/
+status and ordinary seed ROM entries remain gaps. Field-only records cannot
+establish full instruction effects.
 
 S2 is **not complete**. The model explicitly refuses unqualified NaN/near-underflow
 boundaries and conversion sentinel flags. Remaining exceptional floating status, computations,
-OR-shift status, FPACK, conditional SIMD/bank composition and parallel memory/
+OR-shift status, complete FPACK, conditional SIMD/bank composition and parallel memory/
 write-priority expectations are still required. See
 [numeric-reference.md](numeric-reference.md) for the exact scope, source sections
 and gaps. Oracle validation is not installed-image ISA execution coverage. No

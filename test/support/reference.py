@@ -640,6 +640,58 @@ def float_unpack(raw: int, *, astat: int = 0, stky: int = 0) -> IntegerResult:
     return IntegerResult(value, flags, stky)
 
 
+def float_pack_value(raw: int) -> int:
+    """Qualified 16-bit FPACK field only, not full register/status effects.
+
+    The table specifies exponent clipping and exact fields, but does not settle
+    inexact rounding or the complete upper result storage. Those remain gaps.
+    """
+    word = raw_word(raw)  # FPACK consumes the IEEE32 field, not the extension.
+    sign, exponent, fraction = (word >> 16) & 32768, (word >> 23) & 255, word & 0x7FFFFF
+    if exponent > 135:
+        return sign | 32767
+    if exponent < 110:
+        return sign
+    if exponent > 120:
+        value, discarded = divmod(fraction, 4096)
+        value |= (exponent - 120) << 11
+    else:
+        value, discarded = divmod((1 << 23) | fraction, 1 << (133 - exponent))
+    if discarded:
+        raise Unqualified("inexact FPACK rounding requires qualification")
+    return sign | value
+
+
+def floating_seed(operation: str, raw: int, mode: Mode, *, astat: int = 0,
+                  stky: int = 0) -> IntegerResult:
+    """RECIPS/RSQRTS special cases; ordinary ROM seeds are never approximated."""
+    if operation not in ("recips", "rsqrts"):
+        raise Unqualified(f"unmodeled seed operation: {operation}")
+    if any(not isinstance(flags, int) or not 0 <= flags <= WORD_MASK
+           for flags in (astat, stky)):
+        raise ValueError("old flags must be raw 32-bit values")
+    x = operand(raw, mode)
+    zero_input = x.kind in ("zero", "denormal")
+    invalid = x.kind == "nan" or (operation == "rsqrts" and x.negative and not zero_input)
+    if invalid:
+        if operation == "recips" and x.negative:
+            raise Unqualified("RECIPS negative NaN input AN requires qualification")
+        result = _invalid(mode).raw
+    elif zero_input:
+        result = INFINITY | (SIGN if x.negative else 0)
+    elif (operation == "recips" and x.exponent > 252) or x.kind == "infinity":
+        result = SIGN if operation == "recips" and x.negative else 0
+    else:
+        raise Unqualified(f"{operation.upper()} ROM entry requires independent qualification")
+    zero_result = not invalid and not zero_input
+    negative = x.negative if operation == "recips" else x.negative and zero_input
+    flags = AF | (AZ if zero_result else 0) | (AN if negative else 0)
+    flags |= (AV if zero_input else 0) | (AI if invalid else 0)
+    sticky = (AUS if operation == "recips" and zero_result else 0)
+    sticky |= (AVS if zero_input else 0) | (AIS if invalid else 0)
+    return IntegerResult(result, (astat & ~ALU_FLAGS) | flags, stky | sticky)
+
+
 ACCUMULATOR_MASK = (1 << 80) - 1
 MN, MV, MU, MI = (1 << bit for bit in (6, 7, 8, 9))
 MULTIPLIER_FLAGS = MN | MV | MU | MI
