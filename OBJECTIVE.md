@@ -1,6 +1,6 @@
 # Objective
 
-Build a complete, independent, high-performance SIMD SHARC ISA/VISA native JIT
+Build a complete, independent, high-performance SIMD SHARC ISA/VISA native translation
 library for arbitrary consumer programs. Target ADSP-214xx, starting with the
 ADSP-21489 profile. Support Linux x86-64 and macOS ARM64 with identical guest
 semantics. A firmware-specific subset
@@ -13,11 +13,15 @@ supply real I/O, clocks, peripheral models and scheduling. Preserve architectura
 faults, exceptions, reset, interrupts, address aliases, execution state and memory
 ordering. Unsupported operations must fail with useful guest context.
 
-Production execution is JIT-only. Compile connected native regions along natural
-control flow, keep values live, retain immutable translations and link native
-successors. Support executable-memory/mapping changes and cache invalidation with
-explicit ownership. No hidden interpreter fallback, instruction-count translation
-cap, fabricated progress or application-specific instruction substitution.
+Follow doc/core-contract.md, the contract shared by all cores. Production
+executes prepared LLVM images only: the consumer declares executable code,
+entries, variants and memory layouts; the core lowers them to LLVM IR; the
+consumer optimizes, caches and installs. Keep values live across natural control
+flow and link known successors directly. A code or mapping change revokes the
+binding and a declared variant is installed. No interpreter, no per-host emitter,
+no decoding or compilation at run time, no instruction-count translation cap,
+fabricated progress or application-specific instruction substitution. Complete
+state save and restore and cacheable preparation are part of the interface.
 
 Implement the complete documented ADSP-214xx core ISA for the declared profile:
 classic 48-bit instructions and 16-/32-/48-bit VISA instructions. Preserve both
@@ -51,23 +55,24 @@ is implemented by this documentation change.
 
 Provide reproducible independently authored ISA fixtures and independent expected
 results. Verify state, flags, numerical edge cases, memory access/order, faults,
-interrupt boundaries, self-modifying code, aliases and integration callbacks.
+interrupt boundaries, declared code changes and transitions, aliases and
+integration callbacks.
 Production and independent verification must not share a semantic oracle. Report
 exact ISA/mode coverage; unimplemented or unresolved cases prevent completion.
 Tests are synthetic: manufacturer firmware and extracted instruction sequences
 are not test assets. The firmware reconstruction's byte-only acceptance rule is
 separate from this core's correctness requirements.
 
-Measure cold/warm latency, guest instructions, documented base-cycle estimates,
-generated code size and matched JIT/host-ASM throughput on both host platforms.
-Check complete outputs independently. >=70% realistic warm host-ASM throughput is
-a reference, not a device-integration gate. Measure sustainable consumer throughput
-and bounded live latency separately; clock factors and unmeasured host results
-must remain explicit. Profile-driven optimization must preserve all semantics.
+Measure with the common benchmarks of the contract (kernels K1 to K6): host
+instructions and host cycles per guest instruction from hardware counters, guest
+instructions per second, ratio to the same algorithm in portable Clang O3 C++,
+preparation seconds and native code bytes, every kernel checking its complete
+output. Sustainable consumer throughput and live latency are measured in the
+consumer; clock factors and unmeasured host results stay explicit.
 
 Use C++23, LLVM 19, CMake/Ninja, strict builds, formatting, static analysis and
 focused sanitizer verification before publishing implementation increments.
 Every line must be understood, meaningfully named and pleasantly readable.
 Completion requires a usable native engine, documented API, passing independent
-ISA/JIT/core verification and demonstrated supported-host results. Documentation
+ISA and core verification and demonstrated supported-host results. Documentation
 and downloaded manuals alone do not meet this implementation objective.
