@@ -289,3 +289,152 @@ def float_round(raw: int, mode: Mode) -> FloatingResult:
     if x.kind == "infinity":
         return FloatingResult(x.raw)
     return quantize(x.number(), destination, negative_zero=x.negative)
+
+
+ACCUMULATOR_MASK = (1 << 80) - 1
+MN, MV, MU, MI = (1 << bit for bit in (6, 7, 8, 9))
+MULTIPLIER_FLAGS = MN | MV | MU | MI
+MOS = 1 << 6
+
+
+@dataclass(frozen=True)
+class MultiplierResult:
+    accumulator: int
+    raw: int | None
+    astat: int
+    stky: int
+
+
+def _accumulator_input(accumulator: int, astat: int, stky: int):
+    if not isinstance(accumulator, int) or not 0 <= accumulator <= ACCUMULATOR_MASK:
+        raise ValueError("accumulator must be raw 80-bit storage")
+    if any(not isinstance(flags, int) or not 0 <= flags <= WORD_MASK
+           for flags in (astat, stky)):
+        raise ValueError("old flags must be raw 32-bit values")
+
+
+def _signed_accumulator(accumulator: int) -> int:
+    return accumulator - (1 << 80) if accumulator & (1 << 79) else accumulator
+
+
+def _round_accumulator(accumulator: int) -> int:
+    # Rounding is a separate requested operation. Reading MR1 without rounding
+    # simply discards MR0, including for negative fixed-point values (3-14/16).
+    return (rounded_integer(Fraction(accumulator, 1 << 32), "nearest") << 32) & ACCUMULATOR_MASK
+
+
+def _multiplier_result(value: int, old: int, destination: str, fractional: bool,
+                       signed_result: bool, astat: int, stky: int, *,
+                       saturation: bool = False) -> MultiplierResult:
+    if destination not in ("mr", "register"):
+        raise ValueError("multiplier destination must be mr or register")
+    value &= ACCUMULATOR_MASK
+    number = _signed_accumulator(value) if signed_result else value
+    width = 64 if fractional else 32
+    lower = -(1 << (width - 1)) if signed_result else 0
+    upper = (1 << (width - int(signed_result))) - 1
+    overflow = not lower <= number <= upper
+    if saturation:
+        overflow = False
+    high = value >> 32
+    underflow = fractional and bool(value & WORD_MASK) and (
+        high == 0 or (signed_result and high == (1 << 48) - 1)
+    )
+    flags = (MN if value >> 79 else 0) | (MV if overflow else 0) | (MU if underflow else 0)
+    # Instruction-specific rules leave MUS/MVS/MIS unchanged for fixed operations.
+    sticky = MOS if overflow and not saturation else 0
+    raw = ((value >> (32 if fractional else 0)) & WORD_MASK) << 8
+    return MultiplierResult(value if destination == "mr" else old,
+                            None if destination == "mr" else raw,
+                            (astat & ~MULTIPLIER_FLAGS) | flags, stky | sticky)
+
+
+def multiply(operation: str, left: int, right: int, *, modifier: str = "SSF",
+             accumulator: int = 0, destination: str = "mr", astat: int = 0,
+             stky: int = 0) -> MultiplierResult:
+    """Fixed multiply/MAC/MSUB with old raw accumulator and independent modifiers.
+
+    A register destination leaves MR unchanged. Accumulator arithmetic wraps at
+    80 bits; only SS fractional products have the extra left shift (3-14).
+    """
+    _accumulator_input(accumulator, astat, stky)
+    rounded = modifier.endswith("R")
+    base = modifier[:-1] if rounded else modifier
+    if (len(base) != 3 or base[0] not in "SU" or base[1] not in "SU"
+            or base[2] not in "IF" or (rounded and base[2] != "F")):
+        raise ValueError("invalid fixed multiplier modifier")
+    x, y = raw_word(left), raw_word(right)
+    if base[0] == "S":
+        x = signed(x)
+    if base[1] == "S":
+        y = signed(y)
+    product = x * y
+    fractional = base[2] == "F"
+    if fractional and base[:2] == "SS":
+        product *= 2
+    if operation == "mul":
+        value = product
+    elif operation == "mac":
+        value = accumulator + product
+    elif operation == "msub":
+        value = accumulator - product
+    else:
+        raise Unqualified(f"unmodeled multiplier operation: {operation}")
+    value &= ACCUMULATOR_MASK
+    if rounded:
+        value = _round_accumulator(value)
+    return _multiplier_result(value, accumulator, destination, fractional, "S" in base,
+                              astat, stky)
+
+
+def accumulator_unary(operation: str, accumulator: int, *, format: str = "SF",
+                      destination: str = "mr", astat: int = 0,
+                      stky: int = 0) -> MultiplierResult:
+    """Explicit SAT/RND/clear; the format selects signedness and binary point."""
+    _accumulator_input(accumulator, astat, stky)
+    if operation == "clear":
+        if destination != "mr":
+            raise ValueError("accumulator clear has no register destination")
+        return MultiplierResult(0, None, astat & ~MULTIPLIER_FLAGS, stky)
+    if format not in ("SI", "UI", "SF", "UF"):
+        raise ValueError("invalid accumulator format")
+    fractional, signed_result = format[1] == "F", format[0] == "S"
+    if operation == "round":
+        if not fractional:
+            raise ValueError("explicit RND requires fractional format")
+        value = _round_accumulator(accumulator)
+    elif operation == "sat":
+        width = 64 if fractional else 32
+        number = _signed_accumulator(accumulator) if signed_result else accumulator
+        lower = -(1 << (width - 1)) if signed_result else 0
+        upper = (1 << (width - int(signed_result))) - 1
+        value = min(max(number, lower), upper) & ACCUMULATOR_MASK
+    else:
+        raise Unqualified(f"unmodeled accumulator operation: {operation}")
+    return _multiplier_result(value, accumulator, destination, fractional, signed_result,
+                              astat, stky, saturation=operation == "sat")
+
+
+def accumulator_move(direction: str, part: int, accumulator: int, *, register: int = 0,
+                     astat: int = 0, stky: int = 0) -> MultiplierResult:
+    """MR0/MR1/MR2 transfers; MR1 writes sign-extend to MR2 (3-15)."""
+    _accumulator_input(accumulator, astat, stky)
+    if part not in (0, 1, 2):
+        raise ValueError("accumulator part must be MR0, MR1 or MR2")
+    word = raw_word(register)
+    raw = None
+    if direction == "write":
+        if part == 0:
+            accumulator = (accumulator & (ACCUMULATOR_MASK ^ WORD_MASK)) | word
+        elif part == 1:
+            accumulator = ((signed(word) << 32) | (accumulator & WORD_MASK)) & ACCUMULATOR_MASK
+        else:
+            accumulator = ((word & 0xFFFF) << 64) | (accumulator & ((1 << 64) - 1))
+    elif direction == "read":
+        word = (accumulator >> (32 * part)) & (0xFFFF if part == 2 else WORD_MASK)
+        if part == 2 and word & 0x8000:
+            word |= 0xFFFF0000
+        raw = word << 8
+    else:
+        raise ValueError("accumulator transfer must read or write")
+    return MultiplierResult(accumulator, raw, astat & ~MULTIPLIER_FLAGS, stky)

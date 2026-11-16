@@ -11,6 +11,8 @@ from fractions import Fraction
 import json
 from pathlib import Path
 
+import multiplier_expectations
+
 from reference import (
     FloatingResult, IntegerResult, Mode, Unqualified, fixed, float_from_fixed,
     float_round, floating, quantize,
@@ -210,6 +212,8 @@ def main():
     parser.add_argument("--output", type=Path, help="write qualified numeric cases as JSON")
     arguments = parser.parse_args()
     records = anchored_cases()
+    records.extend(multiplier_expectations.anchors())
+    multiplier_count = multiplier_expectations.product_lattice()
     lattice_count = rounding_lattice()
     explicit_gaps()
     if arguments.output:
@@ -217,8 +221,9 @@ def main():
                    "cases": records}
         arguments.output.parent.mkdir(parents=True, exist_ok=True)
         arguments.output.write_text(json.dumps(payload, indent=2) + "\n")
-    print(f"Validated {len(records)} numeric/conversion anchors and "
-          f"{lattice_count} rounding positions; no installed-image ISA coverage claimed.")
+    print(f"Validated {len(records)} numeric/conversion/accumulator anchors and "
+          f"{lattice_count} rounding positions and {multiplier_count} limb-based multiplier cases; "
+          "no installed-image ISA coverage claimed.")
 
 
 if __name__ == "__main__":

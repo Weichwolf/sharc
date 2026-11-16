@@ -46,8 +46,7 @@ top-level ISA/VISA and compute decoding, independent preparation fixtures, and
 the programmer-visible state definition. Operand-level transfer restrictions,
 ordered effects and hidden delayed/interrupt continuation still need native-path
 implementation and installed-image qualification in S3/S4. They are not claimed
-as execution coverage. S2 is in progress as described below. S3 remains gated on
-the announced Lead update in lead-a1-src#2.
+as execution coverage. S2 is in progress as described below and still precedes S3.
 
 Linux x86-64: Clang/LLVM 19.1.7 Release build, four CTest checks (preparation,
 compute, state and installed consumer), clang-format and clang-tidy clean. A
@@ -60,15 +59,17 @@ No native execution, complete ISA, real-time or benchmark claim.
 ## S2 independent expectations (in progress)
 
 `test/support/reference.py` supplies a separate exact integer/rational numeric
-model. `generate_expectations.py` checks 52 numeric/conversion anchors and 48,768
-normal-range rounding positions and can emit deterministic machine-readable
-expectations without loading production code. Fixed ALU records include complete
-modeled scalar flags and sticky effects. Floating records currently cover numeric
-values and exception metadata only; they are not complete instruction results.
+model. `generate_expectations.py` checks 90 numeric/conversion/accumulator
+anchors, 48,768 normal-range rounding positions and 27,648 limb-based multiplier
+cases and can emit deterministic machine-readable expectations without loading
+production code. Fixed ALU records include complete
+modeled scalar flags and sticky effects, including fixed 80-bit arithmetic,
+saturation, rounding and accumulator transfers. Floating records currently cover
+numeric values and exception metadata only; they are not complete instruction results.
 
 S2 is **not complete**. The model explicitly refuses unqualified NaN/near-underflow
 boundaries and still needs floating status, remaining conversions/computations,
-80-bit multiplier and SIMD/parallel expectations. See
+shifter/packing and SIMD/parallel expectations. See
 [numeric-reference.md](numeric-reference.md) for the exact scope, source sections
 and gaps. Oracle validation is not installed-image ISA execution coverage. No
 production lowering, native-image execution or benchmark implementation has been

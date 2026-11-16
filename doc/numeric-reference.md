@@ -8,7 +8,7 @@ processor execution loop or manufacturer program asset. The reference origin is
 the pinned SHARC Processor Programming Reference 2.4 in
 `reference-manifest.json`, especially chapters 3 and 11, appendix A and appendix C.
 
-This is an initial S2 increment, not completion of S2 or of Strict execution.
+S2 remains in progress; this does not establish Strict execution coverage.
 
 | Component | Current scope |
 |---|---|
@@ -20,6 +20,8 @@ This is an initial S2 increment, not completion of S2 or of Strict execution.
 | Computational input views | Strict RND32 clears eight extension bits before arithmetic; denormal inputs become signed zeros without a new numeric underflow event |
 | Special values | Signed-zero value rules, infinities, 40-bit all-ones NaN results and invalid-operation metadata |
 | Conversion values | FLOAT always returns a 40-bit result, including with RND32 selected; explicit RND consumes extension bits and returns 32-bit precision |
+| Fixed multiplier | SSI/SUI/USI/UUI and fractional/rounded variants, full 80-bit multiply/MAC/MSUB, separate MR/register destinations and preserved old flags |
+| Accumulator operations | Signed/unsigned integer/fraction saturation, explicit nearest rounding, clear, all three limb reads/writes; MR1 writes extend their sign into MR2 |
 | Scale extremes | Signed 32-bit scale factors use exponent bounds before allocating a power of two; extreme shifts cannot request gigabytes of oracle storage |
 
 The model requires an explicit `Mode` for floating operations. It is a mathematical
@@ -42,15 +44,20 @@ architecture; the introductory default-mode sentence on 3-37 is inconsistent.
 python3 test/support/generate_expectations.py --output build/local/strict-expectations.json
 ```
 
-The generator checks 52 independently authored numeric/conversion anchors and
-48,768 positions between neighboring normal encodings. The latter span both
-precisions, both signs, all 254 normal exponents, six fraction patterns, four
+The generator checks 90 independently authored numeric/conversion/accumulator
+anchors and 48,768 positions between neighboring normal encodings. The latter
+span both precisions, both signs, all 254 normal exponents, six fraction patterns, four
 quarter-ULP positions and both rounding directions. Expected neighbors are formed
 from monotone raw bit patterns; they do not use the reference's normalization or
 significand division. Additional checks require explicit refusal of unqualified
-cases. The output contains fixed result/flag records and floating **value-only**
-records, with the distinction encoded in each record's kind. It is deterministic
-and declares `isa_execution_coverage: false`.
+cases. Another 27,648 multiplier cases compare direct unbounded arithmetic with
+schoolbook 16-bit partial products, signed-input corrections and five-limb carry/
+borrow propagation. Their expected overflow uses guard-bit patterns while the
+reference checks numeric bounds; their expected underflow uses a magnitude test.
+The output contains fixed result/flag records and floating **value-only** records,
+with the distinction encoded in each record's kind. Raw 80-bit accumulator values
+use fixed-width hexadecimal strings so a JSON reader cannot silently round them.
+Output is deterministic and declares `isa_execution_coverage: false`.
 
 These are checks of the expectation generator, not a new CTest layer and not a
 replacement execution path for ISA tests. They do not call a fake Core or execute
@@ -75,12 +82,45 @@ Currently explicit refusals include:
 
 Still required: instruction-specific floating flags/sticky effects (including NaN
 and signed-zero flags), FIX versus TRUNC and scaled conversions, remaining FP
-operations and seed ROM expectations, 80-bit fixed multiplier/accumulator behavior,
-shifter/packing expectations, and parallel/SIMD result and status combinations.
+operations and seed ROM expectations, shifter/packing expectations, and
+parallel/SIMD result and status combinations.
 The explicit FIX/TRUNC distinction on 11-37 must not be replaced by a shared host
 integer cast. No partial flag mask is used to claim a complete instruction result.
 
 Normal-range rounding validation does not prove the unqualified underflow boundary,
 seed tables, instruction semantics, compiled native results or a supported-host
 performance result. Every execution row in `isa-coverage.md` remains unimplemented.
-S3 is still gated on the announced Lead translation-rules update in lead-a1-src#2.
+S2 still precedes native lowering; coordination is tracked in issue #2.
+
+## Fixed multiplier details
+
+The raw accumulator has 80 bits. Inputs use the upper 32 bits of each data
+register; only signed/signed fractional multiplication removes a redundant sign
+by shifting the product left once (3-14). MAC and MSUB keep all guard/low limbs
+and wrap at 80 bits. The modeled MN sign is the full multiplier result's bit 79,
+not the sign of a separately selected 32-bit register projection. Register
+output selects MR0 for integer format and MR1 for fractional format and leaves
+the old accumulator untouched.
+
+Overflow follows appendix A-18 and the saturation limits of table 3-4: signed
+integer/fraction limits are 32/64 bits, with 49/17 sign-check bits in the 80-bit
+storage; unsigned limits use 48/16 guard bits. Chapter 11's 33/32 fractional
+counts conflict with both the appendix and the stated format/saturation layout.
+The reference uses the latter consistent definitions and records this discrepancy
+rather than silently testing the contradictory counts.
+
+A requested fractional R operation rounds to nearest ties-to-even at bit 32 and
+clears the discarded part of the computed result (3-16, 11-54). Without R,
+selecting MR1 simply discards MR0, including for a negative result; it is not a
+signed host conversion toward zero. A register destination never writes the
+rounded computed value back into MR. SAT uses all six limits in table 3-4.
+Explicit integer RND modifiers are rejected because the encoding only provides
+SF and UF (table 3-6).
+
+Fixed multiplier instructions update MN/MV/MU/MI and preserve ALU flags, including
+AF. Fixed overflow can set MOS, whereas fixed underflow does not set MUS under
+the instruction-specific tables 3-5 and 11-50 through 11-56. This differs from
+the generic underflow wording in appendix A-19. SAT, clear and accumulator limb
+transfers preserve sticky bits; SAT clears MV, and clear/limb transfers clear all
+four multiplier status bits. These remain oracle expectations to be checked by
+installed-image ISA programs when native lowering exists.
