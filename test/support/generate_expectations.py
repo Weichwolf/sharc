@@ -11,11 +11,12 @@ from fractions import Fraction
 import json
 from pathlib import Path
 
+import conversion_expectations
 import multiplier_expectations
 
 from reference import (
-    FloatingResult, IntegerResult, Mode, Unqualified, fixed, float_from_fixed,
-    float_round, floating, quantize,
+    FloatingResult, IntegerResult, Mode, Unqualified, fixed, fixed_from_float,
+    float_from_fixed, float_round, floating, quantize,
 )
 
 
@@ -198,6 +199,9 @@ def explicit_gaps():
         lambda: fixed("unimplemented", 0),
         lambda: quantize(Fraction(1, 1 << 126) - Fraction(1, 1 << 158), Mode(40)),
         lambda: quantize(Fraction(1, 1 << 126) - Fraction(1, 1 << 150), Mode(32)),
+        lambda: fixed_from_float("fix", 0x7FC0000000, Mode(40), saturate=True),
+        lambda: fixed_from_float("fix", 0x4EFFFFFFFF, Mode(40)),
+        lambda: fixed_from_float("trunc", 0x7F80000000, Mode(40)),
     ]
     for call in calls:
         try:
@@ -213,6 +217,8 @@ def main():
     arguments = parser.parse_args()
     records = anchored_cases()
     records.extend(multiplier_expectations.anchors())
+    records.extend(conversion_expectations.anchors())
+    conversion_count, conversion_refusals = conversion_expectations.quotient_lattice()
     multiplier_count = multiplier_expectations.product_lattice()
     lattice_count = rounding_lattice()
     explicit_gaps()
@@ -222,7 +228,8 @@ def main():
         arguments.output.parent.mkdir(parents=True, exist_ok=True)
         arguments.output.write_text(json.dumps(payload, indent=2) + "\n")
     print(f"Validated {len(records)} numeric/conversion/accumulator anchors and "
-          f"{lattice_count} rounding positions and {multiplier_count} limb-based multiplier cases; "
+          f"{lattice_count} rounding positions and {multiplier_count} limb-based multiplier cases, "
+          f"{conversion_count} signed-quotient conversions ({conversion_refusals} explicit refusals); "
           "no installed-image ISA coverage claimed.")
 
 

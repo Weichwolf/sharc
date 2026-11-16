@@ -59,17 +59,20 @@ No native execution, complete ISA, real-time or benchmark claim.
 ## S2 independent expectations (in progress)
 
 `test/support/reference.py` supplies a separate exact integer/rational numeric
-model. `generate_expectations.py` checks 90 numeric/conversion/accumulator
+model. `generate_expectations.py` checks 118 numeric/conversion/accumulator
 anchors, 48,768 normal-range rounding positions and 27,648 limb-based multiplier
 cases and can emit deterministic machine-readable expectations without loading
 production code. Fixed ALU records include complete
 modeled scalar flags and sticky effects, including fixed 80-bit arithmetic,
-saturation, rounding and accumulator transfers. Floating records currently cover
+saturation, rounding and accumulator transfers. Qualified FIX/TRUNC records cover
+finite integer and saturated results with flags, including exponent-based AV and
+pre-rounded AUS; 10,972 signed-quotient comparisons and 1,828 required refusals
+cross-check both conversion instructions. Floating value records currently cover
 numeric values and exception metadata only; they are not complete instruction results.
 
 S2 is **not complete**. The model explicitly refuses unqualified NaN/near-underflow
-boundaries and still needs floating status, remaining conversions/computations,
-shifter/packing and SIMD/parallel expectations. See
+boundaries and conversion sentinel flags. Floating status, remaining computations,
+shifter/packing and SIMD/parallel expectations are still required. See
 [numeric-reference.md](numeric-reference.md) for the exact scope, source sections
 and gaps. Oracle validation is not installed-image ISA execution coverage. No
 production lowering, native-image execution or benchmark implementation has been

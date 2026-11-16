@@ -20,6 +20,7 @@ S2 remains in progress; this does not establish Strict execution coverage.
 | Computational input views | Strict RND32 clears eight extension bits before arithmetic; denormal inputs become signed zeros without a new numeric underflow event |
 | Special values | Signed-zero value rules, infinities, 40-bit all-ones NaN results and invalid-operation metadata |
 | Conversion values | FLOAT always returns a 40-bit result, including with RND32 selected; explicit RND consumes extension bits and returns 32-bit precision |
+| FIX/TRUNC effects | Finite integer outputs and saturated overflow/infinity, scaled inputs, input precision, nearest/floor/toward-zero distinctions, exponent-based AV and pre-rounded AUS; sentinel-result flags explicitly refused |
 | Fixed multiplier | SSI/SUI/USI/UUI and fractional/rounded variants, full 80-bit multiply/MAC/MSUB, separate MR/register destinations and preserved old flags |
 | Accumulator operations | Signed/unsigned integer/fraction saturation, explicit nearest rounding, clear, all three limb reads/writes; MR1 writes extend their sign into MR2 |
 | Scale extremes | Signed 32-bit scale factors use exponent bounds before allocating a power of two; extreme shifts cannot request gigabytes of oracle storage |
@@ -44,7 +45,7 @@ architecture; the introductory default-mode sentence on 3-37 is inconsistent.
 python3 test/support/generate_expectations.py --output build/local/strict-expectations.json
 ```
 
-The generator checks 90 independently authored numeric/conversion/accumulator
+The generator checks 118 independently authored numeric/conversion/accumulator
 anchors and 48,768 positions between neighboring normal encodings. The latter
 span both precisions, both signs, all 254 normal exponents, six fraction patterns, four
 quarter-ULP positions and both rounding directions. Expected neighbors are formed
@@ -54,8 +55,12 @@ cases. Another 27,648 multiplier cases compare direct unbounded arithmetic with
 schoolbook 16-bit partial products, signed-input corrections and five-limb carry/
 borrow propagation. Their expected overflow uses guard-bit patterns while the
 reference checks numeric bounds; their expected underflow uses a magnitude test.
-The output contains fixed result/flag records and floating **value-only** records,
-with the distinction encoded in each record's kind. Raw 80-bit accumulator values
+Another 10,972 conversions compare against signed quotient/remainder arithmetic
+over both precisions, signs, mode-bit values, instructions and saturation choices,
+ten exponents, eight fraction patterns and five scales. The same lattice requires
+1,828 explicit refusals for unqualified unsaturated overflow results.
+The output contains fixed and qualified FIX/TRUNC result/flag records and floating
+**value-only** records, with the distinction encoded in each record's kind. Raw 80-bit accumulator values
 use fixed-width hexadecimal strings so a JSON reader cannot silently round them.
 Output is deterministic and declares `isa_execution_coverage: false`.
 
@@ -78,10 +83,14 @@ Currently explicit refusals include:
 - The extension byte of a canonical NaN in a RND32 result, and RND32 classification
   when the only NaN payload bits are in that byte. Forty-bit NaN values are modeled;
   these 32-bit details require further evidence.
+- Complete FIX/TRUNC flags when the result is the all-ones floating sentinel
+  (NaN input, or unsaturated infinity/overflow). The sentinel value is documented;
+  its AN effect is not established by the fixed-point result wording. Saturated
+  infinities and finite integer results already have complete scalar expectations.
 - Operations outside the currently implemented numerical functions.
 
 Still required: instruction-specific floating flags/sticky effects (including NaN
-and signed-zero flags), FIX versus TRUNC and scaled conversions, remaining FP
+and signed-zero flags), sentinel conversion flags, remaining FP
 operations and seed ROM expectations, shifter/packing expectations, and
 parallel/SIMD result and status combinations.
 The explicit FIX/TRUNC distinction on 11-37 must not be replaced by a shared host
@@ -91,6 +100,25 @@ Normal-range rounding validation does not prove the unqualified underflow bounda
 seed tables, instruction semantics, compiled native results or a supported-host
 performance result. Every execution row in `isa-coverage.md` remains unimplemented.
 S2 still precedes native lowering; coordination is tracked in issue #2.
+
+## FIX/TRUNC details
+
+Chapter 11-37 explicitly gives FIX with MODE1.TRUNC set a rounding direction of
+minus infinity, while the TRUNC instruction always rounds toward zero. The model
+uses this instruction-specific rule despite the general toward-zero description
+on 3-38. With MODE1.TRUNC clear, FIX rounds nearest ties-to-even. Scaling changes
+the exponent before conversion; the model bounds extreme signed 32-bit scales
+before allocating powers of two. Normal inputs use the computational precision
+rule on 3-37; denormal inputs flush before conversion and do not set AUS.
+
+AV uses the stated biased-exponent-plus-scale threshold of 157, independently
+of signed integer range overflow. Consequently exact negative INT_MIN sets AV,
+while rounding the greatest representable value below positive 2**31 can overflow
+without setting AV. Saturation clamps the rounded integer but leaves this AV rule
+intact. AUS describes a nonzero pre-rounded magnitude below one, including when
+nearest rounding produces one or negative floor produces minus one. Unrelated
+ASTAT bits and old sticky bits survive, AF is set and AC/AS/AI are cleared for the
+qualified cases. No sentinel flag expectation is fabricated to fill the gap.
 
 ## Fixed multiplier details
 

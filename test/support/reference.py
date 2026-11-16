@@ -17,6 +17,7 @@ INFINITY = 255 << 31
 AZ, AV, AN, AC, AS, AI, AF = (1 << bit for bit in (0, 1, 2, 3, 4, 5, 10))
 ALU_FLAGS = AZ | AV | AN | AC | AS | AI | AF
 AOS = 1 << 2
+AUS, AVS = 1, 2
 CACC = 255 << 24
 
 
@@ -289,6 +290,54 @@ def float_round(raw: int, mode: Mode) -> FloatingResult:
     if x.kind == "infinity":
         return FloatingResult(x.raw)
     return quantize(x.number(), destination, negative_zero=x.negative)
+
+
+def fixed_from_float(operation: str, raw: int, mode: Mode, *, scale: int = 0,
+                     saturate: bool = False, astat: int = 0,
+                     stky: int = 0) -> IntegerResult:
+    """Qualified FIX/TRUNC result and flags, including exponent-based AV.
+
+    The all-ones floating sentinel's AN effect remains unqualified. This function
+    refuses NaNs and unsaturated overflow rather than guessing complete flags.
+    """
+    if operation not in ("fix", "trunc"):
+        raise Unqualified(f"unmodeled float-to-fixed conversion: {operation}")
+    if not isinstance(scale, int) or not -(1 << 31) <= scale < 1 << 31:
+        raise ValueError("scale must be a signed 32-bit integer")
+    if any(not isinstance(flags, int) or not 0 <= flags <= WORD_MASK
+           for flags in (astat, stky)):
+        raise ValueError("old flags must be raw 32-bit values")
+    x = operand(raw, mode)
+    if x.kind == "nan":
+        raise Unqualified("FIX/TRUNC NaN sentinel status requires qualification")
+    shifted_exponent = x.exponent + scale
+    overflow_flag = x.kind == "infinity" or shifted_exponent > 157
+    small = False
+    if x.kind in ("zero", "denormal"):
+        value = 0
+    elif x.kind == "infinity" or shifted_exponent > 158:
+        # This sentinel is used only for range detection, never as an output.
+        value = -(1 << 32) if x.negative else 1 << 32
+    elif shifted_exponent < 126:
+        small = True
+        value = -1 if x.negative and operation == "fix" and mode.rounding == "zero" else 0
+    else:
+        number = x.number() * power(scale)
+        small = 0 < abs(number) < 1
+        if operation == "fix" and mode.rounding == "zero":
+            # Instruction-specific 11-37 overrides the general toward-zero rule.
+            value = number.numerator // number.denominator
+        else:
+            value = rounded_integer(number, "zero" if operation == "trunc" else "nearest")
+    if not -(1 << 31) <= value < 1 << 31:
+        if not saturate:
+            raise Unqualified("FIX/TRUNC unsaturated overflow sentinel status requires qualification")
+        value = -(1 << 31) if value < 0 else (1 << 31) - 1
+    flags = AF | (AZ if value == 0 else 0) | (AN if value < 0 else 0)
+    flags |= AV if overflow_flag else 0
+    sticky = (AUS if small else 0) | (AVS if overflow_flag else 0)
+    return IntegerResult((value & WORD_MASK) << 8,
+                         (astat & ~ALU_FLAGS) | flags, stky | sticky)
 
 
 ACCUMULATOR_MASK = (1 << 80) - 1
