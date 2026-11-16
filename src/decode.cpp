@@ -134,7 +134,9 @@ Instruction instruction(std::span<const std::uint16_t> parcels,
                      .address = pc,
                      .word = std::uint64_t{head} << 32,
                      .type = format->type,
-                     .bits = format->bits};
+                     .bits = format->bits,
+                     .compute = {},
+                     .instruction_set = set};
   const auto need = [&](std::size_t count) {
     if (parcels.size() < count) {
       refuse(FaultReason::truncated_instruction,
@@ -160,6 +162,7 @@ Instruction instruction(std::span<const std::uint16_t> parcels,
   need(count);
   if (count >= 2) { result.word |= std::uint64_t{parcels[1]} << 16; }
   if (count == 3) { result.word |= parcels[2]; }
+  result.compute = decode_compute(result, identity);
   return result;
 }
 } // namespace

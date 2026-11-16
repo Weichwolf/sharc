@@ -1,7 +1,8 @@
 # Target architecture
 
-This is the implementation target, not a claim of existing code. The S1 foundation contains the public declarations, raw architectural storage
-and structural instruction-format recognition. No lowering or native execution
+This is the implementation target, not a claim of existing execution. The S1
+implementation contains the public declarations, raw architectural storage,
+instruction-format recognition and compute-field normalization. No lowering or native execution
 is implemented yet; see [isa-coverage.md](isa-coverage.md) for current evidence.
 
 ```text

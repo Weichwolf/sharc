@@ -89,6 +89,16 @@ int main() try {
   check(core.registers() == registers, "register inspection lost architectural bits or banks");
   const auto saved_state = core.state();
   const auto snapshot = core.save();
+  constexpr unsigned maximum_fifo_pointer = 0x7f;
+  auto fifo_state = registers;
+  fifo_state.pe[1].bit_fifo_write_pointer = maximum_fifo_pointer;
+  core.set_registers(fifo_state);
+  check(core.registers() == fifo_state, "raw seven-bit FIFO pointer was truncated or rejected");
+  constexpr unsigned excess_fifo_pointer = 0x80;
+  fifo_state.pe[1].bit_fifo_write_pointer = excess_fifo_pointer;
+  fixture::throws<std::invalid_argument>([&] { core.set_registers(fifo_state); },
+                                         "FIFO pointer accepted an eighth bit");
+  core.restore(snapshot);
   core.set_registers({});
   check(core.registers() == sharc::Registers{}, "set_registers retained prior bank state");
   const auto result = core.run(instruction_limit);

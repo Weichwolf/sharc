@@ -2,7 +2,8 @@
 
 Every execution row remains **unimplemented**. The S1 foundation recognizes
 top-level formats during preparation; that does not establish operand legality,
-compute semantics or installed-image execution coverage. S1 is not complete yet.
+compute semantics or installed-image execution coverage. S1 covers the
+preparation/storage boundary; native execution is still absent.
 
 | Area | Required evidence | Status |
 |---|---|---|
@@ -17,7 +18,7 @@ compute semantics or installed-image execution coverage. S1 is not complete yet.
 | Chip-profile boundaries | ADSP-21489 memory/vector parameters and explicit I/O ownership | Unimplemented |
 | JIT coherence and hosts | Self-modifying aliases, natural loops, precise exits, x86-64 and ARM64 | Unimplemented |
 
-## S1 preparation evidence
+## S1 preparation evidence (complete milestone)
 
 `test/core/preparation.cpp` drives only public `Core::lower` and checks structural
 recognition of forms 1a/b, 2a/b/c, 3a/b/c, 4a/b, 5a/b, 6a, 7a/b, 8a,
@@ -26,6 +27,12 @@ recognition of forms 1a/b, 2a/b/c, 3a/b/c, 4a/b, 5a/b, 6a, 7a/b, 8a,
 written numerical fields. Additional cases check compact/classic prefix
 collisions, 16/32/48-bit truncation, instruction-interior entry refusal, ISA/VISA
 PC units, span overlap, vectors, transitions and input/mode identity separation.
+`test/core/compute.cpp` adds single-function, immediate/short-compute, dual-ALU,
+multiplier/ALU and accumulator-transfer cases. It checks reserved opcodes,
+invalid modifiers and class collisions through the same public preparation path.
+The decoder normalizes these compute fields while retaining raw encoding and
+ISA/VISA identity. The detailed inventory is in [encoding.md](encoding.md).
+
 All recognized instructions still fail preparation with identity, variant, PC,
 raw encoding, width and an explicit unsupported-lowering reason.
 
@@ -34,12 +41,18 @@ mode compatibility and clearing a later unprepared-execution fault. These are
 storage/interface checks; hardware reset, interrupted continuation and execution
 semantics are not qualified. See [state.md](state.md).
 
-Open S1 work: operand/compute decoding and legality, a detailed encoding inventory,
-and review of the architectural continuation needed by native execution. S2's
-independent arithmetic model is absent. S3 remains gated on the announced Lead
-update in lead-a1-src#2.
+S1 provides all contract declarations, an installable `sharc::core` package,
+top-level ISA/VISA and compute decoding, independent preparation fixtures, and
+the programmer-visible state definition. Operand-level transfer restrictions,
+ordered effects and hidden delayed/interrupt continuation still need native-path
+implementation and installed-image qualification in S3/S4. They are not claimed
+as execution coverage. S2's independent arithmetic model is absent. S3 remains
+gated on the announced Lead update in lead-a1-src#2.
 
-Linux x86-64: Clang/LLVM 19.1.7 Release build and public preparation/state tests.
+Linux x86-64: Clang/LLVM 19.1.7 Release build, four CTest checks (preparation,
+compute, state and installed consumer), clang-format and clang-tidy clean. A
+source export without manuals or Git metadata builds and passes the same four
+checks. Only the public headers are installed; no LLVM types leak through them.
 macOS ARM64: untested. Hardware user counters `instructions:u,cycles:u` were
 accessible with perf_event_paranoid=2; no guest benchmark measurements exist.
 No native execution, complete ISA, real-time or benchmark claim.

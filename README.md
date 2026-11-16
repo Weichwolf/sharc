@@ -10,9 +10,10 @@ acceptance and [doc/architecture.md](doc/architecture.md) for the target design.
 
 ## Current state
 
-The initial S1 foundation provides the two public headers, the `sharc::core`
-build target, structural ISA/VISA format recognition, preparation diagnostics
-and raw architectural state/snapshot storage. Every instruction still refuses
+The S1 preparation implementation provides the two public headers, the `sharc::core`
+build target, ISA/VISA format and compute-field decoding, preparation diagnostics
+and raw architectural state/snapshot storage. The CMake package installs the
+`sharc::core` target and exactly two public headers. Every instruction still refuses
 lowering explicitly. No native execution or benchmark result exists. See
 [coverage](doc/isa-coverage.md) and [state storage](doc/state.md).
 
@@ -23,7 +24,8 @@ ctest --test-dir build --output-on-failure
 ```
 
 Requirements: C++23, LLVM 19.1, CMake 3.25 and Ninja. The tests work offline
-without local reference manuals. Linux x86-64 is tested; macOS ARM64 is untested.
+without local reference manuals. An installed CMake consumer is checked by CTest.
+Linux x86-64 is tested; macOS ARM64 is untested.
 
 ## Planned numerical modes
 

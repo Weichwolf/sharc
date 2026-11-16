@@ -1,8 +1,9 @@
 # Implementation ownership
 
 `decode.cpp` validates declared image boundaries and recognizes top-level classic
-ISA and VISA formats during preparation. It does not yet validate every operand
-or normalize compute operations. `core.cpp` supplies public preparation refusal,
+ISA and VISA formats during preparation. `compute.cpp` normalizes the compute
+fields and rejects reserved compute opcodes/modifiers. Transfer operand restrictions and all execution semantics
+remain unqualified. `core.cpp` supplies public preparation refusal,
 raw state inspection and snapshot replacement. All lowering and native execution
 remain unimplemented; no interpreter or host emitter exists.
 

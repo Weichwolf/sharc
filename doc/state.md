@@ -1,7 +1,7 @@
 # ADSP-21489 architectural storage
 
 The public `Registers` definition stores physical architectural bits, independently
-of the selected computation precision. It is the initial S1 storage model, not an
+of the selected computation precision. It is the S1 programmer-visible storage model, not an
 execution or reset implementation. Default initialization supplies zeroed inspection
 storage; it does not claim the hardware reset state. The reference is the SHARC
 Processor Programming Reference 2.4, chapters 2–6 and appendix A, identified in
@@ -11,7 +11,7 @@ Processor Programming Reference 2.4, chapters 2–6 and appendix A, identified i
 |---|---|
 | `pe[0]`, `pe[1]` | PEx and PEy; each has two physical banks of sixteen raw 40-bit registers |
 | `pe[].multiplier[0..1]` | Foreground/background 80-bit MRF/MRB or MSF/MSB, split into unsigned 32/32/16-bit limbs |
-| `pe[].bit_fifo`, `bit_fifo_write_pointer` | 64-bit shifter FIFO and occupancy/write pointer, 0 through 64 |
+| `pe[].bit_fifo`, `bit_fifo_write_pointer` | 64-bit shifter FIFO and raw seven-bit write pointer (normal occupancy 0 through 64) |
 | `pe[].astat`, `pe[].stky` | Independent status/sticky bits for both lanes |
 | `dag[bank][0..15]` | Primary/alternate I/M/L/B; indices 0–7 are DAG1, 8–15 DAG2; raw 32-bit values |
 | `pc`, `faddr`, `daddr` | 24-bit execution, fetch and decode addresses; ISA counts 48-bit words, VISA counts 16-bit parcels |
@@ -32,6 +32,10 @@ of each host integer; a guest 32-bit view occupies bits 39:8. Selection through
 MODE1 does not swap the physical bank arrays. Accumulator limbs are raw two's
 complement storage, not three independently signed numbers. PCSTK, LADDR and
 CURLCNTR are views of the stack tops, not duplicate independently mutable fields.
+BFFWRP retains all seven bits: page 11-89 defines a write above 64 as an SV
+condition. The storage boundary must not truncate those raw bits to a valid FIFO
+occupancy. Instruction effects and undefined FIFO overflow/underflow behavior
+still require separate execution qualification.
 No host C++ object layout is a file or generated-code ABI.
 
 `State` adds cumulative instruction/base-cycle progress, instruction set, execution

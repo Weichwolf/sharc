@@ -1,0 +1,5 @@
+# SPDX-License-Identifier: GPL-3.0-only
+@PACKAGE_INIT@
+include(CMakeFindDependencyMacro)
+find_dependency(LLVM 19.1 CONFIG)
+include("${CMAKE_CURRENT_LIST_DIR}/sharcTargets.cmake")

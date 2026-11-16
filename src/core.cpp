@@ -180,6 +180,7 @@ Registers Core::registers() const {
 
 void Core::set_registers(const Registers &registers) {
   constexpr unsigned data_bits = 40;
+  constexpr unsigned maximum_fifo_pointer = 0x7f;
   constexpr unsigned pc_stack_bits = 26;
   constexpr unsigned overflowed_pc_stack_pointer = 31;
   for (const auto &pe : registers.pe) {
@@ -190,8 +191,8 @@ void Core::set_registers(const Registers &registers) {
         }
       }
     }
-    if (pe.bit_fifo_write_pointer > 64) {
-      throw std::invalid_argument("bit FIFO write pointer exceeds 64");
+    if (pe.bit_fifo_write_pointer > maximum_fifo_pointer) {
+      throw std::invalid_argument("bit FIFO write pointer exceeds 7 bits");
     }
   }
   if (registers.pc > detail::maximum_pc || registers.faddr > detail::maximum_pc ||

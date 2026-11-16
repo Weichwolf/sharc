@@ -5,8 +5,8 @@ Exactly three verification layers follow `doc/core-contract.md`:
 - `isa/`: instruction programs executed through declared, installed LLVM images,
   with independently calculated expected results. No execution coverage yet.
 - `core/`: public preparation and lifecycle boundaries. The initial tests exercise
-  format recognition, declared PC boundaries, rejection diagnostics, raw state
-  storage and snapshot replacement. They do not call private decoder functions.
+  format/compute recognition, declared PC boundaries, reserved-opcode rejection,
+  raw state storage, snapshot replacement and an installed CMake consumer. They do not call private decoder functions.
 - `bench/`: K1–K6 with complete output checks and separate Strict/FastFP32 results.
   No kernels are implemented yet.
 
