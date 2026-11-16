@@ -57,8 +57,12 @@ doc/architecture.md; they were paid for on cpu12 and dsp56300.
 
 - German with the user; English code, comments, docs, commits and issues. C++23,
   LLVM 19, CMake/Ninja, warnings as errors, clang-format, clang-tidy clean.
-- Commit reviewed increments and push them to origin/main (private
-  Weichwolf/sharc). No force pushes or backup branches.
+- Commit reviewed increments and push them to origin/main (Weichwolf/sharc).
+  No force pushes or backup branches.
+- This repository is public. Nothing from private repositories enters it: no
+  firmware-derived code or data, no reconstruction notes, no text copied from
+  private issues, no manufacturer documents. Refer to private issues by number
+  only.
 - Linux x86-64 is the development host. macOS ARM64 is validated when a developer
   is available there; mark untested hosts honestly.
 - Coordinate in issues of private Weichwolf/lead-a1-src. Comments starting with
