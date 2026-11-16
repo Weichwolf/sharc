@@ -15,7 +15,8 @@ build target, ISA/VISA format and compute-field decoding, preparation diagnostic
 and raw architectural state/snapshot storage. The CMake package installs the
 `sharc::core` target and exactly two public headers. Every instruction still refuses
 lowering explicitly. No native execution or benchmark result exists. See
-[coverage](doc/isa-coverage.md) and [state storage](doc/state.md).
+[coverage](doc/isa-coverage.md), [state storage](doc/state.md) and the
+in-progress [independent numeric reference](doc/numeric-reference.md).
 
 ```sh
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=clang++-19

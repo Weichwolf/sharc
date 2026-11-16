@@ -6,7 +6,8 @@ Exactly three verification layers follow `doc/core-contract.md`:
   with independently calculated expected results. No execution coverage yet.
 - `core/`: public preparation and lifecycle boundaries. The initial tests exercise
   format/compute recognition, declared PC boundaries, reserved-opcode rejection,
-  raw state storage, snapshot replacement and an installed CMake consumer. They do not call private decoder functions.
+  raw state storage, snapshot replacement and an installed CMake consumer. They
+  do not call private decoder functions.
 - `bench/`: K1–K6 with complete output checks and separate Strict/FastFP32 results.
   No kernels are implemented yet.
 
@@ -17,3 +18,10 @@ recognition and explicit refusal, not legal compute operands or ISA semantics.
 State storage round trips are lifecycle checks, not arithmetic expectations.
 
 Build and tests require no manuals, manufacturer code, network or device firmware.
+
+`support/reference.py` is the independent S2 numerical reference, currently partial.
+Run `python3 test/support/generate_expectations.py` to validate its anchored and
+rational rounding expectations. This is oracle generation/validation, not a fourth
+verification layer or ISA acceptance. Floating value-only records and unqualified
+cases must gain complete instruction expectations before installed-image tests
+can establish coverage. See `doc/numeric-reference.md`.
