@@ -59,7 +59,7 @@ No native execution, complete ISA, real-time or benchmark claim.
 ## S2 independent expectations (in progress)
 
 `test/support/reference.py` supplies a separate exact integer/rational numeric
-model. `generate_expectations.py` checks 274 numeric/conversion/accumulator/shifter
+model. `generate_expectations.py` checks 277 numeric/conversion/accumulator/shifter
 anchors, 48,768 normal-range rounding positions and 27,648 limb-based multiplier
 cases and can emit deterministic machine-readable expectations without loading
 production code. Fixed ALU records include complete
@@ -90,10 +90,17 @@ truth tables. Conditional numerical records preserve inactive raw destinations,
 old flags and SISD PEy state. These are not sequencer, DAG, memory-transfer or
 pipeline execution checks.
 
+Another 10,112 bank/writeback checks cover the documented producer priorities,
+both PE files, all logical data registers and primary/alternate bank combinations;
+256 winning-priority ties require explicit refusal. Complete raw-bank records
+preserve old operands and compose overwritten ALU data with its independently
+computed flags. This is numerical expectation generation; it does not qualify
+parallel memory order, conditional transfers or native writeback execution.
+
 S2 is **not complete**. The model explicitly refuses unqualified NaN/near-underflow
 boundaries and conversion sentinel flags. Remaining exceptional floating status, computations,
-OR-shift status, complete FPACK, full conditional execution/bank composition and parallel memory/
-write-priority expectations are still required. See
+OR-shift status, complete FPACK, full conditional execution/bank composition and parallel memory
+ordering expectations are still required. See
 [numeric-reference.md](numeric-reference.md) for the exact scope, source sections
 and gaps. Oracle validation is not installed-image ISA execution coverage. No
 production lowering, native-image execution or benchmark implementation has been

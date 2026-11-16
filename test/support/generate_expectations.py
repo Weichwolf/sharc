@@ -18,6 +18,7 @@ import multiplier_expectations
 import packing_expectations
 import parallel_expectations
 import shifter_expectations
+import writeback_expectations
 
 from reference import (
     FloatingResult, IntegerResult, Mode, Unqualified, fixed, fixed_from_float,
@@ -228,6 +229,9 @@ def main():
     records.extend(parallel_expectations.anchors())
     records.extend(packing_expectations.anchors())
     records.extend(condition_expectations.anchors())
+    records.extend(writeback_expectations.anchors())
+    writeback_count, writeback_refusals = writeback_expectations.bank_priority_lattice()
+    writeback_expectations.invalid_inputs()
     condition_count = condition_expectations.predicate_lattice() + condition_expectations.lane_lattice()
     condition_expectations.explicit_gaps()
     packing_count, packing_refusals = packing_expectations.packing_lattice()
@@ -263,6 +267,7 @@ def main():
           f"{packing_count} pack fields ({packing_refusals} refused rounding cases), "
           f"{seed_count} seed special cases; "
           f"{condition_count} predicate/aggregation cases; "
+          f"{writeback_count} bank/writeback cases ({writeback_refusals} refused priority ties); "
           "no installed-image ISA coverage claimed.")
 
 

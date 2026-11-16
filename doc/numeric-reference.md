@@ -35,6 +35,7 @@ S2 remains in progress; this does not establish Strict execution coverage.
 | SIMD numeric expectations | Authored paired PEx/PEy values with distinct carry/overflow, saturation, floating exceptions and old flag/sticky inputs; no cross-lane flag union |
 | Numeric/status conditions | EQ/NE/GT/LT/GE/LE, arithmetic/shifter/BTF predicates and complements; old AF/AV/ALUSAT selection, per-lane compute, branch AND and post-modify OR |
 | Conditional numeric effects | Qualified fixed/floating computations from old lane predicates; inactive/SISD lanes and comparison destinations retain all raw storage and old flags |
+| Data register writeback | Raw 40-bit physical cells, low/high alternate-bank selection, producer write priority and independent PE destinations; proposals are already admitted and projected |
 | Scale extremes | Signed 32-bit scale factors use exponent bounds before allocating a power of two; extreme shifts cannot request gigabytes of oracle storage |
 
 The model requires an explicit `Mode` for floating operations. It is a mathematical
@@ -59,7 +60,7 @@ architecture; the introductory default-mode sentence on 3-37 is inconsistent.
 python3 test/support/generate_expectations.py --output build/local/strict-expectations.json
 ```
 
-The generator checks 274 independently authored numeric/conversion/accumulator/shifter
+The generator checks 277 independently authored numeric/conversion/accumulator/shifter
 anchors and 48,768 positions between neighboring normal encodings. The latter
 span both precisions, both signs, all 254 normal exponents, six fraction patterns, four
 quarter-ULP positions and both rounding directions. Expected neighbors are formed
@@ -108,6 +109,14 @@ status. They cannot be consumed as complete instruction expectations. `seed`
 records do contain complete qualified raw/status/sticky effects.
 Output is deterministic and declares `isa_execution_coverage: false`.
 
+Another 10,112 register-writeback cases cover both PEs, all sixteen logical
+registers, the four low/high bank combinations and every producer-priority pair
+in both proposal orders. Another 256 cases refuse an unresolved tie at the
+winning priority. Authored packets show that a memory-source write can replace
+an ALU data result while its new overflow/carry/zero flags remain, and that
+different PE files do not compete. These records describe normalized raw writes;
+they do not establish transfer widths, predicate admission or memory bus order.
+
 These are checks of the expectation generator, not a new CTest layer and not a
 replacement execution path for ISA tests. They do not call a fake Core or execute
 an interpreter. Installed-image ISA tests will need complete independent results,
@@ -147,8 +156,9 @@ Currently explicit refusals include:
 
 Still required: the unqualified floating, conversion, packing and seed details
 above, OR-shift status, and
-parallel memory/write priority, full conditional execution and mode/register-bank
-composition. Qualified arithmetic composition does not close those architectural gaps.
+parallel memory ordering, full conditional transfer admission and mode/register-bank
+composition beyond admitted raw writes. Qualified arithmetic and writeback
+composition do not close those architectural gaps.
 The explicit FIX/TRUNC distinction on 11-37 must not be replaced by a shared host
 integer cast. No partial flag mask is used to claim a complete instruction result.
 

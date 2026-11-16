@@ -64,6 +64,52 @@ class IntegerResult:
     stky: int
 
 
+@dataclass(frozen=True)
+class RegisterWrite:
+    """An admitted raw write proposal, independent of instruction encoding."""
+
+    source: str
+    lane: int
+    register: int
+    raw: int
+
+
+def register_writeback(old: tuple, proposals: tuple[RegisterWrite, ...], *,
+                       mode1: int = 0) -> tuple:
+    """Resolve raw writes into physical banks by the priority on PRM 2-6/2-7.
+
+    Inputs are already admitted and projected to raw40. This models neither
+    transfer widths/predicates nor memory accesses, addresses or bus ordering.
+    """
+    if (len(old) != 2 or any(len(lane) != 2 for lane in old)
+            or any(len(bank) != 16 for lane in old for bank in lane)
+            or not isinstance(mode1, int) or not 0 <= mode1 <= WORD_MASK):
+        raise ValueError("writeback needs two lanes, two banks, sixteen registers and MODE1")
+    result = [[list(bank) for bank in lane] for lane in old]
+    for lane in old:
+        for bank in lane:
+            for raw in bank:
+                raw_word(raw)
+    ranks = {"dag1": 0, "ureg": 0, "dag2": 1, "alu_x": 2, "alu_y": 3,
+             "multiplier_x": 4, "multiplier_y": 5, "shifter_x": 6, "shifter_y": 7}
+    groups = {}
+    for proposal in proposals:
+        if (proposal.source not in ranks or proposal.lane not in (0, 1)
+                or not 0 <= proposal.register < 16):
+            raise ValueError("invalid register write proposal")
+        raw_word(proposal.raw)
+        bank = (mode1 >> (7 if proposal.register // 8 else 10)) & 1
+        location = proposal.lane, bank, proposal.register
+        groups.setdefault(location, []).append((ranks[proposal.source], proposal.raw))
+    for (lane, bank, register), candidates in groups.items():
+        priority = min(rank for rank, _ in candidates)
+        winners = [raw for rank, raw in candidates if rank == priority]
+        if len(winners) != 1:
+            raise Unqualified("equal-priority writes to one physical register require qualification")
+        result[lane][bank][register] = winners[0]
+    return tuple(tuple(tuple(bank) for bank in lane) for lane in result)
+
+
 def fixed(operation: str, left: int, right: int = 0, *, astat: int = 0,
           stky: int = 0, saturate: bool = False, truncate: bool = False) -> IntegerResult:
     """One ALU numeric operation on raw register views, not an ISA executor.
