@@ -2,8 +2,9 @@
 """Independent register-bank and parallel writeback expectations from PRM 2-5..7."""
 
 from dataclasses import asdict
+from itertools import product
 
-from reference import IntegerResult, RegisterWrite, Unqualified, fixed, register_writeback
+from reference import IntegerResult, RegisterWrite, Unqualified, fixed, register_writeback, swap_writes
 
 
 def registers():
@@ -118,3 +119,76 @@ def invalid_inputs():
         except ValueError:
             continue
         raise AssertionError("invalid writeback input was accepted")
+
+
+def swap_anchors():
+    cases = (
+        ("SISD swap moves PEy while its computation is inactive", 0, (True, False),
+         0, 0x7FFFFFFF00, 0x1122334455, (0x1122334455, 0x7FFFFFFF00), (6, 0), (4, 0)),
+        ("SIMD PEy half reads old PEx source and defeats its ALU write", 0x200000,
+         (False, True), 1, 0x123456789A, 0x7FFFFFFF00,
+         (0x123456789A, 0x123456789A), (0, 6), (0, 4)),
+    )
+    records = []
+    for name, mode, selected, lane, x, y, outputs, flags, sticky in cases:
+        x_reg, y_reg = 0, 1
+        compute_reg, addend_reg = (0, 1) if lane == 0 else (1, 2)
+        old = replaced(replaced(registers(), 0, 0, x_reg, x), 1, 0, y_reg, y)
+        old = replaced(old, lane, 0, addend_reg, 0x100)
+        # EQ is selected from these old AZ bits, before the ADD changes AZ.
+        old_astat, old_stky = tuple(int(value) for value in selected), (0, 0)
+        computed = fixed("add", old[lane][0][compute_reg], 0x100,
+                         astat=old_astat[lane], stky=old_stky[lane])
+        require(computed, IntegerResult(0x8000000000, 6, 4), name)
+        proposals = (RegisterWrite("alu_x" if lane == 0 else "alu_y", lane, compute_reg, computed.raw),)
+        proposals += swap_writes(old, x_reg, y_reg, mode1=mode, selected=selected)
+        actual = register_writeback(old, proposals, mode1=mode)
+        expected = replaced(replaced(old, 0, 0, x_reg, outputs[0]), 1, 0, y_reg, outputs[1])
+        actual_flags, actual_sticky = list(old_astat), list(old_stky)
+        actual_flags[lane], actual_sticky[lane] = computed.astat, computed.stky
+        require((actual, tuple(actual_flags), tuple(actual_sticky)), (expected, flags, sticky), name)
+        records.append(dict(name=name, kind="compute-and-data-swap", mode1=mode,
+                            condition="eq", selected=selected, old_astat=old_astat, old_stky=old_stky,
+                            x_register=x_reg, y_register=y_reg, old_registers=old,
+                            compute=dict(lane=lane, operation="add", destination=compute_reg,
+                                         left=compute_reg, right=addend_reg, expected=asdict(computed)),
+                            proposals=[asdict(item) for item in proposals],
+                            expected_registers=expected, expected_astat=flags, expected_stky=sticky))
+    return records
+
+
+def swap_lattice():
+    # Every physical source has a distinct extension byte as well as word value.
+    old = tuple(tuple(tuple(raw - 165 + lane * 64 + bank * 32 + reg
+                            for reg, raw in enumerate(values)) for bank, values in enumerate(banks))
+                for lane, banks in enumerate(registers()))
+    bank_modes = ((0, 0, 0), (0x400, 1, 0), (0x80, 0, 1), (0x480, 1, 1))
+    # Literal transfer truth tables from PRM 4-98. The SISD PEy half is
+    # deliberately different from the existing computation-lane predicate.
+    tables = (((False, False), (False, False), (True, True), (True, True)),
+              ((False, False), (False, True), (True, False), (True, True)))
+    count = 0
+    axes = product(bank_modes, enumerate(tables), (0, 0xA5A5A5A5 & ~0x200480),
+                   range(4), range(16), range(16))
+    for (mode, low_bank, high_bank), (simd, table), noise, index, x_reg, y_reg in axes:
+        context = mode | (simd << 21) | noise
+        selected, admitted = (index >= 2, index % 2 == 1), table[index]
+        x_bank, y_bank = (low_bank if reg < 8 else high_bank for reg in (x_reg, y_reg))
+        x, y = old[0][x_bank][x_reg], old[1][y_bank][y_reg]
+        expected = old
+        if admitted[0]:
+            expected = replaced(expected, 0, x_bank, x_reg, y)
+        if admitted[1]:
+            expected = replaced(expected, 1, y_bank, y_reg, x)
+        writes = swap_writes(old, x_reg, y_reg, mode1=context, selected=selected)
+        require(register_writeback(old, writes, mode1=context), expected,
+                (context, selected, x_reg, y_reg))
+        count += 1
+    for args in ((-1, 0, (True, True)), (0, 16, (True, True)), (0, 1, (True,)),
+                 (0, 1, (1, True))):
+        try:
+            swap_writes(old, args[0], args[1], selected=args[2])
+        except ValueError:
+            continue
+        raise AssertionError("invalid swap operands or predicates were accepted")
+    return count

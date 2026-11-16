@@ -230,6 +230,8 @@ def main():
     records.extend(packing_expectations.anchors())
     records.extend(condition_expectations.anchors())
     records.extend(writeback_expectations.anchors())
+    records.extend(writeback_expectations.swap_anchors())
+    swap_count = writeback_expectations.swap_lattice()
     writeback_count, writeback_refusals = writeback_expectations.bank_priority_lattice()
     writeback_expectations.invalid_inputs()
     condition_count = condition_expectations.predicate_lattice() + condition_expectations.lane_lattice()
@@ -268,6 +270,7 @@ def main():
           f"{seed_count} seed special cases; "
           f"{condition_count} predicate/aggregation cases; "
           f"{writeback_count} bank/writeback cases ({writeback_refusals} refused priority ties); "
+          f"{swap_count} conditional raw40 swap cases; "
           "no installed-image ISA coverage claimed.")
 
 

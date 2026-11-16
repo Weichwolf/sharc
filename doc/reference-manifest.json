@@ -32,6 +32,20 @@
       "redistributed": false,
       "local_origin": "Verified copy of the existing local manufacturer reference",
       "provenance": "Analysis-only copy of manufacturer documentation. Cover title/revision/part number and document metadata identify the manufacturer manual; title/revision agree with the indexed official URL. Direct official download timed out, so exact official byte identity has not been verified. Register addresses/names were read from Appendix B; the PDF is not a source-build input."
+    },
+    {
+      "title": "Installation Guide for CrossCore Embedded Studio",
+      "file": "cces-2.12.1-installation.pdf",
+      "official_url": "https://download.analog.com/tools/CrossCoreEmbeddedStudio/Releases/Release_2.12.1/CrossCoreEmbeddedStudio_Installation_Guide.pdf",
+      "source_url": "https://download.analog.com/tools/CrossCoreEmbeddedStudio/Releases/Release_2.12.1/CrossCoreEmbeddedStudio_Installation_Guide.pdf",
+      "revision": "2.12.1, June 2024",
+      "bytes": 97582,
+      "sha256": "fe01d32b4da355bc7afdc27c90ac91733db9accbbfe29fece77a4c0360a5c2b0",
+      "pages": 11,
+      "scope": "Host availability of classic SHARC simulation/debugging for primary numerical observations; not processor semantics",
+      "redistributed": false,
+      "local_origin": "Downloaded directly from the publisher",
+      "provenance": "Title, release URL, June 2024 cover date and 11-page count verified. Analysis-only reference for Windows/Linux tool availability; not a build input or numerical oracle."
     }
   ],
   "online_references": [

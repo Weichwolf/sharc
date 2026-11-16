@@ -36,6 +36,7 @@ S2 remains in progress; this does not establish Strict execution coverage.
 | Numeric/status conditions | EQ/NE/GT/LT/GE/LE, arithmetic/shifter/BTF predicates and complements; old AF/AV/ALUSAT selection, per-lane compute, branch AND and post-modify OR |
 | Conditional numeric effects | Qualified fixed/floating computations from old lane predicates; inactive/SISD lanes and comparison destinations retain all raw storage and old flags |
 | Data register writeback | Raw 40-bit physical cells, low/high alternate-bank selection, producer write priority and independent PE destinations; proposals are already admitted and projected |
+| Conditional data swaps | Raw40 Rx/Sy exchange proposals from old physical banks; PEx-controlled SISD halves and independently controlled SIMD halves, composed with ALU effects |
 | Scale extremes | Signed 32-bit scale factors use exponent bounds before allocating a power of two; extreme shifts cannot request gigabytes of oracle storage |
 
 The model requires an explicit `Mode` for floating operations. It is a mathematical
@@ -60,7 +61,7 @@ architecture; the introductory default-mode sentence on 3-37 is inconsistent.
 python3 test/support/generate_expectations.py --output build/local/strict-expectations.json
 ```
 
-The generator checks 277 independently authored numeric/conversion/accumulator/shifter
+The generator checks 279 independently authored numeric/conversion/accumulator/shifter
 anchors and 48,768 positions between neighboring normal encodings. The latter
 span both precisions, both signs, all 254 normal exponents, six fraction patterns, four
 quarter-ULP positions and both rounding directions. Expected neighbors are formed
@@ -117,6 +118,17 @@ an ALU data result while its new overflow/carry/zero flags remain, and that
 different PE files do not compete. These records describe normalized raw writes;
 they do not establish transfer widths, predicate admission or memory bus order.
 
+Another 16,384 raw40 swap cases cover all Rx/Sy register pairs, four physical
+bank selections, SISD/SIMD, all predicate pairs and unrelated MODE1 bits. Chapter
+2-7 and table 4-40 on 4-98 define a single 40-bit exchange: in SISD PEx controls
+both halves, even while PEy computation is inactive; in SIMD each predicate
+controls its half independently. Both halves read old values, including distinct
+extension bytes. An admitted half can duplicate a source without executing the
+other half. Two authored ADD/swap packets use old AZ predicates and preserve new
+ALU flags when the higher-priority swap overwrites the computed data result.
+Other UREG transfer forms, their widths and admission rules remain outside this
+swap helper, as do instruction encoding and native execution qualification.
+
 These are checks of the expectation generator, not a new CTest layer and not a
 replacement execution path for ISA tests. They do not call a fake Core or execute
 an interpreter. Installed-image ISA tests will need complete independent results,
@@ -156,7 +168,7 @@ Currently explicit refusals include:
 
 Still required: the unqualified floating, conversion, packing and seed details
 above, OR-shift status, and
-parallel memory ordering, full conditional transfer admission and mode/register-bank
+parallel memory ordering, other conditional transfer admission and mode/register-bank
 composition beyond admitted raw writes. Qualified arithmetic and writeback
 composition do not close those architectural gaps.
 The explicit FIX/TRUNC distinction on 11-37 must not be replaced by a shared host
@@ -166,6 +178,17 @@ Normal-range rounding validation does not prove the unqualified underflow bounda
 seed tables, instruction semantics, compiled native results or a supported-host
 performance result. Every execution row in `isa-coverage.md` remains unimplemented.
 S2 still precedes native lowering; coordination is tracked in issue #2.
+
+## Primary observation tools
+
+The remaining exceptional and seed details require primary observations or
+further primary specification. The CCES 2.12.1 Installation Guide (June 2024,
+sections 6–7) lists classic SHARC simulation/debugging under Windows. Its optional
+Linux functional tools support SHARC+ families and exclude earlier SHARCs such
+as ADSP-21489. Results from a different SHARC+ profile cannot settle these gaps.
+The guide is pinned in `reference-manifest.json` for tool availability only;
+it supplies no numerical expected values. Core builds and tests remain offline
+and independent of ADI software.
 
 ## Qualified floating effects
 

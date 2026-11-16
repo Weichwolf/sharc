@@ -74,6 +74,10 @@ class RegisterWrite:
     raw: int
 
 
+def _data_bank(mode1: int, register: int) -> int:
+    return (mode1 >> (7 if register // 8 else 10)) & 1
+
+
 def register_writeback(old: tuple, proposals: tuple[RegisterWrite, ...], *,
                        mode1: int = 0) -> tuple:
     """Resolve raw writes into physical banks by the priority on PRM 2-6/2-7.
@@ -98,7 +102,7 @@ def register_writeback(old: tuple, proposals: tuple[RegisterWrite, ...], *,
                 or not 0 <= proposal.register < 16):
             raise ValueError("invalid register write proposal")
         raw_word(proposal.raw)
-        bank = (mode1 >> (7 if proposal.register // 8 else 10)) & 1
+        bank = _data_bank(mode1, proposal.register)
         location = proposal.lane, bank, proposal.register
         groups.setdefault(location, []).append((ranks[proposal.source], proposal.raw))
     for (lane, bank, register), candidates in groups.items():
@@ -108,6 +112,25 @@ def register_writeback(old: tuple, proposals: tuple[RegisterWrite, ...], *,
             raise Unqualified("equal-priority writes to one physical register require qualification")
         result[lane][bank][register] = winners[0]
     return tuple(tuple(tuple(bank) for bank in lane) for lane in result)
+
+
+def swap_writes(old: tuple, x_register: int, y_register: int, *, mode1: int = 0,
+                selected: tuple[bool, bool] = (True, True)) -> tuple[RegisterWrite, ...]:
+    """Admitted raw40 Rx <-> Sy writes, using old banks and PRM table 4-40.
+
+    SISD tests PEx for both halves. SIMD tests PEx and PEy independently.
+    Each admitted half copies its source from the same old bank snapshot.
+    """
+    old = register_writeback(old, (), mode1=mode1)
+    if (not 0 <= x_register < 16 or not 0 <= y_register < 16 or len(selected) != 2
+            or any(type(value) is not bool for value in selected)):
+        raise ValueError("swap needs valid data registers and two boolean predicates")
+    x = old[0][_data_bank(mode1, x_register)][x_register]
+    y = old[1][_data_bank(mode1, y_register)][y_register]
+    admits = selected if mode1 & (1 << 21) else (selected[0], selected[0])
+    halves = ((0, x_register, y, admits[0]), (1, y_register, x, admits[1]))
+    return tuple(RegisterWrite("ureg", lane, register, raw)
+                 for lane, register, raw, admitted in halves if admitted)
 
 
 def fixed(operation: str, left: int, right: int = 0, *, astat: int = 0,

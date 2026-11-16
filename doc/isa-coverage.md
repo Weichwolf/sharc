@@ -59,7 +59,7 @@ No native execution, complete ISA, real-time or benchmark claim.
 ## S2 independent expectations (in progress)
 
 `test/support/reference.py` supplies a separate exact integer/rational numeric
-model. `generate_expectations.py` checks 277 numeric/conversion/accumulator/shifter
+model. `generate_expectations.py` checks 279 numeric/conversion/accumulator/shifter
 anchors, 48,768 normal-range rounding positions and 27,648 limb-based multiplier
 cases and can emit deterministic machine-readable expectations without loading
 production code. Fixed ALU records include complete
@@ -96,6 +96,13 @@ both PE files, all logical data registers and primary/alternate bank combination
 preserve old operands and compose overwritten ALU data with its independently
 computed flags. This is numerical expectation generation; it does not qualify
 parallel memory order, conditional transfers or native writeback execution.
+
+Another 16,384 raw40 swap checks cover every Rx/Sy pair, all bank selections,
+SISD/SIMD and all independent predicate pairs. Full raw cells, including distinct
+extension bytes, come from old sources. In SISD PEx admits both halves; in SIMD
+each half has its own predicate. Authored ADD/swap expectations preserve old AZ
+selection and new ALU flags even when a swap replaces the ALU data result.
+This is expectation generation, not installed-image swap coverage.
 
 S2 is **not complete**. The model explicitly refuses unqualified NaN/near-underflow
 boundaries and conversion sentinel flags. Remaining exceptional floating status, computations,
