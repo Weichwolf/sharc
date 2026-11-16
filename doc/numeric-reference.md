@@ -16,7 +16,9 @@ S2 remains in progress; this does not establish Strict execution coverage.
 | Fixed ALU | ADD/SUB, carry/borrow variants, increment/decrement, negate/absolute, average, pass, logic, min/max/clip, signed/unsigned compare |
 | Fixed effects | Raw result with extension cleared, old ASTAT/STKY preservation, AF clearing, carry, saturation/overflow, AS, AOS, CACC history; compare has no data-register write |
 | Finite FP rounding | Exact rational nearest ties-to-even and toward-zero, 24-/32-bit significands, overflow to infinity or format-specific maximum finite |
-| FP value operations | ADD, SUB, average before rounding, multiply; independent value and exception metadata, without instruction-specific ASTAT/STKY expectations |
+| FP value operations | ADD, SUB, average before rounding, multiply; independent value and exception metadata |
+| Qualified FP effects | ADD/SUB and absolute forms, average, negate/absolute/pass, RND, SCALB, FLOAT, MIN/MAX/CLIP/COPYSIGN, ordered compare and floating multiply; complete scalar flags/sticky results within the stated domain |
+| MANT/LOGB effects | Raw mantissa with hidden bit, unbiased fixed exponent, instruction-specific infinity/zero/saturation results, AF/AS/AV/AI and sticky effects; explicit RND32/sentinel gaps |
 | Computational input views | Strict RND32 clears eight extension bits before arithmetic; denormal inputs become signed zeros without a new numeric underflow event |
 | Special values | Signed-zero value rules, infinities, 40-bit all-ones NaN results and invalid-operation metadata |
 | Conversion values | FLOAT always returns a 40-bit result, including with RND32 selected; explicit RND consumes extension bits and returns 32-bit precision |
@@ -37,6 +39,8 @@ ASTAT/STKY effects are instruction-specific. A numerical zero is not interchange
 with a multiplier underflow exception; an ALU instruction may use AZ as an input to
 its AUS rule, while another instruction leaves AUS unchanged. Consequently the
 floating value records deliberately contain no speculative guest flag values.
+Separate qualified effect records contain complete scalar results, including
+ASTAT/STKY, or refuse the whole expectation if any required status is unqualified.
 Fixed ABS preserves AOS even if it sets AV (11-14). Compare history uses the stated
 X-greater-than-Y rule (11-7/8, A-20), rather than the contradictory parenthetical
 expression printed beside it. Appendix A's RND32 selection agrees with the target
@@ -48,7 +52,7 @@ architecture; the introductory default-mode sentence on 3-37 is inconsistent.
 python3 test/support/generate_expectations.py --output build/local/strict-expectations.json
 ```
 
-The generator checks 169 independently authored numeric/conversion/accumulator/shifter
+The generator checks 217 independently authored numeric/conversion/accumulator/shifter
 anchors and 48,768 positions between neighboring normal encodings. The latter
 span both precisions, both signs, all 254 normal exponents, six fraction patterns, four
 quarter-ULP positions and both rounding directions. Expected neighbors are formed
@@ -69,8 +73,14 @@ They also check all 128 pointer reads and all low-byte pointer-write patterns
 with both input SF states and unrelated upper bits.
 All 65,536 short encodings are unpacked and checked by decoding the resulting
 binary32 rational and comparing it to the short format's value equation.
+Another 29,956 full scalar FP cases use an authored wire-value codebook for exact
+dyadic arithmetic, textual compare history and direct mantissa/exponent field
+checks. They span both precisions and rounding settings, ALU/multiplier flag
+ownership, unary/scaled operations, all normal exponents and eight fraction
+patterns. The same checks require 5,132 explicit refusals of unqualified negative
+zero or MANT extension cases; those are not accepted results.
 The output contains fixed and qualified FIX/TRUNC result/flag records and floating
-**value-only** records, with the distinction encoded in each record's kind. Shifter
+value-only or complete qualified effect records, distinguished by record kind. Shifter
 records include raw outputs, flags and FIFO effects where relevant. Raw 80-bit
 accumulators and 64-bit FIFOs use fixed-width hexadecimal strings so a JSON reader
 cannot silently round them.
@@ -99,14 +109,19 @@ Currently explicit refusals include:
   (NaN input, or unsaturated infinity/overflow). The sentinel value is documented;
   its AN effect is not established by the fixed-point result wording. Saturated
   infinities and finite integer results already have complete scalar expectations.
+- Floating AN/MN for negative-zero or NaN results. Instructions whose AN is
+  explicitly cleared, such as absolute sum/difference, already have complete
+  expectations where the other fields are qualified.
+- Unordered floating compare, LOGB's NaN sentinel, and MANT with RND32 selected
+  and nonzero extension input. MANT's exact-output wording and the general input
+  precision rule need stronger evidence to resolve that input boundary.
 - SZ for a negative BTST position and sign extension of a zero-length field.
 - FIFO operations with a prohibited length, overfull/invalid pointer, or insufficient
   capacity/data. The manual defines SV but leaves the resulting data/pointer
   undefined; no invented full-result expectation is emitted.
 - Operations outside the currently implemented numerical functions.
 
-Still required: instruction-specific floating flags/sticky effects (including NaN
-and signed-zero flags), sentinel conversion flags, remaining FP
+Still required: the unqualified floating and conversion status above, FP
 operations and seed ROM expectations, OR-shift status and FPACK expectations, and
 parallel/SIMD result and status combinations.
 The explicit FIX/TRUNC distinction on 11-37 must not be replaced by a shared host
@@ -116,6 +131,31 @@ Normal-range rounding validation does not prove the unqualified underflow bounda
 seed tables, instruction semantics, compiled native results or a supported-host
 performance result. Every execution row in `isa-coverage.md` remains unimplemented.
 S2 still precedes native lowering; coordination is tracked in issue #2.
+
+## Qualified floating effects
+
+Chapters 11-23 through 11-57 give separate flag ownership and sticky predicates.
+Every floating ALU operation sets AF, including conversions with fixed outputs.
+Floating multiplication preserves all ALU bits and updates only MN/MV/MU/MI;
+exact zero is not a new multiplier underflow event. Its overflow/underflow sticky
+bits are MVS/MUS, while MOS remains unchanged.
+
+ADD/SUB, their absolute forms, average and SCALB set AUS whenever AZ is set,
+including an exact zero. Negate, absolute, pass, RND, selection operations and
+compare leave AUS unchanged. Average clears AV and preserves AVS. Scaled FLOAT
+updates AUS/AVS, including when its explicit scale is zero; unscaled FLOAT
+preserves them. The value records still retain signed-zero encodings even when
+the corresponding full status record refuses an unqualified AN/MN.
+
+Ordered compare treats both zeros as equal and orders infinities normally. It
+shifts CACC independently of the numeric result, preserves other non-ALU bits,
+sets AF and writes no data register. MANT returns a fixed 1.31 field with AN
+cleared, AS from the input sign, and an all-ones **fixed field** for infinity/NaN.
+This differs from the all-40-bit-ones floating NaN sentinel. LOGB returns a fixed
+unbiased exponent for a normal input; its zero exponent sets AZ without changing
+AUS. Zero/denormal and infinity inputs use its separately specified saturated
+fixed limits or floating infinities. None of these scalar oracle checks establish
+SIMD lane composition, instruction ordering or native execution coverage.
 
 ## FIX/TRUNC details
 

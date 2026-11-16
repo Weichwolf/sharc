@@ -12,6 +12,7 @@ import json
 from pathlib import Path
 
 import conversion_expectations
+import floating_expectations
 import multiplier_expectations
 import shifter_expectations
 
@@ -220,6 +221,11 @@ def main():
     records.extend(multiplier_expectations.anchors())
     records.extend(conversion_expectations.anchors())
     records.extend(shifter_expectations.anchors())
+    records.extend(floating_expectations.anchors())
+    floating_count, floating_refusals = floating_expectations.exact_lattice()
+    unary_count, unary_refusals = floating_expectations.unary_lattice()
+    parts_count, parts_refusals = floating_expectations.parts_lattice()
+    floating_expectations.explicit_gaps()
     shifter_count = shifter_expectations.bit_lattice()
     shifter_count += shifter_expectations.leading_lattice()
     fifo_count = shifter_expectations.fifo_lattice()
@@ -239,6 +245,8 @@ def main():
           f"{lattice_count} rounding positions and {multiplier_count} limb-based multiplier cases, "
           f"{conversion_count} signed-quotient conversions ({conversion_refusals} explicit refusals); "
           f"{shifter_count} shifter, {fifo_count} FIFO, {unpack_count} unpack cases; "
+          f"{floating_count + unary_count + parts_count} full FP cases "
+          f"({floating_refusals + unary_refusals + parts_refusals} explicit FP refusals); "
           "no installed-image ISA coverage claimed.")
 
 

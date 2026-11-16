@@ -18,6 +18,7 @@ AZ, AV, AN, AC, AS, AI, AF = (1 << bit for bit in (0, 1, 2, 3, 4, 5, 10))
 ALU_FLAGS = AZ | AV | AN | AC | AS | AI | AF
 AOS = 1 << 2
 AUS, AVS = 1, 2
+AIS = 1 << 5
 CACC = 255 << 24
 
 
@@ -56,6 +57,8 @@ def rounded_integer(value: Fraction, rounding: str) -> int:
 
 @dataclass(frozen=True)
 class IntegerResult:
+    """Raw register/flag effects; raw storage is integer-valued even for FP outputs."""
+
     raw: int | None
     astat: int
     stky: int
@@ -292,6 +295,154 @@ def float_round(raw: int, mode: Mode) -> FloatingResult:
     return quantize(x.number(), destination, negative_zero=x.negative)
 
 
+def _floating_negative(raw: int) -> bool:
+    value = Operand(raw)
+    if value.kind == "nan" or (value.kind == "zero" and value.negative):
+        raise Unqualified("floating negative status for NaN or negative zero requires qualification")
+    return value.negative
+
+
+def _floating_order(raw: int):
+    value = Operand(raw)
+    if value.kind == "infinity":
+        return (0 if value.negative else 2, 0)
+    return (1, value.number())
+
+
+def _floating_effects(result: FloatingResult, astat: int, stky: int, *,
+                      zero_sticky: bool = False, overflow_sticky: bool = True,
+                      absolute: bool = False, input_sign: bool = False) -> IntegerResult:
+    if any(not isinstance(flags, int) or not 0 <= flags <= WORD_MASK
+           for flags in (astat, stky)):
+        raise ValueError("old flags must be raw 32-bit values")
+    x = Operand(result.raw)
+    negative = False if absolute else _floating_negative(x.raw)
+    flags = AF | (AZ if x.kind == "zero" else 0)
+    flags |= AN if negative else 0
+    flags |= (AV if result.overflow else 0) | (AI if result.invalid else 0)
+    flags |= AS if input_sign else 0
+    sticky = (AUS if zero_sticky and flags & AZ else 0)
+    sticky |= (AVS if overflow_sticky and flags & AV else 0) | (AIS if flags & AI else 0)
+    return IntegerResult(x.raw, (astat & ~ALU_FLAGS) | flags, stky | sticky)
+
+
+def floating_alu(operation: str, left: int, right: int = 0, *, mode: Mode,
+                 scale: int | None = None, astat: int = 0, stky: int = 0) -> IntegerResult:
+    """Qualified full scalar ALU effects; no partial status masks are returned."""
+    if scale is not None and operation not in ("scale", "float"):
+        raise ValueError("a scale factor is valid only for SCALB and FLOAT")
+    if scale is not None and (not isinstance(scale, int) or not -(1 << 31) <= scale < 1 << 31):
+        raise ValueError("scale must be a signed 32-bit integer")
+    if operation == "scale" and scale is None:
+        raise ValueError("SCALB requires a scale factor")
+    zero_sticky, overflow_sticky, absolute, input_sign = False, True, False, False
+    if operation in ("add", "sub", "avg", "absadd", "abssub"):
+        base = {"absadd": "add", "abssub": "sub"}.get(operation, operation)
+        result = floating(base, left, right, mode)
+        absolute = operation in ("absadd", "abssub")
+        if absolute and not result.invalid:
+            result = FloatingResult(result.raw & ~SIGN, result.overflow, result.underflow)
+        zero_sticky, overflow_sticky = True, operation != "avg"
+    elif operation == "float":
+        result = float_from_fixed(left, mode, scale=0 if scale is None else scale)
+        zero_sticky = overflow_sticky = scale is not None
+    elif operation == "round":
+        result = float_round(left, mode)
+    elif operation in ("neg", "abs", "pass", "scale", "min", "max", "clip", "copysign"):
+        x = operand(left, mode)
+        y = operand(right, mode) if operation in ("min", "max", "clip", "copysign") else None
+        if x.kind == "nan" or (y is not None and y.kind == "nan"):
+            result = _invalid(mode)
+        else:
+            # Flush operands before bitwise selection. All surviving magnitudes
+            # are monotone in their positive raw encodings, including infinity.
+            a = x.raw if x.kind != "denormal" else x.raw & SIGN
+            b = (y.raw if y.kind != "denormal" else y.raw & SIGN) if y is not None else 0
+            if operation == "scale":
+                result = (FloatingResult(a) if x.kind == "infinity" else
+                          quantize(x.number(), mode, negative_zero=x.negative, scale=scale))
+            else:
+                if operation == "neg":
+                    raw = a ^ SIGN
+                elif operation == "abs":
+                    raw = a & ~SIGN
+                elif operation == "pass":
+                    raw = a
+                elif operation == "copysign":
+                    raw = (a & ~SIGN) | (b & SIGN)
+                elif operation == "clip":
+                    raw = min(a & ~SIGN, b & ~SIGN) | (a & SIGN)
+                else:
+                    # Order keys make -infinity < finite < +infinity and compare
+                    # signed zeros numerically equal. Resolve zero ties explicitly.
+                    if (a & ~SIGN) == (b & ~SIGN) == 0:
+                        raw = (a | b) if operation == "min" else (a & b)
+                    else:
+                        raw = (min if operation == "min" else max)((a, b), key=_floating_order)
+                result = FloatingResult(raw)
+        absolute = operation == "abs"
+        input_sign = absolute and x.negative
+        zero_sticky = operation == "scale"
+    else:
+        raise Unqualified(f"unmodeled floating ALU operation: {operation}")
+    return _floating_effects(result, astat, stky, zero_sticky=zero_sticky,
+                             overflow_sticky=overflow_sticky, absolute=absolute,
+                             input_sign=input_sign)
+
+
+def floating_compare(left: int, right: int, mode: Mode, *, astat: int = 0,
+                     stky: int = 0) -> IntegerResult:
+    if any(not isinstance(flags, int) or not 0 <= flags <= WORD_MASK
+           for flags in (astat, stky)):
+        raise ValueError("old flags must be raw 32-bit values")
+    x, y = operand(left, mode), operand(right, mode)
+    if "nan" in (x.kind, y.kind):
+        raise Unqualified("unordered floating compare flags require qualification")
+    a, b = _floating_order(x.raw), _floating_order(y.raw)
+    flags = AF | (AZ if a == b else 0) | (AN if a < b else 0)
+    history = ((astat & CACC) >> 1) & CACC
+    history |= 1 << 31 if a > b else 0
+    return IntegerResult(None, (astat & ~(ALU_FLAGS | CACC)) | history | flags, stky)
+
+
+def float_parts(operation: str, raw: int, mode: Mode, *, saturate: bool = False,
+                astat: int = 0, stky: int = 0) -> IntegerResult:
+    """MANT/LOGB: mixed fixed/floating outputs with instruction-specific flags."""
+    if any(not isinstance(flags, int) or not 0 <= flags <= WORD_MASK
+           for flags in (astat, stky)):
+        raise ValueError("old flags must be raw 32-bit values")
+    if operation == "mant":
+        if mode.precision == 32 and raw & 255:
+            raise Unqualified("MANT extension input with RND32 requires qualification")
+    x = operand(raw, mode)
+    flags = AF
+    if operation == "mant":
+        value = ((1 << 31) | x.fraction) if x.kind == "normal" else 0
+        if x.kind in ("infinity", "nan"):
+            value = WORD_MASK
+        flags |= AS if x.negative else 0
+        flags |= AV if x.kind == "infinity" else 0
+        flags |= AI if x.kind == "nan" else 0
+        result = value << 8
+    elif operation == "logb":
+        if x.kind == "nan":
+            raise Unqualified("LOGB NaN sentinel status requires qualification")
+        if x.kind == "normal":
+            value = x.exponent - 127
+            result = (value & WORD_MASK) << 8
+            flags |= AN if value < 0 else 0
+        else:
+            zero = x.kind != "infinity"
+            result = (((0x80000000 if zero else 0x7FFFFFFF) << 8) if saturate else
+                      INFINITY | (SIGN if zero else 0))
+            flags |= AV | (AN if zero else 0)
+    else:
+        raise Unqualified(f"unmodeled float-part operation: {operation}")
+    flags |= AZ if result == 0 else 0
+    sticky = (AVS if flags & AV else 0) | (AIS if flags & AI else 0)
+    return IntegerResult(result, (astat & ~ALU_FLAGS) | flags, stky | sticky)
+
+
 def fixed_from_float(operation: str, raw: int, mode: Mode, *, scale: int = 0,
                      saturate: bool = False, astat: int = 0,
                      stky: int = 0) -> IntegerResult:
@@ -493,6 +644,21 @@ ACCUMULATOR_MASK = (1 << 80) - 1
 MN, MV, MU, MI = (1 << bit for bit in (6, 7, 8, 9))
 MULTIPLIER_FLAGS = MN | MV | MU | MI
 MOS = 1 << 6
+
+
+def floating_multiply(left: int, right: int, mode: Mode, *, astat: int = 0,
+                      stky: int = 0) -> IntegerResult:
+    if any(not isinstance(flags, int) or not 0 <= flags <= WORD_MASK
+           for flags in (astat, stky)):
+        raise ValueError("old flags must be raw 32-bit values")
+    result = floating("mul", left, right, mode)
+    flags = (MN if _floating_negative(result.raw) else 0)
+    flags |= (MV if result.overflow else 0) | (MU if result.underflow else 0)
+    flags |= MI if result.invalid else 0
+    # Floating multiplication preserves every ALU bit, including AF.
+    sticky = (1 << 7 if result.overflow else 0) | (1 << 8 if result.underflow else 0)
+    sticky |= 1 << 9 if result.invalid else 0
+    return IntegerResult(result.raw, (astat & ~MULTIPLIER_FLAGS) | flags, stky | sticky)
 
 
 @dataclass(frozen=True)
