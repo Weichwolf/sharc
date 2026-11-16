@@ -928,3 +928,72 @@ def parallel_compute(kind: str, multiply_left: int, multiply_right: int,
     flags |= (combined.astat & ALU_FLAGS) | (product.astat & MULTIPLIER_FLAGS)
     mr = product.accumulator if isinstance(product, MultiplierResult) else accumulator
     return ParallelResult((product.raw, *values), flags, product.stky | combined.stky, mr)
+
+
+def condition(mnemonic: str, astat: int, *, saturate: bool = False) -> bool:
+    """Numeric/status IF conditions from table 4-37, including its printed bars."""
+    if not isinstance(astat, int) or not 0 <= astat <= WORD_MASK:
+        raise ValueError("old ASTAT must be a raw 32-bit value")
+    zero, negative = bool(astat & AZ), bool(astat & AN)
+    if not astat & AF:
+        negative ^= bool(astat & AV) and not saturate
+    relations = {"eq": zero, "ne": not zero, "gt": not (negative or zero),
+                 "le": negative or zero, "lt": negative and (not zero or not astat & AF),
+                 "ge": not (negative and (not zero or not astat & AF)), "always": True}
+    if mnemonic in relations:
+        return relations[mnemonic]
+    flags = {"ac": AC, "av": AV, "mv": MV, "ms": MN, "sv": SV,
+             "sz": SZ, "sf": SF, "tf": 1 << 18}
+    if mnemonic in flags:
+        return bool(astat & flags[mnemonic])
+    if mnemonic.startswith("not_") and mnemonic[4:] in flags:
+        return not astat & flags[mnemonic[4:]]
+    raise Unqualified(f"unmodeled IF condition: {mnemonic}")
+
+
+@dataclass(frozen=True)
+class LaneCondition:
+    compute: tuple[bool, bool]
+    branch: bool
+    post_modify: bool
+
+
+def lane_condition(mnemonic: str, astat: tuple[int, int], *, simd: bool = True,
+                   saturate: bool = False) -> LaneCondition:
+    """Pure predicate aggregation, not branches, addressing or cycle accounting."""
+    if len(astat) != 2:
+        raise ValueError("two old lane status words are required")
+    x = condition(mnemonic, astat[0], saturate=saturate)
+    y = condition(mnemonic, astat[1], saturate=saturate)
+    return LaneCondition((x, simd and y), x and (not simd or y), x or (simd and y))
+
+
+def predicated_alu(kind: str, operation: str, left: tuple[int, int], right: tuple[int, int],
+                   old_destination: tuple[int, int], astat: tuple[int, int], stky: tuple[int, int],
+                   mnemonic: str, *, simd: bool = True, mode: Mode | None = None,
+                   saturate: bool = False, truncate: bool = False) -> tuple[IntegerResult, IntegerResult]:
+    """Final raw destination/flags from old predicates and old numeric operands."""
+    if any(len(values) != 2 for values in (left, right, old_destination, astat, stky)):
+        raise ValueError("two values are required for every lane input")
+    if kind not in ("fixed", "float") or (kind == "float" and mode is None):
+        raise ValueError("predicated ALU requires fixed kind or float kind with an explicit Mode")
+    selected = lane_condition(mnemonic, astat, simd=simd, saturate=saturate).compute
+    results = []
+    for lane in range(2):
+        raw_word(left[lane])
+        raw_word(right[lane])
+        raw_word(old_destination[lane])
+        if not isinstance(stky[lane], int) or not 0 <= stky[lane] <= WORD_MASK:
+            raise ValueError("old STKY must be a raw 32-bit value")
+        if not selected[lane]:
+            result = IntegerResult(old_destination[lane], astat[lane], stky[lane])
+        elif kind == "fixed":
+            result = fixed(operation, left[lane], right[lane], astat=astat[lane], stky=stky[lane],
+                           saturate=saturate, truncate=truncate)
+        else:
+            result = floating_alu(operation, left[lane], right[lane], mode=mode,
+                                  astat=astat[lane], stky=stky[lane])
+        if result.raw is None:  # An admitted comparison still leaves the destination untouched.
+            result = IntegerResult(old_destination[lane], result.astat, result.stky)
+        results.append(result)
+    return tuple(results)

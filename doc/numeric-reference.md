@@ -33,6 +33,8 @@ S2 remains in progress; this does not establish Strict execution coverage.
 | Dual ALU | ADD/SUB from common old inputs, OR of the new ALU status bits, sticky union; fixed saturation and qualified 32-/40-bit floating results |
 | Multifunction arithmetic | Fixed product/MAC/MSUB with ALU, floating product with ALU/conversions, multiply plus dual ALU; disjoint flag ownership and old 80-bit accumulator |
 | SIMD numeric expectations | Authored paired PEx/PEy values with distinct carry/overflow, saturation, floating exceptions and old flag/sticky inputs; no cross-lane flag union |
+| Numeric/status conditions | EQ/NE/GT/LT/GE/LE, arithmetic/shifter/BTF predicates and complements; old AF/AV/ALUSAT selection, per-lane compute, branch AND and post-modify OR |
+| Conditional numeric effects | Qualified fixed/floating computations from old lane predicates; inactive/SISD lanes and comparison destinations retain all raw storage and old flags |
 | Scale extremes | Signed 32-bit scale factors use exponent bounds before allocating a power of two; extreme shifts cannot request gigabytes of oracle storage |
 
 The model requires an explicit `Mode` for floating operations. It is a mathematical
@@ -57,7 +59,7 @@ architecture; the introductory default-mode sentence on 3-37 is inconsistent.
 python3 test/support/generate_expectations.py --output build/local/strict-expectations.json
 ```
 
-The generator checks 269 independently authored numeric/conversion/accumulator/shifter
+The generator checks 274 independently authored numeric/conversion/accumulator/shifter
 anchors and 48,768 positions between neighboring normal encodings. The latter
 span both precisions, both signs, all 254 normal exponents, six fraction patterns, four
 quarter-ULP positions and both rounding directions. Expected neighbors are formed
@@ -94,6 +96,8 @@ Another 133,832 PACK field checks construct IEEE inputs with bit strings from al
 65,536 short encodings and exercise exponent clipping; 260 inexact inputs require
 explicit refusal. A further 896 seed special cases check both precisions, both
 rounding settings where qualified, signs, denormals and old status/sticky bits.
+Another 928 predicate and aggregation checks use literal truth tables, independent
+single-flag bit positions and all four true/false lane combinations in SISD/SIMD.
 The output contains fixed and qualified FIX/TRUNC result/flag records and floating
 value-only or complete qualified effect records, distinguished by record kind. Shifter
 records include raw outputs, flags and FIFO effects where relevant. Raw 80-bit
@@ -143,7 +147,7 @@ Currently explicit refusals include:
 
 Still required: the unqualified floating, conversion, packing and seed details
 above, OR-shift status, and
-parallel memory/write priority, conditional SIMD execution and mode/register-bank
+parallel memory/write priority, full conditional execution and mode/register-bank
 composition. Qualified arithmetic composition does not close those architectural gaps.
 The explicit FIX/TRUNC distinction on 11-37 must not be replaced by a shared host
 integer cast. No partial flag mask is used to claim a complete instruction result.
@@ -202,6 +206,27 @@ ASTATy/STKYy, including different old sticky bits. They assume two admitted lane
 SISD inactivity, predicates, banks, parallel memory transfers, duplicated output
 priority and architectural interrupts still require installed-image qualification.
 Unqualified scalar results refuse the entire dual or multifunction expectation.
+
+## Numeric conditions and predicated lanes
+
+The formulae in table 4-37 on 4-93 include overbars that are absent from ordinary
+PDF text extraction. They were inspected in the pinned PDF. Fixed relations use
+AN XOR (AV AND NOT ALUSAT); floating LT excludes AZ, while GT excludes either AN
+or AZ. GE and LE use the specified complementary predicates. Tests enumerate AF,
+ALUSAT, AV, AN and AZ against separately authored literal tables, including raw
+status combinations that need not result from the preceding numeric operation.
+Those combinations do not establish how arithmetic generates NaN/negative-zero AN.
+
+Table 4-39 supplies independent compute predicates per lane, sequencer branch
+AND and post-modify admission OR. In SISD the implicit PEy computation is inactive
+and only PEx controls the aggregate predicates. These are boolean expectations,
+not execution of branches, memory operations or DAG modification. The predicated
+numeric helper observes old AF/status, computes admitted lanes only and returns
+final raw destination/status/sticky values. A comparison has no destination write;
+an inactive lane preserves the complete extension byte and never invokes an
+unqualified scalar computation. External flag-pin, loop-counter and bus-master
+conditions, ELSE/control-flow effects, register banks, pipeline latency and
+instruction-level exits remain outside this numerical helper's scope.
 
 ## FIX/TRUNC details
 

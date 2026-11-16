@@ -11,6 +11,7 @@ from fractions import Fraction
 import json
 from pathlib import Path
 
+import condition_expectations
 import conversion_expectations
 import floating_expectations
 import multiplier_expectations
@@ -226,6 +227,9 @@ def main():
     records.extend(floating_expectations.anchors())
     records.extend(parallel_expectations.anchors())
     records.extend(packing_expectations.anchors())
+    records.extend(condition_expectations.anchors())
+    condition_count = condition_expectations.predicate_lattice() + condition_expectations.lane_lattice()
+    condition_expectations.explicit_gaps()
     packing_count, packing_refusals = packing_expectations.packing_lattice()
     seed_count = packing_expectations.seed_lattice()
     parallel_count = parallel_expectations.fixed_lattice() + parallel_expectations.floating_lattice()
@@ -258,6 +262,7 @@ def main():
           f"{parallel_count} multifunction cases; "
           f"{packing_count} pack fields ({packing_refusals} refused rounding cases), "
           f"{seed_count} seed special cases; "
+          f"{condition_count} predicate/aggregation cases; "
           "no installed-image ISA coverage claimed.")
 
 
