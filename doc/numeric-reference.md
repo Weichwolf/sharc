@@ -28,6 +28,9 @@ S2 remains in progress; this does not establish Strict execution coverage.
 | Scalar shifter | Logical/arithmetic shifts, rotation, bit clear/set/toggle/test, field deposit/extract with sign extension and deposit OR, leading zero/one counts and normal/extended exponent extraction |
 | Bit FIFO | 64-bit raw storage, seven-bit pointer read/write, append, extract and no-update query; defined scalar results and status, explicit refusal of undefined data/pointer results |
 | Short float unpack | All 65,536 short encodings, including gradual underflow, signed zero and maximum finite magnitude; exact binary32 results independent of ALU modes |
+| Dual ALU | ADD/SUB from common old inputs, OR of the new ALU status bits, sticky union; fixed saturation and qualified 32-/40-bit floating results |
+| Multifunction arithmetic | Fixed product/MAC/MSUB with ALU, floating product with ALU/conversions, multiply plus dual ALU; disjoint flag ownership and old 80-bit accumulator |
+| SIMD numeric expectations | Authored paired PEx/PEy values with distinct carry/overflow, saturation, floating exceptions and old flag/sticky inputs; no cross-lane flag union |
 | Scale extremes | Signed 32-bit scale factors use exponent bounds before allocating a power of two; extreme shifts cannot request gigabytes of oracle storage |
 
 The model requires an explicit `Mode` for floating operations. It is a mathematical
@@ -52,7 +55,7 @@ architecture; the introductory default-mode sentence on 3-37 is inconsistent.
 python3 test/support/generate_expectations.py --output build/local/strict-expectations.json
 ```
 
-The generator checks 217 independently authored numeric/conversion/accumulator/shifter
+The generator checks 237 independently authored numeric/conversion/accumulator/shifter
 anchors and 48,768 positions between neighboring normal encodings. The latter
 span both precisions, both signs, all 254 normal exponents, six fraction patterns, four
 quarter-ULP positions and both rounding directions. Expected neighbors are formed
@@ -79,6 +82,12 @@ checks. They span both precisions and rounding settings, ALU/multiplier flag
 ownership, unary/scaled operations, all normal exponents and eight fraction
 patterns. The same checks require 5,132 explicit refusals of unqualified negative
 zero or MANT extension cases; those are not accepted results.
+Another 13,072 multifunction cases compare the composed reference against
+sign-bit overflow identities, independently rounded fixed averages, five-limb
+products/accumulations and the exact floating wire-value codebook. Authored
+multifunction records map old R0/R4/R8/R12 inputs to overlapping destination
+registers, supplying expectations for later installed-image dependency checks.
+Paired lane records give independent complete scalar effects for each PE.
 The output contains fixed and qualified FIX/TRUNC result/flag records and floating
 value-only or complete qualified effect records, distinguished by record kind. Shifter
 records include raw outputs, flags and FIFO effects where relevant. Raw 80-bit
@@ -123,7 +132,8 @@ Currently explicit refusals include:
 
 Still required: the unqualified floating and conversion status above, FP
 operations and seed ROM expectations, OR-shift status and FPACK expectations, and
-parallel/SIMD result and status combinations.
+parallel memory/write priority, conditional SIMD execution and mode/register-bank
+composition. Qualified arithmetic composition does not close those architectural gaps.
 The explicit FIX/TRUNC distinction on 11-37 must not be replaced by a shared host
 integer cast. No partial flag mask is used to claim a complete instruction result.
 
@@ -156,6 +166,31 @@ unbiased exponent for a normal input; its zero exponent sets AZ without changing
 AUS. Zero/denormal and infinity inputs use its separately specified saturated
 fixed limits or floating infinities. None of these scalar oracle checks establish
 SIMD lane composition, instruction ordering or native execution coverage.
+
+## Parallel arithmetic and lane expectations
+
+Chapter 3-33 specifies that both dual-ALU results use the corresponding scalar
+semantics and that their new ALU flags are ORed. The model preserves old unrelated
+status bits and unions sticky results. A nonzero sum can therefore coexist with
+AZ from a zero difference, or AV and AUS can be set by different floating results.
+
+Chapters 3-35/36 and 11-92/93 define the multifunction input groups and forms.
+The numerical functions take all old operands explicitly, never feed a new
+product into the ALU, and combine only the ALU's new flags with the multiplier's
+new flags. ORing whole scalar ASTAT results would incorrectly reintroduce stale
+bits from the other unit. Fixed multifunction supports the listed SSF/SSFR forms
+and foreground accumulator destinations; floating multiplication remains a
+separate operation rather than a floating MAC. Register-destination products
+preserve the old accumulator, while MRF destinations return its updated 80 bits.
+
+The aliasing fixtures use legal source groups with outputs that replace old
+sources in both groups. Their result tuples and destination maps are expectation
+data for future ISA fixtures; no register-file executor or instruction decoder
+was added to the reference. Numeric lane records keep ASTATx/STKYx separate from
+ASTATy/STKYy, including different old sticky bits. They assume two admitted lanes;
+SISD inactivity, predicates, banks, parallel memory transfers, duplicated output
+priority and architectural interrupts still require installed-image qualification.
+Unqualified scalar results refuse the entire dual or multifunction expectation.
 
 ## FIX/TRUNC details
 

@@ -14,6 +14,7 @@ from pathlib import Path
 import conversion_expectations
 import floating_expectations
 import multiplier_expectations
+import parallel_expectations
 import shifter_expectations
 
 from reference import (
@@ -222,6 +223,9 @@ def main():
     records.extend(conversion_expectations.anchors())
     records.extend(shifter_expectations.anchors())
     records.extend(floating_expectations.anchors())
+    records.extend(parallel_expectations.anchors())
+    parallel_count = parallel_expectations.fixed_lattice() + parallel_expectations.floating_lattice()
+    parallel_expectations.explicit_refusals()
     floating_count, floating_refusals = floating_expectations.exact_lattice()
     unary_count, unary_refusals = floating_expectations.unary_lattice()
     parts_count, parts_refusals = floating_expectations.parts_lattice()
@@ -247,6 +251,7 @@ def main():
           f"{shifter_count} shifter, {fifo_count} FIFO, {unpack_count} unpack cases; "
           f"{floating_count + unary_count + parts_count} full FP cases "
           f"({floating_refusals + unary_refusals + parts_refusals} explicit FP refusals); "
+          f"{parallel_count} multifunction cases; "
           "no installed-image ISA coverage claimed.")
 
 

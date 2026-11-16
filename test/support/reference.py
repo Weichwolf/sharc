@@ -802,3 +802,77 @@ def accumulator_move(direction: str, part: int, accumulator: int, *, register: i
     else:
         raise ValueError("accumulator transfer must read or write")
     return MultiplierResult(accumulator, raw, astat & ~MULTIPLIER_FLAGS, stky)
+
+
+@dataclass(frozen=True)
+class ParallelResult:
+    raw: tuple[int | None, ...]
+    astat: int
+    stky: int
+    accumulator: int | None = None
+
+
+def dual_alu(kind: str, left: int, right: int, *, mode: Mode | None = None,
+             saturate: bool = False, astat: int = 0, stky: int = 0) -> ParallelResult:
+    """ADD and SUB read the same old inputs; only their new ALU flags are ORed."""
+    if kind == "fixed":
+        added = fixed("add", left, right, saturate=saturate, astat=astat, stky=stky)
+        subtracted = fixed("sub", left, right, saturate=saturate, astat=astat, stky=stky)
+    elif kind == "float":
+        if mode is None:
+            raise ValueError("floating dual ALU requires an explicit Mode")
+        added = floating_alu("add", left, right, mode=mode, astat=astat, stky=stky)
+        subtracted = floating_alu("sub", left, right, mode=mode, astat=astat, stky=stky)
+    else:
+        raise Unqualified(f"unmodeled dual ALU kind: {kind}")
+    flags = (astat & ~ALU_FLAGS) | ((added.astat | subtracted.astat) & ALU_FLAGS)
+    return ParallelResult((added.raw, subtracted.raw), flags, added.stky | subtracted.stky)
+
+
+def parallel_compute(kind: str, multiply_left: int, multiply_right: int,
+                     alu_left: int, alu_right: int, *, alu: str = "add",
+                     multiplier: str = "mul", modifier: str = "SSFR",
+                     accumulator: int = 0, destination: str = "register",
+                     mode: Mode | None = None, saturate: bool = False,
+                     truncate: bool = False, astat: int = 0, stky: int = 0) -> ParallelResult:
+    """Normalized multifunction arithmetic, not register selection or an executor.
+
+    All four inputs and flags are old values. The ALU sees neither the newly
+    multiplied value nor updated multiplier flags; no floating MAC is implied.
+    """
+    _accumulator_input(accumulator, astat, stky)
+    if kind == "fixed":
+        if alu not in ("add", "sub", "avg", "dual"):
+            raise ValueError("unsupported fixed multifunction ALU operation")
+        if (destination not in ("mr", "register") or multiplier not in ("mul", "mac", "msub")
+                or modifier != ("SSF" if destination == "mr" else "SSFR")
+                or (multiplier == "mul" and destination == "mr")
+                or (alu == "dual" and (multiplier != "mul" or destination != "register"))):
+            raise ValueError("invalid fixed multifunction combination")
+        product = multiply(multiplier, multiply_left, multiply_right, modifier=modifier,
+                           accumulator=accumulator, destination=destination, astat=astat, stky=stky)
+        combined = (dual_alu(kind, alu_left, alu_right, saturate=saturate, astat=astat, stky=stky)
+                    if alu == "dual" else
+                    fixed(alu, alu_left, alu_right, saturate=saturate, truncate=truncate,
+                          astat=astat, stky=stky))
+    elif kind == "float":
+        if mode is None or multiplier != "mul" or destination != "register":
+            raise ValueError("floating multifunction requires Mode and a register multiply")
+        product = floating_multiply(multiply_left, multiply_right, mode, astat=astat, stky=stky)
+        if alu == "dual":
+            combined = dual_alu(kind, alu_left, alu_right, mode=mode, astat=astat, stky=stky)
+        elif alu == "fix":
+            combined = fixed_from_float("fix", alu_left, mode, scale=signed(raw_word(alu_right)),
+                                        saturate=saturate, astat=astat, stky=stky)
+        elif alu in ("add", "sub", "avg", "float", "abs", "min", "max"):
+            combined = floating_alu(alu, alu_left, alu_right, mode=mode, astat=astat, stky=stky,
+                                    scale=signed(raw_word(alu_right)) if alu == "float" else None)
+        else:
+            raise ValueError("unsupported floating multifunction ALU operation")
+    else:
+        raise Unqualified(f"unmodeled multifunction kind: {kind}")
+    values = combined.raw if isinstance(combined, ParallelResult) else (combined.raw,)
+    flags = (astat & ~(ALU_FLAGS | MULTIPLIER_FLAGS))
+    flags |= (combined.astat & ALU_FLAGS) | (product.astat & MULTIPLIER_FLAGS)
+    mr = product.accumulator if isinstance(product, MultiplierResult) else accumulator
+    return ParallelResult((product.raw, *values), flags, product.stky | combined.stky, mr)
