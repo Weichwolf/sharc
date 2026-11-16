@@ -23,6 +23,9 @@ S2 remains in progress; this does not establish Strict execution coverage.
 | FIX/TRUNC effects | Finite integer outputs and saturated overflow/infinity, scaled inputs, input precision, nearest/floor/toward-zero distinctions, exponent-based AV and pre-rounded AUS; sentinel-result flags explicitly refused |
 | Fixed multiplier | SSI/SUI/USI/UUI and fractional/rounded variants, full 80-bit multiply/MAC/MSUB, separate MR/register destinations and preserved old flags |
 | Accumulator operations | Signed/unsigned integer/fraction saturation, explicit nearest rounding, clear, all three limb reads/writes; MR1 writes extend their sign into MR2 |
+| Scalar shifter | Logical/arithmetic shifts, rotation, bit clear/set/toggle/test, field deposit/extract with sign extension and deposit OR, leading zero/one counts and normal/extended exponent extraction |
+| Bit FIFO | 64-bit raw storage, seven-bit pointer read/write, append, extract and no-update query; defined scalar results and status, explicit refusal of undefined data/pointer results |
+| Short float unpack | All 65,536 short encodings, including gradual underflow, signed zero and maximum finite magnitude; exact binary32 results independent of ALU modes |
 | Scale extremes | Signed 32-bit scale factors use exponent bounds before allocating a power of two; extreme shifts cannot request gigabytes of oracle storage |
 
 The model requires an explicit `Mode` for floating operations. It is a mathematical
@@ -45,7 +48,7 @@ architecture; the introductory default-mode sentence on 3-37 is inconsistent.
 python3 test/support/generate_expectations.py --output build/local/strict-expectations.json
 ```
 
-The generator checks 118 independently authored numeric/conversion/accumulator
+The generator checks 169 independently authored numeric/conversion/accumulator/shifter
 anchors and 48,768 positions between neighboring normal encodings. The latter
 span both precisions, both signs, all 254 normal exponents, six fraction patterns, four
 quarter-ULP positions and both rounding directions. Expected neighbors are formed
@@ -59,9 +62,18 @@ Another 10,972 conversions compare against signed quotient/remainder arithmetic
 over both precisions, signs, mode-bit values, instructions and saturation choices,
 ten exponents, eight fraction patterns and five scales. The same lattice requires
 1,828 explicit refusals for unqualified unsaturated overflow results.
+Another 130,817 shifter cases route individual bits and count textual prefixes;
+15,449 FIFO cases use bit lists instead of register shifts, covering every legal
+pointer/length combination for three data patterns, including no-update queries.
+They also check all 128 pointer reads and all low-byte pointer-write patterns
+with both input SF states and unrelated upper bits.
+All 65,536 short encodings are unpacked and checked by decoding the resulting
+binary32 rational and comparing it to the short format's value equation.
 The output contains fixed and qualified FIX/TRUNC result/flag records and floating
-**value-only** records, with the distinction encoded in each record's kind. Raw 80-bit accumulator values
-use fixed-width hexadecimal strings so a JSON reader cannot silently round them.
+**value-only** records, with the distinction encoded in each record's kind. Shifter
+records include raw outputs, flags and FIFO effects where relevant. Raw 80-bit
+accumulators and 64-bit FIFOs use fixed-width hexadecimal strings so a JSON reader
+cannot silently round them.
 Output is deterministic and declares `isa_execution_coverage: false`.
 
 These are checks of the expectation generator, not a new CTest layer and not a
@@ -87,11 +99,15 @@ Currently explicit refusals include:
   (NaN input, or unsaturated infinity/overflow). The sentinel value is documented;
   its AN effect is not established by the fixed-point result wording. Saturated
   infinities and finite integer results already have complete scalar expectations.
+- SZ for a negative BTST position and sign extension of a zero-length field.
+- FIFO operations with a prohibited length, overfull/invalid pointer, or insufficient
+  capacity/data. The manual defines SV but leaves the resulting data/pointer
+  undefined; no invented full-result expectation is emitted.
 - Operations outside the currently implemented numerical functions.
 
 Still required: instruction-specific floating flags/sticky effects (including NaN
 and signed-zero flags), sentinel conversion flags, remaining FP
-operations and seed ROM expectations, shifter/packing expectations, and
+operations and seed ROM expectations, OR-shift status and FPACK expectations, and
 parallel/SIMD result and status combinations.
 The explicit FIX/TRUNC distinction on 11-37 must not be replaced by a shared host
 integer cast. No partial flag mask is used to claim a complete instruction result.
@@ -119,6 +135,36 @@ intact. AUS describes a nonzero pre-rounded magnitude below one, including when
 nearest rounding produces one or negative floor produces minus one. Unrelated
 ASTAT bits and old sticky bits survive, AF is set and AC/AS/AI are cleared for the
 qualified cases. No sentinel flag expectation is fabricated to fill the gap.
+
+## Shifter and bit FIFO details
+
+Chapter 11-58 through 11-91 supplies the scalar effects. Shift amounts and field
+positions/lengths are normalized mathematical inputs here; this reference does
+not decode the register/immediate encoding or establish the register amount's
+significant-bit selection. Positive logical/arithmetic shifts set SV even if no
+nonzero bits are lost. Large magnitudes are bounded before shifting so a signed
+32-bit extreme cannot allocate excessive oracle storage. Rotations wrap modulo
+32. Bit modifications outside the word preserve the data; their SV uses the
+instruction-specific greater-than-31 predicate. BTST writes no data register.
+
+FDEP/FEXT use unsigned six-bit position/length inputs. Cross-boundary fields set
+SV even when discarded bits are zero. Sign extension applies only if the field's
+sign bit is in range; OR-deposit combines the completed field with the old
+destination. Leading-bit counts return 0 through 32, with SV for 32 and SZ for
+zero. EXP returns the signed negative count of redundant sign bits, or +1 for
+extended extraction with old AV set; SS uses the old input sign XOR old AV in the
+extended form. Shifter outputs clear the extension byte, preserve other status
+bits and leave all sticky bits unchanged.
+
+FIFO deposit ORs into the old raw tail, rather than replacing it. Extract aligns
+the remaining bits to the top of the 64-bit FIFO; NU preserves the FIFO, pointer
+and SF. Pointer reads preserve SF and clear SZ/SV/SS. Pointer writes use seven
+bits, update SF at 32 and set SV above 64 without truncating to six bits. The
+lattice starts with SF consistent with the old pointer, including for NU.
+FUNPACK uses all four exponent bits as finite short-format exponents, supports
+the short format's gradual underflow, and clears SZ/SV/SS even for signed zero.
+It ignores unrelated upper input bits and clears the result's extension byte.
+The exact format equations and independently authored anchors follow appendix C.
 
 ## Fixed multiplier details
 

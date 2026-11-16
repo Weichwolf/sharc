@@ -340,6 +340,155 @@ def fixed_from_float(operation: str, raw: int, mode: Mode, *, scale: int = 0,
                          (astat & ~ALU_FLAGS) | flags, stky | sticky)
 
 
+SV, SZ, SS, SF = (1 << bit for bit in (11, 12, 13, 14))
+SHIFTER_FLAGS = SV | SZ | SS
+
+
+def _shifter_result(value: int, astat: int, stky: int, *, overflow: bool = False,
+                    negative: bool = False, write: bool = True) -> IntegerResult:
+    if any(not isinstance(flags, int) or not 0 <= flags <= WORD_MASK
+           for flags in (astat, stky)):
+        raise ValueError("old flags must be raw 32-bit values")
+    value &= WORD_MASK
+    flags = (SV if overflow else 0) | (SZ if value == 0 else 0) | (SS if negative else 0)
+    return IntegerResult(value << 8 if write else None, (astat & ~SHIFTER_FLAGS) | flags, stky)
+
+
+def shift(operation: str, raw: int, amount: int, *, astat: int = 0,
+          stky: int = 0) -> IntegerResult:
+    """Normalized signed shift/bit position; operand projection is preparation's job."""
+    if not isinstance(amount, int) or not -(1 << 31) <= amount < 1 << 31:
+        raise ValueError("shift amount must be a signed 32-bit integer")
+    x = raw_word(raw)
+    overflow = False
+    if operation in ("lshift", "ashift"):
+        overflow = amount > 0  # Independent of whether any nonzero bit is lost.
+        if amount >= 32:
+            value = 0
+        elif amount >= 0:
+            value = x << amount
+        else:
+            value = (signed(x) if operation == "ashift" else x) >> min(-amount, 32)
+    elif operation == "rot":
+        count = amount % 32
+        value = (x << count) | (x >> (32 - count))
+    elif operation in ("bclr", "bset", "btgl", "btst"):
+        if amount < 0 and operation == "btst":
+            raise Unqualified("negative BTST position has no qualified SZ expectation")
+        overflow = amount > 31
+        bit = 1 << amount if 0 <= amount < 32 else 0
+        value = {"bclr": x & ~bit, "bset": x | bit,
+                 "btgl": x ^ bit, "btst": x & bit}[operation]
+    else:
+        raise Unqualified(f"unmodeled shifter operation: {operation}")
+    return _shifter_result(value, astat, stky, overflow=overflow, write=operation != "btst")
+
+
+def field(operation: str, raw: int, position: int, length: int, *,
+          sign_extend: bool = False, old_destination: int = 0,
+          astat: int = 0, stky: int = 0) -> IntegerResult:
+    """FDEP/FEXT with normalized unsigned six-bit position and length."""
+    if any(not isinstance(value, int) or not 0 <= value < 64 for value in (position, length)):
+        raise ValueError("field position and length must be unsigned six-bit values")
+    x, old = raw_word(raw), raw_word(old_destination)
+    if sign_extend and length == 0:
+        raise Unqualified("sign extension of a zero-length field requires qualification")
+    mask = (1 << length) - 1
+    if operation in ("deposit", "deposit_or"):
+        value = (x & mask) << position
+        sign = (value >> (position + length - 1)) & 1 if length else 0
+        if sign_extend and sign and position + length <= 32:
+            value |= WORD_MASK ^ ((1 << (position + length)) - 1)
+        if operation == "deposit_or":
+            value |= old
+    elif operation == "extract":
+        value = (x >> position) & mask
+        if sign_extend and position + length <= 32 and value & (1 << (length - 1)):
+            value |= WORD_MASK ^ mask
+    else:
+        raise Unqualified(f"unmodeled field operation: {operation}")
+    return _shifter_result(value, astat, stky, overflow=position + length > 32)
+
+
+def leading(operation: str, raw: int, *, astat: int = 0, stky: int = 0) -> IntegerResult:
+    x = raw_word(raw)
+    sign = bool(x & (1 << 31))
+    if operation in ("exp", "exp_extended"):
+        overflow = operation == "exp_extended" and bool(astat & AV)
+        count = 32 - ((x ^ WORD_MASK) if sign else x).bit_length()
+        value = 1 if overflow else 1 - count
+        return _shifter_result(value, astat, stky, negative=sign != overflow)
+    if operation not in ("leftz", "lefto"):
+        raise Unqualified(f"unmodeled leading-bit operation: {operation}")
+    value = 32 - (x if operation == "leftz" else x ^ WORD_MASK).bit_length()
+    return _shifter_result(value, astat, stky, overflow=value == 32)
+
+
+@dataclass(frozen=True)
+class FifoResult:
+    fifo: int
+    pointer: int
+    raw: int | None
+    astat: int
+    stky: int
+
+
+def bit_fifo(operation: str, fifo: int, pointer: int, *, raw: int = 0,
+             length: int = 0, no_update: bool = False, astat: int = 0,
+             stky: int = 0) -> FifoResult:
+    """Bit FIFO numeric effects; undefined data/pointer results are refused."""
+    if not isinstance(fifo, int) or not 0 <= fifo < 1 << 64:
+        raise ValueError("bit FIFO must be raw 64-bit storage")
+    if not isinstance(pointer, int) or not 0 <= pointer < 128:
+        raise ValueError("bit FIFO pointer must be raw seven-bit storage")
+    if no_update and operation != "extract":
+        raise ValueError("NU applies only to BITEXT")
+    x = raw_word(raw)
+    result, overflow = None, False
+    if operation == "read_pointer":
+        result = pointer << 8
+    elif operation == "write_pointer":
+        pointer = x & 127
+        overflow = pointer > 64
+    elif operation in ("deposit", "extract"):
+        if not isinstance(length, int) or not 0 <= length <= 32 or pointer > 64:
+            raise Unqualified("bit FIFO length/state has undefined result data or pointer")
+        if operation == "deposit":
+            if pointer + length > 64:
+                raise Unqualified("bit FIFO deposit exceeds available capacity")
+            pointer += length
+            fifo |= (x & ((1 << length) - 1)) << (64 - pointer)
+        else:
+            if length > pointer:
+                raise Unqualified("bit FIFO extract exceeds available data")
+            result = (fifo >> (64 - length)) << 8
+            if not no_update:
+                fifo = (fifo << length) & ((1 << 64) - 1)
+                pointer -= length
+    else:
+        raise Unqualified(f"unmodeled bit FIFO operation: {operation}")
+    flags = _shifter_result(1, astat, stky, overflow=overflow).astat
+    if operation == "extract" and result == 0:
+        flags |= SZ
+    if operation != "read_pointer" and not no_update:
+        flags = (flags & ~SF) | (SF if pointer >= 32 else 0)
+    return FifoResult(fifo, pointer, result, flags, stky)
+
+
+def float_unpack(raw: int, *, astat: int = 0, stky: int = 0) -> IntegerResult:
+    """Exact short-float to binary32 conversion, performed by the shifter."""
+    short = raw_word(raw) & 65535
+    exponent, fraction = (short >> 11) & 15, short & 2047
+    if exponent:
+        magnitude = Fraction(2048 + fraction) * power(exponent - 18)
+    else:
+        magnitude = Fraction(fraction, 1 << 17)
+    value = quantize(-magnitude if short & 32768 else magnitude, Mode(32),
+                     negative_zero=bool(short & 32768)).raw
+    flags = _shifter_result(1, astat, stky).astat  # SZ is cleared even for ±zero.
+    return IntegerResult(value, flags, stky)
+
+
 ACCUMULATOR_MASK = (1 << 80) - 1
 MN, MV, MU, MI = (1 << bit for bit in (6, 7, 8, 9))
 MULTIPLIER_FLAGS = MN | MV | MU | MI

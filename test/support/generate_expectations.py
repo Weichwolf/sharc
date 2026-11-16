@@ -13,6 +13,7 @@ from pathlib import Path
 
 import conversion_expectations
 import multiplier_expectations
+import shifter_expectations
 
 from reference import (
     FloatingResult, IntegerResult, Mode, Unqualified, fixed, fixed_from_float,
@@ -218,6 +219,13 @@ def main():
     records = anchored_cases()
     records.extend(multiplier_expectations.anchors())
     records.extend(conversion_expectations.anchors())
+    records.extend(shifter_expectations.anchors())
+    shifter_count = shifter_expectations.bit_lattice()
+    shifter_count += shifter_expectations.leading_lattice()
+    fifo_count = shifter_expectations.fifo_lattice()
+    fifo_count += shifter_expectations.pointer_lattice()
+    unpack_count = shifter_expectations.unpack_lattice()
+    shifter_expectations.explicit_gaps()
     conversion_count, conversion_refusals = conversion_expectations.quotient_lattice()
     multiplier_count = multiplier_expectations.product_lattice()
     lattice_count = rounding_lattice()
@@ -230,6 +238,7 @@ def main():
     print(f"Validated {len(records)} numeric/conversion/accumulator anchors and "
           f"{lattice_count} rounding positions and {multiplier_count} limb-based multiplier cases, "
           f"{conversion_count} signed-quotient conversions ({conversion_refusals} explicit refusals); "
+          f"{shifter_count} shifter, {fifo_count} FIFO, {unpack_count} unpack cases; "
           "no installed-image ISA coverage claimed.")
 
 
