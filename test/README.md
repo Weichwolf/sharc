@@ -1,11 +1,19 @@
-# Independent verification plan
+# Independent verification
 
-Use isa/ for independent encodings/semantics, core/ for memory, exceptions and
-architectural boundaries, jit/ for code generation and ownership, bench/ for
-checked continuous workloads, and support/ for independent fixture construction.
-No ISA tests exist yet; an empty test directory is not passing coverage.
+Exactly three verification layers follow `doc/core-contract.md`:
 
-Expected results must not be computed with production semantics. Include every
-legal form, aliases, rejected forms, numerical boundaries, partial fault effects,
-interrupt admission and self-modifying code. Test x86-64 and ARM64 independently.
-Keep manufacturer firmware and program extracts out of fixtures and benchmarks.
+- `isa/`: instruction programs executed through declared, installed LLVM images,
+  with independently calculated expected results. No execution coverage yet.
+- `core/`: public preparation and lifecycle boundaries. The initial tests exercise
+  format recognition, declared PC boundaries, rejection diagnostics, raw state
+  storage and snapshot replacement. They do not call private decoder functions.
+- `bench/`: K1–K6 with complete output checks and separate Strict/FastFP32 results.
+  No kernels are implemented yet.
+
+`support/isa.hpp` authors numerical instruction fields independently of production.
+Preparation rejection tests deliberately use `Core::lower`; there is no successful
+execution path or installed image in this increment. They prove structural format
+recognition and explicit refusal, not legal compute operands or ISA semantics.
+State storage round trips are lifecycle checks, not arithmetic expectations.
+
+Build and tests require no manuals, manufacturer code, network or device firmware.

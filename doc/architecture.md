@@ -1,8 +1,8 @@
 # Target architecture
 
-This is the implementation target, not a claim of existing code. The initial
-repository contains project instructions, architecture/verification plans and
-reference materials. No Core API, decoder or lowering is implemented yet.
+This is the implementation target, not a claim of existing code. The S1 foundation contains the public declarations, raw architectural storage
+and structural instruction-format recognition. No lowering or native execution
+is implemented yet; see [isa-coverage.md](isa-coverage.md) for current evidence.
 
 ```text
 consumer: CodeImage + CompileOptions -> Core::lower -> SemanticImage (LLVM bitcode)
@@ -15,7 +15,7 @@ The interface, lifecycle, verification layers and benchmarks are defined in
 
 ## Ownership and public surface
 
-Expose only include/sharc/core.hpp and memory.hpp when implementation starts.
+Expose only include/sharc/core.hpp and memory.hpp as implementation proceeds.
 Use namespace sharc and CMake target sharc::core. Keep LLVM types and native-code
 details private. Core owns architectural state, progress, failure context and
 translation lifetime. Consumers own storage, device models, clocks and scheduling.

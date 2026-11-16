@@ -1,5 +1,6 @@
-# Planned public headers
+# Public headers
 
-The implementation will expose sharc/core.hpp and sharc/memory.hpp.
-Neither header nor any executable API is implemented in this documentation seed.
-See ../../doc/architecture.md before introducing an API.
+`core.hpp` and `memory.hpp` define the contract surface without LLVM types.
+The current library recognizes preparation formats and supports raw architectural
+state storage; it explicitly refuses all native preparation/execution.
+See `doc/state.md` for the storage model and its unimplemented semantics.

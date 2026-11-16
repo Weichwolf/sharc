@@ -1,6 +1,6 @@
 # sharc
 
-Independent SHARC native JIT project, initially targeting ADSP-214xx SIMD cores
+Independent SHARC native translation project, initially targeting ADSP-214xx SIMD cores
 with ISA and VISA decoding.
 
 Target implementation: C++23, LLVM 19, Linux x86-64 and macOS ARM64,
@@ -10,10 +10,20 @@ acceptance and [doc/architecture.md](doc/architecture.md) for the target design.
 
 ## Current state
 
-This is a project and documentation seed. No CPU decoder, execution engine,
-public Core API, CMake library target or performance result is implemented yet.
-All execution coverage is explicitly unimplemented in
-[doc/isa-coverage.md](doc/isa-coverage.md).
+The initial S1 foundation provides the two public headers, the `sharc::core`
+build target, structural ISA/VISA format recognition, preparation diagnostics
+and raw architectural state/snapshot storage. Every instruction still refuses
+lowering explicitly. No native execution or benchmark result exists. See
+[coverage](doc/isa-coverage.md) and [state storage](doc/state.md).
+
+```sh
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=clang++-19
+cmake --build build
+ctest --test-dir build --output-on-failure
+```
+
+Requirements: C++23, LLVM 19.1, CMake 3.25 and Ninja. The tests work offline
+without local reference manuals. Linux x86-64 is tested; macOS ARM64 is untested.
 
 ## Planned numerical modes
 
