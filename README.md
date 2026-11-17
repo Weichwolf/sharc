@@ -19,7 +19,8 @@ installed images, with separate mode identities, artifact caching and snapshots.
 Other instruction families refuse lowering explicitly. The CMake package installs
 the `sharc::core` target and exactly two public headers. The S2 independent
 expectation-generation milestone is complete; numerical gaps and the remaining
-S3 native execution are explicit, and no benchmark result exists. See
+S3 native execution are explicit. Checked Linux K4 and K5 baselines are available
+in [benchmark results](test/bench/README.md); the other common kernels remain open. See
 [coverage](doc/isa-coverage.md), [state storage](doc/state.md), [memory access](doc/memory.md) and the
 [independent numeric reference](doc/numeric-reference.md).
 

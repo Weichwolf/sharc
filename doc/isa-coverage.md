@@ -43,7 +43,7 @@ mode compatibility and clearing a later unprepared-execution fault. These are
 storage/interface checks; hardware reset, interrupted continuation and execution
 semantics are not qualified. See [state.md](state.md).
 
-S1 provides all contract declarations, an installable `sharc::core` package,
+S1 provides the original contract declarations, an installable `sharc::core` package,
 top-level ISA/VISA and compute decoding, independent preparation fixtures, and
 the programmer-visible state definition. Operand-level transfer restrictions,
 ordered effects and hidden delayed/interrupt continuation still need native-path
@@ -57,6 +57,16 @@ O3 and eagerly resolves every export before installation; `run` does not decode
 or compile. Artifacts include bitcode and mode-unit metadata, a compiler/input
 identity and an integrity checksum. `load` parses and verifies those artifacts
 without lowering. The two public headers expose no LLVM types or register layout.
+
+Contract v9 fault attribution is implemented: `NativeSymbols::fault_map` supplies
+linked executable section ranges and guest line intervals, validated and copied
+by `bind`. The standalone compiler obtains them from LLVM's linker and DWARF
+line tables. Guest locations use file `sharc-variant-<id>` and line `PC + 1`;
+compiler-generated locations use line zero. Independent consumer linking tests
+cover PC zero, the highest classic PC, full 32-bit variant IDs and malformed
+maps, and compare native text with debug information stripped before O3.
+Direct/Exact memory-mode selection and the terminal `host_fault` adapter are
+still unimplemented; this is not complete v9 execution support.
 
 Classic ISA support currently includes NOP, immediate moves into data/DAG registers, and
 conditional compute with the 21 fixed ALU opcodes ADD/SUB, carry/borrow forms,

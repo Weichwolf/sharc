@@ -98,6 +98,8 @@ struct PreparedImage {
 struct CompiledSymbols {
   NativeSymbols symbols;
   std::size_t native_bytes{};
+  std::vector<NativeSymbols::TextRange> text_ranges;
+  std::vector<NativeSymbols::Site> sites;
 };
 
 [[nodiscard]] std::shared_ptr<const PreparedImage> lower_image(const CodeImage &image,

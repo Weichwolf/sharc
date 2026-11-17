@@ -173,8 +173,26 @@ struct NativeSymbol {
 };
 
 struct NativeSymbols {
+  struct TextRange {
+    std::uintptr_t address{};
+    std::uint64_t size{};
+  };
+
+  struct Site {
+    std::uintptr_t address{};
+    std::uint64_t size{}, variant{};
+    std::uint32_t guest_pc{};
+  };
+
+  struct FaultMap {
+    std::span<const TextRange> text_ranges;
+    std::span<const Site> sites;
+  };
+
   std::vector<NativeSymbol> entries;
   std::shared_ptr<void> lifetime;
+  // Linked executable sections and guest debug-line intervals; copied by bind.
+  FaultMap fault_map{};
 };
 
 struct PreparationReport {

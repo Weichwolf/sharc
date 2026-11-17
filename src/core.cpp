@@ -15,6 +15,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <sharc/core.hpp>
 #include <span>
 #include <stdexcept>
@@ -49,6 +50,8 @@ struct NativeImage::Impl {
   std::vector<detail::NativeEntry> entries;
   std::shared_ptr<void> lifetime;
   PreparationReport report;
+  std::vector<NativeSymbols::TextRange> text_ranges;
+  std::vector<NativeSymbols::Site> sites;
   bool interrupts_supported{};
 };
 
@@ -76,6 +79,47 @@ PreparationReport NativeImage::report() const {
 }
 
 namespace {
+void validate_fault_map(const detail::PreparedImage &image,
+                        std::vector<NativeSymbols::TextRange> &ranges,
+                        std::vector<NativeSymbols::Site> &sites) {
+  const auto invalid = [&] {
+    detail::refuse(FaultReason::invalid_image, image.identity, 0, 0, "invalid native fault map");
+  };
+  const auto valid = [](const auto &range) {
+    return range.address != 0 && range.size != 0 &&
+           range.size <= std::numeric_limits<std::uintptr_t>::max() - range.address;
+  };
+  std::ranges::sort(ranges, {}, &NativeSymbols::TextRange::address);
+  std::uintptr_t end{};
+  for (const auto &range : ranges) {
+    if (!valid(range) || range.address < end) { invalid(); }
+    end = range.address + range.size;
+  }
+  std::set<std::pair<std::uint64_t, std::uint32_t>> instructions;
+  if (!sites.empty()) {
+    for (const auto &op : detail::decode(image.code, image.identity)) {
+      instructions.emplace(op.variant, op.address);
+    }
+  }
+  std::ranges::sort(sites, {}, &NativeSymbols::Site::address);
+  end = 0;
+  for (const auto &site : sites) {
+    if (!valid(site) || site.address < end ||
+        !instructions.contains({site.variant, site.guest_pc})) {
+      invalid();
+    }
+    end = site.address + site.size;
+    auto covered = site.address;
+    for (const auto &range : ranges) {
+      if (range.address > covered) { break; }
+      const auto next = range.address + range.size;
+      covered = std::max(covered, next);
+      if (covered >= end) { break; }
+    }
+    if (covered < end) { invalid(); }
+  }
+}
+
 struct Resume {
   std::string identity;
   std::uint32_t variant{}, address{}, entry{};
@@ -249,6 +293,10 @@ NativeImage Core::bind(const SemanticImage &image, const NativeSymbols &symbols)
   bound->image = image.impl_->image;
   bound->lifetime = symbols.lifetime;
   bound->report.identity = bound->image->identity;
+  bound->text_ranges.assign(symbols.fault_map.text_ranges.begin(),
+                            symbols.fault_map.text_ranges.end());
+  bound->sites.assign(symbols.fault_map.sites.begin(), symbols.fault_map.sites.end());
+  validate_fault_map(*bound->image, bound->text_ranges, bound->sites);
   std::map<std::string, std::uintptr_t> addresses;
   for (const auto &symbol : symbols.entries) {
     if (symbol.name.empty() || symbol.address == 0 ||
@@ -265,6 +313,16 @@ NativeImage Core::bind(const SemanticImage &image, const NativeSymbols &symbols)
     if (found == addresses.end()) {
       detail::refuse(
           FaultReason::invalid_image, image.identity(), 0, 0, "missing native export " + name);
+    }
+    if (!bound->text_ranges.empty() &&
+        !std::ranges::any_of(bound->text_ranges, [&](const auto &range) {
+          return found->second >= range.address && found->second - range.address < range.size;
+        })) {
+      detail::refuse(FaultReason::invalid_image,
+                     image.identity(),
+                     0,
+                     0,
+                     "native export outside executable text");
     }
     bound->entries.push_back(std::bit_cast<detail::NativeEntry>(found->second));
   }

@@ -14,10 +14,18 @@
 #include <llvm/Analysis/CGSCCPassManager.h>
 #include <llvm/Analysis/LoopAnalysisManager.h>
 #include <llvm/Bitcode/BitcodeReader.h>
+#include <llvm/DebugInfo/DIContext.h>
+#include <llvm/DebugInfo/DWARF/DWARFContext.h>
+#include <llvm/DebugInfo/DWARF/DWARFDebugLine.h>
+#include <llvm/DebugInfo/DWARF/DWARFUnit.h>
+#include <llvm/ExecutionEngine/Orc/Core.h>
 #include <llvm/ExecutionEngine/Orc/JITTargetMachineBuilder.h>
 #include <llvm/ExecutionEngine/Orc/LLJIT.h>
-#include <llvm/ExecutionEngine/Orc/ObjectTransformLayer.h>
+#include <llvm/ExecutionEngine/Orc/Layer.h>
+#include <llvm/ExecutionEngine/Orc/RTDyldObjectLinkingLayer.h>
 #include <llvm/ExecutionEngine/Orc/ThreadSafeModule.h>
+#include <llvm/ExecutionEngine/RuntimeDyld.h>
+#include <llvm/ExecutionEngine/SectionMemoryManager.h>
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/PassManager.h>
@@ -26,12 +34,12 @@
 #include <llvm/Passes/PassBuilder.h>
 #include <llvm/Support/CodeGen.h>
 #include <llvm/Support/Error.h>
-#include <llvm/Support/MemoryBuffer.h>
 #include <llvm/Support/MemoryBufferRef.h>
 #include <llvm/Support/SHA256.h>
 #include <llvm/Support/TargetSelect.h>
 #include <llvm/Support/raw_ostream.h>
 #include <llvm/Target/TargetMachine.h>
+#include <llvm/TargetParser/Triple.h>
 #include <memory>
 #include <set>
 #include <span>
@@ -160,6 +168,57 @@ std::unique_ptr<llvm::Module> parse_module(const PreparedImage &image, llvm::LLV
          0,
          "LLVM preparation failed: " + llvm::toString(std::move(error)));
 }
+
+struct LinkedMap {
+  std::vector<NativeSymbols::TextRange> text_ranges;
+  std::vector<NativeSymbols::Site> sites;
+  std::size_t bytes{};
+  std::string error;
+
+  void loaded(const llvm::object::ObjectFile &object,
+              const llvm::RuntimeDyld::LoadedObjectInfo &addresses) {
+    for (const auto &section : object.sections()) {
+      if (!section.isText() || section.getSize() == 0) { continue; }
+      text_ranges.push_back(
+          {.address = addresses.getSectionLoadAddress(section), .size = section.getSize()});
+      bytes += static_cast<std::size_t>(section.getSize());
+    }
+    const auto diagnostic = [&](llvm::Error failure) {
+      error += llvm::toString(std::move(failure));
+    };
+    auto debug = llvm::DWARFContext::create(object,
+                                            llvm::DWARFContext::ProcessDebugRelocations::Process,
+                                            &addresses,
+                                            "",
+                                            diagnostic,
+                                            diagnostic);
+    for (const auto &unit : debug->compile_units()) {
+      const auto *lines = debug->getLineTableForUnit(unit.get());
+      if (lines == nullptr) { continue; }
+      for (std::size_t i = 0; i + 1 < lines->Rows.size(); ++i) {
+        const auto &row = lines->Rows[i];
+        const auto &next = lines->Rows[i + 1];
+        if (row.EndSequence || row.Line == 0 ||
+            row.Address.SectionIndex != next.Address.SectionIndex ||
+            row.Address.Address >= next.Address.Address) {
+          continue;
+        }
+        std::string filename;
+        if (!lines->getFileNameByIndex(
+                row.File, "", llvm::DILineInfoSpecifier::FileLineInfoKind::RawValue, filename)) {
+          continue;
+        }
+        llvm::StringRef name(filename);
+        std::uint64_t variant{};
+        if (!name.consume_front("sharc-variant-") || name.getAsInteger(10, variant)) { continue; }
+        sites.push_back({.address = row.Address.Address,
+                         .size = next.Address.Address - row.Address.Address,
+                         .variant = variant,
+                         .guest_pc = row.Line - 1});
+      }
+    }
+  }
+};
 
 std::uint64_t code_word(const CodeVariant &variant,
                         const Memory &memory,
@@ -320,20 +379,26 @@ CompiledSymbols compile_image(const PreparedImage &image) {
   target->setCodeGenOptLevel(llvm::CodeGenOptLevel::Aggressive);
   auto machine = target->createTargetMachine();
   if (!machine) { compiler_error(image, machine.takeError()); }
-  auto created = llvm::orc::LLJITBuilder().setJITTargetMachineBuilder(std::move(*target)).create();
+  auto linked = std::make_shared<LinkedMap>();
+  auto created =
+      llvm::orc::LLJITBuilder()
+          .setJITTargetMachineBuilder(std::move(*target))
+          .setObjectLinkingLayerCreator(
+              [linked](llvm::orc::ExecutionSession &session, const llvm::Triple &)
+                  -> llvm::Expected<std::unique_ptr<llvm::orc::ObjectLayer>> {
+                auto layer = std::make_unique<llvm::orc::RTDyldObjectLinkingLayer>(
+                    session, [] { return std::make_unique<llvm::SectionMemoryManager>(); });
+                layer->setNotifyLoaded(
+                    [linked](llvm::orc::MaterializationResponsibility &,
+                             const llvm::object::ObjectFile &object,
+                             const llvm::RuntimeDyld::LoadedObjectInfo &addresses) {
+                      linked->loaded(object, addresses);
+                    });
+                return layer;
+              })
+          .create();
   if (!created) { compiler_error(image, created.takeError()); }
   auto jit = std::shared_ptr<llvm::orc::LLJIT>(std::move(*created));
-  auto bytes = std::make_shared<std::size_t>(0);
-  jit->getObjTransformLayer().setTransform(
-      [bytes](std::unique_ptr<llvm::MemoryBuffer> object)
-          -> llvm::Expected<std::unique_ptr<llvm::MemoryBuffer>> {
-        auto parsed = llvm::object::ObjectFile::createObjectFile(object->getMemBufferRef());
-        if (!parsed) { return parsed.takeError(); }
-        for (const auto &section : (*parsed)->sections()) {
-          if (section.isText()) { *bytes += static_cast<std::size_t>(section.getSize()); }
-        }
-        return object;
-      });
   auto context = std::make_unique<llvm::LLVMContext>();
   auto module = parse_module(image, *context);
   module->setDataLayout(jit->getDataLayout());
@@ -361,7 +426,17 @@ CompiledSymbols compile_image(const PreparedImage &image) {
     if (!address) { compiler_error(image, address.takeError()); }
     result.symbols.entries.push_back({name, static_cast<std::uintptr_t>(address->getValue())});
   }
-  result.native_bytes = *bytes;
+  if (!linked->error.empty()) {
+    refuse(FaultReason::invalid_image,
+           image.identity,
+           0,
+           0,
+           "invalid native line table: " + linked->error);
+  }
+  result.native_bytes = linked->bytes;
+  result.text_ranges = std::move(linked->text_ranges);
+  result.sites = std::move(linked->sites);
+  result.symbols.fault_map = {.text_ranges = result.text_ranges, .sites = result.sites};
   return result;
 }
 

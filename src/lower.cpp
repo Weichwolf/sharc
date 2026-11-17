@@ -13,10 +13,13 @@
 #include <iterator>
 #include <limits>
 #include <llvm/ADT/SmallVector.h>
+#include <llvm/BinaryFormat/Dwarf.h>
 #include <llvm/Bitcode/BitcodeWriter.h>
 #include <llvm/IR/Attributes.h>
 #include <llvm/IR/BasicBlock.h>
 #include <llvm/IR/Constants.h>
+#include <llvm/IR/DIBuilder.h>
+#include <llvm/IR/DebugInfoMetadata.h>
 #include <llvm/IR/DerivedTypes.h>
 #include <llvm/IR/Function.h>
 #include <llvm/IR/GlobalValue.h>
@@ -24,6 +27,7 @@
 #include <llvm/IR/Intrinsics.h>
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/MDBuilder.h>
+#include <llvm/IR/Metadata.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/Verifier.h>
 #include <llvm/Support/Alignment.h>
@@ -464,9 +468,40 @@ struct BlockCost {
   std::uint64_t instructions{1}, cycles{1};
 };
 
+void debug_scope(llvm::DIBuilder &debug, llvm::Function &function, const std::string &filename) {
+  auto *file = debug.createFile(filename, "");
+  function.setSubprogram(
+      debug.createFunction(file,
+                           function.getName(),
+                           function.getName(),
+                           file,
+                           0,
+                           debug.createSubroutineType(debug.getOrCreateTypeArray({})),
+                           0,
+                           llvm::DINode::FlagZero,
+                           llvm::DISubprogram::toSPFlags(false, true, true)));
+}
+
+void finalize_debug(llvm::Module &module, llvm::DIBuilder &debug) {
+  // Retain inlined guest locations in adapters too; line zero has no guest attribution.
+  for (auto &function : module) {
+    if (function.isDeclaration()) { continue; }
+    if (function.getSubprogram() == nullptr) { debug_scope(debug, function, "sharc-generated"); }
+    auto *const unknown =
+        llvm::DILocation::get(module.getContext(), 0, 0, function.getSubprogram());
+    for (auto &block : function) {
+      for (auto &instruction : block) {
+        if (!instruction.getDebugLoc()) { instruction.setDebugLoc(unknown); }
+      }
+    }
+  }
+  debug.finalize();
+}
+
 class Lowering {
 public:
   Lowering(llvm::Module &module,
+           llvm::DIBuilder &debug,
            const NativeAbi &abi,
            const CodeVariant &variant,
            std::vector<Instruction> instructions,
@@ -481,6 +516,7 @@ public:
         builder_(module.getContext()) {
     function_ = abi_.body(unit);
     function_->addFnAttr(llvm::Attribute::NoUnwind);
+    debug_scope(debug, *function_, "sharc-variant-" + std::to_string(variant.id));
   }
 
   void emit();
@@ -1707,6 +1743,8 @@ std::vector<std::optional<BlockCost>> Lowering::unit_costs() const {
 
 void Lowering::emit_instruction(std::size_t i, const std::optional<BlockCost> &grant) {
   const auto &op = instructions_[i];
+  builder_.SetCurrentDebugLocation(
+      llvm::DILocation::get(module_.getContext(), op.address + 1, 0, function_->getSubprogram()));
   builder_.SetInsertPoint(admission_[i].block);
   auto values = admission_[i].values();
   llvm::Value *admitted = builder_.getFalse();
@@ -1874,6 +1912,7 @@ void Lowering::emit() {
   builder_.SetInsertPoint(unknown);
   exit(initial, pc, NativeExit::undeclared);
   for (std::size_t i = 0; i < instructions_.size(); ++i) { emit_instruction(i, grants[i]); }
+  builder_.SetCurrentDebugLocation({});
   emit_exit();
 }
 
@@ -1982,6 +2021,16 @@ std::shared_ptr<const PreparedImage> lower_image(const CodeImage &image,
   result->options = options;
   llvm::LLVMContext context;
   llvm::Module module(result->identity, context);
+  module.addModuleFlag(llvm::Module::Warning, "Debug Info Version", llvm::DEBUG_METADATA_VERSION);
+  llvm::DIBuilder debug(module);
+  debug.createCompileUnit(llvm::dwarf::DW_LANG_C_plus_plus,
+                          debug.createFile("sharc", ""),
+                          "sharc",
+                          true,
+                          "",
+                          0,
+                          "",
+                          llvm::DICompileUnit::LineTablesOnly);
   std::vector<Continuation> continuations;
   for (const auto &variant : image.variants) {
     validate_memory_layout(variant, result->identity);
@@ -2021,8 +2070,9 @@ std::shared_ptr<const PreparedImage> lower_image(const CodeImage &image,
     std::ranges::copy_if(instructions, std::back_inserter(code), [&](const auto &op) {
       return op.variant == unit.variant;
     });
-    Lowering(module, abi, *variant, connected_code(code, unit.entry), unit).emit();
+    Lowering(module, debug, abi, *variant, connected_code(code, unit.entry), unit).emit();
   }
+  finalize_debug(module, debug);
   std::string error;
   llvm::raw_string_ostream diagnostic(error);
   if (llvm::verifyModule(module, &diagnostic)) {

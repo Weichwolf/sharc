@@ -42,7 +42,7 @@ target_include_directories(sharc_core PUBLIC
   "$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>"
   PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
 target_include_directories(sharc_core SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS})
-llvm_map_components_to_libnames(llvm_libraries Support Core BitReader BitWriter OrcJIT native nativecodegen Passes Object)
+llvm_map_components_to_libnames(llvm_libraries Support Core BitReader BitWriter OrcJIT native nativecodegen Passes Object DebugInfoDWARF)
 target_link_libraries(sharc_core PRIVATE ${llvm_libraries})
 target_compile_options(sharc_core PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion -Werror)
 
@@ -74,7 +74,7 @@ if(BUILD_TESTING)
   target_include_directories(sharc_isa_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
   target_compile_options(sharc_isa_test PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion -Werror)
   add_test(NAME isa COMMAND sharc_isa_test)
-  foreach(suite IN ITEMS preparation state compute native control memory)
+  foreach(suite IN ITEMS preparation state compute native control memory faultmap)
     add_executable(sharc_${suite}_test test/core/${suite}.cpp)
     target_link_libraries(sharc_${suite}_test PRIVATE sharc::core)
     target_compile_options(sharc_${suite}_test PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion -Werror)
@@ -82,6 +82,8 @@ if(BUILD_TESTING)
   endforeach()
   target_include_directories(sharc_native_test SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS})
   target_link_libraries(sharc_native_test PRIVATE ${llvm_libraries})
+  target_include_directories(sharc_faultmap_test SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS})
+  target_link_libraries(sharc_faultmap_test PRIVATE ${llvm_libraries})
   add_test(NAME installed_consumer COMMAND "${CMAKE_COMMAND}"
     "-Dcore_build=${CMAKE_CURRENT_BINARY_DIR}"
     "-Dconsumer_source=${CMAKE_CURRENT_SOURCE_DIR}/test/core/consumer"
