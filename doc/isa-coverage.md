@@ -163,10 +163,14 @@ bound with alternate DAG/data banks and broadcast.
 Linux x86-64: Clang/LLVM 19.1.7 Release; the eight CTest checks pass, including an
 installed consumer executing native instructions. clang-format and clang-tidy
 are clean. A source export without manuals or Git metadata builds and passes the
-same eight checks. macOS ARM64 remains untested. Hardware user counters
-`instructions:u,cycles:u` are accessible with perf_event_paranoid=2. K1–K6,
-hardware performance results and goal sanitizer
-qualification remain open. This initial S3 implementation does not complete the S3 milestone.
+same checks. macOS ARM64 remains untested. The benchmark layer now includes K5:
+a full 4096-word copy and running checksum repeated 512 times in each numerical
+mode, with complete output, guard bytes and exact progress checked. Its portable
+Clang O3 reference has separate source and no LTO. See `test/bench/README.md` for
+inputs, counts and measurement scope. Hardware user counters
+`instructions:u,cycles:u` are accessible with perf_event_paranoid=2; authoritative
+K5 hardware results are published separately. K1–K4, K6 and goal sanitizer
+qualification remain open. This does not complete S3.
 
 ## S2 independent expectations (complete milestone, numerical gaps retained)
 

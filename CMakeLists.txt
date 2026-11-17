@@ -88,4 +88,15 @@ if(BUILD_TESTING)
     "-Dconsumer_build=${CMAKE_CURRENT_BINARY_DIR}/local/consumer"
     "-Dllvm_config=${LLVM_DIR}" "-Dcompiler=${CMAKE_CXX_COMPILER}"
     -P "${CMAKE_CURRENT_SOURCE_DIR}/test/core/install.cmake")
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+    add_executable(sharc_k5_bench test/bench/k5.cpp test/bench/reference.cpp)
+    target_link_libraries(sharc_k5_bench PRIVATE sharc::core)
+    target_compile_options(sharc_k5_bench PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion -Werror)
+    set_source_files_properties(test/bench/reference.cpp PROPERTIES COMPILE_OPTIONS "-O3;-fno-lto")
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
+      set_property(SOURCE test/bench/reference.cpp APPEND PROPERTY COMPILE_OPTIONS -march=native)
+    endif()
+    add_test(NAME bench_k5 COMMAND sharc_k5_bench --check)
+  endif()
+
 endif()

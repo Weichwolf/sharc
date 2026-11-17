@@ -36,3 +36,9 @@ compares complete states for all source/destination choices, DAG quarter banks,
 linear/circular arithmetic and canonical overflow latches. Moving-index memory
 controls exercise complete-space grants and exact sparse failures; the small
 copy/checksum control is not a common benchmark.
+
+`bench_k5` is the first common benchmark correctness case. It executes a complete
+4096-word copy/checksum workload exceeding ten million guest instructions in
+both numeric identities and checks all output, guards and progress. Hardware
+measurement is an explicit `--measure` run, separate from CTest. See
+`bench/README.md` for the reproducible protocol and the opaque Clang O3 reference.
