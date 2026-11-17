@@ -46,6 +46,21 @@
       "redistributed": false,
       "local_origin": "Downloaded directly from the publisher",
       "provenance": "Title, release URL, June 2024 cover date and 11-page count verified. Analysis-only reference for Windows/Linux tool availability; not a build input or numerical oracle."
+    },
+    {
+      "title": "ADSP-21160 SHARC DSP Instruction Set Reference",
+      "file": "sharc-21160-instructions.pdf",
+      "official_url": "https://www.analog.com/media/en/dsp-documentation/processor-manuals/ADSP-21160_isr_rev2.1.pdf",
+      "source_url": "https://docs.ampnuts.ru/analog.com.datasheet/adsp-21160n/related_data/ADSP-21160_isr_rev2.1.pdf",
+      "revision": "2.1, April 2013",
+      "document": "82-001967-01",
+      "bytes": 4662803,
+      "sha256": "6ac22d4b8c1f356f4a54bc9b55d84001979acd1ed4c6c5fd54260f04a49b5c3b",
+      "pages": 262,
+      "scope": "Type 6 without data access opcode, section 2-26/27; corroborates the ADSP-214xx code-compatible instruction form where Programming Reference 2.4 section 10-11 repeats its with-data diagram",
+      "redistributed": false,
+      "local_origin": "Downloaded manufacturer reference from a public mirror",
+      "provenance": "Cover, revision, part number, page count and type-6 fields agree with the official indexed PDF. Direct publisher download timed out; byte identity with the publisher is not verified. ADSP-214xx compatibility is stated in Programming Reference 2.4 section 1-10. Analysis-only reference, never a build input."
     }
   ],
   "online_references": [

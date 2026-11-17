@@ -63,6 +63,7 @@ constexpr unsigned system_register_first = 0x60;
 constexpr unsigned ureg_mask = 127, byte_mask = 255;
 constexpr unsigned history_older_mask = 0xff00;
 constexpr unsigned rotate_opcode = 0x08;
+constexpr unsigned immediate_shift_type = 6;
 constexpr unsigned register_move_type = 5;
 constexpr unsigned immediate_move_type = 17;
 constexpr unsigned nop_type = 21;
@@ -115,7 +116,8 @@ bool supported_compute(const Compute &compute) {
   return compute.kind == ComputeKind::none ||
          (compute.kind == ComputeKind::alu &&
           std::ranges::find(fixed_operations, compute.opcode) != fixed_operations.end()) ||
-         (compute.kind == ComputeKind::shifter && compute.opcode == rotate_opcode);
+         ((compute.kind == ComputeKind::shifter || compute.kind == ComputeKind::shift_immediate) &&
+          compute.opcode == rotate_opcode);
 }
 
 struct IndexModify {
@@ -329,6 +331,31 @@ void validate_immediate_move(const Instruction &instruction, std::string_view id
          "this universal-register immediate move is not lowered");
 }
 
+void validate_immediate_shift(const Instruction &instruction, std::string_view identity) {
+  constexpr unsigned prefix_shift = 40;
+  if ((instruction.word >> prefix_shift) != 2) {
+    reject(instruction,
+           identity,
+           FaultReason::unsupported_instruction,
+           "parallel immediate shift and memory transfer is not lowered");
+  }
+  constexpr auto allowed = (std::uint64_t{2} << prefix_shift) |
+                           (std::uint64_t{true_condition} << condition_shift) | 0x3fffff;
+  if ((instruction.word & ~allowed) != 0) {
+    reject(instruction,
+           identity,
+           FaultReason::unsupported_instruction,
+           "standalone immediate shift requires canonical unused fields");
+  }
+  validate_condition(instruction, identity);
+  if (!supported_compute(instruction.compute)) {
+    reject(instruction,
+           identity,
+           FaultReason::unsupported_instruction,
+           "immediate shifter operation has no LLVM lowering");
+  }
+}
+
 void validate(const Instruction &instruction, std::string_view identity) {
   if (instruction.instruction_set != InstructionSet::isa) {
     reject(instruction,
@@ -360,6 +387,10 @@ void validate(const Instruction &instruction, std::string_view identity) {
   }
   if (instruction.type == immediate_move_type) {
     validate_immediate_move(instruction, identity);
+    return;
+  }
+  if (instruction.type == immediate_shift_type) {
+    validate_immediate_shift(instruction, identity);
     return;
   }
   if (instruction.type == 2) {
@@ -977,7 +1008,10 @@ Arithmetic Lowering::rotation(const Values &values, const Compute &compute) {
                                 vector_type(32));
   };
   auto *source = word(compute.inputs[0]);
-  auto *count = word(compute.inputs[1]);
+  // Funnel rotation reduces modulo 32, including signed byte counts.
+  auto *count = compute.kind == ComputeKind::shift_immediate
+                    ? vector(32, compute.immediate & byte_mask)
+                    : word(compute.inputs[1]);
   auto *result =
       builder_.CreateIntrinsic(llvm::Intrinsic::fshl, {vector_type(32)}, {source, source, count});
   auto *zero = builder_.CreateICmpEQ(result, vector(32, 0));
@@ -1034,7 +1068,7 @@ void Lowering::instruction(Values &values, const Instruction &op, bool partial) 
     const auto reg = compute.outputs[1];
     values[reg] = builder_.CreateSelect(selected, difference.raw, values[reg]);
     written_.insert(reg);
-  } else if (compute.kind == ComputeKind::shifter) {
+  } else if (compute.kind == ComputeKind::shifter || compute.kind == ComputeKind::shift_immediate) {
     result = rotation(values, compute);
   } else {
     result = arithmetic(values, compute, compute.opcode);

@@ -107,10 +107,12 @@ void verify(sharc::Core &core, Registers registers, unsigned configuration) {
   }
 }
 
-void branch_interlock() {
+void branch_interlock(bool immediate) {
   constexpr std::uint64_t rotate_r2_r0_r6 = 0x013e00208206;
+  constexpr std::uint64_t rotate_r2_r0_minus_one = 0x023e0002ff20;
   constexpr std::uint64_t jump_sz_next = 0x071000000001;
-  const std::array words{rotate_r2_r0_r6, jump_sz_next, std::uint64_t{0}};
+  const std::array words{
+      immediate ? rotate_r2_r0_minus_one : rotate_r2_r0_r6, jump_sz_next, std::uint64_t{0}};
   fixture::Program program(words);
   for (const auto mode : {sharc::ExecutionMode::strict, sharc::ExecutionMode::fast_fp32}) {
     const auto native = sharc::Core::compile(program.code, {.mode = mode, .callbacks = {}});
@@ -140,11 +142,90 @@ void branch_interlock() {
   }
 }
 
+void immediate_verify(sharc::Core &core, Registers registers, unsigned configuration) {
+  constexpr unsigned count_values = 256;
+  std::vector<std::uint32_t> inputs{0, word_mask};
+  for (unsigned bit = 0; bit < 32; ++bit) { inputs.push_back(1U << bit); }
+  for (const auto input : inputs) {
+    auto expected = initial(configuration);
+    const std::array sources{input, input ^ word_mask};
+    for (unsigned lane = 0; lane < 2; ++lane) {
+      expected.pe[lane].data[bank(expected, registers.source)][registers.source] =
+          (std::uint64_t{sources[lane]} << 8) | source_extension;
+    }
+    core.set_registers(expected);
+    const auto start = core.save();
+    for (unsigned count = 0; count < count_values; ++count) {
+      for (unsigned lane = 0; lane < (((expected.mode1 >> simd_bit) & 1) != 0 ? 2U : 1U); ++lane) {
+        auto &pe = expected.pe[lane];
+        if ((pe.astat & 1) == 0) { continue; }
+        const auto source = static_cast<std::uint32_t>(
+            pe.data[bank(expected, registers.source)][registers.source] >> 8);
+        const auto result = rotate({.word = source, .count = count});
+        pe.data[bank(expected, registers.destination)][registers.destination] =
+            std::uint64_t{result} << 8;
+        pe.astat = (pe.astat & ~shift_flags) | (result == 0 ? zero_flag : 0);
+      }
+      ++expected.pc;
+      expected.faddr = expected.pc + 4;
+      expected.daddr = expected.pc + 2;
+      ++expected.emuclk;
+      const auto snapshot = core.save();
+      const auto retired = core.run(1);
+      check(!retired.has_fault && core.registers() == expected &&
+                retired.progress == sharc::Progress{.instructions = 1, .base_cycles = 1},
+            "immediate ROT lost its count, source alias, predicate, bank, flags or raw extension");
+      core.restore(snapshot);
+      const auto bounded = core.run_until(core.state().progress.base_cycles + 1);
+      check(!bounded.has_fault && core.registers() == expected,
+            "immediate ROT differs at an instruction or cycle prefix");
+    }
+    core.restore(start);
+    const auto granted = core.run(count_values);
+    check(!granted.has_fault && core.registers() == expected &&
+              granted.progress ==
+                  sharc::Progress{.instructions = count_values, .base_cycles = count_values},
+          "immediate ROT whole-unit execution differs from exact prefixes");
+  }
+}
+
+void immediate_rotations() {
+  constexpr unsigned count_values = 256;
+  constexpr std::uint64_t conditional_eq = 0x020000020000;
+  constexpr std::array refused{
+      0x803e0002ff20ULL, 0x023e0802ff20ULL, 0x023e0082ff20ULL, 0x023e0001ff20ULL};
+  for (const auto word : refused) {
+    fixture::throws<sharc::PreparationError>(
+        [&] { (void)sharc::Core::lower(fixture::image(sharc::InstructionSet::isa, word)); },
+        "unqualified parallel, extension, unused field or immediate operation was admitted");
+  }
+  constexpr std::array cases{Registers{.destination = 2, .source = 2, .count = 0},
+                             Registers{.destination = 11, .source = 3, .count = 0}};
+  for (const auto &registers : cases) {
+    std::array<std::uint64_t, count_values> words{};
+    for (unsigned count = 0; count < count_values; ++count) {
+      words[count] = conditional_eq | (std::uint64_t{count} << 8) |
+                     (std::uint64_t{registers.destination} << 4) | registers.source;
+    }
+    fixture::Program program(words);
+    for (const auto mode : {sharc::ExecutionMode::strict, sharc::ExecutionMode::fast_fp32}) {
+      const auto native = sharc::Core::compile(program.code, {.mode = mode, .callbacks = {}});
+      sharc::Core core(program.memory(), mode);
+      (void)core.install(native, fixture::Program::variant_id);
+      for (unsigned configuration = 0; configuration < 128; ++configuration) {
+        immediate_verify(core, registers, configuration);
+      }
+    }
+  }
+}
+
 } // namespace
 
 namespace fixture {
 void rotations() {
-  branch_interlock();
+  branch_interlock(false);
+  branch_interlock(true);
+  immediate_rotations();
   constexpr std::array cases{Registers{.destination = 2, .source = 2, .count = 3},
                              Registers{.destination = 11, .source = 10, .count = 11}};
   for (const auto &registers : cases) {

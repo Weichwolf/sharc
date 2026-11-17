@@ -28,6 +28,12 @@ instruction semantics do not implement this target architecture.
 |---|---|---:|---|
 | SHARC Processor Programming Reference | 2.4, April 2013 | 694 | [Official reference](https://www.analog.com/media/en/dsp-documentation/processor-manuals/ADSP-2136x_2137x_214xx_pgr_rev2.4.pdf) |
 | ADSP-214xx SHARC Processor Hardware Reference | 1.1, April 2013 | 1304 | [Official reference](https://www.analog.com/media/en/dsp-documentation/processor-manuals/adsp-214xx_hwr_rev1.1.pdf) |
+| ADSP-21160 SHARC DSP Instruction Set Reference | 2.1, April 2013 | 262 | [Official reference](https://www.analog.com/media/en/dsp-documentation/processor-manuals/ADSP-21160_isr_rev2.1.pdf) |
+
+The ADSP-21160 reference disambiguates the standalone immediate-shift prefix;
+Programming Reference 2.4 states ADSP-214xx code compatibility in section 1-10
+but duplicates the with-transfer diagram in section 10-11. The standalone
+prefix and its canonical fields are independently encoded in the fixtures.
 
 Use the filenames in reference-manifest.json to open the corresponding PDFs and
 extracted .txt files under doc/local/. All local copies have verified identities.

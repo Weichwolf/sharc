@@ -17,6 +17,7 @@ constexpr std::uint64_t classic_branch = 0xc00000001123;
 constexpr std::uint16_t compact_immediate_head = 0x0f81;
 constexpr std::uint16_t immediate_high = 0x1234, immediate_low = 0xabcd;
 constexpr std::uint16_t conditional_compute_head = 0x013e, add_operands = 0x1123;
+constexpr std::uint16_t immediate_shift_head = 0x023e, reserved_prefix_head = 0x0300;
 constexpr std::uint32_t next_classic_pc = 0x101, next_visa_pc = 0x103;
 constexpr std::uint32_t last_pc = 0xffffff, immediate_value = 0xdeadbeef;
 using fixture::check;
@@ -58,6 +59,7 @@ void formats() {
                              Format{.word = 0x700000001123, .type = 5, .bits = 48},
                              Format{.word = 0x7000003f0000, .type = 5, .bits = 32},
                              Format{.word = 0x800000001123, .type = 6, .bits = 48},
+                             Format{.word = 0x020000001123, .type = 6, .bits = 48},
                              Format{.word = 0x040000001123, .type = 7, .bits = 48},
                              Format{.word = 0x0400003f0000, .type = 7, .bits = 32},
                              Format{.word = 0x063e00000100, .type = 8, .bits = 48},
@@ -138,7 +140,7 @@ void boundaries() {
           "entry inside instruction accepted");
   }
   for (const auto set : {InstructionSet::isa, InstructionSet::visa}) {
-    image = fixture::image(set, {0, 0, 0, 0x0200, 0, 0});
+    image = fixture::image(set, {0, 0, 0, reserved_prefix_head, 0, 0});
     const auto fault = refusal(image);
     check(fault.reason == FaultReason::invalid_encoding, "later invalid prefix not decoded");
     check(fault.address == (set == InstructionSet::isa ? next_classic_pc : next_visa_pc),
@@ -147,6 +149,8 @@ void boundaries() {
   for (const auto parcels : {std::initializer_list<std::uint16_t>{0x0f01},
                              {0x0f01, immediate_high},
                              {compact_immediate_head},
+                             {immediate_shift_head},
+                             {immediate_shift_head, 0x0002},
                              {0x2000}}) {
     image = fixture::image(InstructionSet::visa, parcels);
     check(refusal(image).reason == FaultReason::truncated_instruction, "truncation accepted");
@@ -176,8 +180,7 @@ void declarations() {
   variant.interrupt_vectors.clear();
   image.transitions = {{.from_variant = 7, .address = 0x100, .to_variants = {9}}};
   check(refusal(image).reason == FaultReason::invalid_image, "unknown transition target accepted");
-  for (const auto word : {0x020000000000ULL,
-                          0x030000000000ULL,
+  for (const auto word : {0x030000000000ULL,
                           0x150000000000ULL,
                           0x00c000000000ULL,
                           0x900c00000000ULL,

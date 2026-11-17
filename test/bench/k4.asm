@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // Authored classic ISA K4; the consumer places the three PM sections.
-// Entry: R0=3, R1=0x2468ace0, R3=3, R4=1048576, R5=table, R6=-1, R7=7.
+// Entry: R0=3, R1=0x2468ace0, R3=3, R4=1048576, R5=table, R7=7.
 // MODE1=0; M8=0; all DAG lengths/bases=0; eight table words name the handlers.
 .SECTION/PM k4_main;
 .GLOBAL _k4;
@@ -73,7 +73,7 @@ _handler7:
     RTS;
 .SECTION/PM k4_common;
 _common:
-    R2 = ROT R0 BY R6;
+    R2 = ROT R0 BY -1;
     R1 = R1 XOR R2;
     R1 = R1 + R3;
     RTS;

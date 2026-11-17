@@ -73,6 +73,7 @@ constexpr std::array classic_formats{
     Format{.mask = 0xffc0, .value = 0x0040, .type = 22, .bits = 48},
     Format{.mask = 0xffc0, .value = 0x0080, .type = 22, .bits = 48},
     Format{.mask = 0xff00, .value = 0x0100, .type = 2, .bits = 48},
+    Format{.mask = 0xff00, .value = 0x0200, .type = 6, .bits = 48},
     Format{.mask = 0xff00, .value = 0x0400, .type = 7, .bits = 48},
     Format{.mask = 0xff00, .value = 0x0600, .type = 8, .bits = 48},
     Format{.mask = 0xff00, .value = 0x0700, .type = 8, .bits = 48},

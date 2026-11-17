@@ -191,8 +191,17 @@ conditional lane and writeback machinery as other computations.
 negative counts including both signed extrema, destination/source/count aliases,
 independent data banks, SISD/SIMD predicates, ALUSAT/RND32 preservation and both
 numeric identities against an independent bit permutation. A shifter-condition
-branch checks its interlock across a cross-Core snapshot. Immediate ROT, other
-shifter operations and complete parallel-shifter qualification remain open.
+branch checks its interlock across a cross-Core snapshot. Standalone classic
+type-6 immediate ROT uses the same LLVM rotation and writeback with a signed
+8-bit immediate count. Its installed fixtures cover all 256 count encodings,
+zero/full words and every source bit, source/destination aliases, distinct
+physical read/write banks, SISD/SIMD predicates, raw extensions, flags and sticky
+preservation under all bank/SIMD/ALUSAT/RND32 selections, both numerical modes
+and whole-unit runs against instruction/cycle prefixes with snapshot replay.
+Both count forms check
+the shifter-condition branch interlock. Nonzero unused/DATAEX fields, other
+immediate shifter operations, parallel memory forms and full shifter qualification
+remain open. See `encoding.md` for standalone-prefix reference evidence.
 
 Classic type 15 transfers use direct normal-word PM/DM layouts, pre-indexed
 32-bit displacements, physical DAG/data banks, explicit R/S registers, SIMD and

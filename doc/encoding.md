@@ -20,7 +20,7 @@ may not overlap, even if their instruction sets differ.
 | DAG register-modified transfer | 3a | 3a/b/c | General, no-compute compact, short DM transfer |
 | Immediate-modified transfer | 4a | 4a/b | General or compact without compute |
 | Register transfer/exchange | 5a | 5a/b | General or compact without compute |
-| Immediate shift and optional transfer | 6a | 6a | Dedicated immediate compute field |
+| Immediate shift and optional transfer | 6a | 6a | Dedicated immediate compute field; distinct standalone and memory-transfer prefixes |
 | DAG modify and optional computation | 7a | 7a/b | General or compact without compute |
 | Absolute/PC-relative jump or call | 8a | 8a | Distinct direct/relative prefixes |
 | Indirect/short PC-relative branch and computation | 9a | 9a/b | General or compact without compute |
@@ -39,6 +39,16 @@ may not overlap, even if their instruction sets differ.
 | IDLE/EMUIDLE | 22a | 22a/c | Full or short idle subtype |
 | Reserved types | 23/24 | 23/24 | No admitted instruction prefix |
 | Compiler frame operations | 25a | 25a/c | CJUMP/RFRAME prefix and short RFRAME marker |
+
+The standalone type-6 prefix is `0x02` in bits 47:40. Programming Reference 2.4,
+section 10-11, repeats the with-transfer diagram for its without-transfer form.
+The code-compatible ADSP-21160 Instruction Set Reference 2.1, section 2-26/27,
+distinguishes these prefixes and the common immediate compute field; it is pinned
+in `reference-manifest.json`. ADSP-214xx code compatibility with ADSP-2116x is
+stated in Programming Reference 2.4, section 1-10. The previous decoder omitted
+this standalone prefix; malformed-span and reserved-prefix fixtures incorrectly
+called it reserved. The malformed span now uses `0x03`, and explicit
+standalone type-6 fixtures cover recognition and installed execution.
 
 The 1001 VISA prefix uses additional discriminator bits to separate full-width
 immediate stores, compact immediate stores/offset transfers and short transfers.

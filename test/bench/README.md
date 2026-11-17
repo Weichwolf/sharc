@@ -63,9 +63,11 @@ and transition count. Neither expected-result calculation shares production code
 
 `k4.asm` is 79 source lines and 61 authored classic ISA instructions. `k4.cpp`
 encodes them without an assembler, places main/handlers/common at PM addresses
-`0x100/0x200/0x300`, and supplies eight table words at DM `0x90000`. Register R6
-holds the rotation count -1. Register-count ROT is lowered; immediate shifter
-forms remain open. Main dispatches indirectly, each handler calls the common
+`0x100/0x200/0x300`, and supplies eight table words at DM `0x90000`. The common
+routine uses the immediate ROT count -1. Historical results through the
+complete-view measurements used the register-count form with R6 initialized to
+-1. Both forms retain the same instruction/cycle counts and algorithm output.
+Main dispatches indirectly, each handler calls the common
 routine directly, and RTS unwinds both architectural PC-stack frames. The
 caller's return site is a prepared continuation, not a public entry.
 
