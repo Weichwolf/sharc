@@ -107,7 +107,8 @@ two physical DAG-load dependency tags under the existing native signature.
 Owner exits and snapshots preserve the same history. Fixed-cost loop admission
 proves empty incoming load history and propagates that fact into its body;
 acyclic grants reserve possible stalls and account the actual instruction costs.
-Complete normal-word PM/DM views support explicit Direct preparation and a
+Complete normal-word PM/DM views support separate lent read/write reservations,
+optional mirrored tails, explicit Direct preparation and a
 terminal host-fault adapter; see [memory.md](memory.md). Cross-unit flag recipes,
 remaining memory views and runtime data callbacks remain implementation work. See private issues
 blofeld-src #36/#37 and lead-a1-src #2 for coordination.

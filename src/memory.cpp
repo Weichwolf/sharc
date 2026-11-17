@@ -3,13 +3,18 @@
 #include "native.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <set>
 #include <sharc/core.hpp>
 #include <sharc/memory.hpp>
+#include <span>
+#include <stdexcept>
+#include <string>
 #include <string_view>
+#include <unistd.h>
 #include <vector>
 
 namespace sharc::detail {
@@ -80,6 +85,37 @@ bool code_storage_declared(const CodeVariant &variant) {
 }
 } // namespace
 
+std::string_view complete_views_error(const Memory::Views &views) {
+  const auto page = sysconf(_SC_PAGESIZE);
+  if (page <= 0) { return "host page size is unavailable"; }
+  const auto page_bytes = static_cast<std::size_t>(page);
+  constexpr auto space_bytes = address_count * normal_bytes;
+  for (std::size_t space = 0; space < views.read.size(); ++space) {
+    const auto &read = views.read[space];
+    const auto &write = views.write[space];
+    if (read.data.empty() != write.data.empty()) {
+      return "complete memory requires both read and write views";
+    }
+    for (const auto &view : {read, write}) {
+      if (view.data.empty()) {
+        if (!view.mirrored_tail.empty()) { return "a mirrored tail requires a complete view"; }
+        continue;
+      }
+      const auto start = reinterpret_cast<std::uintptr_t>(view.data.data());
+      if (start == 0 || view.data.size() != space_bytes || start % page_bytes != 0 ||
+          start > std::numeric_limits<std::uintptr_t>::max() - space_bytes) {
+        return "complete normal-word view requires an aligned 16 GiB reservation";
+      }
+      if (!view.mirrored_tail.empty() &&
+          (view.mirrored_tail.size() != page_bytes ||
+           reinterpret_cast<std::uintptr_t>(view.mirrored_tail.data()) != start + space_bytes)) {
+        return "mirrored tail must be one host page immediately after its complete view";
+      }
+    }
+  }
+  return {};
+}
+
 void validate_memory_layout(const CodeVariant &variant, std::string_view identity) {
   const auto &regions = variant.layout.regions;
   for (std::size_t i = 0; i < regions.size(); ++i) {
@@ -113,8 +149,12 @@ direct_memory(const PreparedImage &image, std::uint32_t variant_id, const Memory
   }
   validate_memory_layout(*variant, image.identity);
   validate_storage(memory, image, variant_id);
-  std::vector<void *> result(variant->layout.regions.size());
-  for (std::size_t i = 0; i < result.size(); ++i) {
+  if (const auto error = complete_views_error(memory.views()); !error.empty()) {
+    refuse(FaultReason::invalid_image, image.identity, variant_id, 0, std::string(error));
+  }
+  const auto count = variant->layout.regions.size();
+  std::vector<void *> result(count * 2);
+  for (std::size_t i = 0; i < count; ++i) {
     const auto &layout = variant->layout.regions[i];
     if (!layout.initialized || layout.count == 0 || layout.view != MemoryView::normal_word) {
       continue;
@@ -130,6 +170,14 @@ direct_memory(const PreparedImage &image, std::uint32_t variant_id, const Memory
              "direct normal-word storage is missing, truncated or has an invalid stride");
     }
     result[i] = region->bytes.data() + static_cast<std::size_t>(layout.byte_offset);
+    result[count + i] = result[i];
+    const auto space = static_cast<std::size_t>(layout.space);
+    if (space < memory.views().read.size() && layout.byte_stride == normal_bytes &&
+        !memory.views().read[space].data.empty()) {
+      const auto offset = std::uint64_t{layout.first} * normal_bytes;
+      result[i] = memory.views().read[space].data.data() + offset;
+      result[count + i] = memory.views().write[space].data.data() + offset;
+    }
   }
   return result;
 }
@@ -145,3 +193,12 @@ bool aliases_code(const CodeVariant &variant, std::size_t region) {
   });
 }
 } // namespace sharc::detail
+
+namespace sharc {
+Memory Memory::complete(std::span<const MemoryRegion> regions, const Views &views) {
+  if (const auto error = detail::complete_views_error(views); !error.empty()) {
+    throw std::invalid_argument(std::string(error));
+  }
+  return {.regions = {regions.begin(), regions.end()}, .io = {}, .complete_views = views};
+}
+} // namespace sharc

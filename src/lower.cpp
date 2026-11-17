@@ -503,6 +503,11 @@ public:
   void emit();
 
 private:
+  llvm::Value *memory_binding(std::size_t region, bool writing) {
+    return pointer(register_pointer_count + region +
+                   (writing ? variant_.layout.regions.size() : 0));
+  }
+
   bool host_protected(const RegionLayout &layout) const {
     return memory_mode_ == CompileOptions::MemoryMode::direct && layout.initialized &&
            layout.view == MemoryView::normal_word && layout.count == (std::uint64_t{1} << 32);
@@ -1125,7 +1130,7 @@ bool Lowering::plan_changing_memory(const Instruction &op) {
                                      (move.write && aliases_code(variant_, i))))) {
       continue;
     }
-    plan.pointers.fill(pointer(register_pointer_count + i));
+    plan.pointers.fill(memory_binding(i, move.write));
     plan.stride = layout.byte_stride;
     return true;
   }
@@ -1164,8 +1169,7 @@ llvm::Value *Lowering::memory_pointer(const Values &values,
     } else {
       auto *offset = builder_.CreateMul(builder_.CreateZExt(index, builder_.getInt64Ty()),
                                         builder_.getInt64(layout.byte_stride));
-      auto *host =
-          builder_.CreateGEP(builder_.getInt8Ty(), pointer(register_pointer_count + i), offset);
+      auto *host = builder_.CreateGEP(builder_.getInt8Ty(), memory_binding(i, move.write), offset);
       result->addIncoming(host, builder_.GetInsertBlock());
       builder_.CreateBr(done);
     }
@@ -1181,9 +1185,8 @@ llvm::Value *Lowering::memory_pointer(const Values &values,
 }
 
 void Lowering::memory_instruction(Values &values, const Instruction &op, bool partial) {
-  // In Direct mode every guest word access can end the run. Dead values and
-  // overwritten stores must not remove, widen or reorder those observable accesses.
-  const bool observable = memory_mode_ == CompileOptions::MemoryMode::direct;
+  // Lent read/write and PM/DM views can alias behind distinct virtual addresses.
+  // Preserve word width and guest access order in both memory contracts.
   const auto move = memory_move(op);
   const bool broadcast = !move.write && ((move.index == 1 && (context_ & broadcast1_mode) != 0) ||
                                          (move.index == 9 && (context_ & broadcast9_mode) != 0));
@@ -1207,13 +1210,13 @@ void Lowering::memory_instruction(Values &values, const Instruction &op, bool pa
           builder_.CreateLShr(raw, builder_.getInt64(raw_extension_bits)), builder_.getInt32Ty());
       auto *write = builder_.CreateStore(word, transfer == 0 ? explicit_pointer : implicit_pointer);
       write->setAlignment(llvm::Align(1));
-      write->setVolatile(observable);
+      write->setVolatile(true);
     }
     return;
   }
   auto *word = builder_.CreateLoad(builder_.getInt32Ty(), explicit_pointer);
   word->setAlignment(llvm::Align(1));
-  word->setVolatile(observable);
+  word->setVolatile(true);
   auto *raw = builder_.CreateShl(builder_.CreateZExt(word, builder_.getInt64Ty()),
                                  builder_.getInt64(raw_extension_bits));
   values[move.reg] =
@@ -1223,7 +1226,7 @@ void Lowering::memory_instruction(Values &values, const Instruction &op, bool pa
     if (!broadcast) {
       auto *read = builder_.CreateLoad(builder_.getInt32Ty(), implicit_pointer);
       read->setAlignment(llvm::Align(1));
-      read->setVolatile(observable);
+      read->setVolatile(true);
       other = read;
     }
     auto *other_raw = builder_.CreateShl(builder_.CreateZExt(other, builder_.getInt64Ty()),
@@ -1647,7 +1650,7 @@ std::pair<llvm::Value *, llvm::Value *> Lowering::plan_pointer(const MemoryMove 
     auto *offset = builder_.CreateMul(builder_.CreateZExt(index, builder_.getInt64Ty()),
                                       builder_.getInt64(layout.byte_stride));
     auto *candidate =
-        builder_.CreateGEP(builder_.getInt8Ty(), pointer(register_pointer_count + i), offset);
+        builder_.CreateGEP(builder_.getInt8Ty(), memory_binding(i, move.write), offset);
     host = builder_.CreateSelect(inside, candidate, host);
     valid = builder_.CreateOr(valid, inside);
   }

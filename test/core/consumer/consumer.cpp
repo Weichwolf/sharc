@@ -8,7 +8,9 @@
 
 int main() try {
   const sharc::CompileOptions defaults;
+  const auto empty_memory = sharc::Memory::complete({}, {});
   if (defaults.memory_mode != sharc::CompileOptions::MemoryMode::exact ||
+      !empty_memory.regions.empty() || !empty_memory.views().read[0].data.empty() ||
       sharc::Core::host_fault(0, false, 0)) {
     return 1;
   }

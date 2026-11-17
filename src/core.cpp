@@ -406,18 +406,7 @@ PreparationReport Core::install(const NativeImage &image, std::uint32_t variant)
     if (image.impl_->image->options.memory_mode == CompileOptions::MemoryMode::direct) {
       const auto &variants = image.impl_->image->code.variants;
       const auto &layout = std::ranges::find(variants, variant, &CodeVariant::id)->layout.regions;
-      for (std::size_t i = 0; i < layout.size(); ++i) {
-        const auto &region = layout[i];
-        if (!region.initialized || region.view != MemoryView::normal_word ||
-            region.count != (std::uint64_t{1} << 32)) {
-          continue;
-        }
-        constexpr unsigned word_bytes = 4;
-        impl_->views.push_back({.address = reinterpret_cast<std::uintptr_t>(storage[i]),
-                                .size = ((region.count - 1) * region.byte_stride) + word_bytes,
-                                .space = region.space,
-                                .stride = region.byte_stride});
-      }
+      impl_->views = detail::host_views(layout, storage, impl_->memory.views());
     }
   }
   impl_->installed = image.impl_;
@@ -630,16 +619,18 @@ RunResult Core::Impl::host_failure(Progress progress) {
       result.fault.instruction = access->word;
       result.fault.instruction_bits = access->bits;
       const auto view = std::ranges::find_if(views, [&](const auto &candidate) {
-        return candidate.space == access->space && record.address >= candidate.address &&
+        return candidate.space == access->space && candidate.writing == record.writing &&
+               record.address >= candidate.address &&
                record.address - candidate.address < candidate.size;
       });
       if (view == views.end()) {
         result.fault.reason = FaultReason::invalid_image;
         result.fault.detail += ": fault address is outside the guest instruction's view";
       } else {
-        result.fault.detail += ", space " + std::to_string(static_cast<unsigned>(view->space)) +
-                               ", word address " +
-                               std::to_string((record.address - view->address) / view->stride);
+        result.fault.detail +=
+            ", space " + std::to_string(static_cast<unsigned>(view->space)) + ", word address " +
+            std::to_string(
+                static_cast<std::uint32_t>((record.address - view->address) / view->stride));
       }
     }
   }

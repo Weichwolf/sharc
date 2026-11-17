@@ -6,9 +6,12 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <sharc/core.hpp>
+#include <sharc/memory.hpp>
 #include <span>
+#include <vector>
 
 namespace sharc::detail {
 namespace {
@@ -28,6 +31,36 @@ template <class Ranges> bool contains(const Ranges &ranges, std::uintptr_t addre
   });
 }
 } // namespace
+
+std::vector<HostView> host_views(std::span<const RegionLayout> layout,
+                                 std::span<void *const> storage,
+                                 const Memory::Views &views) {
+  std::vector<HostView> result;
+  constexpr auto words = std::uint64_t{1} << 32;
+  constexpr unsigned word_bytes = 4;
+  for (std::size_t region = 0; region < layout.size(); ++region) {
+    const auto &entry = layout[region];
+    if (!entry.initialized || entry.view != MemoryView::normal_word || entry.count != words) {
+      continue;
+    }
+    for (std::size_t direction = 0; direction < 2; ++direction) {
+      const auto *base = storage[region + (direction * layout.size())];
+      auto size = ((entry.count - 1) * entry.byte_stride) + word_bytes;
+      const auto space = static_cast<std::size_t>(entry.space);
+      const auto &loans = direction == 0 ? views.read : views.write;
+      if (space < loans.size() && entry.byte_stride == word_bytes &&
+          base == loans[space].data.data()) {
+        size += loans[space].mirrored_tail.size();
+      }
+      result.push_back({.address = reinterpret_cast<std::uintptr_t>(base),
+                        .size = size,
+                        .space = entry.space,
+                        .stride = entry.byte_stride,
+                        .writing = direction != 0});
+    }
+  }
+  return result;
+}
 
 void NativeCall::bind(std::span<const NativeSymbols::TextRange> text,
                       std::span<const HostView> views) noexcept {

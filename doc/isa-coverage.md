@@ -80,16 +80,22 @@ backing is not a snapshot. Exact checked faults remain precise and resumable.
 Other views, peripheral fault emulation and macOS ARM64 escape qualification
 remain open; this is not complete memory or v9 profile execution coverage.
 
-Contract v10 additionally requires `Memory::complete` read/write views with
-mirrored tails and preparation partitioned for concurrent consumer compilation.
-Those interfaces and their independent qualification remain open. Public
+Contract v10 `Memory::complete` read/write views with optional mirrored tails
+are implemented for packed initialized normal-word layouts. Construction and
+installation validate geometry; the consumer declares backing and tail aliases.
+Linux x86-64 installed-image tests cover distinct read/write aliases in PM/DM,
+store/load visibility, paired wrapping, rebinding and snapshot replay, Exact
+checked denials and actual Direct write-view faults in both numerical modes.
+Both memory modes use volatile word operations to preserve physical aliases.
+Other formats and macOS ARM64 remain unqualified.
+Preparation partitioned for concurrent consumer compilation remains open. Public
 `lower`, `load` and `bind` pass a cold-start concurrent preparation test: four
 workers prepare eight independent images with distinct code variants, both
 numerical modes and both memory contracts. Serialized artifacts, consumer-linked
 native text, complete final state and memory match serial preparation; arithmetic
 and stored bytes also have literal independent expectations. This qualifies
 concurrent whole-image preparation, not partitioning within one image. The current
-complete normal-word layout uses one binding for both access directions and
+complete normal-word layout binds read and write directions separately and
 explicitly wraps paired word addresses at the top of the space.
 
 Classic ISA support currently includes NOP, immediate moves into data/DAG registers, and

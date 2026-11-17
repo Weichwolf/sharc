@@ -6,6 +6,7 @@
 #include <atomic>
 #include <cstdint>
 #include <span>
+#include <vector>
 
 namespace sharc::detail {
 struct HostView {
@@ -13,7 +14,12 @@ struct HostView {
   std::uint64_t size{};
   MemorySpace space{};
   std::uint32_t stride{};
+  bool writing{};
 };
+
+[[nodiscard]] std::vector<HostView> host_views(std::span<const RegionLayout> layout,
+                                               std::span<void *const> storage,
+                                               const Memory::Views &views);
 
 struct HostFault {
   std::uintptr_t address{}, pc{};

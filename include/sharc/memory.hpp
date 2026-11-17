@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -39,7 +40,22 @@ struct MemoryRegion {
 };
 
 struct Memory {
+  struct View {
+    std::span<std::byte> data;
+    std::span<std::byte> mirrored_tail;
+  };
+
+  // Indexed by MemorySpace. An empty pair leaves that space on ordinary regions.
+  struct Views {
+    std::array<View, 2> read, write;
+  };
+
+  [[nodiscard]] static Memory complete(std::span<const MemoryRegion> regions, const Views &views);
+
+  [[nodiscard]] const Views &views() const noexcept { return complete_views; }
+
   std::vector<MemoryRegion> regions;
   Io io;
+  Views complete_views{};
 };
 } // namespace sharc

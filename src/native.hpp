@@ -111,6 +111,7 @@ struct CompiledSymbols {
 [[nodiscard]] CompiledSymbols compile_image(const PreparedImage &image);
 void validate_code_storage(const PreparedImage &image, std::uint32_t variant, const Memory &memory);
 void validate_memory_layout(const CodeVariant &variant, std::string_view identity);
+[[nodiscard]] std::string_view complete_views_error(const Memory::Views &views);
 [[nodiscard]] std::vector<void *>
 direct_memory(const PreparedImage &image, std::uint32_t variant, const Memory &memory);
 [[nodiscard]] bool aliases_code(const CodeVariant &variant, std::size_t region);

@@ -63,7 +63,28 @@ the consumer protects absent, read-only and executable backing pages. Other
 layouts retain checked lowering. Memory mode is part of the artifact identity,
 independent of the Strict/FastFP32 numerical selection.
 
-Direct guest word accesses are volatile LLVM operations. Every access must occur
+`Memory::complete(regions, views)` copies the region and view descriptors and
+borrows their storage. `Memory::Views::read` and `write` are indexed by
+`MemorySpace` (program zero, data one). Each nonempty pair supplies page-aligned
+16 GiB normal-word reservations. Either both directions are present or neither
+is; empty pairs retain ordinary region bindings. Packed initialized normal-word
+layouts bind through those reservations at their logical word addresses. Padded
+layouts continue to use canonical region storage. Region declarations still
+supply permissions, storage identity and code-alias information, and their
+canonical storage must cover the declared range.
+
+A `Memory::View` has a `data` span and an optional `mirrored_tail`: exactly one
+host page immediately after the reservation. The consumer maps the same backing
+in both directions and aliases the first page at the tail. Read-only pages may
+be absent from the write view. Construction rejects malformed geometry with
+`std::invalid_argument`; installation rechecks it and reports `PreparationError`.
+Backing identity and tail aliasing are consumer declarations and are not probed.
+The implemented paired normal-word transfers explicitly wrap their second word;
+formats that require a contiguous access across the tail remain unimplemented.
+
+Guest word accesses are volatile LLVM operations in both memory modes because
+distinct virtual views can alias physical storage without LLVM knowing it.
+Every access must occur
 at its original width and in guest order, including a load whose result is dead
 or a store overwritten later. This preserves the first protected access as the
 faulting instruction. SIMD uses separate explicit and implicit word accesses;
@@ -130,6 +151,11 @@ The installed-image ISA fixtures compare full registers and padded RAM under bot
 numerical identities, all sixteen index registers, both DAG banks, all data-bank
 selections, SISD/SIMD, broadcast and every instruction/cycle prefix. Core fixtures
 cover complete fault prefixes, rebinding, code aliases, invalid layouts/storage
-and missing implicit SIMD storage. Cached consumer-bound IR and the installed
+and missing implicit SIMD storage. A Linux x86-64 fixture also lends distinct
+read-only read and writable write aliases, verifies store/load visibility,
+PM/DM selection, wrapping, optional tails, geometry validation, rebinding and
+snapshot replay. It checks actual protected-write faults in Direct and precise
+checked denials in Exact under both numerical identities.
+Cached consumer-bound IR and the installed
 two-header SDK also execute memory accesses. K4/K5 check both numerical and memory
 modes; published hardware results are recorded separately in `test/bench/results/`.
