@@ -6,6 +6,8 @@ ARM64 and protected-page I/O are untested.
 
 The [terminal host-fault measurements](results/linux-host-fault.md) compare Exact,
 ordered Direct and an isolated unsound ordinary-access control on K4/K5.
+The [complete read/write view measurements](results/linux-complete-views.md)
+report the additional base cost on those same bindings.
 The [IR optimisation-level experiment](results/linux-optimization-levels.md)
 compares O1/O2/O3/Os with native code generation and the reference held fixed.
 
