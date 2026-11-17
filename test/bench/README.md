@@ -4,6 +4,9 @@ K4 and K5 are implemented. K1–K3 and K6 remain open; this is not complete S3 o
 profile performance result. The current driver targets Linux with Clang. macOS
 ARM64 and protected-page I/O are untested.
 
+The [terminal host-fault measurements](results/linux-host-fault.md) compare Exact,
+ordered Direct and an isolated unsound ordinary-access control on K4/K5.
+
 Configure a Release build with Clang 19, then run:
 
 ```sh
