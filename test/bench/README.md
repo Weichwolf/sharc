@@ -80,5 +80,5 @@ contexts and cold paths, not only the executed context.
 
 K5 is an integer workload: the two numerical modes have the same arithmetic
 contract here. Separate measurements do not claim a floating-point speedup,
-floating qualification, or consumer whole-instrument throughput. Hardware results
-are published separately after the benchmark implementation is committed.
+floating qualification, or consumer whole-instrument throughput. The first [Linux K5 baseline](results/linux-k5.md) includes raw counts,
+min/median/max metrics and the host/source receipt.
