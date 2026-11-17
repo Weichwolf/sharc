@@ -11,6 +11,9 @@ report the additional base cost on those same bindings.
 The [IR optimisation-level experiment](results/linux-optimization-levels.md)
 compares O1/O2/O3/Os with native code generation and the reference held fixed.
 
+The [immediate ROT measurements](results/linux-immediate-rotate.md) compare K4
+using its immediate count with the earlier register-count program.
+
 Configure a Release build with Clang 19, then run:
 
 ```sh

@@ -1,0 +1,59 @@
+{
+  "measured_revision": "0c5ef636dc1302eeab625a16d79636d9dac27019",
+  "clean_published_main_at_start": true,
+  "receipt_utc": "2026-11-17T17:34:35.380180+00:00",
+  "host": {
+    "cpu": "Intel(R) Core(TM) i5-10400 CPU @ 2.90GHz",
+    "platform": "Linux-6.12.117+deb13-amd64-x86_64-with-glibc2.41",
+    "machine": "x86_64",
+    "affinity_cpu": 4,
+    "perf_event_paranoid": 2
+  },
+  "configuration": "Release; C++23 Clang 19.1.7; C23 GCC 14.2.0; LLVM 19.1.7; poison OFF; Core::compile O3, native Aggressive",
+  "counter_scope": "Per-thread pinned unscaled instructions:u and cycles:u; public Core::run plus userspace timing/control wrapper",
+  "time_scope": "Core::run only; paired separate non-LTO Clang O3 reference, -march=native",
+  "own_concurrent_build_test_probe": false,
+  "external_activity": "Host not isolated; unrelated developer processes untouched.",
+  "source_files": {
+    "CMakeLists.txt": "48af6a01640b0c9a1174cc4e432b4232d1bccae1d2e86f43947f5850821ab8a4",
+    "include/sharc/README.md": "c1265ac3acdab180770d062b0b1358e49ef2aef8c3ef7fe0036542d3398618f0",
+    "include/sharc/core.hpp": "6c072d8626e7ef1cf1a8af064d27c35ae66fd2508304f0f12add8ece5134d543",
+    "include/sharc/memory.hpp": "04e5ca8676a398ad3e95493f2f0007f60e9ee00dd7b1c81245b608b1c46c8b75",
+    "src/README.md": "98dc09601c5317a35425520d28ff0f725786edc96768beac684ca701f1642d9e",
+    "src/abi.cpp": "338d7c8bb55d513780ec3e4b7d83e27fb1fc941f2a47d402850971d56e1f86a1",
+    "src/abi.hpp": "4461e14b1ef2bfe99f23bc9c199493cfb613161dd05eb554c0a7c0c0b83c7221",
+    "src/compute.cpp": "5b1bf8acbbb9e2ade89ccc62b5af49b2f4f086aa3a4093457d903f5972ae4ba5",
+    "src/core.cpp": "62f823a616ffcad32ab496df2a923c29c12fb105c71598626710951ac4b86d7e",
+    "src/decode.cpp": "8f9fe2a6af327d72fee53723d0063d4abf2c8cd47a119e7f980a88c57e17e61a",
+    "src/decode.hpp": "2497051e74ba4cc9e9ad2902fed2046bdd06cbc4bbf95c526c2c1d636c645c81",
+    "src/escape.cpp": "6e40cc2f2e5eb1e5476ac30aa098943008eee6221dc05e78168697eb82558a2d",
+    "src/escape.hpp": "ebb184b2424f82465a61bd8caeb24b01c95d476b6038cd4feddb1da2f770085a",
+    "src/image.cpp": "aee2534f54b8bbfb58468cdcdfadbd7d6c1f0e5a87f5593d492c5ea733ce90f4",
+    "src/landing.c": "ac2ef8f1d57e14a3e84ee6399228160a6cfc4691bd488f902927473ab9061fee",
+    "src/landing.h": "7cbcddc3b3ff5033c6b2cd370b3168b4f8df688e1a692bd03f321b772ec96717",
+    "src/lower.cpp": "737a47b092950fd01d18b2977e9c65be5dbdc9e5ff9052caa2e5f4e6b1c5f669",
+    "src/memory.cpp": "720657525c053f8142897734efaa186af74b616077b3145cff2c2967c3c7564b",
+    "src/native.hpp": "e3371618ac7be6bcee539a43d53f625c55f37ba93b574904a06a62f628dc5c94",
+    "test/bench/README.md": "9575d3f9a3fde09b1b6d5326747b5fd373be38d67946aa01d9e2102c2fcbf673",
+    "test/bench/control_expectations.py": "1b8c3f221be6fb5e433c8150e6266cd5446aaca85ed9e5e82bf00aa98cea2a16",
+    "test/bench/counters.hpp": "2b413afc24a51dcbcdbdc01fb52f1e00f1ca6ca257959e2def48d376f9bcebd5",
+    "test/bench/k4.asm": "56a9a7feec2708b214a1517b3d2aa3c4cc1fdcf190815cbb6c79a483ca73b5ee",
+    "test/bench/k4.cpp": "f900073296f9b53556343a8646bfdcbc5e24ba286a1a3b0b3b2f8a97e6af163a",
+    "test/bench/k5.asm": "caca4aa2218b23ef4cb01472d12201aea9067ebf672f0d9daf5e27f46dcd62e1",
+    "test/bench/k5.cpp": "c5fd41b0813f0317be13eaaae8d3bb258fcafcbb348920a085fd86e240589757",
+    "test/bench/reference.cpp": "c302cd30de3b89a0e530388754cd9b01c0ce51cfcd32e9e88292d89e8498f217",
+    "test/bench/reference.hpp": "e8af9190d7c80215b6deebecf3e86d5fa587776adf6d25df2b78cac7c15c6e59",
+    "test/bench/runner.hpp": "7d6d510f6d3f4bf00ef6ae1d786295d6576aa127223e3c4a821375dfd0d436e9",
+    "test/bench/summarize.py": "aa78486a9811c9a639346cc47a1b21a85f3bb697d7d426cc390858dd08656ffb"
+  },
+  "binaries": {
+    "build/sharc_k4_bench": "e859366a2aad1e91bd5b2623a23bd1eb903ec5a4a03faf45ea523105d5a9a045",
+    "build/sharc_k5_bench": "3961b1005d6f8e4a4f93f3056be88d9b835524cfac9dbffac1172f0b6289263b"
+  },
+  "raw_files": {
+    "linux-immediate-rotate-k4-exact.jsonl": "76240103bc0f15fa8913511167c333b9d89459da9cee20c9dd59e49d3b7086a7",
+    "linux-immediate-rotate-k4-direct.jsonl": "327af847457449e4216a6ef2f95da8ac04f4e47fa6a070808a2a4165c2cd3ede",
+    "linux-immediate-rotate-k5-exact.jsonl": "bb6f2c8ff08961da2b9f9b75558dea7a8370e738d6d8a7b3d74cd498ca3eb979",
+    "linux-immediate-rotate-k5-direct.jsonl": "fabeaedc633b57d31d143c7950419eca86e9b752a996836f8519e81696c77eb2"
+  }
+}
