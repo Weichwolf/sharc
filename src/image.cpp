@@ -56,7 +56,7 @@
 
 namespace sharc::detail {
 namespace {
-constexpr std::string_view artifact_magic = "sharc-llvm-image-v2";
+constexpr std::string_view artifact_magic = "sharc-llvm-image-v3";
 constexpr unsigned byte_bits = 8;
 constexpr unsigned word_bytes = 6;
 
@@ -344,6 +344,7 @@ std::vector<std::byte> serialize_image(const PreparedImage &image) {
   writer.text(Core::compiler_identity());
   writer.text(image.identity);
   writer.number(static_cast<std::uint8_t>(image.options.mode));
+  writer.number(static_cast<std::uint8_t>(image.options.memory_mode));
   writer.number(image.units.size());
   for (const auto &unit : image.units) {
     writer.number(unit.variant);
@@ -363,6 +364,7 @@ std::shared_ptr<const PreparedImage> load_image(const CodeImage &code,
                                                 const CompileOptions &options,
                                                 std::span<const std::byte> artifact) {
   const auto identity = input_identity(code, options);
+  validate_options(options, identity);
   constexpr std::size_t checksum_bytes = 32;
   if (artifact.size() < checksum_bytes) {
     refuse(FaultReason::invalid_image, identity, 0, 0, "truncated semantic artifact");
@@ -376,8 +378,9 @@ std::shared_ptr<const PreparedImage> load_image(const CodeImage &code,
   }
   Reader reader(body, identity);
   if (reader.text() != artifact_magic || reader.text() != Core::compiler_identity() ||
-      reader.text() != identity || reader.number() != static_cast<std::uint8_t>(options.mode)) {
-    reader.invalid("artifact format, compiler, code or numerical mode mismatch");
+      reader.text() != identity || reader.number() != static_cast<std::uint8_t>(options.mode) ||
+      reader.number() != static_cast<std::uint8_t>(options.memory_mode)) {
+    reader.invalid("artifact format, compiler, code or execution options mismatch");
   }
   auto result = std::make_shared<PreparedImage>();
   result->code = code;

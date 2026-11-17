@@ -49,14 +49,44 @@ stores use those proven pointers without access checks. If any proof fails, the
 same raw transfer lowering runs in the cold exact tail with precise access
 failures. An invalid access on an unexecuted branch does not fault early.
 Values stay in SSA across known control flow; memory accesses do not split
-ordinary blocks for budget accounting. Full consumer-lent PM/DM virtual mappings
-and protected-page runtime I/O remain open. A consumer can already lend a complete
+ordinary blocks for budget accounting. A consumer can lend a complete
 normal-word space: `first = 0`, `count = 2^32`, stride four and a 16 GiB virtual
 reservation. Its address proof is constant true, so the generated access needs
 only base plus the word address scaled by four. The Linux core fixture lends
 such a lazily committed reservation and checks SISD/SIMD wrapping from the last
-word to word zero in both execution modes. It does not install a fault handler
-or model protected holes.
+word to word zero in both numerical modes.
+
+`CompileOptions::memory_mode` defaults to `MemoryMode::exact`. An explicitly
+prepared `direct` image uses host protection for initialized complete normal-word
+spaces. Those accesses have no range, permission or code-alias admission checks;
+the consumer protects absent, read-only and executable backing pages. Other
+layouts retain checked lowering. Memory mode is part of the artifact identity,
+independent of the Strict/FastFP32 numerical selection.
+
+Direct guest word accesses are volatile LLVM operations. Every access must occur
+at its original width and in guest order, including a load whose result is dead
+or a store overwritten later. This preserves the first protected access as the
+faulting instruction. SIMD uses separate explicit and implicit word accesses;
+an implicit access can fault after the explicit store has changed memory.
+
+The consumer installs the process-wide handler for SIGSEGV/SIGBUS. It extracts
+the native PC, fault address and read/write direction, restores the interrupted
+signal mask and calls `Core::host_fault(address, writing, native_pc)`. If that
+returns false, it restores the handler mask before chaining its previous handler.
+The core claims only faults in its active generated text and a complete view
+lent to that owner. A fixed record and a small POSIX C23 landing frame leave C++
+execution scopes intact. The processor implementation remains C++23. A successful entry performs no signal-mask syscall;
+attribution and diagnostic formatting happen after the escape.
+
+A claimed fault permanently terminates the instance. Only fault diagnostics are
+defined; register backing can be partially materialized and is not an
+architectural snapshot. Progress reports completed owner returns, excluding any
+prefix inside the interrupted native call. Further runs return the latched fault;
+mutation, saving and restoring that instance are rejected. Use Exact for precise
+resumable faults. The Linux x86-64 fixture exercises actual protected-page and
+truncated-file faults, mask restoration, handler chaining, nested owners and
+independent owner threads. macOS ARM64 fault escape remains unqualified.
+Protected-page peripheral emulation and resumable runtime I/O remain open.
 
 Classic type 19 immediate MODIFY/BITREV updates I in SSA, selecting source and
 destination DAG banks independently. Its circular adjustment uses the source B/L,
@@ -74,7 +104,8 @@ They never reuse a host pointer computed from an obsolete I value.
 
 ## Boundaries and current gaps
 
-Denied reads/writes report `access_fault`. Unprepared addresses, callback regions,
+In Exact and checked fallback, denied reads/writes report `access_fault`.
+Unprepared addresses, callback regions,
 unsupported views and stores whose declared storage may overlap code report
 `unsupported_feature`. Diagnostics retain image identity, guest PC, instruction
 and data-space/address context. The failed instruction does not retire; completed
@@ -100,5 +131,5 @@ numerical identities, all sixteen index registers, both DAG banks, all data-bank
 selections, SISD/SIMD, broadcast and every instruction/cycle prefix. Core fixtures
 cover complete fault prefixes, rebinding, code aliases, invalid layouts/storage
 and missing implicit SIMD storage. Cached consumer-bound IR and the installed
-two-header SDK also execute memory accesses. K4/K5 and their hardware measurements
-remain open.
+two-header SDK also execute memory accesses. K4/K5 check both numerical and memory
+modes; published hardware results are recorded separately in `test/bench/results/`.

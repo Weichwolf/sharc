@@ -43,6 +43,15 @@ struct Instruction {
   InstructionSet instruction_set{InstructionSet::isa};
 };
 
+struct MemoryMove {
+  unsigned index{}, reg{}, lane{};
+  MemorySpace space{};
+  bool write{};
+};
+
+[[nodiscard]] MemoryMove memory_move(const Instruction &instruction);
+void validate_options(const CompileOptions &options, std::string_view identity);
+
 [[nodiscard]] Compute decode_compute(const Instruction &instruction, std::string_view identity);
 [[nodiscard]] std::vector<Instruction> decode(const CodeImage &image, std::string_view identity);
 [[nodiscard]] std::string input_identity(const CodeImage &image, const CompileOptions &options);

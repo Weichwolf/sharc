@@ -30,6 +30,7 @@ def summary(records):
             metrics["nanoseconds_per_guest"].append(run["nanoseconds"] / guest)
         entry = {
             "kernel": record["kernel"], "mode": record["mode"], "identity": record["identity"],
+            "memory_mode": record.get("memory_mode", "exact"),
             "guest_instructions": guest, "guest_base_cycles": record["guest_base_cycles"],
             "preparation_seconds": record["preparation_seconds"], "native_bytes": record["native_bytes"],
             "metrics": {name: {"min": min(values), "median": statistics.median(values), "max": max(values)}

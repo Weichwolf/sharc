@@ -69,8 +69,22 @@ The standalone compiler retains LLVM's default linker; JITLink supplies its
 allocated executable sections and relocated debug objects, with RTDyld load
 notifications supported separately. Fault attribution does not select a different
 native code model.
-Direct/Exact memory-mode selection and the terminal `host_fault` adapter are
-still unimplemented; this is not complete v9 execution support.
+Exact/Direct preparation has separate artifact identities. Direct initialized
+complete normal-word views use ordered volatile word accesses with host
+protection. Real Linux x86-64 SIGSEGV/SIGBUS tests cover PM/DM reads/writes,
+SIMD second-word faults, dead loads, overwritten stores, top-to-zero wrapping,
+native unit transitions, consumer-bound artifacts, mask restoration, chaining,
+nested owners and independent threads in both numerical modes. A claimed fault
+is terminal: diagnostics and completed-owner progress are defined, register
+backing is not a snapshot. Exact checked faults remain precise and resumable.
+Other views, peripheral fault emulation and macOS ARM64 escape qualification
+remain open; this is not complete memory or v9 profile execution coverage.
+
+Contract v10 additionally requires `Memory::complete` read/write views with
+mirrored tails and preparation partitioned for concurrent consumer compilation.
+Those interfaces and their independent qualification remain open. The current
+complete normal-word layout uses one binding for both access directions and
+explicitly wraps paired word addresses at the top of the space.
 
 Classic ISA support currently includes NOP, immediate moves into data/DAG registers, and
 conditional compute with the 21 fixed ALU opcodes ADD/SUB, carry/borrow forms,

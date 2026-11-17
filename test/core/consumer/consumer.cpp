@@ -7,6 +7,11 @@
 #include <sharc/memory.hpp>
 
 int main() try {
+  const sharc::CompileOptions defaults;
+  if (defaults.memory_mode != sharc::CompileOptions::MemoryMode::exact ||
+      sharc::Core::host_fault(0, false, 0)) {
+    return 1;
+  }
   // R0 = 2; call a leaf that sets R1 = 3; return; R3 = 9; jump to R2 = R0 + R1.
   constexpr std::array<std::uint64_t, 12> words{0x0f0000000002,
                                                 0x06be00000104,

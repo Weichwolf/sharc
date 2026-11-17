@@ -2,6 +2,7 @@
 #include "decode.hpp"
 
 #include "sharc/core.hpp"
+#include "sharc/memory.hpp"
 
 #include <algorithm>
 #include <array>
@@ -183,10 +184,36 @@ Instruction instruction(std::span<const std::uint16_t> parcels,
                           .detail = std::move(message)});
 }
 
+MemoryMove memory_move(const Instruction &instruction) {
+  constexpr unsigned dag_shift = 44;
+  constexpr unsigned index_shift = 41;
+  constexpr unsigned register_shift = 32;
+  constexpr std::uint64_t memory_write = std::uint64_t{1} << 40;
+  const bool program = ((instruction.word >> dag_shift) & 1) != 0;
+  const auto ureg = static_cast<unsigned>((instruction.word >> register_shift) & 0x7f);
+  return {.index =
+              static_cast<unsigned>((instruction.word >> index_shift) & 7) + (program ? 8U : 0U),
+          .reg = ureg & 15,
+          .lane = ureg < 16 ? 0U : 1U,
+          .space = program ? MemorySpace::program : MemorySpace::data,
+          .write = (instruction.word & memory_write) != 0};
+}
+
+void validate_options(const CompileOptions &options, std::string_view identity) {
+  if (options.mode != ExecutionMode::strict && options.mode != ExecutionMode::fast_fp32) {
+    refuse(FaultReason::invalid_image, identity, 0, 0, "unknown numerical mode");
+  }
+  if (options.memory_mode != CompileOptions::MemoryMode::exact &&
+      options.memory_mode != CompileOptions::MemoryMode::direct) {
+    refuse(FaultReason::invalid_image, identity, 0, 0, "unknown memory mode");
+  }
+}
+
 std::string input_identity(const CodeImage &image, const CompileOptions &options) {
   Digest digest;
   digest.text(Core::compiler_identity());
   digest.number(static_cast<std::uint8_t>(options.mode));
+  digest.number(static_cast<std::uint8_t>(options.memory_mode));
   digest.number(options.callbacks.size());
   for (const auto &callback : options.callbacks) {
     digest.text(callback.role);

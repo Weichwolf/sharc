@@ -80,20 +80,31 @@ inline std::uint64_t nanoseconds(Clock::time_point start, Clock::time_point end)
       std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
 }
 
-inline bool start(int argc, char **argv) {
-  fixture::check(argc == 1 || (argc == 2 && (std::string_view(argv[1]) == "--measure" ||
-                                             std::string_view(argv[1]) == "--check")),
-                 "usage: benchmark [--check|--measure]");
+struct Options {
+  bool measure{};
+  sharc::CompileOptions::MemoryMode memory_mode{sharc::CompileOptions::MemoryMode::exact};
+};
+
+inline Options start(int argc, char **argv) {
+  fixture::check(argc == 1 ||
+                     ((argc == 2 || argc == 3) && (std::string_view(argv[1]) == "--measure" ||
+                                                   std::string_view(argv[1]) == "--check")),
+                 "usage: benchmark [--check|--measure [--direct]]");
+  fixture::check(argc != 3 || std::string_view(argv[2]) == "--direct",
+                 "expected --direct as the second argument");
   std::cout << std::setprecision(10);
   std::cout << R"({"platform":"Linux","cpu":)" << pin_cpu()
             << ",\"compiler\":" << std::quoted(__clang_version__)
             << ",\"compiler_identity\":" << std::quoted(sharc::Core::compiler_identity()) << "}\n";
-  return argc == 2 && std::string_view(argv[1]) == "--measure";
+  return {.measure = argc >= 2 && std::string_view(argv[1]) == "--measure",
+          .memory_mode = argc == 3 ? sharc::CompileOptions::MemoryMode::direct
+                                   : sharc::CompileOptions::MemoryMode::exact};
 }
 
 struct Kernel {
   std::string_view name;
   sharc::ExecutionMode mode;
+  sharc::CompileOptions::MemoryMode memory_mode;
   sharc::Progress progress;
   unsigned prepared_instructions;
 };
@@ -112,6 +123,10 @@ void sample(Kernel kernel,
   const auto report = native.report();
   std::cout << R"({"kernel":)" << std::quoted(kernel.name) << R"(,"mode":)"
             << std::quoted(kernel.mode == sharc::ExecutionMode::strict ? "Strict" : "FastFP32")
+            << R"(,"memory_mode":)"
+            << std::quoted(kernel.memory_mode == sharc::CompileOptions::MemoryMode::direct
+                               ? "direct"
+                               : "exact")
             << R"(,"identity":)" << std::quoted(report.identity)
             << ",\"preparation_seconds\":" << report.seconds
             << ",\"native_bytes\":" << report.native_bytes

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #include "compiler_identity.hpp"
 #include "decode.hpp"
+#include "escape.hpp"
 #include "native.hpp"
 #include "sharc/memory.hpp"
 
@@ -45,6 +46,15 @@ struct SemanticImage::Impl {
   std::shared_ptr<const detail::PreparedImage> image;
 };
 
+namespace {
+struct FaultAccess {
+  std::uint32_t variant{}, pc{};
+  std::uint64_t word{};
+  std::uint8_t bits{};
+  MemorySpace space{};
+};
+} // namespace
+
 struct NativeImage::Impl {
   std::shared_ptr<const detail::PreparedImage> image;
   std::vector<detail::NativeEntry> entries;
@@ -52,6 +62,7 @@ struct NativeImage::Impl {
   PreparationReport report;
   std::vector<NativeSymbols::TextRange> text_ranges;
   std::vector<NativeSymbols::Site> sites;
+  std::vector<FaultAccess> accesses;
   bool interrupts_supported{};
 };
 
@@ -81,7 +92,8 @@ PreparationReport NativeImage::report() const {
 namespace {
 void validate_fault_map(const detail::PreparedImage &image,
                         std::vector<NativeSymbols::TextRange> &ranges,
-                        std::vector<NativeSymbols::Site> &sites) {
+                        std::vector<NativeSymbols::Site> &sites,
+                        std::span<const detail::Instruction> decoded) {
   const auto invalid = [&] {
     detail::refuse(FaultReason::invalid_image, image.identity, 0, 0, "invalid native fault map");
   };
@@ -96,11 +108,7 @@ void validate_fault_map(const detail::PreparedImage &image,
     end = range.address + range.size;
   }
   std::set<std::pair<std::uint64_t, std::uint32_t>> instructions;
-  if (!sites.empty()) {
-    for (const auto &op : detail::decode(image.code, image.identity)) {
-      instructions.emplace(op.variant, op.address);
-    }
-  }
+  for (const auto &op : decoded) { instructions.emplace(op.variant, op.address); }
   std::ranges::sort(sites, {}, &NativeSymbols::Site::address);
   end = 0;
   for (const auto &site : sites) {
@@ -160,8 +168,15 @@ struct Core::Impl {
     }
   }
 
-  void stopped_owner() const {
+  void idle_owner() const {
     if (executing) { throw std::logic_error("a running Core cannot be mutated or re-entered"); }
+  }
+
+  void stopped_owner() const {
+    idle_owner();
+    if (terminal_fault) {
+      throw std::logic_error("a Core terminated by a host fault cannot be resumed");
+    }
   }
 
   RunResult fail(FaultReason reason, std::string detail) {
@@ -237,12 +252,17 @@ struct Core::Impl {
   }
 
   RunResult execute(std::uint64_t instructions, std::uint64_t cycles);
+  RunResult host_failure(Progress progress);
+  bool enter(std::size_t index, detail::ControlWords &control);
 
   Memory memory;
   const ExecutionMode mode;
   State state;
   bool yield_requested{};
   bool executing{};
+  bool terminal_fault{};
+  detail::NativeCall native_call;
+  std::vector<detail::HostView> views;
   std::uint32_t pipeline_history{};
   std::shared_ptr<const NativeImage::Impl> installed;
   std::uint32_t variant{};
@@ -296,7 +316,27 @@ NativeImage Core::bind(const SemanticImage &image, const NativeSymbols &symbols)
   bound->text_ranges.assign(symbols.fault_map.text_ranges.begin(),
                             symbols.fault_map.text_ranges.end());
   bound->sites.assign(symbols.fault_map.sites.begin(), symbols.fault_map.sites.end());
-  validate_fault_map(*bound->image, bound->text_ranges, bound->sites);
+  const auto decoded = bound->sites.empty() ? std::vector<detail::Instruction>{}
+                                            : detail::decode(bound->image->code, image.identity());
+  validate_fault_map(*bound->image, bound->text_ranges, bound->sites, decoded);
+  if (bound->image->options.memory_mode == CompileOptions::MemoryMode::direct) {
+    if (bound->text_ranges.empty() || bound->sites.empty()) {
+      detail::refuse(FaultReason::invalid_image,
+                     image.identity(),
+                     0,
+                     0,
+                     "direct image requires native fault attribution");
+    }
+    constexpr unsigned memory_move_type = 15;
+    for (const auto &op : decoded) {
+      if (op.type != memory_move_type) { continue; }
+      bound->accesses.push_back({.variant = op.variant,
+                                 .pc = op.address,
+                                 .word = op.word,
+                                 .bits = op.bits,
+                                 .space = detail::memory_move(op).space});
+    }
+  }
   std::map<std::string, std::uintptr_t> addresses;
   for (const auto &symbol : symbols.entries) {
     if (symbol.name.empty() || symbol.address == 0 ||
@@ -355,6 +395,7 @@ PreparationReport Core::install(const NativeImage &image, std::uint32_t variant)
                    "native image uses a different numerical mode");
   }
   impl_->installed.reset();
+  impl_->views.clear();
   {
     impl_->executing = true;
     const auto release = llvm::make_scope_exit([&] { impl_->executing = false; });
@@ -362,10 +403,31 @@ PreparationReport Core::install(const NativeImage &image, std::uint32_t variant)
     impl_->pointers.resize(detail::register_pointer_count);
     impl_->pointers.insert(impl_->pointers.end(), storage.begin(), storage.end());
     detail::validate_code_storage(*image.impl_->image, variant, impl_->memory);
+    if (image.impl_->image->options.memory_mode == CompileOptions::MemoryMode::direct) {
+      const auto &variants = image.impl_->image->code.variants;
+      const auto &layout = std::ranges::find(variants, variant, &CodeVariant::id)->layout.regions;
+      for (std::size_t i = 0; i < layout.size(); ++i) {
+        const auto &region = layout[i];
+        if (!region.initialized || region.view != MemoryView::normal_word ||
+            region.count != (std::uint64_t{1} << 32)) {
+          continue;
+        }
+        constexpr unsigned word_bytes = 4;
+        impl_->views.push_back({.address = reinterpret_cast<std::uintptr_t>(storage[i]),
+                                .size = ((region.count - 1) * region.byte_stride) + word_bytes,
+                                .space = region.space,
+                                .stride = region.byte_stride});
+      }
+    }
   }
   impl_->installed = image.impl_;
   impl_->variant = variant;
+  impl_->native_call.bind(image.impl_->text_ranges, impl_->views);
   return image.impl_->report;
+}
+
+bool Core::host_fault(std::uintptr_t address, bool writing, std::uintptr_t native_pc) noexcept {
+  return detail::NativeCall::claim(address, writing, native_pc);
 }
 
 RunResult Core::run(std::uint64_t instruction_budget) {
@@ -472,8 +534,18 @@ void Core::restore(const Snapshot &snapshot) {
   impl_->pipeline_history = snapshot.impl_->pipeline_history;
 }
 
+bool Core::Impl::enter(std::size_t index, detail::ControlWords &control) {
+  executing = true;
+  const auto release = llvm::make_scope_exit([&] { executing = false; });
+  if (views.empty()) {
+    installed->entries[index](pointers.data(), control.data());
+    return true;
+  }
+  return native_call.invoke(installed->entries[index], pointers.data(), control.data());
+}
+
 RunResult Core::Impl::execute(std::uint64_t instructions, std::uint64_t cycles) {
-  stopped_owner();
+  idle_owner();
   if (state.has_fault) {
     return {.progress = {}, .execution = state.execution, .has_fault = true, .fault = state.fault};
   }
@@ -511,11 +583,7 @@ RunResult Core::Impl::execute(std::uint64_t instructions, std::uint64_t cycles) 
     control[detail::remaining_instructions] = instructions - progress.instructions;
     control[detail::remaining_cycles] = cycle_budget;
     state.execution = ExecutionState::running;
-    {
-      executing = true;
-      const auto release = llvm::make_scope_exit([&] { executing = false; });
-      installed->entries[*index](pointers.data(), control.data());
-    }
+    if (!enter(*index, control)) { return host_failure(progress); }
     const Progress retired{.instructions = control[detail::retired_instructions],
                            .base_cycles = control[detail::retired_cycles]};
     progress.instructions += retired.instructions;
@@ -534,5 +602,48 @@ RunResult Core::Impl::execute(std::uint64_t instructions, std::uint64_t cycles) 
   }
   state.execution = ExecutionState::stopped;
   return {.progress = progress, .execution = state.execution, .has_fault = false, .fault = {}};
+}
+
+RunResult Core::Impl::host_failure(Progress progress) {
+  terminal_fault = true;
+  const auto record = native_call.fault();
+  auto result = fail(FaultReason::access_fault,
+                     std::string("host ") + (record.writing ? "write" : "read") + ", address " +
+                         std::to_string(record.address));
+  result.progress = progress;
+  const auto site = std::ranges::find_if(installed->sites, [&](const auto &candidate) {
+    return record.pc >= candidate.address && record.pc - candidate.address < candidate.size;
+  });
+  if (site == installed->sites.end()) {
+    result.fault.reason = FaultReason::invalid_image;
+    result.fault.detail += ": native PC has no guest line attribution";
+  } else {
+    result.fault.variant = static_cast<std::uint32_t>(site->variant);
+    result.fault.address = site->guest_pc;
+    const auto access = std::ranges::find_if(installed->accesses, [&](const auto &candidate) {
+      return candidate.variant == site->variant && candidate.pc == site->guest_pc;
+    });
+    if (access == installed->accesses.end()) {
+      result.fault.reason = FaultReason::invalid_image;
+      result.fault.detail += ": faulting guest instruction has no memory access metadata";
+    } else {
+      result.fault.instruction = access->word;
+      result.fault.instruction_bits = access->bits;
+      const auto view = std::ranges::find_if(views, [&](const auto &candidate) {
+        return candidate.space == access->space && record.address >= candidate.address &&
+               record.address - candidate.address < candidate.size;
+      });
+      if (view == views.end()) {
+        result.fault.reason = FaultReason::invalid_image;
+        result.fault.detail += ": fault address is outside the guest instruction's view";
+      } else {
+        result.fault.detail += ", space " + std::to_string(static_cast<unsigned>(view->space)) +
+                               ", word address " +
+                               std::to_string((record.address - view->address) / view->stride);
+      }
+    }
+  }
+  state.fault = result.fault;
+  return result;
 }
 } // namespace sharc

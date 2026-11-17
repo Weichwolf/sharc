@@ -71,7 +71,6 @@ constexpr unsigned computed_branch_type = 9;
 constexpr unsigned return_branch_type = 11;
 constexpr unsigned memory_move_type = 15;
 constexpr unsigned index_modify_type = 19;
-constexpr std::uint64_t memory_write = std::uint64_t{1} << 40;
 constexpr std::uint64_t forced_long = std::uint64_t{1} << 39;
 constexpr std::uint64_t relative_branch = std::uint64_t{1} << 40;
 constexpr std::uint64_t call_branch = std::uint64_t{1} << 39;
@@ -117,26 +116,6 @@ bool supported_compute(const Compute &compute) {
          (compute.kind == ComputeKind::alu &&
           std::ranges::find(fixed_operations, compute.opcode) != fixed_operations.end()) ||
          (compute.kind == ComputeKind::shifter && compute.opcode == rotate_opcode);
-}
-
-struct MemoryMove {
-  unsigned index{}, reg{}, lane{};
-  MemorySpace space{};
-  bool write{};
-};
-
-MemoryMove memory_move(const Instruction &instruction) {
-  constexpr unsigned dag_shift = 44;
-  constexpr unsigned index_shift = 41;
-  constexpr unsigned register_shift = 32;
-  const bool program = ((instruction.word >> dag_shift) & 1) != 0;
-  const auto ureg = static_cast<unsigned>((instruction.word >> register_shift) & 0x7f);
-  return {.index =
-              static_cast<unsigned>((instruction.word >> index_shift) & 7) + (program ? 8U : 0U),
-          .reg = ureg & 15,
-          .lane = ureg < 16 ? 0U : 1U,
-          .space = program ? MemorySpace::program : MemorySpace::data,
-          .write = (instruction.word & memory_write) != 0};
 }
 
 struct IndexModify {
@@ -502,11 +481,13 @@ class Lowering {
 public:
   Lowering(llvm::Module &module,
            llvm::DIBuilder &debug,
+           CompileOptions::MemoryMode memory_mode,
            const NativeAbi &abi,
            const CodeVariant &variant,
            std::vector<Instruction> instructions,
            const NativeUnit &unit)
       : module_(module),
+        memory_mode_(memory_mode),
         abi_(abi),
         unit_(unit),
         variant_(variant),
@@ -522,6 +503,11 @@ public:
   void emit();
 
 private:
+  bool host_protected(const RegionLayout &layout) const {
+    return memory_mode_ == CompileOptions::MemoryMode::direct && layout.initialized &&
+           layout.view == MemoryView::normal_word && layout.count == (std::uint64_t{1} << 32);
+  }
+
   llvm::Type *vector_type(unsigned bits) const {
     return llvm::FixedVectorType::get(llvm::IntegerType::get(module_.getContext(), bits), 2);
   }
@@ -653,6 +639,7 @@ private:
   std::vector<std::optional<BlockCost>> unit_costs() const;
 
   llvm::Module &module_;
+  CompileOptions::MemoryMode memory_mode_;
   const NativeAbi &abi_;
   const NativeUnit &unit_;
   const CodeVariant &variant_;
@@ -1134,8 +1121,8 @@ bool Lowering::plan_changing_memory(const Instruction &op) {
     const auto &layout = variant_.layout.regions[i];
     if (layout.space != move.space || layout.count != (std::uint64_t{1} << 32) ||
         layout.view != MemoryView::normal_word || !layout.initialized ||
-        !(move.write ? layout.writable : layout.readable) ||
-        (move.write && aliases_code(variant_, i))) {
+        (!host_protected(layout) && (!(move.write ? layout.writable : layout.readable) ||
+                                     (move.write && aliases_code(variant_, i))))) {
       continue;
     }
     plan.pointers.fill(pointer(register_pointer_count + i));
@@ -1168,11 +1155,11 @@ llvm::Value *Lowering::memory_pointer(const Values &values,
                              index, builder_.getInt32(static_cast<std::uint32_t>(layout.count)));
     builder_.CreateCondBr(inside, hit, next);
     builder_.SetInsertPoint(hit);
-    if (!(move.write ? layout.writable : layout.readable)) {
+    if (!host_protected(layout) && !(move.write ? layout.writable : layout.readable)) {
       memory_failure(values, op, address, NativeExit::access_fault, partial);
     } else if (!layout.initialized || layout.view != MemoryView::normal_word) {
       memory_failure(values, op, address, NativeExit::unsupported_memory, partial);
-    } else if (move.write && aliases_code(variant_, i)) {
+    } else if (!host_protected(layout) && move.write && aliases_code(variant_, i)) {
       memory_failure(values, op, address, NativeExit::code_alias, partial);
     } else {
       auto *offset = builder_.CreateMul(builder_.CreateZExt(index, builder_.getInt64Ty()),
@@ -1194,6 +1181,9 @@ llvm::Value *Lowering::memory_pointer(const Values &values,
 }
 
 void Lowering::memory_instruction(Values &values, const Instruction &op, bool partial) {
+  // In Direct mode every guest word access can end the run. Dead values and
+  // overwritten stores must not remove, widen or reorder those observable accesses.
+  const bool observable = memory_mode_ == CompileOptions::MemoryMode::direct;
   const auto move = memory_move(op);
   const bool broadcast = !move.write && ((move.index == 1 && (context_ & broadcast1_mode) != 0) ||
                                          (move.index == 9 && (context_ & broadcast9_mode) != 0));
@@ -1217,11 +1207,13 @@ void Lowering::memory_instruction(Values &values, const Instruction &op, bool pa
           builder_.CreateLShr(raw, builder_.getInt64(raw_extension_bits)), builder_.getInt32Ty());
       auto *write = builder_.CreateStore(word, transfer == 0 ? explicit_pointer : implicit_pointer);
       write->setAlignment(llvm::Align(1));
+      write->setVolatile(observable);
     }
     return;
   }
   auto *word = builder_.CreateLoad(builder_.getInt32Ty(), explicit_pointer);
   word->setAlignment(llvm::Align(1));
+  word->setVolatile(observable);
   auto *raw = builder_.CreateShl(builder_.CreateZExt(word, builder_.getInt64Ty()),
                                  builder_.getInt64(raw_extension_bits));
   values[move.reg] =
@@ -1231,6 +1223,7 @@ void Lowering::memory_instruction(Values &values, const Instruction &op, bool pa
     if (!broadcast) {
       auto *read = builder_.CreateLoad(builder_.getInt32Ty(), implicit_pointer);
       read->setAlignment(llvm::Align(1));
+      read->setVolatile(observable);
       other = read;
     }
     auto *other_raw = builder_.CreateShl(builder_.CreateZExt(other, builder_.getInt64Ty()),
@@ -1641,8 +1634,9 @@ std::pair<llvm::Value *, llvm::Value *> Lowering::plan_pointer(const MemoryMove 
   for (std::size_t i = 0; i < variant_.layout.regions.size(); ++i) {
     const auto &layout = variant_.layout.regions[i];
     if (layout.space != move.space || layout.count == 0 || layout.view != MemoryView::normal_word ||
-        !layout.initialized || !(move.write ? layout.writable : layout.readable) ||
-        (move.write && aliases_code(variant_, i))) {
+        !layout.initialized ||
+        (!host_protected(layout) && (!(move.write ? layout.writable : layout.readable) ||
+                                     (move.write && aliases_code(variant_, i))))) {
       continue;
     }
     auto *index = builder_.CreateSub(address, builder_.getInt32(layout.first));
@@ -2012,9 +2006,7 @@ std::shared_ptr<const PreparedImage> lower_image(const CodeImage &image,
                                                  const CompileOptions &options) {
   auto result = std::make_shared<PreparedImage>();
   result->identity = input_identity(image, options);
-  if (options.mode != ExecutionMode::strict && options.mode != ExecutionMode::fast_fp32) {
-    refuse(FaultReason::invalid_image, result->identity, 0, 0, "unknown numerical mode");
-  }
+  validate_options(options, result->identity);
   auto instructions = decode(image, result->identity);
   for (const auto &instruction : instructions) { validate(instruction, result->identity); }
   result->code = image;
@@ -2070,7 +2062,9 @@ std::shared_ptr<const PreparedImage> lower_image(const CodeImage &image,
     std::ranges::copy_if(instructions, std::back_inserter(code), [&](const auto &op) {
       return op.variant == unit.variant;
     });
-    Lowering(module, debug, abi, *variant, connected_code(code, unit.entry), unit).emit();
+    Lowering(
+        module, debug, options.memory_mode, abi, *variant, connected_code(code, unit.entry), unit)
+        .emit();
   }
   finalize_debug(module, debug);
   std::string error;

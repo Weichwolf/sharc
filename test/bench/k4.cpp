@@ -196,7 +196,7 @@ std::uint64_t reference_run() {
   return bench::nanoseconds(begin, end);
 }
 
-void run(sharc::ExecutionMode mode, bool measure) {
+void run(sharc::ExecutionMode mode, bench::Options options) {
   const auto input = table();
   const Storage storage;
   storage.initialize(input);
@@ -214,7 +214,8 @@ void run(sharc::ExecutionMode mode, bool measure) {
                                                      .initialized = true});
   auto memory = program.memory();
   memory.regions.push_back({.storage_id = ram_id, .bytes = storage.all(), .generation = 1});
-  const auto native = sharc::Core::compile(program.code, {.mode = mode, .callbacks = {}});
+  const auto native = sharc::Core::compile(
+      program.code, {.mode = mode, .memory_mode = options.memory_mode, .callbacks = {}});
   sharc::Core core(memory, mode);
   core.set_registers(registers());
   (void)core.install(native, fixture::Program::variant_id);
@@ -222,11 +223,12 @@ void run(sharc::ExecutionMode mode, bool measure) {
   bench::sample(
       {.name = "K4",
        .mode = mode,
+       .memory_mode = options.memory_mode,
        .progress = {.instructions = guests, .base_cycles = cycles},
        .prepared_instructions = prepared_instructions},
       native,
       core,
-      measure,
+      options.measure,
       [&] { core.restore(checkpoint); },
       [&](const sharc::RunResult &result) {
         validate(core, result);
@@ -237,9 +239,9 @@ void run(sharc::ExecutionMode mode, bool measure) {
 } // namespace
 
 int main(int argc, char **argv) try {
-  const bool measure = bench::start(argc, argv);
-  run(sharc::ExecutionMode::strict, measure);
-  run(sharc::ExecutionMode::fast_fp32, measure);
+  const auto options = bench::start(argc, argv);
+  run(sharc::ExecutionMode::strict, options);
+  run(sharc::ExecutionMode::fast_fp32, options);
 } catch (const std::exception &error) {
 
   std::cerr << error.what() << '\n';

@@ -163,7 +163,9 @@ struct CallbackBinding {
 };
 
 struct CompileOptions {
+  enum class MemoryMode : std::uint8_t { exact, direct };
   ExecutionMode mode{ExecutionMode::strict};
+  MemoryMode memory_mode{MemoryMode::exact};
   std::vector<CallbackBinding> callbacks;
 };
 
@@ -252,6 +254,11 @@ public:
   [[nodiscard]] static NativeImage bind(const SemanticImage &image, const NativeSymbols &symbols);
   [[nodiscard]] static NativeImage compile(const CodeImage &image,
                                            const CompileOptions &options = {});
+  // Called with the interrupted signal mask in effect. A claimed host fault is terminal;
+  // Only fault diagnostics and progress at the last completed owner return are defined.
+  // Register backing may be partially materialized; it is not an architectural snapshot.
+  [[nodiscard]] static bool
+  host_fault(std::uintptr_t address, bool writing, std::uintptr_t native_pc) noexcept;
   [[nodiscard]] PreparationReport install(const NativeImage &image, std::uint32_t variant);
   [[nodiscard]] RunResult run(std::uint64_t instruction_budget);
   [[nodiscard]] RunResult run_until(std::uint64_t base_cycle_deadline);

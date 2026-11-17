@@ -10,12 +10,21 @@ Configure a Release build with Clang 19, then run:
 cmake --build build --target sharc_k4_bench sharc_k5_bench
 build/sharc_k4_bench --check
 build/sharc_k5_bench --check
+build/sharc_k4_bench --check --direct
+build/sharc_k5_bench --check --direct
 mkdir -p build/local
 build/sharc_k4_bench --measure > build/local/k4.jsonl
 build/sharc_k5_bench --measure > build/local/k5.jsonl
 python3 test/bench/summarize.py build/local/k4.jsonl > build/local/k4-summary.json
 python3 test/bench/summarize.py build/local/k5.jsonl > build/local/k5-summary.json
 ```
+
+Add `--direct` after `--measure` to measure Direct instead of the default Exact
+memory contract. Each JSON record names `memory_mode`; keep those results
+separate, as well as the Strict/FastFP32 numerical modes. Historical records
+without a memory-mode field used Exact. Direct uses the same complete word-space
+binding and checked outputs, with ordered volatile accesses. These all-RAM
+benchmarks do not expect a host fault and do not install a handler.
 
 `bench_k4` and `bench_k5` are correctness tests in the benchmark layer. They run the complete
 kernels through the public interface in Strict and FastFP32 without requiring
