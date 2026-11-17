@@ -30,9 +30,15 @@ enum UnitArgument : std::uint8_t {
   unit_sticky = unit_status + 1
 };
 
+struct Continuation {
+  std::uint32_t variant{}, address{}, root{};
+};
+
 class NativeAbi {
 public:
-  NativeAbi(llvm::Module &module, std::span<const NativeUnit> units);
+  NativeAbi(llvm::Module &module,
+            std::span<const NativeUnit> units,
+            std::span<const Continuation> continuations);
   [[nodiscard]] llvm::Function *body(const NativeUnit &unit) const;
   void leave(llvm::IRBuilder<> &builder,
              const NativeUnit &unit,
@@ -44,6 +50,7 @@ private:
   void emit_dispatch(std::uint32_t variant);
   llvm::Module &module_;
   std::span<const NativeUnit> units_;
+  std::span<const Continuation> continuations_;
   llvm::FunctionType *type_{};
   llvm::Function *reload_{}, *spill_{};
 };

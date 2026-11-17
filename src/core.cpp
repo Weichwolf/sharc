@@ -470,7 +470,7 @@ RunResult Core::Impl::execute(std::uint64_t instructions, std::uint64_t cycles) 
                     .entry = static_cast<std::uint32_t>(control[detail::resume_entry])};
     const auto reason = static_cast<detail::NativeExit>(control[detail::exit_reason]);
     if (const auto result = native_failure(control, progress)) { return *result; }
-    if (reason != detail::NativeExit::indirect) { break; }
+    if (reason != detail::NativeExit::indirect && reason != detail::NativeExit::returned) { break; }
     resume.reset();
     if (progress.instructions == instructions || progress.base_cycles >= cycles) { break; }
   }

@@ -15,7 +15,7 @@ is claimed.
 | FastFP32 numerical mode (opt-in) | Independent approximation expectations, rounding/flags, unchanged raw moves/integer behavior, separate translations | Unimplemented |
 | Parallel operations | Old operands, memory aliases, register exchanges and ordered partial effects | Unimplemented |
 | Address generation and memory | Both DAGs, modulo/reverse addressing, PM/DM and physical view aliases | Partial: type 15 normal-word pre-indexing and type 19 immediate modify/reverse |
-| Sequencer and control | Delayed flow, DO/loop endpoints, LR, stacks, reset and interrupts | Partial: non-delayed direct flow, static calls/returns and branch stalls |
+| Sequencer and control | Delayed flow, DO/loop endpoints, LR, stacks, reset and interrupts | Partial: non-delayed direct/indirect flow, calls/returns and branch stalls |
 | Chip-profile boundaries | ADSP-21489 memory/vector parameters and explicit I/O ownership | Unimplemented |
 | JIT coherence and hosts | Self-modifying aliases, natural loops, precise exits, x86-64 and ARM64 | Unimplemented |
 
@@ -84,6 +84,30 @@ Empty/overflowed stacks and returns with a loop/interrupt continuation tag fail 
 retiring that instruction, retaining any preceding completed prefix. These are
 qualification gaps, not architectural stack-exception implementations. Delayed,
 loop-reentry, interrupt and parallel-compute returns remain unsupported.
+
+Classic type 9 adds non-delayed DAG2-indirect and signed six-bit PC-relative
+jumps and calls, optionally with supported single-function fixed ALU computation.
+Indirect targets use the old I+M value, wrap to 24 bits and leave I unchanged;
+I and M independently select their physical DAG quarter banks. Branch predicates
+read the old flags. Without ELSE, SISD computes unconditionally while SIMD
+computes in lanes satisfying the condition; ELSE computes in active lanes with
+the inverse condition (Programming Reference 2.4, 9-35–9-38, 10-14).
+Taken transfers clear the compute interlock; a fallthrough retains its parallel
+compute history across bounds and snapshots. A refused full-stack parallel CALL
+commits neither the computation nor the call.
+
+Cross-unit RTS dispatch recognizes prepared CALL continuations without requiring
+them to be public entries. Ordinary indirect jumps and calls still require
+declared entries. Resolving a return exactly at the run bound preserves the
+caller root for later execution and cross-Core snapshots; unknown targets retain
+their completed prefix. `test/isa/indirect.cpp` checks both numeric identities,
+all I8–I15/M8–M15 selector fields, independent DAG quarters, displacement extremes
+and wrap, EQ lane combinations with/without ELSE, complete call/return prefixes,
+cycle bounds, cross-Core snapshots, interlocks and refusal before parallel effects.
+`test/core/native.cpp` also exercises a cached, consumer-linked indirect call.
+Universal-register loads and their DAG dependency stalls, other parallel compute
+classes, delayed flow and architectural stack exceptions remain open. This is
+preparation for K4, not a completed or measured K4 kernel.
 
 Classic type 15 transfers use direct normal-word PM/DM layouts, pre-indexed
 32-bit displacements, physical DAG/data banks, explicit R/S registers, SIMD and
@@ -160,7 +184,7 @@ and replays the return. Cached bitcode also executes a call/return after loading
 and binding through consumer-linked IR. Cached memory IR is also loaded and
 bound with alternate DAG/data banks and broadcast.
 
-Linux x86-64: Clang/LLVM 19.1.7 Release; the eight CTest checks pass, including an
+Linux x86-64: Clang/LLVM 19.1.7 Release; the nine CTest checks pass, including an
 installed consumer executing native instructions. clang-format and clang-tidy
 are clean. A source export without manuals or Git metadata builds and passes the
 same checks. macOS ARM64 remains untested. The benchmark layer now includes K5:

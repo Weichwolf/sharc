@@ -69,7 +69,7 @@ if(BUILD_TESTING)
       --fixed-header "${fixed_expectations}"
     DEPENDS ${reference_sources}
     VERBATIM)
-  add_executable(sharc_isa_test test/isa/fixed.cpp test/isa/control.cpp test/isa/memory.cpp test/isa/dag.cpp "${fixed_expectations}")
+  add_executable(sharc_isa_test test/isa/fixed.cpp test/isa/control.cpp test/isa/indirect.cpp test/isa/memory.cpp test/isa/dag.cpp "${fixed_expectations}")
   target_link_libraries(sharc_isa_test PRIVATE sharc::core)
   target_include_directories(sharc_isa_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
   target_compile_options(sharc_isa_test PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion -Werror)

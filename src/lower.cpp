@@ -57,6 +57,7 @@ constexpr unsigned minimum = 0x61, maximum = 0x62, clip = 0x63, dual_add_subtrac
 constexpr unsigned immediate_move_type = 17;
 constexpr unsigned nop_type = 21;
 constexpr unsigned direct_branch_type = 8;
+constexpr unsigned computed_branch_type = 9;
 constexpr unsigned return_branch_type = 11;
 constexpr unsigned memory_move_type = 15;
 constexpr unsigned index_modify_type = 19;
@@ -66,6 +67,7 @@ constexpr std::uint64_t relative_branch = std::uint64_t{1} << 40;
 constexpr std::uint64_t call_branch = std::uint64_t{1} << 39;
 constexpr std::uint64_t abort_branch = std::uint64_t{1} << 38;
 constexpr std::uint64_t delayed_branch = std::uint64_t{1} << 26;
+constexpr std::uint64_t else_compute = std::uint64_t{1} << 25;
 constexpr std::uint64_t clear_interrupt_branch = std::uint64_t{1} << 24;
 // Programming Reference 2.4, 4-19: three pipeline bubbles on a taken jump.
 constexpr unsigned branch_penalty = 3;
@@ -144,6 +146,30 @@ IndexModify index_modify(const Instruction &instruction) {
           .reverse = (instruction.word & reverse) != 0};
 }
 
+bool branch(const Instruction &op) {
+  return op.type == direct_branch_type || op.type == computed_branch_type ||
+         op.type == return_branch_type;
+}
+
+bool call_branch_instruction(const Instruction &op) {
+  return (op.type == direct_branch_type || op.type == computed_branch_type) &&
+         (op.word & call_branch) != 0;
+}
+
+bool indirect_branch(const Instruction &op) {
+  return op.type == computed_branch_type && (op.word & relative_branch) == 0;
+}
+
+unsigned branch_index(const Instruction &op) {
+  constexpr unsigned shift = 30;
+  return 8U + static_cast<unsigned>((op.word >> shift) & 7);
+}
+
+unsigned branch_modifier(const Instruction &op) {
+  constexpr unsigned shift = 27;
+  return 8U + static_cast<unsigned>((op.word >> shift) & 7);
+}
+
 void validate_condition(const Instruction &instruction, std::string_view identity) {
   const auto cond = (instruction.word >> condition_shift) & true_condition;
   const auto base = cond & 15;
@@ -173,8 +199,31 @@ void validate_branch(const Instruction &instruction, std::string_view identity) 
 }
 
 std::uint32_t branch_target(const Instruction &instruction) {
+  if (instruction.type == computed_branch_type) {
+    constexpr unsigned displacement_shift = 27;
+    constexpr unsigned displacement_mask = 63;
+    constexpr unsigned sign_bit = 32;
+    const auto field =
+        static_cast<std::uint32_t>(instruction.word >> displacement_shift) & displacement_mask;
+    return (instruction.address + (field ^ sign_bit) - sign_bit) & maximum_pc;
+  }
   const auto base = (instruction.word & relative_branch) != 0 ? instruction.address : 0;
   return (base + static_cast<std::uint32_t>(instruction.word)) & maximum_pc;
+}
+
+void validate_computed_branch(const Instruction &instruction, std::string_view identity) {
+  constexpr auto reserved = std::uint64_t{1} << 23;
+  if ((instruction.word & reserved) != 0) {
+    reject(instruction, identity, FaultReason::invalid_encoding, "reserved computed-branch bit");
+  }
+  if ((instruction.word & (abort_branch | delayed_branch | clear_interrupt_branch)) != 0 ||
+      !supported_compute(instruction.compute)) {
+    reject(instruction,
+           identity,
+           FaultReason::unsupported_instruction,
+           "modified branch or parallel compute is not lowered");
+  }
+  validate_condition(instruction, identity);
 }
 
 void validate_return(const Instruction &instruction, std::string_view identity) {
@@ -221,6 +270,10 @@ void validate(const Instruction &instruction, std::string_view identity) {
   if (instruction.type == index_modify_type) { return; }
   if (instruction.type == direct_branch_type) {
     validate_branch(instruction, identity);
+    return;
+  }
+  if (instruction.type == computed_branch_type) {
+    validate_computed_branch(instruction, identity);
     return;
   }
   if (instruction.type == return_branch_type) {
@@ -442,7 +495,9 @@ private:
                       bool partial);
   void finish(Values values, std::uint32_t next, bool partial);
   void credit(Values &values, llvm::Value *count, llvm::Value *cycles, bool partial);
-  void complete(Values values, const Instruction &op, bool partial);
+  void complete(Values values, const Instruction &op, bool partial, llvm::Value *lanes);
+  llvm::Value *branch_lanes(const Values &values, const Instruction &op, bool partial);
+  llvm::Value *branch_taken(llvm::Value *lanes);
   void stack_guard(const Values &values, const Instruction &op, llvm::Value *allowed, bool partial);
   void stack_status(Values &values);
   void call(Values &values, const Instruction &op, bool partial);
@@ -451,6 +506,7 @@ private:
   std::vector<BlockCost> block_costs() const;
   void emit_exit();
   void load_indices();
+  void load_index(unsigned index);
   void plan_memory();
   std::pair<llvm::Value *, llvm::Value *> plan_pointer(const MemoryMove &move,
                                                        llvm::Value *address);
@@ -474,7 +530,7 @@ private:
   llvm::Value *memory_admitted_{};
   std::set<unsigned> written_;
   std::set<unsigned> y_written_;
-  std::array<llvm::Value *, 16> indices_{}, lengths_{}, bases_{};
+  std::array<llvm::Value *, 16> indices_{}, lengths_{}, bases_{}, modifiers_{};
   std::set<unsigned> index_written_;
   bool dag_status_written_{};
   std::vector<BlockCost> costs_;
@@ -676,7 +732,7 @@ void Lowering::instruction(Values &values, const Instruction &op, bool partial) 
     values[hazard_value] = builder_.getFalse();
     return;
   }
-  if (op.type != direct_branch_type && op.type != return_branch_type) {
+  if (!branch(op)) {
     values[hazard_value] = builder_.getInt1(op.compute.kind != ComputeKind::none);
   }
   if (op.type == immediate_move_type) {
@@ -695,6 +751,14 @@ void Lowering::instruction(Values &values, const Instruction &op, bool partial) 
   if (compute.kind == ComputeKind::none) { return; }
   auto *selected =
       condition(values, static_cast<unsigned>((op.word >> condition_shift) & true_condition));
+  if (op.type == computed_branch_type) {
+    if ((op.word & else_compute) != 0) {
+      selected =
+          builder_.CreateAnd(builder_.CreateNot(selected), condition(values, true_condition));
+    } else if ((context_ & simd_mode) == 0) {
+      selected = condition(values, true_condition);
+    }
+  }
   Arithmetic result;
   if (compute.kind == ComputeKind::dual_alu) {
     result = arithmetic(values, compute, alu::add);
@@ -948,10 +1012,12 @@ void Lowering::call(Values &values, const Instruction &op, bool partial) {
   constexpr unsigned almost_full = Registers::pc_stack_capacity - 1;
   constexpr std::uint32_t stack_overflow_interrupt = 1U << 3;
   auto *depth = values[pc_stack_depth_value];
-  stack_guard(values,
-              op,
-              builder_.CreateICmpULT(depth, builder_.getInt32(Registers::pc_stack_capacity)),
-              partial);
+  if (op.compute.kind == ComputeKind::none) {
+    stack_guard(values,
+                op,
+                builder_.CreateICmpULT(depth, builder_.getInt32(Registers::pc_stack_capacity)),
+                partial);
+  }
   values[pc_stack_value] = builder_.CreateInsertElement(
       values[pc_stack_value], builder_.getInt32(((op.address + 1) & maximum_pc) | call_tag), depth);
   depth = builder_.CreateAdd(depth, builder_.getInt32(1));
@@ -991,9 +1057,7 @@ void Lowering::return_to_caller(Values values, llvm::Value *target, bool partial
   auto *dispatch = builder_.CreateSwitch(target, unknown);
   std::set<std::uint32_t> returns;
   for (const auto &op : instructions_) {
-    if (op.type == direct_branch_type && (op.word & call_branch) != 0) {
-      returns.insert((op.address + 1) & maximum_pc);
-    }
+    if (call_branch_instruction(op)) { returns.insert((op.address + 1) & maximum_pc); }
   }
   for (const auto address : returns) {
     const auto found = addresses_.find(address);
@@ -1003,7 +1067,7 @@ void Lowering::return_to_caller(Values values, llvm::Value *target, bool partial
     dispatch->addCase(builder_.getInt32(address), destination.block);
   }
   builder_.SetInsertPoint(unknown);
-  exit(values, target, NativeExit::indirect);
+  exit(values, target, NativeExit::returned);
 }
 
 void Lowering::credit(Values &values, llvm::Value *count, llvm::Value *cycles, bool partial) {
@@ -1021,49 +1085,69 @@ void Lowering::credit(Values &values, llvm::Value *count, llvm::Value *cycles, b
   values[cycles_retired_value] = builder_.CreateAdd(values[cycles_retired_value], cycles);
 }
 
-void Lowering::complete(Values values, const Instruction &op, bool partial) {
+llvm::Value *Lowering::branch_taken(llvm::Value *lanes) {
+  auto *taken = builder_.CreateExtractElement(lanes, builder_.getInt32(0));
+  if ((context_ & simd_mode) != 0) {
+    taken = builder_.CreateAnd(taken, builder_.CreateExtractElement(lanes, builder_.getInt32(1)));
+  }
+  return taken;
+}
+
+llvm::Value *Lowering::branch_lanes(const Values &values, const Instruction &op, bool partial) {
+  if (!branch(op)) { return nullptr; }
+  auto *lanes =
+      condition(values, static_cast<unsigned>((op.word >> condition_shift) & true_condition));
+  if (call_branch_instruction(op) && op.compute.kind != ComputeKind::none) {
+    auto *room = builder_.CreateICmpULT(values[pc_stack_depth_value],
+                                        builder_.getInt32(Registers::pc_stack_capacity));
+    stack_guard(
+        values, op, builder_.CreateOr(builder_.CreateNot(branch_taken(lanes)), room), partial);
+  }
+  return lanes;
+}
+
+void Lowering::complete(Values values, const Instruction &op, bool partial, llvm::Value *lanes) {
   if (!partial && loop_ends_.contains(addresses_.at(op.address))) {
     complete_loop(values, op);
     return;
   }
   auto *count = partial ? builder_.getInt64(1) : values[credit_value];
   const auto next = (op.address + 1) & maximum_pc;
-  if (op.type != direct_branch_type && op.type != return_branch_type) {
+  if (!branch(op)) {
     credit(values, count, count, partial);
     finish(values, next, partial);
     return;
   }
-  auto *lanes =
-      condition(values, static_cast<unsigned>((op.word >> condition_shift) & true_condition));
   // Conditional branches need the preceding compute's flags in Address, before
   // Execute writes them back. The interlock survives owner bounds (4-115).
   auto *stall = ((op.word >> condition_shift) & true_condition) == true_condition
                     ? builder_.getInt64(0)
                     : builder_.CreateZExt(values[hazard_value], builder_.getInt64Ty());
   auto *cycles = builder_.CreateAdd(count, stall);
-  auto *taken = builder_.CreateExtractElement(lanes, builder_.getInt32(0));
-  if ((context_ & simd_mode) != 0) {
-    taken = builder_.CreateAnd(taken, builder_.CreateExtractElement(lanes, builder_.getInt32(1)));
-  }
+  auto *taken = branch_taken(lanes);
   auto *branch = llvm::BasicBlock::Create(module_.getContext(), "jump", function_);
   auto *fallthrough = llvm::BasicBlock::Create(module_.getContext(), "fallthrough", function_);
   builder_.CreateCondBr(taken, branch, fallthrough);
   builder_.SetInsertPoint(branch);
   auto branch_values = values;
-  if (op.type == direct_branch_type && (op.word & call_branch) != 0) {
-    call(branch_values, op, partial);
-  }
+  if (call_branch_instruction(op)) { call(branch_values, op, partial); }
   auto *target = op.type == return_branch_type ? pop(branch_values, op, partial) : nullptr;
   branch_values[hazard_value] = builder_.getFalse();
   credit(
       branch_values, count, builder_.CreateAdd(cycles, builder_.getInt64(branch_penalty)), partial);
   if (target != nullptr) {
     return_to_caller(branch_values, target, partial);
+  } else if (indirect_branch(op)) {
+    auto *address =
+        builder_.CreateAdd(values[index_value + branch_index(op)], modifiers_[branch_modifier(op)]);
+    exit(branch_values,
+         builder_.CreateAnd(address, builder_.getInt32(maximum_pc)),
+         NativeExit::indirect);
   } else {
     finish(branch_values, branch_target(op), partial);
   }
   builder_.SetInsertPoint(fallthrough);
-  values[hazard_value] = builder_.getFalse();
+  values[hazard_value] = builder_.getInt1(op.compute.kind != ComputeKind::none);
   credit(values, count, cycles, partial);
   finish(values, next, partial);
 }
@@ -1140,12 +1224,15 @@ std::vector<BlockCost> Lowering::block_costs() const {
   for (const auto &vector : variant_.interrupt_vectors) { leaders.insert(vector.vector); }
   std::vector<BlockCost> result(instructions_.size());
   for (const auto &op : instructions_) {
-    if (op.type == direct_branch_type) { leaders.insert(branch_target(op)); }
+    if ((op.type == direct_branch_type || op.type == computed_branch_type) &&
+        !indirect_branch(op)) {
+      leaders.insert(branch_target(op));
+    }
   }
   for (std::size_t i = instructions_.size(); i != 0; --i) {
     const auto index = i - 1;
     const auto &op = instructions_[index];
-    if (op.type == direct_branch_type || op.type == return_branch_type) {
+    if (branch(op)) {
       result[index].cycles += branch_penalty;
       if (((op.word >> condition_shift) & true_condition) != true_condition) {
         ++result[index].cycles;
@@ -1161,20 +1248,29 @@ std::vector<BlockCost> Lowering::block_costs() const {
   return result;
 }
 
+void Lowering::load_index(unsigned index) {
+  if (indices_[index] != nullptr) { return; }
+  const auto bank = (context_ & dag_bank_mode(index)) != 0 ? 1U : 0U;
+  indices_[index] = load(32, dag_slot(bank, index));
+}
+
 void Lowering::load_indices() {
   for (const auto &op : instructions_) {
     if (op.type == index_modify_type) { index_written_.insert(index_modify(op).destination); }
   }
   for (const auto &op : instructions_) {
+    if (indirect_branch(op)) {
+      const auto index = branch_index(op);
+      const auto modifier = branch_modifier(op);
+      load_index(index);
+      const auto modifier_bank = (context_ & dag_bank_mode(modifier)) != 0 ? 1U : 0U;
+      modifiers_[modifier] = load(32, dag_slot(modifier_bank, modifier, 1));
+    }
     if (op.type != memory_move_type && op.type != index_modify_type) { continue; }
     const auto source =
         op.type == memory_move_type ? memory_move(op).index : index_modify(op).source;
     const auto destination = op.type == memory_move_type ? source : index_modify(op).destination;
-    for (const auto index : {source, destination}) {
-      if (indices_[index] != nullptr) { continue; }
-      const auto bank = (context_ & dag_bank_mode(index)) != 0 ? 1U : 0U;
-      indices_[index] = load(32, dag_slot(bank, index));
-    }
+    for (const auto index : {source, destination}) { load_index(index); }
     if (op.type == index_modify_type && lengths_[source] == nullptr) {
       const auto bank = (context_ & dag_bank_mode(source)) != 0 ? 1U : 0U;
       lengths_[source] = load(32, dag_slot(bank, source, 2));
@@ -1196,8 +1292,7 @@ void Lowering::plan_loops() {
     bool linear = true;
     for (std::size_t i = start; i < end; ++i) {
       linear = linear && instructions_[i].address + 1 == instructions_[i + 1].address &&
-               instructions_[i].type != direct_branch_type &&
-               instructions_[i].type != return_branch_type;
+               !branch(instructions_[i]);
     }
     if (!linear) { continue; }
     const bool stall = conditional && instructions_[end - 1].compute.kind != ComputeKind::none;
@@ -1303,11 +1398,13 @@ void Lowering::plan_memory() {
 
 std::set<std::uint32_t> instruction_successors(const Instruction &op,
                                                const std::set<std::uint32_t> &returns) {
-  const bool branch = op.type == direct_branch_type || op.type == return_branch_type;
+  const bool is_branch = branch(op);
   std::set<std::uint32_t> next;
-  if (op.type == direct_branch_type) { next.insert(branch_target(op)); }
+  if ((op.type == direct_branch_type || op.type == computed_branch_type) && !indirect_branch(op)) {
+    next.insert(branch_target(op));
+  }
   if (op.type == return_branch_type) { next.insert(returns.begin(), returns.end()); }
-  if (!branch || ((op.word >> condition_shift) & true_condition) != true_condition) {
+  if (!is_branch || ((op.word >> condition_shift) & true_condition) != true_condition) {
     next.insert((op.address + 1) & maximum_pc);
   }
   return next;
@@ -1318,16 +1415,14 @@ std::vector<std::optional<BlockCost>> Lowering::unit_costs() const {
   std::vector<unsigned> visited(instructions_.size());
   std::set<std::uint32_t> returns;
   for (const auto &op : instructions_) {
-    if (op.type == direct_branch_type && (op.word & call_branch) != 0) {
-      returns.insert((op.address + 1) & maximum_pc);
-    }
+    if (call_branch_instruction(op)) { returns.insert((op.address + 1) & maximum_pc); }
   }
   const std::function<std::optional<BlockCost>(std::size_t)> visit =
       [&](std::size_t i) -> std::optional<BlockCost> {
     if (visited[i] != 0) { return visited[i] == 2 ? result[i] : std::nullopt; }
     visited[i] = 1;
     const auto &op = instructions_[i];
-    const bool branch = op.type == direct_branch_type || op.type == return_branch_type;
+    const bool is_branch = branch(op);
     const auto next = instruction_successors(op, returns);
     BlockCost suffix{.instructions = 0, .cycles = 0};
     for (const auto address : next) {
@@ -1343,7 +1438,7 @@ std::vector<std::optional<BlockCost>> Lowering::unit_costs() const {
     }
     ++suffix.instructions;
     ++suffix.cycles;
-    if (branch) {
+    if (is_branch) {
       suffix.cycles += branch_penalty;
       if (((op.word >> condition_shift) & true_condition) != true_condition) { ++suffix.cycles; }
     }
@@ -1396,11 +1491,12 @@ void Lowering::emit_instruction(std::size_t i, const std::optional<BlockCost> &g
   jump(fast_[i], values);
   builder_.SetInsertPoint(fast_[i].block);
   values = fast_[i].values();
+  auto *lanes = branch_lanes(values, op, false);
   instruction(values, op, false);
   if (costs_[i].instructions > 1) {
     jump(fast_[i + 1], values);
   } else {
-    complete(values, op, false);
+    complete(values, op, false, lanes);
   }
   builder_.SetInsertPoint(partial_[i].block);
   values = partial_[i].values();
@@ -1415,19 +1511,19 @@ void Lowering::emit_instruction(std::size_t i, const std::optional<BlockCost> &g
   builder_.SetInsertPoint(bound);
   exit(values, builder_.getInt32(op.address), NativeExit::bound);
   builder_.SetInsertPoint(execute);
+  lanes = branch_lanes(values, op, true);
   instruction(values, op, true);
   if (costs_[i].instructions > 1) {
     credit(values, builder_.getInt64(1), builder_.getInt64(1), true);
     jump(partial_[i + 1], values);
   } else {
-    complete(values, op, true);
+    complete(values, op, true, lanes);
   }
 }
 
 void Lowering::emit() {
   stack_written_ = std::ranges::any_of(instructions_, [](const auto &op) {
-    return op.type == return_branch_type ||
-           (op.type == direct_branch_type && (op.word & call_branch) != 0);
+    return op.type == return_branch_type || call_branch_instruction(op);
   });
   dag_status_written_ = std::ranges::any_of(instructions_, [](const auto &op) {
     return op.type == index_modify_type && (index_modify(op).source & 7) == 7;
@@ -1521,8 +1617,9 @@ std::uint32_t instruction_context(const Instruction &instruction) {
     if (!move.write && move.index == 1) { mask |= broadcast1_mode; }
     if (!move.write && move.index == 9) { mask |= broadcast9_mode; }
   }
-  if (instruction.type == direct_branch_type || instruction.type == return_branch_type) {
-    mask |= simd_mode | saturation_mode;
+  if (branch(instruction)) { mask |= simd_mode | saturation_mode; }
+  if (indirect_branch(instruction)) {
+    mask |= dag_bank_mode(branch_index(instruction)) | dag_bank_mode(branch_modifier(instruction));
   }
   if (instruction.type == immediate_move_type) {
     mask |= low_bank_mode | high_bank_mode | simd_mode;
@@ -1552,8 +1649,8 @@ std::vector<Instruction> connected_code(const std::vector<Instruction> &code, st
     if (found == addresses.end() || !visited.insert(address).second) { continue; }
     const auto &op = *found->second;
     result.push_back(op);
-    if (op.type == direct_branch_type) {
-      pending.push_back(branch_target(op));
+    if (op.type == direct_branch_type || op.type == computed_branch_type) {
+      if (!indirect_branch(op)) { pending.push_back(branch_target(op)); }
       if ((op.word & call_branch) == 0 &&
           ((op.word >> condition_shift) & true_condition) == true_condition) {
         continue;
@@ -1567,6 +1664,19 @@ std::vector<Instruction> connected_code(const std::vector<Instruction> &code, st
   }
   std::ranges::sort(result, {}, &Instruction::address);
   return result;
+}
+
+void collect_continuations(std::vector<Continuation> &continuations,
+                           const std::vector<Instruction> &connected,
+                           const CodeVariant &variant,
+                           std::uint32_t entry) {
+  for (const auto &op : connected) {
+    if (!call_branch_instruction(op)) { continue; }
+    const auto next = (op.address + 1) & maximum_pc;
+    if (std::ranges::find(connected, next, &Instruction::address) != connected.end()) {
+      continuations.push_back({.variant = variant.id, .address = next, .root = entry});
+    }
+  }
 }
 } // namespace
 
@@ -1583,6 +1693,7 @@ std::shared_ptr<const PreparedImage> lower_image(const CodeImage &image,
   result->options = options;
   llvm::LLVMContext context;
   llvm::Module module(result->identity, context);
+  std::vector<Continuation> continuations;
   for (const auto &variant : image.variants) {
     validate_memory_layout(variant, result->identity);
     std::vector<Instruction> code;
@@ -1593,6 +1704,7 @@ std::shared_ptr<const PreparedImage> lower_image(const CodeImage &image,
     for (const auto &request : variant.interrupt_vectors) { entries.insert(request.vector); }
     for (const auto entry : entries) {
       const auto connected = connected_code(code, entry);
+      collect_continuations(continuations, connected, variant, entry);
       const auto mask = context_mask(connected);
       std::vector<std::uint32_t> contexts{0};
       for (std::uint32_t bit = 1; bit != 0; bit <<= 1) {
@@ -1613,7 +1725,7 @@ std::shared_ptr<const PreparedImage> lower_image(const CodeImage &image,
       }
     }
   }
-  const NativeAbi abi(module, result->units);
+  const NativeAbi abi(module, result->units, continuations);
   for (const auto &unit : result->units) {
     const auto variant = std::ranges::find(image.variants, unit.variant, &CodeVariant::id);
     std::vector<Instruction> code;

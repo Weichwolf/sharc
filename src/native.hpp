@@ -74,7 +74,8 @@ enum class NativeExit : std::uint8_t {
   indirect,
   unsupported_memory,
   access_fault,
-  code_alias
+  code_alias,
+  returned
 };
 using NativeEntry = void (*)(void **, std::uint64_t *);
 using RegisterPointers = std::vector<void *>;

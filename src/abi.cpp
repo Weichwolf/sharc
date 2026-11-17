@@ -4,6 +4,7 @@
 #include "decode.hpp"
 #include "native.hpp"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <llvm/ADT/ArrayRef.h>
@@ -15,6 +16,7 @@
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/Intrinsics.h>
 #include <llvm/IR/Value.h>
+#include <map>
 #include <set>
 #include <span>
 #include <string>
@@ -74,8 +76,10 @@ std::string dispatcher(std::uint32_t variant) {
 }
 } // namespace
 
-NativeAbi::NativeAbi(llvm::Module &module, std::span<const NativeUnit> units)
-    : module_(module), units_(units) {
+NativeAbi::NativeAbi(llvm::Module &module,
+                     std::span<const NativeUnit> units,
+                     std::span<const Continuation> continuations)
+    : module_(module), units_(units), continuations_(continuations) {
   llvm::IRBuilder<> builder(module.getContext());
   std::vector<llvm::Type *> types{builder.getPtrTy(),
                                   builder.getPtrTy(),
@@ -246,27 +250,50 @@ void NativeAbi::emit_dispatch(std::uint32_t variant) {
   auto args = arguments(*function);
   auto *done = llvm::BasicBlock::Create(module_.getContext(), "cold.spill", function);
   auto *select = llvm::BasicBlock::Create(module_.getContext(), "target", function);
-  auto *available =
+  auto *returned = builder.CreateICmpEQ(
+      args[unit_reason], builder.getInt64(static_cast<unsigned>(NativeExit::returned)));
+  auto *available = builder.CreateOr(
+      returned,
       builder.CreateAnd(builder.CreateICmpNE(args[unit_instructions], builder.getInt64(0)),
-                        builder.CreateICmpNE(args[unit_cycles], builder.getInt64(0)));
+                        builder.CreateICmpNE(args[unit_cycles], builder.getInt64(0))));
   builder.CreateCondBr(available, select, done);
-  builder.SetInsertPoint(select);
+  std::map<std::uint32_t, std::uint32_t> targets;
+  std::set<std::uint32_t> roots;
   for (const auto &unit : units_) {
-    if (unit.variant != variant) { continue; }
-    auto *hit = llvm::BasicBlock::Create(module_.getContext(), "unit", function);
-    auto *next = llvm::BasicBlock::Create(module_.getContext(), "next", function);
-    auto *match = builder.CreateAnd(
-        builder.CreateICmpEQ(args[unit_pc], builder.getInt32(unit.entry)),
-        builder.CreateICmpEQ(builder.CreateAnd(args[unit_mode], builder.getInt32(unit.mask)),
-                             builder.getInt32(unit.context)));
-    builder.CreateCondBr(match, hit, next);
-    builder.SetInsertPoint(hit);
-    args[unit_root] = builder.getInt32(unit.entry);
-    tail(builder, body(unit), args);
-    args[unit_root] = function->getArg(unit_root);
-    builder.SetInsertPoint(next);
+    if (unit.variant == variant) {
+      targets.emplace(unit.entry, unit.entry);
+      roots.insert(unit.entry);
+    }
   }
-  builder.CreateBr(done);
+  for (const auto &point : continuations_) {
+    if (point.variant == variant) { targets.try_emplace(point.address, point.root); }
+  }
+  builder.SetInsertPoint(select);
+  auto *dispatch = builder.CreateSwitch(args[unit_pc], done);
+  for (const auto [address, root] : targets) {
+    auto *target = llvm::BasicBlock::Create(module_.getContext(), "target.mode", function);
+    dispatch->addCase(builder.getInt32(address), target);
+    builder.SetInsertPoint(target);
+    if (!roots.contains(address)) {
+      auto *valid = llvm::BasicBlock::Create(module_.getContext(), "return.mode", function);
+      builder.CreateCondBr(returned, valid, done);
+      builder.SetInsertPoint(valid);
+    }
+    const auto unit = std::ranges::find_if(units_, [&](const auto &candidate) {
+      return candidate.variant == variant && candidate.entry == root;
+    });
+    auto *mode = builder.CreateAnd(args[unit_mode], builder.getInt32(unit->mask));
+    auto *modes = builder.CreateSwitch(mode, done);
+    for (const auto &candidate : units_) {
+      if (candidate.variant != variant || candidate.entry != root) { continue; }
+      auto *hit = llvm::BasicBlock::Create(module_.getContext(), "unit", function);
+      modes->addCase(builder.getInt32(candidate.context), hit);
+      builder.SetInsertPoint(hit);
+      args[unit_root] = builder.getInt32(root);
+      tail(builder, body(candidate), args);
+    }
+  }
+  args[unit_root] = function->getArg(unit_root);
   builder.SetInsertPoint(done);
   tail(builder, spill_, args);
 }
@@ -279,8 +306,11 @@ void NativeAbi::leave(llvm::IRBuilder<> &builder,
   auto *done = llvm::BasicBlock::Create(
       module_.getContext(), "cold.spill", builder.GetInsertBlock()->getParent());
   builder.CreateCondBr(
-      builder.CreateICmpEQ(args[unit_reason],
-                           builder.getInt64(static_cast<unsigned>(NativeExit::indirect))),
+      builder.CreateOr(
+          builder.CreateICmpEQ(args[unit_reason],
+                               builder.getInt64(static_cast<unsigned>(NativeExit::indirect))),
+          builder.CreateICmpEQ(args[unit_reason],
+                               builder.getInt64(static_cast<unsigned>(NativeExit::returned)))),
       dispatch,
       done);
   builder.SetInsertPoint(dispatch);

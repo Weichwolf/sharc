@@ -410,6 +410,39 @@ void cached_call() {
         "cached consumer-bound CALL/RTS lost architectural stack or bound state");
 }
 
+void cached_indirect_call() {
+  constexpr std::uint64_t call_m8_i8 = 0x08be00000000;
+  constexpr std::uint64_t rts = 0x0a3e00000000;
+  constexpr std::uint32_t call_tag = 1U << 24;
+  constexpr std::uint32_t empty = 1U << 22;
+  const auto base = fixture::code_address;
+  const std::array words{call_m8_i8, std::uint64_t{0}, rts};
+  fixture::Program program(words);
+  program.code.variants[0].entries.push_back(base + 2);
+  for (const auto mode : {sharc::ExecutionMode::strict, sharc::ExecutionMode::fast_fp32}) {
+    const sharc::CompileOptions options{.mode = mode, .callbacks = {}};
+    const auto semantic = sharc::Core::lower(program.code, options);
+    const auto loaded = sharc::Core::load(program.code, options, semantic.artifact());
+    const auto native = sharc::Core::bind(loaded, consumer_compile(loaded));
+    sharc::Core core(program.memory(), mode);
+    auto expected = initial_registers();
+    expected.dag[0][8].index = base + 2;
+    core.set_registers(expected);
+    (void)core.install(native, fixture::Program::variant_id);
+    const auto result = core.run(3);
+    expected.pc = base + 2;
+    expected.faddr = expected.pc + 4;
+    expected.daddr = expected.pc + 2;
+    expected.pc_stack[0] = (base + 1) | call_tag;
+    expected.pe[0].stky = empty;
+    expected.emuclk += 9;
+    check(!result.has_fault &&
+              result.progress == sharc::Progress{.instructions = 3, .base_cycles = 9} &&
+              core.registers() == expected,
+          "cached consumer-bound indirect CALL lost its private return continuation");
+  }
+}
+
 void cached_memory() {
   constexpr std::uint64_t load = 0xa20000000000;
   constexpr std::uint32_t ram_address = 0x90000;
@@ -496,6 +529,7 @@ int main() try {
   installation_callbacks();
   connected_entries();
   cached_call();
+  cached_indirect_call();
   cached_memory();
   cached_dag();
 } catch (const std::exception &error) {

@@ -125,6 +125,7 @@ void verify(const fixture::FixedCase &expected,
 
 int main() try {
   fixture::control_flow();
+  fixture::computed_control_flow();
   fixture::memory_access();
   fixture::dag_addressing();
   using Key = std::tuple<unsigned, bool, sharc::ExecutionMode>;
