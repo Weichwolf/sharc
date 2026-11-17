@@ -138,8 +138,9 @@ inline sharc::NativeSymbols link(const sharc::SemanticImage &image,
                                  const std::shared_ptr<Provider> &provider,
                                  bool strip,
                                  ConsumerEffects effects = {}) {
-  check(!llvm::InitializeNativeTarget() && !llvm::InitializeNativeTargetAsmPrinter(),
-        "LLVM unavailable");
+  static const bool initialized =
+      !llvm::InitializeNativeTarget() && !llvm::InitializeNativeTargetAsmPrinter();
+  check(initialized, "LLVM unavailable");
   auto target = llvm::orc::JITTargetMachineBuilder::detectHost();
   if (!target) { throw std::runtime_error(llvm::toString(target.takeError())); }
   target->setCodeGenOptLevel(llvm::CodeGenOptLevel::Aggressive);

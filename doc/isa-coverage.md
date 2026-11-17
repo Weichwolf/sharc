@@ -82,7 +82,13 @@ remain open; this is not complete memory or v9 profile execution coverage.
 
 Contract v10 additionally requires `Memory::complete` read/write views with
 mirrored tails and preparation partitioned for concurrent consumer compilation.
-Those interfaces and their independent qualification remain open. The current
+Those interfaces and their independent qualification remain open. Public
+`lower`, `load` and `bind` pass a cold-start concurrent preparation test: four
+workers prepare eight independent images with distinct code variants, both
+numerical modes and both memory contracts. Serialized artifacts, consumer-linked
+native text, complete final state and memory match serial preparation; arithmetic
+and stored bytes also have literal independent expectations. This qualifies
+concurrent whole-image preparation, not partitioning within one image. The current
 complete normal-word layout uses one binding for both access directions and
 explicitly wraps paired word addresses at the top of the space.
 
