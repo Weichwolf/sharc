@@ -28,7 +28,8 @@ inline constexpr std::size_t stack_slot = hazard_slot + 1;
 inline constexpr std::size_t stack_depth_slot = stack_slot + Registers::pc_stack_capacity;
 inline constexpr std::size_t interrupt_latch_slot = stack_depth_slot + 1;
 inline constexpr std::size_t dag_index_slot = interrupt_latch_slot + 1;
-inline constexpr std::size_t mode_slot = dag_index_slot + 32;
+inline constexpr std::size_t dag_fields = 4;
+inline constexpr std::size_t mode_slot = dag_index_slot + (32 * dag_fields);
 inline constexpr std::size_t register_pointer_count = mode_slot + 1;
 inline constexpr std::uint32_t dag1_high_mode = 1U << 3;
 inline constexpr std::uint32_t dag1_low_mode = 1U << 4;
@@ -41,12 +42,17 @@ inline constexpr std::uint32_t truncation_mode = 1U << 15;
 inline constexpr std::uint32_t simd_mode = 1U << 21;
 inline constexpr std::uint32_t broadcast9_mode = 1U << 22;
 inline constexpr std::uint32_t broadcast1_mode = 1U << 23;
+inline constexpr std::uint32_t circular_mode = 1U << 24;
 
 [[nodiscard]] constexpr std::uint32_t dag_bank_mode(unsigned index) {
   if (index < 4) { return dag1_low_mode; }
   if (index < 8) { return dag1_high_mode; }
   if (index < 12) { return dag2_low_mode; }
   return dag2_high_mode;
+}
+
+[[nodiscard]] constexpr std::size_t dag_slot(unsigned bank, unsigned index, unsigned field = 0) {
+  return dag_index_slot + (((std::size_t{bank} * 16) + index) * dag_fields) + field;
 }
 
 enum ControlSlot : std::uint8_t {

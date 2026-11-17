@@ -2,7 +2,7 @@
 
 The initial memory implementation executes classic type 15 pre-indexed transfers
 between R0–R15/S0–S15 and declared direct normal-word regions. Other transfers,
-DAG updates, runtime I/O callbacks and code-changing stores remain open; this is
+runtime I/O callbacks and code-changing stores remain open; this is
 not complete memory or ADSP-21489 profile coverage. The reference is Programming
 Reference 2.4, sections 6-10, 6-19–6-29, 7-36–7-40, 9-56–9-59 and 10-21/31/32,
 pinned in `reference-manifest.json`.
@@ -42,8 +42,8 @@ and its complement at consecutive normal-word addresses, including odd explicit
 addresses. Read broadcast through I1 or I9 loads both complementary registers
 from one word independently of PEYEN. Broadcast does not duplicate stores.
 
-The currently supported address registers cannot change within a unit. LLVM
-therefore computes the normal-word host addresses and combines layout, permission
+For an index unchanged within a unit, LLVM computes the normal-word host
+addresses and combines layout, permission
 and code-alias proofs before entering the admitted unit or loop. Its loads and
 stores use those proven pointers without access checks. If any proof fails, the
 same raw transfer lowering runs in the cold exact tail with precise access
@@ -57,6 +57,20 @@ only base plus the word address scaled by four. The Linux core fixture lends
 such a lazily committed reservation and checks SISD/SIMD wrapping from the last
 word to word zero in both execution modes. It does not install a fault handler
 or model protected holes.
+
+Classic type 19 immediate MODIFY/BITREV updates I in SSA, selecting source and
+destination DAG banks independently. Its circular adjustment uses the source B/L,
+independently of CBUFEN when L is nonzero; BITREV reverses the adjusted 32-bit
+value. The source remains unchanged for a distinct destination. No register-file
+lane or floating value is involved. Source I7/I15 wrap events update STKYx and
+IRPTL; enhanced overflow routing and immediate-consumer timing retain the
+qualification gaps described in `isa-coverage.md`.
+
+For a changing index, a complete normal-word space needs only a fresh address
+calculation at each access; no range comparison is emitted. Sparse layouts with
+changing indices currently use the cold exact path until their affine proof is
+implemented. Both forms use the same raw transfer and DAG instruction lowering.
+They never reuse a host pointer computed from an obsolete I value.
 
 ## Boundaries and current gaps
 

@@ -274,7 +274,7 @@ std::shared_ptr<const PreparedImage> load_image(const CodeImage &code,
   }
   std::set<std::tuple<std::uint32_t, std::uint32_t, std::uint32_t>> contexts;
   std::set<std::string> names;
-  constexpr auto allowed_modes = high_bank_mode | low_bank_mode | saturation_mode |
+  constexpr auto allowed_modes = circular_mode | high_bank_mode | low_bank_mode | saturation_mode |
                                  truncation_mode | simd_mode | dag1_high_mode | dag1_low_mode |
                                  dag2_high_mode | dag2_low_mode | broadcast1_mode | broadcast9_mode;
   for (std::uint64_t index = 0; index < count; ++index) {

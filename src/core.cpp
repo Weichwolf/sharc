@@ -5,6 +5,7 @@
 #include "sharc/memory.hpp"
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <chrono>
 #include <cstddef>
@@ -106,8 +107,11 @@ struct Core::Impl {
     pointers[detail::interrupt_latch_slot] = &state.registers.irptl;
     for (unsigned bank = 0; bank < 2; ++bank) {
       for (unsigned index = 0; index < 16; ++index) {
-        pointers[detail::dag_index_slot + (std::size_t{bank} * 16) + index] =
-            &state.registers.dag[bank][index].index;
+        auto &dag = state.registers.dag[bank][index];
+        const std::array fields{&dag.index, &dag.modifier, &dag.length, &dag.base};
+        for (unsigned field = 0; field < fields.size(); ++field) {
+          pointers[detail::dag_slot(bank, index, field)] = fields[field];
+        }
       }
     }
   }

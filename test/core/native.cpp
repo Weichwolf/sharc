@@ -456,6 +456,39 @@ void cached_memory() {
             core.registers() == expected && ram == initial_bytes,
         "cached consumer-bound memory lost storage, broadcast or bank context");
 }
+
+void cached_dag() {
+  constexpr std::uint64_t modify_i7 = 0x160700000001;
+  constexpr unsigned circular_bit = 24;
+  constexpr unsigned bank_bit = 3;
+  constexpr unsigned sticky_bit = 17;
+  constexpr unsigned interrupt_bit = 20;
+  constexpr std::uint32_t base = 0x2340;
+  constexpr std::uint32_t length = 17;
+  const std::array words{modify_i7};
+  fixture::Program program(words);
+  const auto semantic = sharc::Core::lower(program.code);
+  const auto loaded = sharc::Core::load(program.code, {}, semantic.artifact());
+  const auto native = sharc::Core::bind(loaded, consumer_compile(loaded));
+  sharc::Core core(program.memory());
+  auto expected = initial_registers();
+  expected.mode1 = (1U << circular_bit) | (1U << bank_bit);
+  expected.dag[1][7] = {.index = base + length - 1, .modifier = 0, .length = length, .base = base};
+  core.set_registers(expected);
+  (void)core.install(native, fixture::Program::variant_id);
+  const auto result = core.run(1);
+  expected.dag[1][7].index = base;
+  expected.pe[0].stky |= 1U << sticky_bit;
+  expected.irptl |= 1U << interrupt_bit;
+  ++expected.pc;
+  expected.faddr = expected.pc + 4;
+  expected.daddr = expected.pc + 2;
+  ++expected.emuclk;
+  check(!result.has_fault && core.registers() == expected &&
+            result.progress == sharc::Progress{.instructions = 1, .base_cycles = 1},
+        "cached consumer-bound DAG update lost MODE1, flags or register-bank metadata");
+}
+
 } // namespace
 
 int main() try {
@@ -464,6 +497,7 @@ int main() try {
   connected_entries();
   cached_call();
   cached_memory();
+  cached_dag();
 } catch (const std::exception &error) {
 
   std::cerr << error.what() << '\n';

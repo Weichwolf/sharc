@@ -140,6 +140,48 @@ void unexecuted_failure() {
         "failed unit proof lost the exact executed branch fault");
 }
 
+void changing_sparse_indices() {
+  constexpr std::uint64_t modify_i0 = 0x160000000001;
+  constexpr std::uint64_t load_r1 = load_r0 | (std::uint64_t{1} << 32);
+  constexpr std::uint64_t load_r2 = load_r0 | (std::uint64_t{2} << 32);
+  constexpr std::uint64_t first_raw = 0x4433221100;
+  constexpr std::uint64_t second_raw = 0x8877665500;
+  const std::array words{load_r0,
+                         modify_i0,
+                         std::uint64_t{0},
+                         std::uint64_t{0},
+                         load_r1,
+                         modify_i0,
+                         std::uint64_t{0},
+                         std::uint64_t{0},
+                         load_r2};
+  Program program(words);
+  const auto native = sharc::Core::compile(program.code.code);
+  sharc::Core core(program.memory());
+  auto expected = initial();
+  core.set_registers(expected);
+  (void)core.install(native, fixture::Program::variant_id);
+  check(!core.run(2).has_fault, "sparse index prefix failed");
+  const auto saved = core.save();
+  const auto result = core.run(7);
+  expected.pe[0].data[0][0] = first_raw;
+  expected.pe[0].data[0][1] = second_raw;
+  expected.dag[0][0].index += 2;
+  expected.pc += 8;
+  expected.faddr = expected.pc + 4;
+  expected.daddr = expected.pc + 2;
+  expected.emuclk = 8;
+  check(result.has_fault && result.fault.address == expected.pc &&
+            result.progress == sharc::Progress{.instructions = 6, .base_cycles = 6} &&
+            core.registers() == expected && program.ram == initial_ram,
+        "changing sparse address used an obsolete pointer or lost the exact fault prefix");
+  sharc::Core resumed(program.memory());
+  (void)resumed.install(native, fixture::Program::variant_id);
+  resumed.restore(saved);
+  check(resumed.run(7).has_fault && resumed.registers() == expected,
+        "DAG snapshot retained a different Core's index continuation");
+}
+
 #if defined(__linux__)
 class VirtualWords {
 public:
@@ -213,6 +255,92 @@ void complete_word_space() {
                                         : std::span(initial_ram).last(4)) &&
                 std::ranges::equal(storage.last(4), std::span(initial_ram).last(4)),
             "complete virtual word space lost raw values or wrapped address aliases");
+    }
+  }
+}
+
+void changing_complete_space() {
+  constexpr unsigned turns = 16;
+  constexpr unsigned input_words = 32;
+  constexpr unsigned byte_bits = 8;
+  constexpr unsigned simd_bit = 21;
+  constexpr std::uint32_t output_address = 0xa0000;
+  constexpr std::uint32_t old_status = 0x10000000;
+  constexpr std::uint64_t modify_i0 = 0x160000000000;
+  constexpr std::uint64_t modify_i1 = 0x160100000000;
+  constexpr std::uint64_t decrement_r2 = 0x013e0002a220;
+  constexpr std::uint64_t loop = 0x072000fffffa;
+  constexpr unsigned instructions = (turns * 7) + 1;
+  constexpr unsigned cycles = (turns * 11) - 2;
+  constexpr unsigned scalar_sum = 136;
+  constexpr unsigned x_sum = 256;
+  constexpr unsigned y_sum = 272;
+  constexpr std::byte untouched{0xa5};
+  const VirtualWords mapping;
+  auto storage = mapping.storage();
+  auto input = storage.subspan(std::size_t{ram_address} * 4, std::size_t{input_words} * 4);
+  auto output =
+      storage.subspan(std::size_t{output_address} * 4, (std::size_t{input_words} + 1) * 4);
+  for (unsigned i = 0; i < input_words; ++i) {
+    for (unsigned byte = 0; byte < 4; ++byte) {
+      input[(i * 4) + byte] = static_cast<std::byte>((i + 1) >> (byte * byte_bits));
+    }
+  }
+  for (const bool simd : {false, true}) {
+    const unsigned step = simd ? 2U : 1U;
+    const unsigned copied = turns * step;
+    const auto copied_bytes = std::size_t{copied} * 4;
+    const std::array words{load_r0,
+                           fixture::add(3, 3, 0),
+                           store_r0 | (std::uint64_t{1} << 41),
+                           modify_i0 | step,
+                           modify_i1 | step,
+                           decrement_r2,
+                           loop,
+                           std::uint64_t{0}};
+    Program program(words);
+    auto &layout = program.code.code.variants[0].layout.regions.back();
+    layout.first = 0;
+    layout.count = VirtualWords::words;
+    auto memory = program.memory();
+    memory.regions.back().bytes = storage;
+    for (const auto mode : {sharc::ExecutionMode::strict, sharc::ExecutionMode::fast_fp32}) {
+      const auto native = sharc::Core::compile(program.code.code, {.mode = mode, .callbacks = {}});
+      sharc::Core core(memory, mode);
+      auto expected = initial();
+      expected.mode1 = simd ? 1U << simd_bit : 0;
+      expected.dag[0][1].index = output_address;
+      for (auto &lane : expected.pe) {
+        lane.data[0][2] = turns << 8;
+        lane.astat = old_status;
+      }
+      core.set_registers(expected);
+      (void)core.install(native, fixture::Program::variant_id);
+      std::ranges::fill(output, untouched);
+      const auto result = core.run(instructions);
+      expected.dag[0][0].index += copied;
+      expected.dag[0][1].index += copied;
+      expected.pe[0].data[0][0] = std::uint64_t{simd ? input_words - 1 : turns} << 8;
+      expected.pe[0].data[0][2] = 0;
+      expected.pe[0].data[0][3] = std::uint64_t{simd ? x_sum : scalar_sum} << 8;
+      expected.pe[0].astat = old_status | 9;
+      if (simd) {
+        expected.pe[1].data[0][0] = 32U << 8;
+        expected.pe[1].data[0][2] = 0;
+        expected.pe[1].data[0][3] = y_sum << 8;
+        expected.pe[1].astat = old_status | 9;
+      }
+      expected.pc += static_cast<std::uint32_t>(words.size());
+      expected.faddr = expected.pc + 4;
+      expected.daddr = expected.pc + 2;
+      expected.emuclk = cycles;
+      check(!result.has_fault && core.registers() == expected &&
+                result.progress ==
+                    sharc::Progress{.instructions = instructions, .base_cycles = cycles} &&
+                std::ranges::equal(output.first(copied_bytes), input.first(copied_bytes)) &&
+                std::ranges::all_of(output.subspan(copied_bytes),
+                                    [](std::byte byte) { return byte == untouched; }),
+            "whole-turn grant lost changing DAG indices, SIMD copy, checksum or guard bytes");
     }
   }
 }
@@ -408,8 +536,10 @@ void opaque_code_store() {
 int main() try {
   fault_prefixes();
   unexecuted_failure();
+  changing_sparse_indices();
 #if defined(__linux__)
   complete_word_space();
+  changing_complete_space();
 #endif
   rebound_snapshot();
   refused_code_alias();

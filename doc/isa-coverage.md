@@ -8,13 +8,13 @@ is claimed.
 
 | Area | Required evidence | Status |
 |---|---|---|
-| Classic 48-bit ISA | Every documented instruction class, condition, legal operand and parallel form | Partial: register-immediate, fixed ALU, direct flow, normal-word pre-indexed memory, NOP |
+| Classic 48-bit ISA | Every documented instruction class, condition, legal operand and parallel form | Partial: register-immediate, fixed ALU, direct flow, normal-word pre-indexed memory, immediate DAG modify/reverse, NOP |
 | VISA 16/32/48 | All compact encodings, fetch boundaries, PC units and mode transitions | Unimplemented |
 | Arithmetic and SIMD | PEx/PEy, fixed point, 32-/40-bit float, rounding, modes, flags and exceptions | Partial: fixed ALU and bank/SIMD execution |
 | Strict numerical mode (default) | Exact guest 32-/40-bit behavior, RND32, conversion exceptions and native-path identity | Unimplemented |
 | FastFP32 numerical mode (opt-in) | Independent approximation expectations, rounding/flags, unchanged raw moves/integer behavior, separate translations | Unimplemented |
 | Parallel operations | Old operands, memory aliases, register exchanges and ordered partial effects | Unimplemented |
-| Address generation and memory | Both DAGs, modulo/reverse addressing, PM/DM and physical view aliases | Partial: type 15 direct normal-word pre-indexing |
+| Address generation and memory | Both DAGs, modulo/reverse addressing, PM/DM and physical view aliases | Partial: type 15 normal-word pre-indexing and type 19 immediate modify/reverse |
 | Sequencer and control | Delayed flow, DO/loop endpoints, LR, stacks, reset and interrupts | Partial: non-delayed direct flow, static calls/returns and branch stalls |
 | Chip-profile boundaries | ADSP-21489 memory/vector parameters and explicit I/O ownership | Unimplemented |
 | JIT coherence and hosts | Self-modifying aliases, natural loops, precise exits, x86-64 and ARM64 | Unimplemented |
@@ -93,6 +93,29 @@ precise access/refusal prefixes, rebinding, declared code-storage reads, protect
 code-alias writes, ambiguous/truncated layouts and missing implicit SIMD storage.
 Runtime data callbacks, post-modification, other views and actual code transitions
 remain unimplemented. See [memory.md](memory.md) for the exact storage contract.
+
+Classic type 19 implements immediate MODIFY/BITREV, including distinct source
+and destination I registers. The source B/L define circular adjustment before
+bit reversal; MODIFY ignores CBUFEN for nonzero L. All sixteen I registers, all
+within-DAG destination choices, both physical banks in each DAG quarter,
+positive/negative adjustment, wrapping and raw bit reversal are exercised by
+`test/isa/dag.cpp` in both numeric identities. Each prefix compares all registers
+under instruction and cycle bounds. SIMD does not duplicate the DAG operation.
+Canonical I7/I15 updates test the documented sticky/interrupt latches, including
+CBUFEN with L zero. Overflow routing when an enhanced I7/I15 operation writes a
+different I remains unverified: the implementation follows the source buffer,
+and the enhanced matrix deliberately does not claim that overflow case. Immediate
+consumption timing after a standalone MODIFY/BITREV has not been observed on a
+primary implementation; the current nominal one-cycle operation follows the DAG
+operation model. These gaps prevent complete Strict profile qualification.
+
+Changing I values remain SSA across loop grants. Complete normal-word spaces
+use the current index directly without access guards. Changing sparse mappings
+currently select the cold exact path pending their affine proof. Core fixtures
+check moving-index scalar/SIMD copy and checksum loops, exact sparse failure and
+cross-Core snapshots. Cached consumer-bound IR preserves circular mode and DAG
+bank metadata. The installed SDK also executes an index update and a subsequent
+load. These authored controls are not K5 measurements.
 
 `test/isa/fixed.cpp` obtains 116 paired-lane expectations from the independent
 Python reference and executes them under both numerical identities, both register

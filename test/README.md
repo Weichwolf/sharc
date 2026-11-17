@@ -30,3 +30,9 @@ write before the common spill. Run the same ISA, core and installed SDK tests
 in that build; it is excluded from production code by default. Loop controls
 check every instruction prefix and cycle deadline across complete grants and
 their final partial turn, in both numeric identities and both low data banks.
+
+`isa/dag.cpp` independently encodes immediate index modification/reversal and
+compares complete states for all source/destination choices, DAG quarter banks,
+linear/circular arithmetic and canonical overflow latches. Moving-index memory
+controls exercise complete-space grants and exact sparse failures; the small
+copy/checksum control is not a common benchmark.
