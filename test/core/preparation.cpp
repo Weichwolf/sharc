@@ -96,7 +96,7 @@ void formats() {
     check(fault.detail.starts_with(name), "wrong instruction class");
     if (item.bits == full_width) {
       const auto image = fixture::image(InstructionSet::isa, item.word);
-      if (item.type == 2 || item.type == 8 || item.type == immediate_move_type ||
+      if (item.type == 2 || item.type == 8 || item.type == 15 || item.type == immediate_move_type ||
           item.type == nop_type) {
         const auto semantic = Core::lower(image);
         check(!semantic.bitcode().empty() && !semantic.exports().empty(),

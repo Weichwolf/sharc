@@ -2,8 +2,8 @@
 
 This is the implementation target, not a claim of complete execution. Initial
 LLVM lowering executes a limited classic ISA subset. Numerical qualification,
-complete control flow, memory instructions and the complete profile remain
-open; see [isa-coverage.md](isa-coverage.md) for current evidence.
+complete control flow, remaining memory instructions and the complete profile
+remain open; see [isa-coverage.md](isa-coverage.md) for current evidence.
 
 ```text
 consumer: CodeImage + CompileOptions -> Core::lower -> SemanticImage (LLVM bitcode)
@@ -46,19 +46,24 @@ These rules come from whole-instrument measurements of the Blofeld emulator
 (Weichwolf/blofeld-src issues #32, #34, #35). Start with them.
 
 1. **Lower every instruction directly to LLVM IR.** Architectural registers are
-   SSA values inside a translation unit, loaded at entry and stored at real
-   exits. Do not clone an interpreter step per instruction and rely on the
-   optimizer to dissolve it: dsp56300 did, and it cost 54 to 62 host
+   SSA values inside a translation unit. Pass the active hot register set as
+   arguments between native units under one `preserve_none` signature and use
+   `musttail` for chaining. Load and spill that set only at the owner boundary.
+   Do not clone an interpreter step per instruction and rely on the optimizer to dissolve it: dsp56300 did, and it cost 54 to 62 host
    instructions per guest instruction.
 2. **One lowering path for the whole instruction set.** No fast subset beside a
    slow general path. In dsp56300 the fast path covered two thirds of the
    executed instructions and the remaining third carried most of the cost,
    including the hottest loops.
-3. **Account time and budget per basic block.** One admission check per block
-   against the run bound; the exact per-instruction path exists only to finish
-   a bound. Counters are updated once per block.
-4. **Compute status bits where they can be observed.** A later instruction or an
-   exit observes them; sticky bits accumulate in one value. In the dsp56300
+3. **Admit a grant before executing it.** Prove enough budget for an acyclic
+   unit or select the number of complete loop turns before entering the loop.
+   Account a loop grant at its exit. The admitted path has no instruction or
+   turn budget checks. A failed grant uses the same instruction lowering in a
+   cold exact tail, where instruction checks finish the requested bound.
+4. **Compute status bits where they can be observed.** Keep flag recipes until
+   a reader or a complete owner exit needs them. Analyze flag liveness across
+   static unit edges and admit the successor before dropping dead flag recipes.
+   Sticky flags accumulate even when ordinary flags are dead. In the dsp56300
    per-instruction path 33 of 39 host instructions of an ADD were status work.
 5. **One processor or numeric mode per prepared unit.** Never emit all modes side
    by side at each site and select at run time. dsp56300 produced 27.8 MB of
@@ -67,8 +72,10 @@ These rules come from whole-instrument measurements of the Blofeld emulator
 6. **Mark exits cold.** Fault, refusal, bound and unprepared paths carry branch
    weights and stay out of line, so the executed code is dense.
 7. **State lives in registers, not in core memory.** Guest RAM is consumer
-   storage reached through declared layouts; the processor state is not written
-   back between instructions.
+   storage reached through declared layouts. Use consumer-lent virtual address
+   spaces for PM and DM and lower word views over their physical backing.
+   Host protection provides the eventual cold I/O boundary; qualify plain
+   faulting loads and stores before adding that handler.
 8. **Cacheable preparation and complete save and restore from the first usable
    Core.** Both are contract requirements and both were expensive to retrofit.
 9. **Idle loops are data.** A firmware loop pass that changes nothing can be
@@ -82,6 +89,16 @@ loops with a proved fixed iteration cost should obtain a whole-iteration grant
 from the remaining bound and account at the exit. Guard returns against an
 altered architectural return address. These requirements also apply as calls
 and hardware loops are added to the initial native subset.
+
+The current native ABI passes R0–R5 and their paired raw values, both ASTAT/STKY
+pairs, execution bounds and progress as arguments. Other data registers and the
+architectural stack remain SSA within a connected unit and are materialized at
+unit exits. A shared reload and spill handle the pinned set; an explicit
+`SHARC_POISON_NATIVE_STATE` build verifies that its old Core fields stay untouched
+while native code runs. This build selection changes prepared-code identity.
+Cross-unit flag recipes, complete PM/DM virtual mappings, runtime data callbacks
+and their host fault handlers remain implementation work. See private issues
+blofeld-src #36/#37 and lead-a1-src #2 for coordination.
 
 Hoist checks only with a valid alias or permission proof. Keep the host stack
 bounded across guest loops. Host SIMD is used only where guest dependencies and

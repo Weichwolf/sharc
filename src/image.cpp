@@ -274,8 +274,9 @@ std::shared_ptr<const PreparedImage> load_image(const CodeImage &code,
   }
   std::set<std::tuple<std::uint32_t, std::uint32_t, std::uint32_t>> contexts;
   std::set<std::string> names;
-  constexpr auto allowed_modes =
-      high_bank_mode | low_bank_mode | saturation_mode | truncation_mode | simd_mode;
+  constexpr auto allowed_modes = high_bank_mode | low_bank_mode | saturation_mode |
+                                 truncation_mode | simd_mode | dag1_high_mode | dag1_low_mode |
+                                 dag2_high_mode | dag2_low_mode | broadcast1_mode | broadcast9_mode;
   for (std::uint64_t index = 0; index < count; ++index) {
     NativeUnit unit{.variant = reader.word(),
                     .entry = reader.word(),
@@ -371,12 +372,6 @@ void validate_code_storage(const PreparedImage &image,
   if (variant == image.code.variants.end()) {
     refuse(
         FaultReason::invalid_image, image.identity, variant_id, 0, "unknown installation variant");
-  }
-  std::set<std::uint32_t> storage;
-  for (const auto &region : memory.regions) {
-    if (!storage.insert(region.storage_id).second) {
-      refuse(FaultReason::invalid_image, image.identity, variant_id, 0, "duplicate storage id");
-    }
   }
   constexpr unsigned parcel_bits = 16;
   for (const auto &span : variant->spans) {

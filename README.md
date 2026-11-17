@@ -14,13 +14,13 @@ The preparation implementation provides the two public headers, the `sharc::core
 build target, ISA/VISA format and compute-field decoding, preparation diagnostics
 and raw architectural state/snapshot storage. Initial LLVM lowering executes
 classic ISA register-immediate moves, fixed ALU operations, non-delayed jumps,
-calls/returns and NOP through
+calls/returns, direct normal-word memory moves and NOP through
 installed images, with separate mode identities, artifact caching and snapshots.
 Other instruction families refuse lowering explicitly. The CMake package installs
 the `sharc::core` target and exactly two public headers. The S2 independent
 expectation-generation milestone is complete; numerical gaps and the remaining
 S3 native execution are explicit, and no benchmark result exists. See
-[coverage](doc/isa-coverage.md), [state storage](doc/state.md) and the
+[coverage](doc/isa-coverage.md), [state storage](doc/state.md), [memory access](doc/memory.md) and the
 [independent numeric reference](doc/numeric-reference.md).
 
 ```sh

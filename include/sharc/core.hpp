@@ -30,7 +30,8 @@ enum class FaultReason : std::uint8_t {
   undeclared_entry,
   unsupported_instruction,
   unprepared,
-  unsupported_feature
+  unsupported_feature,
+  access_fault
 };
 
 // Raw little-significance limbs, not host floating-point values.

@@ -125,6 +125,7 @@ void verify(const fixture::FixedCase &expected,
 
 int main() try {
   fixture::control_flow();
+  fixture::memory_access();
   using Key = std::tuple<unsigned, bool, sharc::ExecutionMode>;
   std::map<Key, sharc::NativeImage> cache;
   for (const auto &expected : fixture::fixed_cases) {

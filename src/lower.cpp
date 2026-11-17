@@ -1,12 +1,15 @@
 // SPDX-License-Identifier: GPL-3.0-only
+#include "abi.hpp"
 #include "decode.hpp"
 #include "native.hpp"
 #include "sharc/core.hpp"
+#include "sharc/memory.hpp"
 
 #include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <iterator>
 #include <limits>
 #include <llvm/ADT/SmallVector.h>
@@ -22,10 +25,12 @@
 #include <llvm/IR/MDBuilder.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/Verifier.h>
+#include <llvm/Support/Alignment.h>
 #include <llvm/Support/TypeSize.h>
 #include <llvm/Support/raw_ostream.h>
 #include <map>
 #include <memory>
+#include <optional>
 #include <set>
 #include <span>
 #include <string>
@@ -52,6 +57,9 @@ constexpr unsigned immediate_move_type = 17;
 constexpr unsigned nop_type = 21;
 constexpr unsigned direct_branch_type = 8;
 constexpr unsigned return_branch_type = 11;
+constexpr unsigned memory_move_type = 15;
+constexpr std::uint64_t memory_write = std::uint64_t{1} << 40;
+constexpr std::uint64_t forced_long = std::uint64_t{1} << 39;
 constexpr std::uint64_t relative_branch = std::uint64_t{1} << 40;
 constexpr std::uint64_t call_branch = std::uint64_t{1} << 39;
 constexpr std::uint64_t abort_branch = std::uint64_t{1} << 38;
@@ -94,6 +102,26 @@ bool supported_compute(const Compute &compute) {
   return compute.kind == ComputeKind::none ||
          (compute.kind == ComputeKind::alu &&
           std::ranges::find(fixed_operations, compute.opcode) != fixed_operations.end());
+}
+
+struct MemoryMove {
+  unsigned index{}, reg{}, lane{};
+  MemorySpace space{};
+  bool write{};
+};
+
+MemoryMove memory_move(const Instruction &instruction) {
+  constexpr unsigned dag_shift = 44;
+  constexpr unsigned index_shift = 41;
+  constexpr unsigned register_shift = 32;
+  const bool program = ((instruction.word >> dag_shift) & 1) != 0;
+  const auto ureg = static_cast<unsigned>((instruction.word >> register_shift) & 0x7f);
+  return {.index =
+              static_cast<unsigned>((instruction.word >> index_shift) & 7) + (program ? 8U : 0U),
+          .reg = ureg & 15,
+          .lane = ureg < 16 ? 0U : 1U,
+          .space = program ? MemorySpace::program : MemorySpace::data,
+          .write = (instruction.word & memory_write) != 0};
 }
 
 void validate_condition(const Instruction &instruction, std::string_view identity) {
@@ -148,6 +176,20 @@ void validate_return(const Instruction &instruction, std::string_view identity) 
   validate_condition(instruction, identity);
 }
 
+void validate_memory_move(const Instruction &instruction, std::string_view identity) {
+  constexpr unsigned register_shift = 32;
+  constexpr unsigned y_first = 0x50;
+  constexpr unsigned y_limit = 0x60;
+  const auto ureg = (instruction.word >> register_shift) & 0x7f;
+  if ((instruction.word & forced_long) == 0 && (ureg < 16 || (ureg >= y_first && ureg < y_limit))) {
+    return;
+  }
+  reject(instruction,
+         identity,
+         FaultReason::unsupported_instruction,
+         "forced long-word or non-data-register memory transfer is not lowered");
+}
+
 void validate(const Instruction &instruction, std::string_view identity) {
   if (instruction.instruction_set != InstructionSet::isa) {
     reject(instruction,
@@ -162,6 +204,10 @@ void validate(const Instruction &instruction, std::string_view identity) {
   }
   if (instruction.type == return_branch_type) {
     validate_return(instruction, identity);
+    return;
+  }
+  if (instruction.type == memory_move_type) {
+    validate_memory_move(instruction, identity);
     return;
   }
   if (instruction.type == immediate_move_type) {
@@ -216,7 +262,10 @@ constexpr std::size_t hazard_value = credit_value + 1;
 constexpr std::size_t pc_stack_value = hazard_value + 1;
 constexpr std::size_t pc_stack_depth_value = pc_stack_value + 1;
 constexpr std::size_t interrupt_latch_value = pc_stack_depth_value + 1;
-constexpr std::size_t state_value_count = interrupt_latch_value + 1;
+constexpr std::size_t loop_grant_value = interrupt_latch_value + 1;
+constexpr std::size_t loop_remaining_value = loop_grant_value + 1;
+constexpr std::size_t tail_value = loop_remaining_value + 1;
+constexpr std::size_t state_value_count = tail_value + 1;
 using Values = std::array<llvm::Value *, state_value_count>;
 
 struct Node {
@@ -249,30 +298,20 @@ struct BlockCost {
 class Lowering {
 public:
   Lowering(llvm::Module &module,
+           const NativeAbi &abi,
            const CodeVariant &variant,
            std::vector<Instruction> instructions,
            const NativeUnit &unit)
       : module_(module),
+        abi_(abi),
+        unit_(unit),
         variant_(variant),
         instructions_(std::move(instructions)),
         entry_address_(unit.entry),
         context_(unit.context),
         builder_(module.getContext()) {
-    auto *pointer = builder_.getPtrTy();
-    function_ = llvm::Function::Create(
-        llvm::FunctionType::get(builder_.getVoidTy(), {pointer, pointer}, false),
-        llvm::GlobalValue::ExternalLinkage,
-        unit.symbol,
-        module_);
+    function_ = abi_.body(unit);
     function_->addFnAttr(llvm::Attribute::NoUnwind);
-    for (auto &argument : function_->args()) {
-      argument.addAttr(llvm::Attribute::NoAlias);
-      argument.addAttr(llvm::Attribute::NonNull);
-      argument.addAttr(llvm::Attribute::NoCapture);
-    }
-    function_->getArg(0)->addAttr(llvm::Attribute::ReadOnly);
-    function_->getArg(0)->setName("register_pointers");
-    function_->getArg(1)->setName("control_words");
   }
 
   void emit();
@@ -333,7 +372,7 @@ private:
       llvm::Type *type = builder_.getInt64Ty();
       if (i < instruction_remaining_value) { type = vector_type(32); }
       if (i < status_value) { type = vector_type(64); }
-      if (i == hazard_value) { type = builder_.getInt1Ty(); }
+      if (i == hazard_value || i == tail_value) { type = builder_.getInt1Ty(); }
       if (i == pc_stack_value) { type = stack_type(); }
       if (i == pc_stack_depth_value || i == interrupt_latch_value) { type = builder_.getInt32Ty(); }
       result.phi[i] = start.CreatePHI(type, 2);
@@ -361,32 +400,53 @@ private:
                            llvm::Value *x,
                            llvm::Value *y,
                            unsigned opcode);
-  void instruction(Values &values, const Instruction &op);
-  void finish(Values values, std::uint32_t next);
+  void instruction(Values &values, const Instruction &op, bool partial);
+  void memory_instruction(Values &values, const Instruction &op, bool partial);
+  llvm::Value *
+  memory_pointer(const Values &values, const Instruction &op, llvm::Value *address, bool partial);
+  void memory_failure(const Values &values,
+                      const Instruction &op,
+                      llvm::Value *address,
+                      NativeExit reason,
+                      bool partial);
+  void finish(Values values, std::uint32_t next, bool partial);
   void credit(Values &values, llvm::Value *count, llvm::Value *cycles, bool partial);
   void complete(Values values, const Instruction &op, bool partial);
   void stack_guard(const Values &values, const Instruction &op, llvm::Value *allowed, bool partial);
   void stack_status(Values &values);
   void call(Values &values, const Instruction &op, bool partial);
   llvm::Value *pop(Values &values, const Instruction &op, bool partial);
-  void return_to_caller(Values values, llvm::Value *target);
+  void return_to_caller(Values values, llvm::Value *target, bool partial);
   std::vector<BlockCost> block_costs() const;
   void emit_exit();
+  void load_indices();
+  void plan_memory();
+  std::pair<llvm::Value *, llvm::Value *> plan_pointer(const MemoryMove &move,
+                                                       llvm::Value *address);
+  void emit_instruction(std::size_t i, const std::optional<BlockCost> &grant);
+  void plan_loops();
+  void complete_loop(Values values, const Instruction &op);
+  std::vector<std::optional<BlockCost>> unit_costs() const;
 
   llvm::Module &module_;
+  const NativeAbi &abi_;
+  const NativeUnit &unit_;
   const CodeVariant &variant_;
   std::vector<Instruction> instructions_;
   std::uint32_t entry_address_;
   std::uint32_t context_;
   llvm::IRBuilder<> builder_;
   llvm::Function *function_{};
-  llvm::Value *initial_clock_{};
-  llvm::Value *initial_fetch_{};
-  llvm::Value *initial_decode_{};
   std::map<std::uint32_t, std::size_t> addresses_;
-  std::vector<Node> admission_, fast_, partial_;
+  std::vector<Node> admission_, fast_entry_, fast_, partial_;
+  std::map<std::uint32_t, std::array<llvm::Value *, 2>> memory_plan_;
+  llvm::Value *memory_admitted_{};
   std::set<unsigned> written_;
-  bool flags_written_{};
+  std::set<unsigned> y_written_;
+  std::array<llvm::Value *, 16> indices_{};
+  std::vector<BlockCost> costs_;
+  std::map<std::size_t, std::size_t> loop_headers_;
+  std::map<std::size_t, BlockCost> loop_ends_;
   bool stack_written_{};
   Node exit_;
   llvm::PHINode *exit_pc_{}, *exit_reason_{};
@@ -577,7 +637,12 @@ Arithmetic Lowering::status_result(const Values &values,
   return {.raw = raw, .status = status, .sticky = sticky};
 }
 
-void Lowering::instruction(Values &values, const Instruction &op) {
+void Lowering::instruction(Values &values, const Instruction &op, bool partial) {
+  if (op.type == memory_move_type) {
+    memory_instruction(values, op, partial);
+    values[hazard_value] = builder_.getFalse();
+    return;
+  }
   if (op.type != direct_branch_type && op.type != return_branch_type) {
     values[hazard_value] = builder_.getInt1(op.compute.kind != ComputeKind::none);
   }
@@ -612,7 +677,127 @@ void Lowering::instruction(Values &values, const Instruction &op) {
   }
   values[status_value] = builder_.CreateSelect(selected, result.status, values[status_value]);
   values[sticky_value] = builder_.CreateSelect(selected, result.sticky, values[sticky_value]);
-  flags_written_ = true;
+}
+
+void Lowering::memory_failure(const Values &values,
+                              const Instruction &op,
+                              llvm::Value *address,
+                              NativeExit reason,
+                              bool partial) {
+  for (const auto [slot, value] :
+       {std::pair{memory_address, builder_.CreateZExt(address, builder_.getInt64Ty())},
+        std::pair{memory_space,
+                  static_cast<llvm::Value *>(
+                      builder_.getInt64(static_cast<unsigned>(memory_move(op).space)))},
+        std::pair{fault_instruction, static_cast<llvm::Value *>(builder_.getInt64(op.word))}}) {
+    builder_.CreateStore(
+        value,
+        builder_.CreateGEP(builder_.getInt64Ty(), function_->getArg(1), builder_.getInt64(slot)));
+  }
+  auto prefix = values;
+  if (!partial) {
+    auto *count = builder_.CreateSub(
+        values[credit_value], builder_.getInt64(costs_[addresses_.at(op.address)].instructions));
+    credit(prefix, count, count, false);
+  }
+  exit(prefix, builder_.getInt32(op.address), reason);
+}
+
+llvm::Value *Lowering::memory_pointer(const Values &values,
+                                      const Instruction &op,
+                                      llvm::Value *address,
+                                      bool partial) {
+  const auto move = memory_move(op);
+  auto *done = llvm::BasicBlock::Create(module_.getContext(), "memory.address", function_);
+  llvm::IRBuilder<> join(done);
+  auto *result = join.CreatePHI(builder_.getPtrTy(), 2);
+  const auto &regions = variant_.layout.regions;
+  for (std::size_t i = 0; i < regions.size(); ++i) {
+    const auto &layout = regions[i];
+    if (layout.space != move.space || layout.view == MemoryView::instruction || layout.count == 0) {
+      continue;
+    }
+    auto *hit = llvm::BasicBlock::Create(module_.getContext(), "memory.region", function_);
+    auto *next = llvm::BasicBlock::Create(module_.getContext(), "memory.next", function_);
+    auto *index = builder_.CreateSub(address, builder_.getInt32(layout.first));
+    auto *inside = layout.count == (std::uint64_t{1} << 32)
+                       ? static_cast<llvm::Value *>(builder_.getTrue())
+                       : builder_.CreateICmpULT(
+                             index, builder_.getInt32(static_cast<std::uint32_t>(layout.count)));
+    builder_.CreateCondBr(inside, hit, next);
+    builder_.SetInsertPoint(hit);
+    if (!(move.write ? layout.writable : layout.readable)) {
+      memory_failure(values, op, address, NativeExit::access_fault, partial);
+    } else if (!layout.initialized || layout.view != MemoryView::normal_word) {
+      memory_failure(values, op, address, NativeExit::unsupported_memory, partial);
+    } else if (move.write && aliases_code(variant_, i)) {
+      memory_failure(values, op, address, NativeExit::code_alias, partial);
+    } else {
+      auto *offset = builder_.CreateMul(builder_.CreateZExt(index, builder_.getInt64Ty()),
+                                        builder_.getInt64(layout.byte_stride));
+      auto *host =
+          builder_.CreateGEP(builder_.getInt8Ty(), pointer(register_pointer_count + i), offset);
+      result->addIncoming(host, builder_.GetInsertBlock());
+      builder_.CreateBr(done);
+    }
+    builder_.SetInsertPoint(next);
+  }
+  memory_failure(values, op, address, NativeExit::unsupported_memory, partial);
+  builder_.SetInsertPoint(done);
+  if (result->getNumIncomingValues() == 0) {
+    result->eraseFromParent();
+    return llvm::PoisonValue::get(builder_.getPtrTy());
+  }
+  return result;
+}
+
+void Lowering::memory_instruction(Values &values, const Instruction &op, bool partial) {
+  const auto move = memory_move(op);
+  const bool broadcast = !move.write && ((move.index == 1 && (context_ & broadcast1_mode) != 0) ||
+                                         (move.index == 9 && (context_ & broadcast9_mode) != 0));
+  const bool paired = broadcast || (context_ & simd_mode) != 0;
+  auto *address = builder_.CreateAdd(indices_[move.index],
+                                     builder_.getInt32(static_cast<std::uint32_t>(op.word)));
+  auto *explicit_pointer =
+      partial ? memory_pointer(values, op, address, true) : memory_plan_.at(op.address)[0];
+  llvm::Value *implicit_pointer = explicit_pointer;
+  if (paired && !broadcast) {
+    implicit_pointer =
+        partial
+            ? memory_pointer(values, op, builder_.CreateAdd(address, builder_.getInt32(1)), true)
+            : memory_plan_.at(op.address)[1];
+  }
+  if (move.write) {
+    for (unsigned transfer = 0; transfer < (paired ? 2U : 1U); ++transfer) {
+      const auto lane = move.lane ^ transfer;
+      auto *raw = builder_.CreateExtractElement(values[move.reg], builder_.getInt32(lane));
+      auto *word = builder_.CreateTrunc(
+          builder_.CreateLShr(raw, builder_.getInt64(raw_extension_bits)), builder_.getInt32Ty());
+      auto *write = builder_.CreateStore(word, transfer == 0 ? explicit_pointer : implicit_pointer);
+      write->setAlignment(llvm::Align(1));
+    }
+    return;
+  }
+  auto *word = builder_.CreateLoad(builder_.getInt32Ty(), explicit_pointer);
+  word->setAlignment(llvm::Align(1));
+  auto *raw = builder_.CreateShl(builder_.CreateZExt(word, builder_.getInt64Ty()),
+                                 builder_.getInt64(raw_extension_bits));
+  values[move.reg] =
+      builder_.CreateInsertElement(values[move.reg], raw, builder_.getInt32(move.lane));
+  if (paired) {
+    llvm::Value *other = word;
+    if (!broadcast) {
+      auto *read = builder_.CreateLoad(builder_.getInt32Ty(), implicit_pointer);
+      read->setAlignment(llvm::Align(1));
+      other = read;
+    }
+    auto *other_raw = builder_.CreateShl(builder_.CreateZExt(other, builder_.getInt64Ty()),
+                                         builder_.getInt64(raw_extension_bits));
+    values[move.reg] =
+        builder_.CreateInsertElement(values[move.reg], other_raw, builder_.getInt32(move.lane ^ 1));
+  }
+  written_.insert(move.reg);
+  if (move.lane != 0 || paired) { y_written_.insert(move.reg); }
 }
 
 void Lowering::stack_guard(const Values &values,
@@ -655,7 +840,6 @@ void Lowering::stack_status(Values &values) {
           builder_.getInt32(0)));
   values[sticky_value] =
       builder_.CreateInsertElement(values[sticky_value], status, builder_.getInt32(0));
-  flags_written_ = true;
 }
 
 void Lowering::call(Values &values, const Instruction &op, bool partial) {
@@ -701,7 +885,7 @@ llvm::Value *Lowering::pop(Values &values, const Instruction &op, bool partial) 
   return builder_.CreateAnd(top, builder_.getInt32(maximum_pc));
 }
 
-void Lowering::return_to_caller(Values values, llvm::Value *target) {
+void Lowering::return_to_caller(Values values, llvm::Value *target, bool partial) {
   auto *unknown = llvm::BasicBlock::Create(module_.getContext(), "cold.return", function_);
   auto *dispatch = builder_.CreateSwitch(target, unknown);
   std::set<std::uint32_t> returns;
@@ -713,7 +897,7 @@ void Lowering::return_to_caller(Values values, llvm::Value *target) {
   for (const auto address : returns) {
     const auto found = addresses_.find(address);
     if (found == addresses_.end()) { continue; }
-    auto &destination = admission_[found->second];
+    auto &destination = partial ? partial_[found->second] : fast_entry_[found->second];
     destination.incoming(values, builder_.GetInsertBlock());
     dispatch->addCase(builder_.getInt32(address), destination.block);
   }
@@ -737,11 +921,15 @@ void Lowering::credit(Values &values, llvm::Value *count, llvm::Value *cycles, b
 }
 
 void Lowering::complete(Values values, const Instruction &op, bool partial) {
+  if (!partial && loop_ends_.contains(addresses_.at(op.address))) {
+    complete_loop(values, op);
+    return;
+  }
   auto *count = partial ? builder_.getInt64(1) : values[credit_value];
   const auto next = (op.address + 1) & maximum_pc;
   if (op.type != direct_branch_type && op.type != return_branch_type) {
     credit(values, count, count, partial);
-    finish(values, next);
+    finish(values, next, partial);
     return;
   }
   auto *lanes =
@@ -769,20 +957,27 @@ void Lowering::complete(Values values, const Instruction &op, bool partial) {
   credit(
       branch_values, count, builder_.CreateAdd(cycles, builder_.getInt64(branch_penalty)), partial);
   if (target != nullptr) {
-    return_to_caller(branch_values, target);
+    return_to_caller(branch_values, target, partial);
   } else {
-    finish(branch_values, branch_target(op));
+    finish(branch_values, branch_target(op), partial);
   }
   builder_.SetInsertPoint(fallthrough);
   values[hazard_value] = builder_.getFalse();
   credit(values, count, cycles, partial);
-  finish(values, next);
+  finish(values, next, partial);
 }
 
-void Lowering::finish(Values values, std::uint32_t next) {
+void Lowering::finish(Values values, std::uint32_t next, bool partial) {
   const auto target = addresses_.find(next);
   if (target != addresses_.end()) {
-    jump(admission_[target->second], values);
+    const auto i = target->second;
+    if (partial && loop_headers_.contains(i)) {
+      partial_[i].incoming(values, builder_.GetInsertBlock());
+      admission_[i].incoming(values, builder_.GetInsertBlock());
+      builder_.CreateCondBr(values[tail_value], partial_[i].block, admission_[i].block);
+    } else {
+      jump(partial ? partial_[i] : fast_entry_[i], values);
+    }
     return;
   }
   auto *bound = llvm::BasicBlock::Create(module_.getContext(), "cold.bound", function_);
@@ -801,17 +996,10 @@ void Lowering::emit_exit() {
   builder_.SetInsertPoint(exit_.block);
   const auto values = exit_.values();
   for (const auto reg : written_) {
+    if (reg < pinned_registers) { continue; }
     store(builder_.CreateExtractElement(values[reg], builder_.getInt32(0)), data_slot(0, reg));
-    if ((context_ & simd_mode) != 0) {
+    if ((context_ & simd_mode) != 0 || y_written_.contains(reg)) {
       store(builder_.CreateExtractElement(values[reg], builder_.getInt32(1)), data_slot(1, reg));
-    }
-  }
-  if (flags_written_) {
-    for (unsigned lane = 0; lane < ((context_ & simd_mode) != 0 ? 2U : 1U); ++lane) {
-      store(builder_.CreateExtractElement(values[status_value], builder_.getInt32(lane)),
-            astat_slot + lane);
-      store(builder_.CreateExtractElement(values[sticky_value], builder_.getInt32(lane)),
-            stky_slot + lane);
     }
   }
   if (stack_written_) {
@@ -823,25 +1011,21 @@ void Lowering::emit_exit() {
           stack_depth_slot);
     store(values[interrupt_latch_value], interrupt_latch_slot);
   }
-  store(exit_pc_, pc_slot);
-  auto *retired = builder_.CreateICmpNE(values[instructions_retired_value], builder_.getInt64(0));
-  auto *fetch = builder_.CreateAnd(builder_.CreateAdd(exit_pc_, builder_.getInt32(4)),
-                                   builder_.getInt32(maximum_pc));
-  auto *decode = builder_.CreateAnd(builder_.CreateAdd(exit_pc_, builder_.getInt32(2)),
-                                    builder_.getInt32(maximum_pc));
-  store(builder_.CreateSelect(retired, fetch, initial_fetch_), faddr_slot);
-  store(builder_.CreateSelect(retired, decode, initial_decode_), daddr_slot);
-  store(builder_.CreateAdd(initial_clock_, values[cycles_retired_value]), clock_slot);
-  store(builder_.CreateZExt(values[hazard_value], builder_.getInt8Ty()), hazard_slot);
-  for (const auto [slot, value] :
-       {std::pair{retired_instructions, values[instructions_retired_value]},
-        std::pair{retired_cycles, values[cycles_retired_value]},
-        std::pair{exit_reason, static_cast<llvm::Value *>(exit_reason_)}}) {
-    builder_.CreateStore(
-        value,
-        builder_.CreateGEP(builder_.getInt64Ty(), function_->getArg(1), builder_.getInt64(slot)));
-  }
-  builder_.CreateRetVoid();
+  std::vector<llvm::Value *> args{function_->getArg(unit_pointers),
+                                  function_->getArg(unit_controls),
+                                  values[instruction_remaining_value],
+                                  values[cycle_remaining_value],
+                                  values[instructions_retired_value],
+                                  values[cycles_retired_value],
+                                  exit_pc_,
+                                  builder_.getInt32(entry_address_),
+                                  function_->getArg(unit_mode),
+                                  values[hazard_value],
+                                  exit_reason_};
+  for (unsigned reg = 0; reg < pinned_registers; ++reg) { args.push_back(values[reg]); }
+  args.push_back(values[status_value]);
+  args.push_back(values[sticky_value]);
+  abi_.leave(builder_, unit_, args);
 }
 
 std::vector<BlockCost> Lowering::block_costs() const {
@@ -870,6 +1054,253 @@ std::vector<BlockCost> Lowering::block_costs() const {
   return result;
 }
 
+void Lowering::load_indices() {
+  for (const auto &op : instructions_) {
+    if (op.type != memory_move_type) { continue; }
+    const auto index = memory_move(op).index;
+    if (indices_[index] != nullptr) { continue; }
+    const auto bank = (context_ & dag_bank_mode(index)) != 0 ? 1U : 0U;
+    indices_[index] = load(32, dag_index_slot + (std::size_t{bank} * 16) + index);
+  }
+}
+
+void Lowering::plan_loops() {
+  for (std::size_t end = 0; end < instructions_.size(); ++end) {
+    const auto &op = instructions_[end];
+    if (op.type != direct_branch_type || (op.word & call_branch) != 0) { continue; }
+    const auto header = addresses_.find(branch_target(op));
+    if (header == addresses_.end() || header->second > end) { continue; }
+    const auto start = header->second;
+    const auto count = end - start + 1;
+    const bool conditional = ((op.word >> condition_shift) & true_condition) != true_condition;
+    if ((count == 1 && conditional) || costs_[start].instructions != count) { continue; }
+    bool linear = true;
+    for (std::size_t i = start; i < end; ++i) {
+      linear = linear && instructions_[i].address + 1 == instructions_[i + 1].address &&
+               instructions_[i].type != direct_branch_type &&
+               instructions_[i].type != return_branch_type;
+    }
+    if (!linear) { continue; }
+    const bool stall = conditional && instructions_[end - 1].compute.kind != ComputeKind::none;
+    loop_headers_.emplace(start, end);
+    loop_ends_.emplace(
+        end,
+        BlockCost{.instructions = count, .cycles = count + branch_penalty + (stall ? 1U : 0U)});
+  }
+}
+
+void Lowering::complete_loop(Values values, const Instruction &op) {
+  const auto end = addresses_.at(op.address);
+  const auto start = addresses_.at(branch_target(op));
+  const auto cost = loop_ends_.at(end);
+  auto *lanes =
+      condition(values, static_cast<unsigned>((op.word >> condition_shift) & true_condition));
+  auto *taken = builder_.CreateExtractElement(lanes, builder_.getInt32(0));
+  if ((context_ & simd_mode) != 0) {
+    taken = builder_.CreateAnd(taken, builder_.CreateExtractElement(lanes, builder_.getInt32(1)));
+  }
+  values[hazard_value] = builder_.getFalse();
+  auto *remaining = builder_.CreateSub(values[loop_remaining_value], builder_.getInt64(1));
+  values[loop_remaining_value] = remaining;
+  auto *account = llvm::BasicBlock::Create(module_.getContext(), "grant.account", function_);
+  auto *again = builder_.CreateAnd(taken, builder_.CreateICmpNE(remaining, builder_.getInt64(0)));
+  fast_[start].incoming(values, builder_.GetInsertBlock());
+  builder_.CreateCondBr(again, fast_[start].block, account);
+  builder_.SetInsertPoint(account);
+  auto *turns = builder_.CreateSub(values[loop_grant_value], remaining);
+  auto *count = builder_.CreateMul(turns, builder_.getInt64(cost.instructions));
+  auto *cycles = builder_.CreateSub(
+      builder_.CreateMul(turns, builder_.getInt64(cost.cycles)),
+      builder_.CreateSelect(taken, builder_.getInt64(0), builder_.getInt64(branch_penalty)));
+  credit(values, count, cycles, false);
+  values[loop_grant_value] = builder_.getInt64(0);
+  values[loop_remaining_value] = builder_.getInt64(0);
+  auto *tail = llvm::BasicBlock::Create(module_.getContext(), "cold.loop.tail", function_);
+  auto *finished = llvm::BasicBlock::Create(module_.getContext(), "loop.finished", function_);
+  builder_.CreateCondBr(taken, tail, finished);
+  builder_.SetInsertPoint(tail);
+  auto prefix = values;
+  prefix[tail_value] = builder_.getTrue();
+  jump(partial_[start], prefix);
+  builder_.SetInsertPoint(finished);
+  const auto next = (op.address + 1) & maximum_pc;
+  const auto successor = addresses_.find(next);
+  if (successor == addresses_.end()) {
+    finish(values, next, false);
+  } else {
+    jump(admission_[successor->second], values);
+  }
+}
+
+std::pair<llvm::Value *, llvm::Value *> Lowering::plan_pointer(const MemoryMove &move,
+                                                               llvm::Value *address) {
+  llvm::Value *valid = builder_.getFalse();
+  llvm::Value *host = llvm::PoisonValue::get(builder_.getPtrTy());
+  for (std::size_t i = 0; i < variant_.layout.regions.size(); ++i) {
+    const auto &layout = variant_.layout.regions[i];
+    if (layout.space != move.space || layout.count == 0 || layout.view != MemoryView::normal_word ||
+        !layout.initialized || !(move.write ? layout.writable : layout.readable) ||
+        (move.write && aliases_code(variant_, i))) {
+      continue;
+    }
+    auto *index = builder_.CreateSub(address, builder_.getInt32(layout.first));
+    auto *inside = layout.count == (std::uint64_t{1} << 32)
+                       ? static_cast<llvm::Value *>(builder_.getTrue())
+                       : builder_.CreateICmpULT(
+                             index, builder_.getInt32(static_cast<std::uint32_t>(layout.count)));
+    auto *offset = builder_.CreateMul(builder_.CreateZExt(index, builder_.getInt64Ty()),
+                                      builder_.getInt64(layout.byte_stride));
+    auto *candidate =
+        builder_.CreateGEP(builder_.getInt8Ty(), pointer(register_pointer_count + i), offset);
+    host = builder_.CreateSelect(inside, candidate, host);
+    valid = builder_.CreateOr(valid, inside);
+  }
+  return {host, valid};
+}
+
+void Lowering::plan_memory() {
+  memory_admitted_ = builder_.getTrue();
+  for (const auto &op : instructions_) {
+    if (op.type != memory_move_type) { continue; }
+    const auto move = memory_move(op);
+    const bool broadcast = !move.write && ((move.index == 1 && (context_ & broadcast1_mode) != 0) ||
+                                           (move.index == 9 && (context_ & broadcast9_mode) != 0));
+    const unsigned transfers = !broadcast && (context_ & simd_mode) != 0 ? 2U : 1U;
+    auto &plan = memory_plan_[op.address];
+    for (unsigned transfer = 0; transfer < transfers; ++transfer) {
+      auto *address = builder_.CreateAdd(
+          indices_[move.index], builder_.getInt32(static_cast<std::uint32_t>(op.word) + transfer));
+      const auto [host, valid] = plan_pointer(move, address);
+      plan[transfer] = host;
+      memory_admitted_ = builder_.CreateAnd(memory_admitted_, valid);
+    }
+    if (transfers == 1) { plan[1] = plan[0]; }
+  }
+}
+
+std::set<std::uint32_t> instruction_successors(const Instruction &op,
+                                               const std::set<std::uint32_t> &returns) {
+  const bool branch = op.type == direct_branch_type || op.type == return_branch_type;
+  std::set<std::uint32_t> next;
+  if (op.type == direct_branch_type) { next.insert(branch_target(op)); }
+  if (op.type == return_branch_type) { next.insert(returns.begin(), returns.end()); }
+  if (!branch || ((op.word >> condition_shift) & true_condition) != true_condition) {
+    next.insert((op.address + 1) & maximum_pc);
+  }
+  return next;
+}
+
+std::vector<std::optional<BlockCost>> Lowering::unit_costs() const {
+  std::vector<std::optional<BlockCost>> result(instructions_.size());
+  std::vector<unsigned> visited(instructions_.size());
+  std::set<std::uint32_t> returns;
+  for (const auto &op : instructions_) {
+    if (op.type == direct_branch_type && (op.word & call_branch) != 0) {
+      returns.insert((op.address + 1) & maximum_pc);
+    }
+  }
+  const std::function<std::optional<BlockCost>(std::size_t)> visit =
+      [&](std::size_t i) -> std::optional<BlockCost> {
+    if (visited[i] != 0) { return visited[i] == 2 ? result[i] : std::nullopt; }
+    visited[i] = 1;
+    const auto &op = instructions_[i];
+    const bool branch = op.type == direct_branch_type || op.type == return_branch_type;
+    const auto next = instruction_successors(op, returns);
+    BlockCost suffix{.instructions = 0, .cycles = 0};
+    for (const auto address : next) {
+      const auto found = addresses_.find(address);
+      if (found == addresses_.end()) { continue; }
+      const auto cost = visit(found->second);
+      if (!cost.has_value()) {
+        visited[i] = 2;
+        return std::nullopt;
+      }
+      suffix.instructions = std::max(suffix.instructions, cost->instructions);
+      suffix.cycles = std::max(suffix.cycles, cost->cycles);
+    }
+    ++suffix.instructions;
+    ++suffix.cycles;
+    if (branch) {
+      suffix.cycles += branch_penalty;
+      if (((op.word >> condition_shift) & true_condition) != true_condition) { ++suffix.cycles; }
+    }
+    visited[i] = 2;
+    result[i] = suffix;
+    return suffix;
+  };
+  for (std::size_t i = 0; i < instructions_.size(); ++i) { (void)visit(i); }
+  return result;
+}
+
+void Lowering::emit_instruction(std::size_t i, const std::optional<BlockCost> &grant) {
+  const auto &op = instructions_[i];
+  builder_.SetInsertPoint(admission_[i].block);
+  auto values = admission_[i].values();
+  llvm::Value *admitted = builder_.getFalse();
+  const auto loop = loop_headers_.find(i);
+  if (loop != loop_headers_.end()) {
+    const auto cost = loop_ends_.at(loop->second);
+    auto *instructions = builder_.CreateUDiv(values[instruction_remaining_value],
+                                             builder_.getInt64(cost.instructions));
+    auto *cycles =
+        builder_.CreateUDiv(values[cycle_remaining_value], builder_.getInt64(cost.cycles));
+    auto *turns =
+        builder_.CreateSelect(builder_.CreateICmpULT(instructions, cycles), instructions, cycles);
+    values[loop_grant_value] = turns;
+    values[loop_remaining_value] = turns;
+    admitted =
+        builder_.CreateAnd(memory_admitted_, builder_.CreateICmpNE(turns, builder_.getInt64(0)));
+  } else if (grant.has_value()) {
+    admitted = builder_.CreateAnd(
+        memory_admitted_,
+        builder_.CreateAnd(builder_.CreateICmpUGE(values[instruction_remaining_value],
+                                                  builder_.getInt64(grant->instructions)),
+                           builder_.CreateICmpUGE(values[cycle_remaining_value],
+                                                  builder_.getInt64(grant->cycles))));
+  }
+  fast_entry_[i].incoming(values, admission_[i].block);
+  auto tail = values;
+  tail[tail_value] = builder_.getInt1(loop != loop_headers_.end() || grant.has_value());
+  partial_[i].incoming(tail, admission_[i].block);
+  builder_.CreateCondBr(
+      admitted,
+      fast_entry_[i].block,
+      partial_[i].block,
+      llvm::MDBuilder(module_.getContext()).createBranchWeights(common_weight, 1));
+  builder_.SetInsertPoint(fast_entry_[i].block);
+  values = fast_entry_[i].values();
+  values[credit_value] = builder_.getInt64(costs_[i].instructions);
+  jump(fast_[i], values);
+  builder_.SetInsertPoint(fast_[i].block);
+  values = fast_[i].values();
+  instruction(values, op, false);
+  if (costs_[i].instructions > 1) {
+    jump(fast_[i + 1], values);
+  } else {
+    complete(values, op, false);
+  }
+  builder_.SetInsertPoint(partial_[i].block);
+  values = partial_[i].values();
+  auto *execute = llvm::BasicBlock::Create(
+      module_.getContext(), "cold.execute." + std::to_string(i), function_);
+  auto *bound =
+      llvm::BasicBlock::Create(module_.getContext(), "cold.stop." + std::to_string(i), function_);
+  auto *available = builder_.CreateAnd(
+      builder_.CreateICmpNE(values[instruction_remaining_value], builder_.getInt64(0)),
+      builder_.CreateICmpNE(values[cycle_remaining_value], builder_.getInt64(0)));
+  builder_.CreateCondBr(available, execute, bound);
+  builder_.SetInsertPoint(bound);
+  exit(values, builder_.getInt32(op.address), NativeExit::bound);
+  builder_.SetInsertPoint(execute);
+  instruction(values, op, true);
+  if (costs_[i].instructions > 1) {
+    credit(values, builder_.getInt64(1), builder_.getInt64(1), true);
+    jump(partial_[i + 1], values);
+  } else {
+    complete(values, op, true);
+  }
+}
+
 void Lowering::emit() {
   stack_written_ = std::ranges::any_of(instructions_, [](const auto &op) {
     return op.type == return_branch_type ||
@@ -883,28 +1314,33 @@ void Lowering::emit() {
   for (std::size_t i = 0; i < instructions_.size(); ++i) {
     addresses_.emplace(instructions_[i].address, i);
     admission_.push_back(node("admit." + std::to_string(i)));
+    fast_entry_.push_back(node("grant.body." + std::to_string(i)));
     fast_.push_back(node("body." + std::to_string(i)));
     partial_.push_back(node("cold.prefix." + std::to_string(i)));
   }
-  const auto remaining = block_costs();
+  costs_ = block_costs();
+  plan_loops();
   builder_.SetInsertPoint(entry);
+  load_indices();
+  plan_memory();
+  const auto grants = unit_costs();
   Values initial{};
   for (unsigned reg = 0; reg < 16; ++reg) {
-    initial[reg] = pair(load(64, data_slot(0, reg)), load(64, data_slot(1, reg)), 64);
+    initial[reg] = reg < pinned_registers
+                       ? function_->getArg(unit_data + reg)
+                       : pair(load(64, data_slot(0, reg)), load(64, data_slot(1, reg)), 64);
   }
-  initial[status_value] = pair(load(32, astat_slot), load(32, astat_slot + 1), 32);
-  initial[sticky_value] = pair(load(32, stky_slot), load(32, stky_slot + 1), 32);
-  for (const auto [value, slot] : {std::pair{instruction_remaining_value, remaining_instructions},
-                                   std::pair{cycle_remaining_value, remaining_cycles}}) {
-    initial[value] = builder_.CreateLoad(
-        builder_.getInt64Ty(),
-        builder_.CreateGEP(builder_.getInt64Ty(), function_->getArg(1), builder_.getInt64(slot)));
-  }
-  for (const auto value : {instructions_retired_value, cycles_retired_value, credit_value}) {
-    initial[value] = builder_.getInt64(0);
-  }
-  initial_clock_ = load(64, clock_slot);
-  initial[hazard_value] = builder_.CreateICmpNE(load(8, hazard_slot), builder_.getInt8(0));
+  initial[status_value] = function_->getArg(unit_status);
+  initial[sticky_value] = function_->getArg(unit_sticky);
+  initial[instruction_remaining_value] = function_->getArg(unit_instructions);
+  initial[cycle_remaining_value] = function_->getArg(unit_cycles);
+  initial[instructions_retired_value] = function_->getArg(unit_retired_instructions);
+  initial[cycles_retired_value] = function_->getArg(unit_retired_cycles);
+  initial[credit_value] = builder_.getInt64(0);
+  initial[loop_grant_value] = builder_.getInt64(0);
+  initial[loop_remaining_value] = builder_.getInt64(0);
+  initial[tail_value] = builder_.getFalse();
+  initial[hazard_value] = function_->getArg(unit_hazard);
   initial[pc_stack_value] = llvm::PoisonValue::get(stack_type());
   initial[pc_stack_depth_value] = builder_.getInt32(0);
   initial[interrupt_latch_value] = builder_.getInt32(0);
@@ -917,9 +1353,7 @@ void Lowering::emit() {
         builder_.CreateZExt(load(8, stack_depth_slot), builder_.getInt32Ty());
     initial[interrupt_latch_value] = load(32, interrupt_latch_slot);
   }
-  initial_fetch_ = load(32, faddr_slot);
-  initial_decode_ = load(32, daddr_slot);
-  auto *pc = load(32, pc_slot);
+  auto *pc = function_->getArg(unit_pc);
   auto *resume = llvm::BasicBlock::Create(module_.getContext(), "cold.resume", function_);
   auto *unknown = llvm::BasicBlock::Create(module_.getContext(), "cold.entry", function_);
   const auto root = addresses_.at(entry_address_);
@@ -938,57 +1372,20 @@ void Lowering::emit() {
   }
   builder_.SetInsertPoint(unknown);
   exit(initial, pc, NativeExit::undeclared);
-  for (std::size_t i = 0; i < instructions_.size(); ++i) {
-    const auto &op = instructions_[i];
-    builder_.SetInsertPoint(admission_[i].block);
-    auto values = admission_[i].values();
-    values[credit_value] = builder_.getInt64(remaining[i].instructions);
-    auto *admitted = builder_.CreateAnd(
-        builder_.CreateICmpUGE(values[instruction_remaining_value], values[credit_value]),
-        builder_.CreateICmpUGE(values[cycle_remaining_value],
-                               builder_.getInt64(remaining[i].cycles)));
-    fast_[i].incoming(values, admission_[i].block);
-    partial_[i].incoming(values, admission_[i].block);
-    builder_.CreateCondBr(
-        admitted,
-        fast_[i].block,
-        partial_[i].block,
-        llvm::MDBuilder(module_.getContext()).createBranchWeights(common_weight, 1));
-    builder_.SetInsertPoint(fast_[i].block);
-    values = fast_[i].values();
-    instruction(values, op);
-    if (remaining[i].instructions > 1) {
-      jump(fast_[i + 1], values);
-    } else {
-      complete(values, op, false);
-    }
-    builder_.SetInsertPoint(partial_[i].block);
-    values = partial_[i].values();
-    auto *execute = llvm::BasicBlock::Create(
-        module_.getContext(), "cold.execute." + std::to_string(i), function_);
-    auto *bound =
-        llvm::BasicBlock::Create(module_.getContext(), "cold.stop." + std::to_string(i), function_);
-    auto *available = builder_.CreateAnd(
-        builder_.CreateICmpNE(values[instruction_remaining_value], builder_.getInt64(0)),
-        builder_.CreateICmpNE(values[cycle_remaining_value], builder_.getInt64(0)));
-    builder_.CreateCondBr(available, execute, bound);
-    builder_.SetInsertPoint(bound);
-    exit(values, builder_.getInt32(op.address), NativeExit::bound);
-    builder_.SetInsertPoint(execute);
-    instruction(values, op);
-    if (remaining[i].instructions > 1) {
-      credit(values, builder_.getInt64(1), builder_.getInt64(1), true);
-      jump(partial_[i + 1], values);
-    } else {
-      complete(values, op, true);
-    }
-  }
+  for (std::size_t i = 0; i < instructions_.size(); ++i) { emit_instruction(i, grants[i]); }
   emit_exit();
 }
 
 std::uint32_t context_mask(const std::vector<Instruction> &instructions) {
-  std::uint32_t mask{};
+  std::uint32_t mask{low_bank_mode};
   for (const auto &instruction : instructions) {
+    if (instruction.type == memory_move_type) {
+      const auto move = memory_move(instruction);
+      mask |=
+          dag_bank_mode(move.index) | simd_mode | (move.reg < 8 ? low_bank_mode : high_bank_mode);
+      if (!move.write && move.index == 1) { mask |= broadcast1_mode; }
+      if (!move.write && move.index == 9) { mask |= broadcast9_mode; }
+    }
     if (instruction.type == direct_branch_type || instruction.type == return_branch_type) {
       mask |= simd_mode | saturation_mode;
     }
@@ -1047,6 +1444,7 @@ std::shared_ptr<const PreparedImage> lower_image(const CodeImage &image,
   llvm::LLVMContext context;
   llvm::Module module(result->identity, context);
   for (const auto &variant : image.variants) {
+    validate_memory_layout(variant, result->identity);
     std::vector<Instruction> code;
     std::ranges::copy_if(instructions, std::back_inserter(code), [&](const auto &instruction) {
       return instruction.variant == variant.id;
@@ -1057,8 +1455,7 @@ std::shared_ptr<const PreparedImage> lower_image(const CodeImage &image,
       const auto connected = connected_code(code, entry);
       const auto mask = context_mask(connected);
       std::vector<std::uint32_t> contexts{0};
-      for (const auto bit :
-           {low_bank_mode, high_bank_mode, saturation_mode, truncation_mode, simd_mode}) {
+      for (std::uint32_t bit = 1; bit != 0; bit <<= 1) {
         if ((mask & bit) == 0) { continue; }
         const auto count = contexts.size();
         for (std::size_t i = 0; i < count; ++i) { contexts.push_back(contexts[i] | bit); }
@@ -1071,11 +1468,19 @@ std::shared_ptr<const PreparedImage> lower_image(const CodeImage &image,
                         .mask = mask,
                         .context = value,
                         .symbol = symbol};
-        Lowering(module, variant, connected, unit).emit();
         result->exports.push_back(symbol);
         result->units.push_back(std::move(unit));
       }
     }
+  }
+  const NativeAbi abi(module, result->units);
+  for (const auto &unit : result->units) {
+    const auto variant = std::ranges::find(image.variants, unit.variant, &CodeVariant::id);
+    std::vector<Instruction> code;
+    std::ranges::copy_if(instructions, std::back_inserter(code), [&](const auto &op) {
+      return op.variant == unit.variant;
+    });
+    Lowering(module, abi, *variant, connected_code(code, unit.entry), unit).emit();
   }
   std::string error;
   llvm::raw_string_ostream diagnostic(error);

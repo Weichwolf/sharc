@@ -83,7 +83,7 @@ struct Resume {
 
 struct Core::Impl {
   explicit Impl(Memory input, ExecutionMode input_mode)
-      : memory(std::move(input)), mode(input_mode) {
+      : memory(std::move(input)), mode(input_mode), pointers(detail::register_pointer_count) {
     for (unsigned lane = 0; lane < 2; ++lane) {
       for (unsigned bank = 0; bank < 2; ++bank) {
         for (unsigned reg = 0; reg < 16; ++reg) {
@@ -98,11 +98,18 @@ struct Core::Impl {
     pointers[detail::daddr_slot] = &state.registers.daddr;
     pointers[detail::clock_slot] = &state.registers.emuclk;
     pointers[detail::hazard_slot] = &previous_compute;
+    pointers[detail::mode_slot] = &state.registers.mode1;
     for (std::size_t index = 0; index < Registers::pc_stack_capacity; ++index) {
       pointers[detail::stack_slot + index] = &state.registers.pc_stack[index];
     }
     pointers[detail::stack_depth_slot] = &state.registers.pc_stack_pointer;
     pointers[detail::interrupt_latch_slot] = &state.registers.irptl;
+    for (unsigned bank = 0; bank < 2; ++bank) {
+      for (unsigned index = 0; index < 16; ++index) {
+        pointers[detail::dag_index_slot + (std::size_t{bank} * 16) + index] =
+            &state.registers.dag[bank][index].index;
+      }
+    }
   }
 
   void stopped_owner() const {
@@ -121,6 +128,37 @@ struct Core::Impl {
                    .instruction_bits = 0,
                    .detail = std::move(detail)};
     return {.progress = {}, .execution = state.execution, .has_fault = true, .fault = state.fault};
+  }
+
+  std::optional<RunResult> native_failure(const detail::ControlWords &control, Progress progress) {
+    const auto reason = static_cast<detail::NativeExit>(control[detail::exit_reason]);
+    RunResult result;
+    switch (reason) {
+      case detail::NativeExit::unsupported_memory:
+      case detail::NativeExit::access_fault:
+      case detail::NativeExit::code_alias:
+        result = fail(reason == detail::NativeExit::access_fault ? FaultReason::access_fault
+                                                                 : FaultReason::unsupported_feature,
+                      "memory space " + std::to_string(control[detail::memory_space]) +
+                          ", address " + std::to_string(control[detail::memory_address]) +
+                          (reason == detail::NativeExit::code_alias
+                               ? ": store may alias prepared instruction storage"
+                               : ": access denied or no prepared direct normal-word binding"));
+        result.fault.instruction = control[detail::fault_instruction];
+        result.fault.instruction_bits = detail::full_instruction_bits;
+        state.fault = result.fault;
+        break;
+      case detail::NativeExit::unsupported_stack:
+        result = fail(FaultReason::unsupported_feature,
+                      "PC stack underflow, overflow or tagged continuation is not implemented");
+        break;
+      case detail::NativeExit::undeclared:
+        result = fail(FaultReason::undeclared_entry, "execution reached an undeclared instruction");
+        break;
+      default: return std::nullopt;
+    }
+    result.progress = progress;
+    return result;
   }
 
   [[nodiscard]] bool continuing() const {
@@ -161,7 +199,7 @@ struct Core::Impl {
   std::shared_ptr<const NativeImage::Impl> installed;
   std::uint32_t variant{};
   std::optional<Resume> resume;
-  detail::RegisterPointers pointers{};
+  detail::RegisterPointers pointers;
 };
 
 struct Snapshot::Impl {
@@ -258,6 +296,9 @@ PreparationReport Core::install(const NativeImage &image, std::uint32_t variant)
   {
     impl_->executing = true;
     const auto release = llvm::make_scope_exit([&] { impl_->executing = false; });
+    const auto storage = detail::direct_memory(*image.impl_->image, variant, impl_->memory);
+    impl_->pointers.resize(detail::register_pointer_count);
+    impl_->pointers.insert(impl_->pointers.end(), storage.begin(), storage.end());
     detail::validate_code_storage(*image.impl_->image, variant, impl_->memory);
   }
   impl_->installed = image.impl_;
@@ -422,15 +463,9 @@ RunResult Core::Impl::execute(std::uint64_t instructions, std::uint64_t cycles) 
     resume = Resume{.identity = image.identity,
                     .variant = variant,
                     .address = state.registers.pc,
-                    .entry = image.units[*index].entry};
+                    .entry = static_cast<std::uint32_t>(control[detail::resume_entry])};
     const auto reason = static_cast<detail::NativeExit>(control[detail::exit_reason]);
-    if (reason == detail::NativeExit::unsupported_stack) {
-      return failure(FaultReason::unsupported_feature,
-                     "PC stack underflow, overflow or tagged continuation is not implemented");
-    }
-    if (reason == detail::NativeExit::undeclared) {
-      return failure(FaultReason::undeclared_entry, "execution reached an undeclared instruction");
-    }
+    if (const auto result = native_failure(control, progress)) { return *result; }
     if (reason != detail::NativeExit::indirect) { break; }
     resume.reset();
     if (progress.instructions == instructions || progress.base_cycles >= cycles) { break; }

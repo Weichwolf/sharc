@@ -409,6 +409,53 @@ void cached_call() {
             core.registers() == expected,
         "cached consumer-bound CALL/RTS lost architectural stack or bound state");
 }
+
+void cached_memory() {
+  constexpr std::uint64_t load = 0xa20000000000;
+  constexpr std::uint32_t ram_address = 0x90000;
+  constexpr std::uint32_t ram_id = 11;
+  constexpr std::uint32_t broadcast = 1U << 23;
+  constexpr std::uint32_t dag_alternate = 1U << 4;
+  constexpr std::uint32_t data_alternate = 1U << 10;
+  constexpr std::uint64_t raw = 0x1234567800;
+  constexpr std::array initial_bytes{
+      std::byte{0xee}, std::byte{0x78}, std::byte{0x56}, std::byte{0x34}, std::byte{0x12}};
+  auto ram = initial_bytes;
+  const std::array words{load};
+  fixture::Program program(words);
+  program.code.variants[0].layout.regions.push_back({.space = sharc::MemorySpace::data,
+                                                     .view = sharc::MemoryView::normal_word,
+                                                     .first = ram_address,
+                                                     .count = 1,
+                                                     .storage_id = ram_id,
+                                                     .byte_offset = 1,
+                                                     .byte_stride = 4,
+                                                     .readable = true,
+                                                     .writable = false,
+                                                     .initialized = true});
+  auto memory = program.memory();
+  memory.regions.push_back({.storage_id = ram_id, .bytes = ram, .generation = 1});
+  const auto semantic = sharc::Core::lower(program.code);
+  const auto loaded = sharc::Core::load(program.code, {}, semantic.artifact());
+  const auto native = sharc::Core::bind(loaded, consumer_compile(loaded));
+  sharc::Core core(memory);
+  auto expected = initial_registers();
+  expected.mode1 = broadcast | dag_alternate | data_alternate;
+  expected.dag[1][1].index = ram_address;
+  core.set_registers(expected);
+  (void)core.install(native, fixture::Program::variant_id);
+  const auto result = core.run(1);
+  expected.pe[0].data[1][0] = raw;
+  expected.pe[1].data[1][0] = raw;
+  ++expected.pc;
+  expected.faddr = expected.pc + 4;
+  expected.daddr = expected.pc + 2;
+  ++expected.emuclk;
+  check(!result.has_fault &&
+            result.progress == sharc::Progress{.instructions = 1, .base_cycles = 1} &&
+            core.registers() == expected && ram == initial_bytes,
+        "cached consumer-bound memory lost storage, broadcast or bank context");
+}
 } // namespace
 
 int main() try {
@@ -416,6 +463,7 @@ int main() try {
   installation_callbacks();
   connected_entries();
   cached_call();
+  cached_memory();
 } catch (const std::exception &error) {
 
   std::cerr << error.what() << '\n';

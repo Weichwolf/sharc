@@ -15,8 +15,10 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+option(SHARC_POISON_NATIVE_STATE "Check stale pinned fields during native execution" OFF)
+
 # The preparation identity follows source contents, including uncommitted edits.
-set(identity_input "${LLVM_PACKAGE_VERSION};${CMAKE_CXX_COMPILER_ID};${CMAKE_CXX_COMPILER_VERSION};${CMAKE_SYSTEM_NAME};${CMAKE_SYSTEM_PROCESSOR};${CMAKE_SIZEOF_VOID_P}")
+set(identity_input "${LLVM_PACKAGE_VERSION};${CMAKE_CXX_COMPILER_ID};${CMAKE_CXX_COMPILER_VERSION};${CMAKE_SYSTEM_NAME};${CMAKE_SYSTEM_PROCESSOR};${CMAKE_SIZEOF_VOID_P};${SHARC_POISON_NATIVE_STATE}")
 file(GLOB_RECURSE identity_sources CONFIGURE_DEPENDS src/*.cpp src/*.hpp include/*.hpp)
 list(APPEND identity_sources "${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.txt")
 foreach(source IN LISTS identity_sources)
@@ -28,8 +30,11 @@ string(SHA256 compiler_hash "${identity_input}")
 file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/generated/compiler_identity.hpp"
   CONTENT "// SPDX-License-Identifier: GPL-3.0-only\n#pragma once\n#define SHARC_COMPILER_IDENTITY \"sharc-preparation-v1-llvm${LLVM_PACKAGE_VERSION}-${compiler_hash}\"\n")
 
-add_library(sharc_core src/core.cpp src/decode.cpp src/compute.cpp src/image.cpp src/lower.cpp)
+add_library(sharc_core src/core.cpp src/decode.cpp src/compute.cpp src/image.cpp src/lower.cpp src/memory.cpp src/abi.cpp)
 add_library(sharc::core ALIAS sharc_core)
+if(SHARC_POISON_NATIVE_STATE)
+  target_compile_definitions(sharc_core PRIVATE SHARC_POISON_NATIVE_STATE=1)
+endif()
 set_target_properties(sharc_core PROPERTIES EXPORT_NAME core)
 target_compile_features(sharc_core PUBLIC cxx_std_23)
 target_include_directories(sharc_core PUBLIC
@@ -64,12 +69,12 @@ if(BUILD_TESTING)
       --fixed-header "${fixed_expectations}"
     DEPENDS ${reference_sources}
     VERBATIM)
-  add_executable(sharc_isa_test test/isa/fixed.cpp test/isa/control.cpp "${fixed_expectations}")
+  add_executable(sharc_isa_test test/isa/fixed.cpp test/isa/control.cpp test/isa/memory.cpp "${fixed_expectations}")
   target_link_libraries(sharc_isa_test PRIVATE sharc::core)
   target_include_directories(sharc_isa_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
   target_compile_options(sharc_isa_test PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion -Werror)
   add_test(NAME isa COMMAND sharc_isa_test)
-  foreach(suite IN ITEMS preparation state compute native control)
+  foreach(suite IN ITEMS preparation state compute native control memory)
     add_executable(sharc_${suite}_test test/core/${suite}.cpp)
     target_link_libraries(sharc_${suite}_test PRIVATE sharc::core)
     target_compile_options(sharc_${suite}_test PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion -Werror)

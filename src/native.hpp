@@ -10,6 +10,7 @@
 #include <sharc/core.hpp>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace sharc::detail {
@@ -26,12 +27,27 @@ inline constexpr std::size_t hazard_slot = clock_slot + 1;
 inline constexpr std::size_t stack_slot = hazard_slot + 1;
 inline constexpr std::size_t stack_depth_slot = stack_slot + Registers::pc_stack_capacity;
 inline constexpr std::size_t interrupt_latch_slot = stack_depth_slot + 1;
-inline constexpr std::size_t register_pointer_count = interrupt_latch_slot + 1;
+inline constexpr std::size_t dag_index_slot = interrupt_latch_slot + 1;
+inline constexpr std::size_t mode_slot = dag_index_slot + 32;
+inline constexpr std::size_t register_pointer_count = mode_slot + 1;
+inline constexpr std::uint32_t dag1_high_mode = 1U << 3;
+inline constexpr std::uint32_t dag1_low_mode = 1U << 4;
+inline constexpr std::uint32_t dag2_high_mode = 1U << 5;
+inline constexpr std::uint32_t dag2_low_mode = 1U << 6;
 inline constexpr std::uint32_t high_bank_mode = 1U << 7;
 inline constexpr std::uint32_t low_bank_mode = 1U << 10;
 inline constexpr std::uint32_t saturation_mode = 1U << 13;
 inline constexpr std::uint32_t truncation_mode = 1U << 15;
 inline constexpr std::uint32_t simd_mode = 1U << 21;
+inline constexpr std::uint32_t broadcast9_mode = 1U << 22;
+inline constexpr std::uint32_t broadcast1_mode = 1U << 23;
+
+[[nodiscard]] constexpr std::uint32_t dag_bank_mode(unsigned index) {
+  if (index < 4) { return dag1_low_mode; }
+  if (index < 8) { return dag1_high_mode; }
+  if (index < 12) { return dag2_low_mode; }
+  return dag2_high_mode;
+}
 
 enum ControlSlot : std::uint8_t {
   remaining_instructions,
@@ -39,11 +55,23 @@ enum ControlSlot : std::uint8_t {
   retired_instructions,
   retired_cycles,
   exit_reason,
+  memory_address,
+  memory_space,
+  fault_instruction,
+  resume_entry,
   control_count
 };
-enum class NativeExit : std::uint8_t { bound, undeclared, unsupported_stack, indirect };
+enum class NativeExit : std::uint8_t {
+  bound,
+  undeclared,
+  unsupported_stack,
+  indirect,
+  unsupported_memory,
+  access_fault,
+  code_alias
+};
 using NativeEntry = void (*)(void **, std::uint64_t *);
-using RegisterPointers = std::array<void *, register_pointer_count>;
+using RegisterPointers = std::vector<void *>;
 using ControlWords = std::array<std::uint64_t, control_count>;
 
 struct NativeUnit {
@@ -73,4 +101,8 @@ struct CompiledSymbols {
                                                               std::span<const std::byte> artifact);
 [[nodiscard]] CompiledSymbols compile_image(const PreparedImage &image);
 void validate_code_storage(const PreparedImage &image, std::uint32_t variant, const Memory &memory);
+void validate_memory_layout(const CodeVariant &variant, std::string_view identity);
+[[nodiscard]] std::vector<void *>
+direct_memory(const PreparedImage &image, std::uint32_t variant, const Memory &memory);
+[[nodiscard]] bool aliases_code(const CodeVariant &variant, std::size_t region);
 } // namespace sharc::detail

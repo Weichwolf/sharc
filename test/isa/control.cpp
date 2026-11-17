@@ -10,6 +10,7 @@
 #include <map>
 #include <sharc/core.hpp>
 #include <tuple>
+#include <vector>
 
 namespace {
 using fixture::check;
@@ -121,6 +122,89 @@ void counted_control_flow() {
             complete.progress == sharc::Progress{.instructions = 14, .base_cycles = loop_cycles} &&
             core.registers() == registers,
         "native backward branch lost loop-carried state or cycles");
+}
+
+std::vector<sharc::Registers> loop_prefixes(sharc::Registers registers, bool simd, unsigned bank) {
+  constexpr std::uint32_t preserved_status = 0x20000000;
+  constexpr unsigned turns = 5;
+  std::vector<sharc::Registers> result;
+  const auto record = [&](unsigned pc, unsigned cycles) {
+    registers.pc = fixture::code_address + pc;
+    registers.faddr = registers.pc + 4;
+    registers.daddr = registers.pc + 2;
+    registers.emuclk += cycles;
+    result.push_back(registers);
+  };
+  for (unsigned turn = 1; turn <= turns; ++turn) {
+    for (unsigned lane = 0; lane < (simd ? 2U : 1U); ++lane) {
+      registers.pe[lane].data[bank][0] += 1U << 8;
+      registers.pe[lane].astat = preserved_status;
+    }
+    record(1, 1);
+    for (unsigned lane = 0; lane < (simd ? 2U : 1U); ++lane) {
+      registers.pe[lane].data[bank][1] = std::uint64_t{turns - turn} << 8;
+      registers.pe[lane].astat = preserved_status | (turn == turns ? 9U : 8U);
+    }
+    record(2, 1);
+    record(turn == turns ? 3U : 0U, turn == turns ? 2U : 5U);
+  }
+  for (unsigned lane = 0; lane < (simd ? 2U : 1U); ++lane) {
+    registers.pe[lane].data[bank][3] = std::uint64_t{final_marker} << 8;
+  }
+  record(4, 1);
+  record(5, 1);
+  return result;
+}
+
+void loop_grant_boundaries() {
+  constexpr std::uint64_t decrement_r1 = 0x013e0002a110;
+  const std::array words{fixture::add(0, 0, 2),
+                         decrement_r1,
+                         jump(ne_condition, address_mask - 1, true),
+                         fixture::immediate(3, final_marker),
+                         std::uint64_t{0}};
+  fixture::Program program(words);
+  for (const auto mode : {sharc::ExecutionMode::strict, sharc::ExecutionMode::fast_fp32}) {
+    const auto native = sharc::Core::compile(program.code, {.mode = mode, .callbacks = {}});
+    for (const bool simd : {false, true}) {
+      for (const unsigned bank : {0U, 1U}) {
+        auto initial = initial_registers();
+        initial.mode1 = (bank << 10) | (unsigned{simd} << simd_bit);
+        for (auto &lane : initial.pe) {
+          lane.data[bank][0] = 0;
+          lane.data[bank][1] = 5U << 8;
+          lane.data[bank][2] = 1U << 8;
+          lane.astat = 0x20000000;
+          lane.stky = 0x80000000;
+        }
+        const auto expected = loop_prefixes(initial, simd, bank);
+        sharc::Core core(program.memory(), mode);
+        core.set_registers(initial);
+        (void)core.install(native, fixture::Program::variant_id);
+        const auto saved = core.save();
+        for (std::size_t i = 0; i < expected.size(); ++i) {
+          core.restore(saved);
+          const auto result = core.run(i + 1);
+          check(!result.has_fault && core.registers() == expected[i] &&
+                    result.progress ==
+                        sharc::Progress{.instructions = i + 1,
+                                        .base_cycles = expected[i].emuclk - initial.emuclk},
+                "whole-turn grant changed an instruction prefix");
+        }
+        for (std::uint64_t deadline = 1; deadline <= expected.back().emuclk - initial.emuclk;
+             ++deadline) {
+          const auto stop = std::ranges::find_if(expected, [&](const auto &registers) {
+            return registers.emuclk - initial.emuclk >= deadline;
+          });
+          core.restore(saved);
+          const auto result = core.run_until(deadline);
+          check(!result.has_fault && core.registers() == *stop &&
+                    result.progress.base_cycles == stop->emuclk - initial.emuclk,
+                "whole-turn grant changed a cycle deadline");
+        }
+      }
+    }
+  }
 }
 
 void wrapped_target() {
@@ -364,6 +448,7 @@ namespace fixture {
 void control_flow() {
   predicates();
   counted_control_flow();
+  loop_grant_boundaries();
   wrapped_target();
   long_native_loop();
   rejected_branch_forms();

@@ -158,6 +158,14 @@ void call_snapshot() {
             result.progress == sharc::Progress{.instructions = 2, .base_cycles = 5} &&
             second.registers() == redirected,
         "guarded return ignored an altered architectural return address");
+  const auto redirected_snapshot = second.save();
+  check(!second.run(1).has_fault && second.registers().pc == base + 8,
+        "native transfer lost the destination unit continuation");
+  sharc::Core resumed(program.memory());
+  (void)resumed.install(native, fixture::Program::variant_id);
+  resumed.restore(redirected_snapshot);
+  check(!resumed.run(1).has_fault && resumed.registers() == second.registers(),
+        "snapshot after a native unit transfer retained the source root");
   second.restore(saved);
   redirected = second.registers();
   redirected.pc_stack[0] = (base + 4) | call_tag;

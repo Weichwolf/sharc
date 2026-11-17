@@ -31,6 +31,7 @@ struct RegionLayout {
   bool initialized{};
 };
 
+// Overlapping physical bytes use one storage id; express logical aliases in layouts.
 struct MemoryRegion {
   std::uint32_t storage_id{};
   std::span<std::byte> bytes;

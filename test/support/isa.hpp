@@ -15,6 +15,7 @@ namespace fixture {
 enum class Width : std::uint8_t { short_word = 16, wide_word = 32, full_word = 48 };
 inline constexpr std::uint32_t code_address = 0x100;
 void control_flow();
+void memory_access();
 
 // Independently authored numerical encodings. No production decoder is included.
 inline void append(sharc::CodeSpan &span, std::uint64_t word, Width width = Width::full_word) {

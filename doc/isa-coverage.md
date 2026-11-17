@@ -8,13 +8,13 @@ is claimed.
 
 | Area | Required evidence | Status |
 |---|---|---|
-| Classic 48-bit ISA | Every documented instruction class, condition, legal operand and parallel form | Partial: register-immediate, fixed ALU, direct jump/call/return, NOP |
+| Classic 48-bit ISA | Every documented instruction class, condition, legal operand and parallel form | Partial: register-immediate, fixed ALU, direct flow, normal-word pre-indexed memory, NOP |
 | VISA 16/32/48 | All compact encodings, fetch boundaries, PC units and mode transitions | Unimplemented |
 | Arithmetic and SIMD | PEx/PEy, fixed point, 32-/40-bit float, rounding, modes, flags and exceptions | Partial: fixed ALU and bank/SIMD execution |
 | Strict numerical mode (default) | Exact guest 32-/40-bit behavior, RND32, conversion exceptions and native-path identity | Unimplemented |
 | FastFP32 numerical mode (opt-in) | Independent approximation expectations, rounding/flags, unchanged raw moves/integer behavior, separate translations | Unimplemented |
 | Parallel operations | Old operands, memory aliases, register exchanges and ordered partial effects | Unimplemented |
-| Address generation and memory | Both DAGs, modulo/reverse addressing, PM/DM and physical view aliases | Unimplemented |
+| Address generation and memory | Both DAGs, modulo/reverse addressing, PM/DM and physical view aliases | Partial: type 15 direct normal-word pre-indexing |
 | Sequencer and control | Delayed flow, DO/loop endpoints, LR, stacks, reset and interrupts | Partial: non-delayed direct flow, static calls/returns and branch stalls |
 | Chip-profile boundaries | ADSP-21489 memory/vector parameters and explicit I/O ownership | Unimplemented |
 | JIT coherence and hosts | Self-modifying aliases, natural loops, precise exits, x86-64 and ARM64 | Unimplemented |
@@ -70,7 +70,7 @@ Reference 2.4, 4-19–4-21 and 4-115–4-116). The preceding-compute history is 
 state, stored at exits and included in snapshots. Cycle bounds may cross the
 deadline to finish the current instruction; cycle credit cannot wrap under zero.
 External-flag and loop conditions refuse preparation. VISA, floating computation,
-multiplier, shifter, guest memory, delayed jumps, hardware loops, timer, reset and
+multiplier, shifter, remaining memory forms, delayed jumps, hardware loops, timer, reset and
 interrupt entry remain unimplemented. `interrupt_ready` reports false.
 
 Non-delayed direct CALL and plain conditional RTS keep static call targets and
@@ -84,6 +84,15 @@ Empty/overflowed stacks and returns with a loop/interrupt continuation tag fail 
 retiring that instruction, retaining any preceding completed prefix. These are
 qualification gaps, not architectural stack-exception implementations. Delayed,
 loop-reentry, interrupt and parallel-compute returns remain unsupported.
+
+Classic type 15 transfers use direct normal-word PM/DM layouts, pre-indexed
+32-bit displacements, physical DAG/data banks, explicit R/S registers, SIMD and
+read broadcast. Full raw registers and padded storage are checked at every
+instruction/cycle prefix by `test/isa/memory.cpp`. `test/core/memory.cpp` checks
+precise access/refusal prefixes, rebinding, declared code-storage reads, protected
+code-alias writes, ambiguous/truncated layouts and missing implicit SIMD storage.
+Runtime data callbacks, post-modification, other views and actual code transitions
+remain unimplemented. See [memory.md](memory.md) for the exact storage contract.
 
 `test/isa/fixed.cpp` obtains 116 paired-lane expectations from the independent
 Python reference and executes them under both numerical identities, both register
@@ -108,22 +117,30 @@ Reserved branch fields refuse preparation; legal but unimplemented modifiers
 refuse explicitly. These are ISA checks, not K4 benchmark results.
 Each prepared unit starts at one declared entry and includes its reachable direct
 control flow. Distinct entries receive independent units; a saved continuation
-retains its originating entry. Normal entry links directly into that flow; only
+retains the entry of its current unit, including after a native tail transfer. Normal entry links directly into that flow; only
 cold continuation resumes dispatch on PC. Artifact metadata preserves the entry
 identity across loading and binding. Disconnected and overlapping entry paths,
 owner PC replacement and cross-Core artifact-bound replay compare complete state.
+Simple contiguous backedge loops receive a whole-turn grant and account on exit;
+acyclic control flow uses a conservative unit grant. Other cycles use the cold
+exact path until their loop plan is implemented. Independent five-turn programs
+compare complete state at every instruction and deadline, in both numerical
+identities, SISD/SIMD and both low data banks. The optional poisoned-state build
+runs the same tests with stale pinned fields guarded. Full PM/DM virtual mappings
+and cross-unit flag recipes remain open; no performance result is claimed here.
 
 `test/core/native.cpp` checks cache round trips/refusal, consumer-linked LLVM IR,
 precise bounds and undeclared exits, stopped installation, code validation,
 memory rebinding and snapshot replay in another Core. The installed CMake
 consumer executes its own literal instruction program, snapshots inside a callee
 and replays the return. Cached bitcode also executes a call/return after loading
-and binding through consumer-linked IR.
+and binding through consumer-linked IR. Cached memory IR is also loaded and
+bound with alternate DAG/data banks and broadcast.
 
-Linux x86-64: Clang/LLVM 19.1.7 Release; the seven CTest checks pass, including an
+Linux x86-64: Clang/LLVM 19.1.7 Release; the eight CTest checks pass, including an
 installed consumer executing native instructions. clang-format and clang-tidy
 are clean. A source export without manuals or Git metadata builds and passes the
-same seven checks. macOS ARM64 remains untested. Hardware user counters
+same eight checks. macOS ARM64 remains untested. Hardware user counters
 `instructions:u,cycles:u` are accessible with perf_event_paranoid=2. K1–K6,
 hardware performance results and goal sanitizer
 qualification remain open. This initial S3 implementation does not complete the S3 milestone.
