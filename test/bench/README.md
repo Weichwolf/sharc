@@ -63,7 +63,8 @@ all PC-stack cells, both final return words, table contents and surrounding
 guards. The complete normal-word DM reservation is made read-only after table
 initialization, so any unexpected write fails the process. Code storage is
 separate. This is a consumer all-RAM mapping; protected peripheral I/O remains
-open. Hardware results for this first K4 baseline are pending publication.
+open. The [first Linux K4 baseline](results/linux-k4.md) records both modes
+and a K5 comparison at the same published source revision.
 
 ## K5 definition
 

@@ -235,7 +235,9 @@ are clean. A source export without manuals or Git metadata builds and passes the
 same checks. macOS ARM64 remains untested. The benchmark layer includes K4:
 a table-driven eight-state machine with nested calls, register-count rotation,
 complete registers/table/stack output and exact progress in both identities.
-Its hardware baseline awaits publication. K5 checks
+The [first Linux K4 baseline](../test/bench/results/linux-k4.md) reports
+both numeric identities with complete output and unscaled hardware counts.
+K5 checks
 a full 4096-word copy and running checksum repeated 512 times in each numerical
 mode, with complete output, guard bytes and exact progress checked. Its portable
 Clang O3 reference has separate source and no LTO. See `test/bench/README.md` for

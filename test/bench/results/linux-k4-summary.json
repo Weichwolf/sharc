@@ -1,0 +1,86 @@
+{
+  "host": {
+    "platform": "Linux",
+    "cpu": 4,
+    "compiler": "19.1.7 (3+b1)",
+    "compiler_identity": "sharc-preparation-v1-llvm19.1.7-bba7ec2ed9cdff200b943e107204bd8ab0ca539807c49e60b41f7decb503d3a2"
+  },
+  "results": [
+    {
+      "kernel": "K4",
+      "mode": "Strict",
+      "identity": "a64a3de35ba2c85cf3035e5358731ea55cbffd6c9f5c552ffe50e87bcaa0a096",
+      "guest_instructions": 18874369,
+      "guest_base_cycles": 39845886,
+      "preparation_seconds": 10.76204454,
+      "native_bytes": 1178592,
+      "metrics": {
+        "host_instructions_per_guest": {
+          "min": 78.19449476695088,
+          "median": 78.19449481993279,
+          "max": 78.19449487291469
+        },
+        "host_cycles_per_guest": {
+          "min": 26.901135449879146,
+          "median": 26.904262123941734,
+          "max": 26.950294921117628
+        },
+        "guest_instructions_per_second": {
+          "min": 149764318.22916368,
+          "median": 150385754.9468289,
+          "max": 150465441.241524
+        },
+        "guest_to_reference_time": {
+          "min": 141.33071441868393,
+          "median": 150.568586545802,
+          "max": 150.6409561795069
+        },
+        "nanoseconds_per_guest": {
+          "min": 6.646044379020035,
+          "median": 6.649565980192503,
+          "max": 6.677157895980523
+        }
+      },
+      "prepared_instructions": 61,
+      "native_bytes_per_prepared_instruction": 19321.180327868853
+    },
+    {
+      "kernel": "K4",
+      "mode": "FastFP32",
+      "identity": "c17db79a0b7168ba7209182c388c3dac5a213bf6c882dc46586133e25d8631c2",
+      "guest_instructions": 18874369,
+      "guest_base_cycles": 39845886,
+      "preparation_seconds": 10.75014628,
+      "native_bytes": 1178592,
+      "metrics": {
+        "host_instructions_per_guest": {
+          "min": 78.19449476695088,
+          "median": 78.19449487291469,
+          "max": 78.19449487291469
+        },
+        "host_cycles_per_guest": {
+          "min": 26.89913405846839,
+          "median": 26.906237713165403,
+          "max": 26.93821382849938
+        },
+        "guest_instructions_per_second": {
+          "min": 148438486.20273,
+          "median": 149628707.83018816,
+          "max": 150346332.66270918
+        },
+        "guest_to_reference_time": {
+          "min": 147.69630903719766,
+          "median": 148.2377284567553,
+          "max": 152.61730088771742
+        },
+        "nanoseconds_per_guest": {
+          "min": 6.651309561660048,
+          "median": 6.68320948901656,
+          "max": 6.73679734670865
+        }
+      },
+      "prepared_instructions": 61,
+      "native_bytes_per_prepared_instruction": 19321.180327868853
+    }
+  ]
+}
