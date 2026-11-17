@@ -14,3 +14,8 @@ LLVM 19 supplies SHA-256, LLVM IR/bitcode, optimization and ORC native compilati
 LLVM is licensed under Apache-2.0 WITH LLVM-exception; no LLVM
 source is vendored. See https://llvm.org/LICENSE.txt. No emulator instruction
 semantics were imported.
+
+The K4 benchmark follows the public armv5 32-bit control definition documented
+in Weichwolf/armv5 at revision a2c7a2b8b7a18eeb3ae49024a1ff8e6ca6e9aca8,
+test/bench/README.md. The SHARC program and its independent expectation
+calculations are authored here; no processor implementation is imported.

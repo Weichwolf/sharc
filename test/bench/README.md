@@ -1,26 +1,69 @@
 # Common benchmarks
 
-K5 is implemented. K1–K4 and K6 remain open; this is not complete S3 or a full
+K4 and K5 are implemented. K1–K3 and K6 remain open; this is not complete S3 or a full
 profile performance result. The current driver targets Linux with Clang. macOS
 ARM64 and protected-page I/O are untested.
 
 Configure a Release build with Clang 19, then run:
 
 ```sh
-cmake --build build --target sharc_k5_bench
+cmake --build build --target sharc_k4_bench sharc_k5_bench
+build/sharc_k4_bench --check
 build/sharc_k5_bench --check
 mkdir -p build/local
+build/sharc_k4_bench --measure > build/local/k4.jsonl
 build/sharc_k5_bench --measure > build/local/k5.jsonl
+python3 test/bench/summarize.py build/local/k4.jsonl > build/local/k4-summary.json
 python3 test/bench/summarize.py build/local/k5.jsonl > build/local/k5-summary.json
 ```
 
-`bench_k5` is a correctness test in the benchmark layer. It runs the complete
-kernel through the public interface in Strict and FastFP32 without requiring
+`bench_k4` and `bench_k5` are correctness tests in the benchmark layer. They run the complete
+kernels through the public interface in Strict and FastFP32 without requiring
 counter access. Measurement requires per-thread Linux user hardware counters;
 `--measure` fails if its instruction/cycle group cannot run fully and unscaled.
 No wall-time estimate substitutes for a counter. The process pins its own thread
 to its current allowed CPU. Stop other work owned by the measurement session;
 preparation, validation and native-reference execution stay outside guest counts.
+
+## K4 definition
+
+K4 follows the shared 32-bit state-machine definition in the public
+[armv5 benchmark description](https://github.com/Weichwolf/armv5/blob/a2c7a2b8b7a18eeb3ae49024a1ff8e6ca6e9aca8/test/bench/README.md).
+Starting at state 3 and accumulator `0x2468ace0`, run 1,048,576 transitions.
+Mask the state to three bits and use it to select one of eight handler addresses.
+The handler adds state to the accumulator, XORs state+1, sets state to
+`(state+3) mod 8`, and calls a common subroutine. That subroutine XORs the
+accumulator with a 32-bit right rotation of the new state by one and adds 3.
+All accumulator arithmetic wraps modulo `2^32`. Both stack frames return before
+the loop counter is decremented. Every handler is visited 131,072 times.
+
+The complete algorithm output is `(state, accumulator, last_handler)` =
+`(3, 0x24d0ace0, 0)`. Its twelve unsigned little-endian bytes have SHA-256
+`490294093fdf6b9e10740daa992391bae19396c6e78bff448f035b4e7ca37f25`.
+`control_expectations.py` computes that result and the first eight transitions
+using unbounded integers, a literal successor table and bit/quotient rotation.
+The separate portable C++ reference uses `std::rotr` and runtime initial state
+and transition count. Neither expected-result calculation shares production code.
+
+`k4.asm` is 79 source lines and 61 authored classic ISA instructions. `k4.cpp`
+encodes them without an assembler, places main/handlers/common at PM addresses
+`0x100/0x200/0x300`, and supplies eight table words at DM `0x90000`. Register R6
+holds the rotation count -1. Register-count ROT is lowered; immediate shifter
+forms remain open. Main dispatches indirectly, each handler calls the common
+routine directly, and RTS unwinds both architectural PC-stack frames. The
+caller's return site is a prepared continuation, not a public entry.
+
+Each transition retires 18 instructions. Its 38 nominal cycles include two
+DAG-load stalls at each of the table load and indirect CALL, three bubbles for
+each of the four call/return transfers, and the final conditional branch's
+three bubbles plus one flag interlock. The last branch saves three cycles and
+one final NOP retires. Each complete run therefore checks **18,874,369 guest
+instructions** and **39,845,886 base cycles**, the full register file, flags,
+all PC-stack cells, both final return words, table contents and surrounding
+guards. The complete normal-word DM reservation is made read-only after table
+initialization, so any unexpected write fails the process. Code storage is
+separate. This is a consumer all-RAM mapping; protected peripheral I/O remains
+open. Hardware results for this first K4 baseline are pending publication.
 
 ## K5 definition
 
@@ -60,11 +103,15 @@ map or peripheral protection. No handler, device or firmware asset is involved.
 
 Each numeric mode gets its own prepared image, identity, preparation seconds and
 native bytes. One full guest/reference warm-up precedes three measured pairs.
-The portable C++ copy/checksum in `reference.cpp` receives runtime spans and a
-pass count; CMake compiles that separate translation unit with `-O3 -fno-lto`.
+The portable C++ algorithms in `reference.cpp` receive runtime parameters; CMake compiles that separate translation unit with `-O3 -fno-lto`.
 On x86-64, `-march=native` selects host features, as the LLVM guest code generator
 does. It has no shared production implementation, compiler barriers or disabled
 optimization. Its complete output and checksum are checked independently.
+
+Both drivers share reservation, counter and timing code in `runner.hpp` and
+`counters.hpp`. JSONL also reports native bytes per unique prepared guest
+instruction: 61 for K4 and 13 for K5. This denominator counts declared words
+once, while native bytes include every prepared mode context.
 
 The JSONL stores every guest wall time, adjacent native-reference time, raw user
 instructions/cycles and counter enabled/running times. Counts cover the public
@@ -78,7 +125,7 @@ and cycles per guest instruction, guest instructions/second, and each paired
 ratio to the native-reference time. Native bytes include all prepared mode
 contexts and cold paths, not only the executed context.
 
-K5 is an integer workload: the two numerical modes have the same arithmetic
+K4 and K5 are integer workloads: the two numerical modes have the same arithmetic
 contract here. Separate measurements do not claim a floating-point speedup,
 floating qualification, or consumer whole-instrument throughput. The first [Linux K5 baseline](results/linux-k5.md) includes raw counts,
 min/median/max metrics and the host/source receipt.

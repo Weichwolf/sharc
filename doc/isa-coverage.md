@@ -8,9 +8,9 @@ is claimed.
 
 | Area | Required evidence | Status |
 |---|---|---|
-| Classic 48-bit ISA | Every documented instruction class, condition, legal operand and parallel form | Partial: register-immediate, fixed ALU, direct flow, normal-word pre-indexed memory, immediate DAG modify/reverse, NOP |
+| Classic 48-bit ISA | Every documented instruction class, condition, legal operand and parallel form | Partial: data/DAG transfers, fixed ALU/ROT, direct/indirect flow, normal-word pre-indexed memory, immediate DAG modify/reverse, NOP |
 | VISA 16/32/48 | All compact encodings, fetch boundaries, PC units and mode transitions | Unimplemented |
-| Arithmetic and SIMD | PEx/PEy, fixed point, 32-/40-bit float, rounding, modes, flags and exceptions | Partial: fixed ALU and bank/SIMD execution |
+| Arithmetic and SIMD | PEx/PEy, fixed point, 32-/40-bit float, rounding, modes, flags and exceptions | Partial: fixed ALU, register-count ROT and bank/SIMD execution |
 | Strict numerical mode (default) | Exact guest 32-/40-bit behavior, RND32, conversion exceptions and native-path identity | Unimplemented |
 | FastFP32 numerical mode (opt-in) | Independent approximation expectations, rounding/flags, unchanged raw moves/integer behavior, separate translations | Unimplemented |
 | Parallel operations | Old operands, memory aliases, register exchanges and ordered partial effects | Partial: raw register moves/swaps with supported fixed ALU writeback |
@@ -70,7 +70,7 @@ Reference 2.4, 4-19–4-21 and 4-115–4-116). The preceding-compute history is 
 state, stored at exits and included in snapshots. Cycle bounds may cross the
 deadline to finish the current instruction; cycle credit cannot wrap under zero.
 External-flag and loop conditions refuse preparation. VISA, floating computation,
-multiplier, shifter, remaining memory forms, delayed jumps, hardware loops, timer, reset and
+multiplier, remaining shifter and memory forms, delayed jumps, hardware loops, timer, reset and
 interrupt entry remain unimplemented. `interrupt_ready` reports false.
 
 Non-delayed direct CALL and plain conditional RTS keep static call targets and
@@ -107,7 +107,7 @@ cycle bounds, cross-Core snapshots, interlocks and refusal before parallel effec
 `test/core/native.cpp` also exercises a cached, consumer-linked indirect call.
 System-register transfers, other parallel compute classes, delayed flow and
 architectural stack exceptions remain open. This is
-preparation for K4, not a completed or measured K4 kernel.
+ISA evidence; the K4 benchmark below exercises nested direct/indirect calls.
 
 Classic type 5 transfers raw data among R/S and I/M/L/B registers, including
 cross-PE data moves and raw40 register swaps, with supported single-function fixed
@@ -140,8 +140,19 @@ bytes and old-operand/ALU-priority cases. Memory and indirect-branch fixtures ch
 zero/one/two intervening instructions, matching and unrelated I/M/L/B loads,
 consecutive pending loads, conditional loads, overlapping compute/branch stalls,
 cycle deadlines and cross-Core snapshots. Cached consumer-linked IR also loads
-B/L/I and consumes them in a circular MODIFY. This is ISA evidence; K4 remains
-unimplemented and unmeasured.
+B/L/I and consumes them in a circular MODIFY. This is ISA evidence; K4
+performance is measured separately in the benchmark layer.
+
+Register-count ROT projects the full signed 32-bit count, rotates the fixed-point
+word modulo 32, clears the destination extension byte, updates SZ and clears
+SV/SS while preserving other flags and STKY (PRM 2.4, 11-63). It uses the same
+conditional lane and writeback machinery as other computations.
+`test/isa/rotate.cpp` checks every source bit, zero/full words, large positive and
+negative counts including both signed extrema, destination/source/count aliases,
+independent data banks, SISD/SIMD predicates, ALUSAT/RND32 preservation and both
+numeric identities against an independent bit permutation. A shifter-condition
+branch checks its interlock across a cross-Core snapshot. Immediate ROT, other
+shifter operations and complete parallel-shifter qualification remain open.
 
 Classic type 15 transfers use direct normal-word PM/DM layouts, pre-indexed
 32-bit displacements, physical DAG/data banks, explicit R/S registers, SIMD and
@@ -218,17 +229,20 @@ and replays the return. Cached bitcode also executes a call/return after loading
 and binding through consumer-linked IR. Cached memory IR is also loaded and
 bound with alternate DAG/data banks and broadcast.
 
-Linux x86-64: Clang/LLVM 19.1.7 Release; the nine CTest checks pass, including an
+Linux x86-64: Clang/LLVM 19.1.7 Release; the ten CTest checks pass, including an
 installed consumer executing native instructions. clang-format and clang-tidy
 are clean. A source export without manuals or Git metadata builds and passes the
-same checks. macOS ARM64 remains untested. The benchmark layer now includes K5:
+same checks. macOS ARM64 remains untested. The benchmark layer includes K4:
+a table-driven eight-state machine with nested calls, register-count rotation,
+complete registers/table/stack output and exact progress in both identities.
+Its hardware baseline awaits publication. K5 checks
 a full 4096-word copy and running checksum repeated 512 times in each numerical
 mode, with complete output, guard bytes and exact progress checked. Its portable
 Clang O3 reference has separate source and no LTO. See `test/bench/README.md` for
 inputs, counts and measurement scope. Hardware user counters
 `instructions:u,cycles:u` are accessible with perf_event_paranoid=2. The first
 [Linux K5 measurements](../test/bench/results/linux-k5.md) publish both modes
-with complete output checks and unscaled hardware groups. K1–K4, K6 and goal sanitizer
+with complete output checks and unscaled hardware groups. K1–K3, K6 and goal sanitizer
 qualification remain open. This does not complete S3.
 
 ## S2 independent expectations (complete milestone, numerical gaps retained)

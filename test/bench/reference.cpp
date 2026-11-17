@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #include "reference.hpp"
 
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -17,4 +18,17 @@ std::uint32_t bench::copy_checksum(std::span<const std::uint32_t> input,
     }
   }
   return checksum;
+}
+
+bench::Control bench::control(std::uint32_t transitions, Control initial) {
+  for (std::uint32_t index = 0; index < transitions; ++index) {
+    const auto selected = initial.state & 7;
+    initial.accumulator += selected;
+    initial.accumulator ^= selected + 1;
+    initial.state = (selected + 3) & 7;
+    initial.accumulator ^= std::rotr(initial.state, 1);
+    initial.accumulator += 3;
+    initial.last_handler = selected;
+  }
+  return initial;
 }

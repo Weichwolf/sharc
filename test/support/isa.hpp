@@ -17,6 +17,7 @@ inline constexpr std::uint32_t code_address = 0x100;
 void control_flow();
 void computed_control_flow();
 void register_transfers();
+void rotations();
 void memory_access();
 void dag_addressing();
 

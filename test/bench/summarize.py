@@ -28,13 +28,21 @@ def summary(records):
             metrics["guest_instructions_per_second"].append(guest * 1e9 / run["nanoseconds"])
             metrics["guest_to_reference_time"].append(run["nanoseconds"] / run["reference_nanoseconds"])
             metrics["nanoseconds_per_guest"].append(run["nanoseconds"] / guest)
-        result.append({
+        entry = {
             "kernel": record["kernel"], "mode": record["mode"], "identity": record["identity"],
             "guest_instructions": guest, "guest_base_cycles": record["guest_base_cycles"],
             "preparation_seconds": record["preparation_seconds"], "native_bytes": record["native_bytes"],
             "metrics": {name: {"min": min(values), "median": statistics.median(values), "max": max(values)}
                         for name, values in metrics.items()},
-        })
+        }
+        if "prepared_instructions" in record:
+            prepared = record["prepared_instructions"]
+            if prepared <= 0:
+                raise ValueError("missing prepared instruction denominator")
+            entry["prepared_instructions"] = prepared
+            entry["native_bytes_per_prepared_instruction"] = record["native_bytes"] / prepared
+        result.append(entry)
+
     if not result:
         raise ValueError("no kernel records")
     return {"host": records[0], "results": result}

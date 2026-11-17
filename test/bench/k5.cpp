@@ -1,30 +1,22 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #include "../support/check.hpp"
 #include "../support/isa.hpp"
-#include "counters.hpp"
 #include "reference.hpp"
+#include "runner.hpp"
 
 #include <algorithm>
 #include <array>
-#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
-#include <iomanip>
 #include <iostream>
-#include <memory>
-#include <sched.h>
 #include <sharc/core.hpp>
 #include <sharc/memory.hpp>
-#include <span>
-#include <stdexcept>
-#include <string_view>
-#include <sys/mman.h>
 
 namespace {
 using fixture::check;
-using Clock = std::chrono::steady_clock;
-constexpr unsigned word_count = 4096, passes = 512, repetitions = 3;
+using Clock = bench::Clock;
+constexpr unsigned word_count = 4096, passes = 512;
 constexpr unsigned word_bytes = 4, byte_bits = 8, raw_shift = 8;
 constexpr std::uint32_t input_address = 0x90000, output_address = 0xa0000, ram_id = 11;
 constexpr std::uint32_t expected_checksum = 0xd9dd7e00, last_input = 0xc54bba88;
@@ -81,35 +73,8 @@ Words inputs() {
   return result;
 }
 
-class Storage {
+class Storage : public bench::WordSpace {
 public:
-  static constexpr auto bytes = std::size_t{1} << 34;
-
-  Storage()
-      : base_(mmap(nullptr,
-                   bytes,
-                   PROT_READ | PROT_WRITE,
-                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
-                   -1,
-                   0)) {
-    if (base_ == MAP_FAILED) { throw std::runtime_error("K5 complete-space reservation failed"); }
-  }
-
-  ~Storage() { (void)munmap(base_, bytes); }
-
-  Storage(const Storage &) = delete;
-  Storage &operator=(const Storage &) = delete;
-  Storage(Storage &&) = delete;
-  Storage &operator=(Storage &&) = delete;
-
-  [[nodiscard]] std::span<std::byte> all() const {
-    return {static_cast<std::byte *>(base_), bytes};
-  }
-
-  [[nodiscard]] std::span<std::byte> at(std::uint32_t address, std::size_t size) const {
-    return all().subspan(std::size_t{address} * word_bytes, size);
-  }
-
   void initialize(const Words &input) const {
     auto target = at(input_address, sizeof(input));
     for (std::size_t i = 0; i < input.size(); ++i) {
@@ -141,28 +106,7 @@ public:
             "K5 changed an output guard word");
     }
   }
-
-private:
-  void *base_;
 };
-
-int pin_cpu() {
-  cpu_set_t allowed;
-  CPU_ZERO(&allowed);
-  check(sched_getaffinity(0, sizeof(allowed), &allowed) == 0, "cannot read CPU affinity");
-  const auto current = sched_getcpu();
-  check(current >= 0 && CPU_ISSET(current, &allowed), "current CPU is outside the allowed set");
-  cpu_set_t selected;
-  CPU_ZERO(&selected);
-  CPU_SET(current, &selected);
-  check(sched_setaffinity(0, sizeof(selected), &selected) == 0, "cannot pin benchmark thread");
-  return current;
-}
-
-std::uint64_t nanoseconds(Clock::time_point start, Clock::time_point end) {
-  return static_cast<std::uint64_t>(
-      std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
-}
 
 void validate(const sharc::Core &core, const sharc::RunResult &result) {
   const auto registers = core.registers();
@@ -186,7 +130,7 @@ std::uint64_t reference_run(const Words &input) {
   const auto checksum = bench::copy_checksum(input, output, passes);
   const auto end = Clock::now();
   check(checksum == expected_checksum && output == input, "K5 native reference output differs");
-  return nanoseconds(start, end);
+  return bench::nanoseconds(start, end);
 }
 
 void run(sharc::ExecutionMode mode, bool measure) {
@@ -216,58 +160,28 @@ void run(sharc::ExecutionMode mode, bool measure) {
   core.set_registers(registers);
   (void)core.install(native, fixture::Program::variant_id);
   const auto initial = core.save();
-  validate(core, core.run(guest_instructions));
-  storage.validate(input);
-  (void)reference_run(input);
-  const auto report = native.report();
-  std::cout << R"({"kernel":"K5","mode":")"
-            << (mode == sharc::ExecutionMode::strict ? "Strict" : "FastFP32") << R"(","identity":)"
-            << std::quoted(report.identity) << ",\"preparation_seconds\":" << report.seconds
-            << ",\"native_bytes\":" << report.native_bytes
-            << ",\"guest_instructions\":" << guest_instructions
-            << ",\"guest_base_cycles\":" << guest_cycles << ",\"runs\":[";
-  std::unique_ptr<bench::Counters> counters;
-  if (measure) { counters = std::make_unique<bench::Counters>(); }
-  for (unsigned repeat = 0; repeat < (measure ? repetitions : 1); ++repeat) {
-    const auto reference = reference_run(input);
-    core.restore(initial);
-    storage.clear_output();
-    if (counters) { counters->start(); }
-    const auto start = Clock::now();
-    const auto result = core.run(guest_instructions);
-    const auto end = Clock::now();
-    const auto counts = counters ? counters->stop() : bench::Counts{};
-    validate(core, result);
-    storage.validate(input);
-    if (repeat != 0) { std::cout << ','; }
-    std::cout << "{\"nanoseconds\":" << nanoseconds(start, end)
-              << ",\"reference_nanoseconds\":" << reference << ",\"host_instructions\":";
-    if (measure) {
-      std::cout << counts.instructions;
-    } else {
-      std::cout << "null";
-    }
-    std::cout << ",\"host_cycles\":";
-    if (measure) {
-      std::cout << counts.cycles;
-    } else {
-      std::cout << "null";
-    }
-    std::cout << ",\"enabled\":" << counts.enabled << ",\"running\":" << counts.running << '}';
-  }
-  std::cout << "]}\n";
+  bench::sample(
+      {.name = "K5",
+       .mode = mode,
+       .progress = {.instructions = guest_instructions, .base_cycles = guest_cycles},
+       .prepared_instructions = 13},
+      native,
+      core,
+      measure,
+      [&] {
+        core.restore(initial);
+        storage.clear_output();
+      },
+      [&](const sharc::RunResult &result) {
+        validate(core, result);
+        storage.validate(input);
+      },
+      [&] { return reference_run(input); });
 }
 } // namespace
 
 int main(int argc, char **argv) try {
-  check(argc == 1 || (argc == 2 && (std::string_view(argv[1]) == "--measure" ||
-                                    std::string_view(argv[1]) == "--check")),
-        "usage: sharc_k5_bench [--check|--measure]");
-  const bool measure = argc == 2 && std::string_view(argv[1]) == "--measure";
-  std::cout << std::setprecision(10);
-  std::cout << R"({"platform":"Linux","cpu":)" << pin_cpu()
-            << ",\"compiler\":" << std::quoted(__clang_version__)
-            << ",\"compiler_identity\":" << std::quoted(sharc::Core::compiler_identity()) << "}\n";
+  const bool measure = bench::start(argc, argv);
   run(sharc::ExecutionMode::strict, measure);
   run(sharc::ExecutionMode::fast_fp32, measure);
 } catch (const std::exception &error) {

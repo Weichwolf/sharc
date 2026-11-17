@@ -58,6 +58,7 @@ constexpr unsigned shadow_register_first = 0x50;
 constexpr unsigned system_register_first = 0x60;
 constexpr unsigned ureg_mask = 127, byte_mask = 255;
 constexpr unsigned history_older_mask = 0xff00;
+constexpr unsigned rotate_opcode = 0x08;
 constexpr unsigned register_move_type = 5;
 constexpr unsigned immediate_move_type = 17;
 constexpr unsigned nop_type = 21;
@@ -110,7 +111,8 @@ constexpr std::array fixed_operations{
 bool supported_compute(const Compute &compute) {
   return compute.kind == ComputeKind::none ||
          (compute.kind == ComputeKind::alu &&
-          std::ranges::find(fixed_operations, compute.opcode) != fixed_operations.end());
+          std::ranges::find(fixed_operations, compute.opcode) != fixed_operations.end()) ||
+         (compute.kind == ComputeKind::shifter && compute.opcode == rotate_opcode);
 }
 
 struct MemoryMove {
@@ -564,6 +566,7 @@ private:
 
   llvm::Value *condition(const Values &values, unsigned code);
   Arithmetic arithmetic(const Values &values, const Compute &compute, unsigned opcode);
+  Arithmetic rotation(const Values &values, const Compute &compute);
   Arithmetic status_result(const Values &values,
                            const FixedResult &result,
                            llvm::Value *x,
@@ -938,6 +941,26 @@ void Lowering::retire_pipeline(Values &values, PipelineEffects effects) {
   values[extra_cycles_value] = builder_.CreateAdd(values[extra_cycles_value], stall);
 }
 
+Arithmetic Lowering::rotation(const Values &values, const Compute &compute) {
+  constexpr std::uint32_t shifter_flags = 0x3800;
+  constexpr std::uint32_t shifter_zero = 0x1000;
+  const auto word = [&](unsigned reg) {
+    return builder_.CreateTrunc(builder_.CreateLShr(values[reg], vector(64, raw_extension_bits)),
+                                vector_type(32));
+  };
+  auto *source = word(compute.inputs[0]);
+  auto *count = word(compute.inputs[1]);
+  auto *result =
+      builder_.CreateIntrinsic(llvm::Intrinsic::fshl, {vector_type(32)}, {source, source, count});
+  auto *zero = builder_.CreateICmpEQ(result, vector(32, 0));
+  auto *status =
+      builder_.CreateOr(builder_.CreateAnd(values[status_value], vector(32, ~shifter_flags)),
+                        flag(zero, shifter_zero));
+  auto *raw = builder_.CreateShl(builder_.CreateZExt(result, vector_type(64)),
+                                 vector(64, raw_extension_bits));
+  return {.raw = raw, .status = status, .sticky = values[sticky_value]};
+}
+
 void Lowering::instruction(Values &values, const Instruction &op, bool partial) {
   if (op.type == memory_move_type) {
     memory_instruction(values, op, partial);
@@ -983,6 +1006,8 @@ void Lowering::instruction(Values &values, const Instruction &op, bool partial) 
     const auto reg = compute.outputs[1];
     values[reg] = builder_.CreateSelect(selected, difference.raw, values[reg]);
     written_.insert(reg);
+  } else if (compute.kind == ComputeKind::shifter) {
+    result = rotation(values, compute);
   } else {
     result = arithmetic(values, compute, compute.opcode);
   }
