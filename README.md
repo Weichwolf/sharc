@@ -13,7 +13,8 @@ acceptance and [doc/architecture.md](doc/architecture.md) for the target design.
 The preparation implementation provides the two public headers, the `sharc::core`
 build target, ISA/VISA format and compute-field decoding, preparation diagnostics
 and raw architectural state/snapshot storage. Initial LLVM lowering executes
-classic ISA register-immediate moves, fixed ALU operations, direct jumps and NOP through
+classic ISA register-immediate moves, fixed ALU operations, non-delayed jumps,
+calls/returns and NOP through
 installed images, with separate mode identities, artifact caching and snapshots.
 Other instruction families refuse lowering explicitly. The CMake package installs
 the `sharc::core` target and exactly two public headers. The S2 independent

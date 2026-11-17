@@ -41,8 +41,10 @@ No host C++ object layout is a file or generated-code ABI.
 `State` adds cumulative instruction/base-cycle progress, instruction set, execution
 state and a latched fault. `Snapshot` is an immutable owning copy of the current
 state, yield request, prepared continuation identity/entry/address and preceding-compute
-history, tagged with the numerical mode. The latter preserves the conditional
-branch interlock across run bounds and snapshots. Restore replaces that
+history, tagged with the numerical mode. That history preserves the conditional
+branch interlock across run bounds and snapshots. Non-delayed CALL/RTS also retain
+every PC-stack cell, including popped entries; changing a return cell while
+stopped is observed by the guarded native return. Restore replaces that
 state, including clearing a later fault. It does not replace consumer memory or
 bindings. `set_registers` preserves hidden continuation when PC is unchanged;
 replacing PC starts a fresh declared entry and clears its preceding-compute

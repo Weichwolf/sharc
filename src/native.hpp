@@ -23,7 +23,10 @@ inline constexpr std::size_t faddr_slot = pc_slot + 1;
 inline constexpr std::size_t daddr_slot = faddr_slot + 1;
 inline constexpr std::size_t clock_slot = daddr_slot + 1;
 inline constexpr std::size_t hazard_slot = clock_slot + 1;
-inline constexpr std::size_t register_pointer_count = hazard_slot + 1;
+inline constexpr std::size_t stack_slot = hazard_slot + 1;
+inline constexpr std::size_t stack_depth_slot = stack_slot + Registers::pc_stack_capacity;
+inline constexpr std::size_t interrupt_latch_slot = stack_depth_slot + 1;
+inline constexpr std::size_t register_pointer_count = interrupt_latch_slot + 1;
 inline constexpr std::uint32_t high_bank_mode = 1U << 7;
 inline constexpr std::uint32_t low_bank_mode = 1U << 10;
 inline constexpr std::uint32_t saturation_mode = 1U << 13;
@@ -38,7 +41,7 @@ enum ControlSlot : std::uint8_t {
   exit_reason,
   control_count
 };
-enum class NativeExit : std::uint8_t { bound, undeclared };
+enum class NativeExit : std::uint8_t { bound, undeclared, unsupported_stack, indirect };
 using NativeEntry = void (*)(void **, std::uint64_t *);
 using RegisterPointers = std::array<void *, register_pointer_count>;
 using ControlWords = std::array<std::uint64_t, control_count>;

@@ -381,12 +381,41 @@ void connected_entries() {
             replay.registers().pe[0].data[0][8] == (alternate_marker << byte_shift),
         "owner PC replacement retained the previous region continuation");
 }
+
+void cached_call() {
+  constexpr std::uint64_t call = 0x06be00000000;
+  constexpr std::uint64_t rts = 0x0a3e00000000;
+  constexpr std::uint32_t call_tag = 1U << 24;
+  constexpr std::uint32_t empty = 1U << 22;
+  const auto base = fixture::code_address;
+  const std::array words{call | (base + 2), std::uint64_t{0}, rts};
+  fixture::Program program(words);
+  const auto semantic = sharc::Core::lower(program.code);
+  const auto loaded = sharc::Core::load(program.code, {}, semantic.artifact());
+  const auto native = sharc::Core::bind(loaded, consumer_compile(loaded));
+  sharc::Core core(program.memory());
+  auto expected = initial_registers();
+  core.set_registers(expected);
+  (void)core.install(native, fixture::Program::variant_id);
+  const auto result = core.run(3);
+  expected.pc = base + 2;
+  expected.faddr = expected.pc + 4;
+  expected.daddr = expected.pc + 2;
+  expected.pc_stack[0] = (base + 1) | call_tag;
+  expected.pe[0].stky = empty;
+  expected.emuclk += 9;
+  check(!result.has_fault &&
+            result.progress == sharc::Progress{.instructions = 3, .base_cycles = 9} &&
+            core.registers() == expected,
+        "cached consumer-bound CALL/RTS lost architectural stack or bound state");
+}
 } // namespace
 
 int main() try {
   lifecycle();
   installation_callbacks();
   connected_entries();
+  cached_call();
 } catch (const std::exception &error) {
 
   std::cerr << error.what() << '\n';

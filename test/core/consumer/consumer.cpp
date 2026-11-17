@@ -7,8 +7,14 @@
 #include <sharc/memory.hpp>
 
 int main() try {
-  // Independently authored: R0 = 2; R1 = 3; R2 = R0 + R1.
-  constexpr std::array<std::uint64_t, 3> words{0x0f0000000002, 0x0f0100000003, 0x013e00001201};
+  // R0 = 2; call a leaf that sets R1 = 3; return; R3 = 9; jump to R2 = R0 + R1.
+  constexpr std::array<std::uint64_t, 7> words{0x0f0000000002,
+                                               0x06be00000104,
+                                               0x0f0300000009,
+                                               0x063e00000106,
+                                               0x0f0100000003,
+                                               0x0a3e00000000,
+                                               0x013e00001201};
   constexpr unsigned word_bytes = 6;
   constexpr unsigned byte_bits = 8;
   constexpr std::uint32_t entry = 0x100;
@@ -46,11 +52,32 @@ int main() try {
   core.set_registers(registers);
   (void)core.install(native, 0);
   const auto snapshot = core.save();
-  const auto result = core.run(words.size());
-  if (result.has_fault || result.progress.instructions != words.size() ||
-      core.registers().pe[0].data[0][2] != (5U << byte_bits)) {
+  constexpr unsigned prefix = 2;
+  constexpr unsigned suffix = words.size() - prefix;
+  constexpr std::uint32_t call_tag = 1U << 24;
+  constexpr std::uint32_t empty = 1U << 22;
+  const auto called = core.run(prefix);
+  if (called.has_fault ||
+      called.progress != sharc::Progress{.instructions = prefix, .base_cycles = 5} ||
+      core.registers().pc != entry + 4 || core.registers().pc_stack_pointer != 1 ||
+      core.registers().pc_stack[0] != ((entry + 2) | call_tag)) {
     return 1;
   }
+  const auto callee = core.save();
+  const auto result = core.run(suffix);
+  constexpr unsigned suffix_cycles = 11;
+  const auto final = core.state();
+  if (result.has_fault ||
+      result.progress != sharc::Progress{.instructions = suffix, .base_cycles = suffix_cycles} ||
+      final.registers.pe[0].data[0][2] != (5U << byte_bits) ||
+      final.registers.pe[0].data[0][3] != (9U << byte_bits) ||
+      final.registers.pe[0].stky != empty || final.registers.pc != entry + words.size() ||
+      final.registers.pc_stack_pointer != 0 ||
+      final.registers.pc_stack[0] != ((entry + 2) | call_tag)) {
+    return 1;
+  }
+  core.restore(callee);
+  if (core.run(suffix).has_fault || core.state() != final) { return 1; }
   core.restore(snapshot);
   if (sharc::Core::compiler_identity().empty()) { return 1; }
   return core.state().progress.instructions == 0 ? 0 : 1;

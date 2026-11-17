@@ -98,6 +98,11 @@ struct Core::Impl {
     pointers[detail::daddr_slot] = &state.registers.daddr;
     pointers[detail::clock_slot] = &state.registers.emuclk;
     pointers[detail::hazard_slot] = &previous_compute;
+    for (std::size_t index = 0; index < Registers::pc_stack_capacity; ++index) {
+      pointers[detail::stack_slot + index] = &state.registers.pc_stack[index];
+    }
+    pointers[detail::stack_depth_slot] = &state.registers.pc_stack_pointer;
+    pointers[detail::interrupt_latch_slot] = &state.registers.irptl;
   }
 
   void stopped_owner() const {
@@ -116,6 +121,33 @@ struct Core::Impl {
                    .instruction_bits = 0,
                    .detail = std::move(detail)};
     return {.progress = {}, .execution = state.execution, .has_fault = true, .fault = state.fault};
+  }
+
+  [[nodiscard]] bool continuing() const {
+    return resume && resume->identity == installed->image->identity && resume->variant == variant &&
+           resume->address == state.registers.pc;
+  }
+
+  [[nodiscard]] bool entry_allowed() const {
+    if (continuing()) { return true; }
+    const auto &variants = installed->image->code.variants;
+    const auto code = std::ranges::find(variants, variant, &CodeVariant::id);
+    return code != variants.end() &&
+           (std::ranges::find(code->entries, state.registers.pc) != code->entries.end() ||
+            std::ranges::any_of(code->interrupt_vectors, [&](const auto &request) {
+              return request.vector == state.registers.pc;
+            }));
+  }
+
+  [[nodiscard]] std::optional<std::size_t> prepared_unit() const {
+    const auto &units = installed->image->units;
+    const auto entry = resume && continuing() ? resume->entry : state.registers.pc;
+    const auto unit = std::ranges::find_if(units, [&](const auto &candidate) {
+      return candidate.variant == variant && candidate.entry == entry &&
+             (state.registers.mode1 & candidate.mask) == candidate.context;
+    });
+    if (unit == units.end()) { return std::nullopt; }
+    return static_cast<std::size_t>(unit - units.begin());
   }
 
   RunResult execute(std::uint64_t instructions, std::uint64_t cycles);
@@ -347,64 +379,61 @@ RunResult Core::Impl::execute(std::uint64_t instructions, std::uint64_t cycles) 
   }
   const auto &image = *installed->image;
   const auto &registers = state.registers;
-  const auto code = std::ranges::find(image.code.variants, variant, &CodeVariant::id);
-  const bool continuing = resume && resume->identity == image.identity &&
-                          resume->variant == variant && resume->address == registers.pc;
-  const bool declared = code != image.code.variants.end() &&
-                        (std::ranges::find(code->entries, registers.pc) != code->entries.end() ||
-                         std::ranges::any_of(code->interrupt_vectors, [&](const auto &request) {
-                           return request.vector == registers.pc;
-                         }));
-  if (!continuing && !declared) {
-    return fail(FaultReason::undeclared_entry,
-                "execution PC is not a declared entry or saved continuation");
-  }
-  constexpr unsigned timer_enable = 1U << 5;
-  if (state.instruction_set != InstructionSet::isa || (registers.mode2 & timer_enable) != 0) {
-    return fail(FaultReason::unsupported_feature,
-                "VISA execution or an enabled core timer is not implemented");
-  }
-  if (yield_requested) {
-    yield_requested = false;
-    state.execution = ExecutionState::yielded;
-    return {.progress = {}, .execution = state.execution, .has_fault = false, .fault = {}};
-  }
-  if (instructions == 0 || cycles == 0) {
-    state.execution = ExecutionState::stopped;
-    return {.progress = {}, .execution = state.execution, .has_fault = false, .fault = {}};
-  }
-  const auto &units = image.units;
-  const auto unit = std::ranges::find_if(units, [&](const auto &candidate) {
-    return candidate.variant == variant &&
-           candidate.entry == (continuing ? resume->entry : registers.pc) &&
-           (registers.mode1 & candidate.mask) == candidate.context;
-  });
-  if (unit == units.end()) {
-    return fail(FaultReason::unsupported_feature, "no prepared MODE1 context");
-  }
-  detail::ControlWords control{};
-  control[detail::remaining_instructions] = instructions;
-  control[detail::remaining_cycles] = cycles;
-  const auto index = static_cast<std::size_t>(unit - units.begin());
-  state.execution = ExecutionState::running;
-  {
-    executing = true;
-    const auto release = llvm::make_scope_exit([&] { executing = false; });
-    installed->entries[index](pointers.data(), control.data());
-  }
-  const Progress progress{.instructions = control[detail::retired_instructions],
-                          .base_cycles = control[detail::retired_cycles]};
-  state.progress.instructions += progress.instructions;
-  state.progress.base_cycles += progress.base_cycles;
-  resume = Resume{.identity = image.identity,
-                  .variant = variant,
-                  .address = state.registers.pc,
-                  .entry = unit->entry};
-  if (control[detail::exit_reason] == static_cast<std::uint64_t>(detail::NativeExit::undeclared)) {
-    auto result =
-        fail(FaultReason::undeclared_entry, "execution reached an undeclared instruction");
+  Progress progress;
+  const auto failure = [&](FaultReason reason, std::string message) {
+    auto result = fail(reason, std::move(message));
     result.progress = progress;
     return result;
+  };
+  for (;;) {
+    if (!entry_allowed()) {
+      return failure(FaultReason::undeclared_entry,
+                     "execution PC is not a declared entry or saved continuation");
+    }
+    constexpr unsigned timer_enable = 1U << 5;
+    if (state.instruction_set != InstructionSet::isa || (registers.mode2 & timer_enable) != 0) {
+      return failure(FaultReason::unsupported_feature,
+                     "VISA execution or an enabled core timer is not implemented");
+    }
+    if (yield_requested) {
+      yield_requested = false;
+      state.execution = ExecutionState::yielded;
+      return {.progress = progress, .execution = state.execution, .has_fault = false, .fault = {}};
+    }
+    const auto cycle_budget = cycles - std::min(cycles, progress.base_cycles);
+    if (instructions == progress.instructions || cycle_budget == 0) { break; }
+    const auto index = prepared_unit();
+    if (!index) { return failure(FaultReason::unsupported_feature, "no prepared MODE1 context"); }
+    detail::ControlWords control{};
+    control[detail::remaining_instructions] = instructions - progress.instructions;
+    control[detail::remaining_cycles] = cycle_budget;
+    state.execution = ExecutionState::running;
+    {
+      executing = true;
+      const auto release = llvm::make_scope_exit([&] { executing = false; });
+      installed->entries[*index](pointers.data(), control.data());
+    }
+    const Progress retired{.instructions = control[detail::retired_instructions],
+                           .base_cycles = control[detail::retired_cycles]};
+    progress.instructions += retired.instructions;
+    progress.base_cycles += retired.base_cycles;
+    state.progress.instructions += retired.instructions;
+    state.progress.base_cycles += retired.base_cycles;
+    resume = Resume{.identity = image.identity,
+                    .variant = variant,
+                    .address = state.registers.pc,
+                    .entry = image.units[*index].entry};
+    const auto reason = static_cast<detail::NativeExit>(control[detail::exit_reason]);
+    if (reason == detail::NativeExit::unsupported_stack) {
+      return failure(FaultReason::unsupported_feature,
+                     "PC stack underflow, overflow or tagged continuation is not implemented");
+    }
+    if (reason == detail::NativeExit::undeclared) {
+      return failure(FaultReason::undeclared_entry, "execution reached an undeclared instruction");
+    }
+    if (reason != detail::NativeExit::indirect) { break; }
+    resume.reset();
+    if (progress.instructions == instructions || progress.base_cycles >= cycles) { break; }
   }
   state.execution = ExecutionState::stopped;
   return {.progress = progress, .execution = state.execution, .has_fault = false, .fault = {}};

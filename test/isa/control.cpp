@@ -3,7 +3,9 @@
 #include "../support/isa.hpp"
 #include "fixed_cases.hpp"
 
+#include <algorithm>
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <map>
 #include <sharc/core.hpp>
@@ -171,13 +173,189 @@ void rejected_branch_forms() {
             "reserved branch lost fault identity or location");
     }
   }
-  constexpr std::array unsupported_bits{24U, 26U, 38U, 39U};
+  constexpr std::array unsupported_bits{24U, 26U, 38U};
   for (const auto bit : unsupported_bits) {
     const auto word =
         jump(true_condition, fixture::code_address, false) | (std::uint64_t{1} << bit);
     fixture::throws<sharc::PreparationError>(
         [&] { (void)sharc::Core::lower(fixture::image(sharc::InstructionSet::isa, word)); },
         "unimplemented direct-branch modifier was accepted");
+  }
+}
+
+struct CallBoundary {
+  unsigned pc, cycles, depth;
+};
+
+constexpr std::array call_boundaries{CallBoundary{.pc = 1, .cycles = 1, .depth = 0},
+                                     CallBoundary{.pc = 6, .cycles = 5, .depth = 1},
+                                     CallBoundary{.pc = 9, .cycles = 9, .depth = 2},
+                                     CallBoundary{.pc = 7, .cycles = 13, .depth = 1},
+                                     CallBoundary{.pc = 8, .cycles = 14, .depth = 1},
+                                     CallBoundary{.pc = 2, .cycles = 18, .depth = 0},
+                                     CallBoundary{.pc = 3, .cycles = 19, .depth = 0},
+                                     CallBoundary{.pc = 10, .cycles = 23, .depth = 0},
+                                     CallBoundary{.pc = 11, .cycles = 24, .depth = 0}};
+
+sharc::Registers call_state(sharc::Registers initial, std::size_t completed) {
+  constexpr std::uint32_t call_tag = 1U << 24;
+  constexpr std::uint32_t stack_empty = 1U << 22;
+  const auto depth = initial.pc_stack_pointer;
+  const bool simd = (initial.mode1 & (1U << simd_bit)) != 0;
+  for (std::size_t step = 0; step < completed; ++step) {
+    if (step == 0) {
+      initial.pe[0].data[0][0] = 5U << 8;
+      if (simd) { initial.pe[1].data[0][0] = 5U << 8; }
+    }
+    if (step == 1) { initial.pc_stack[depth] = (fixture::code_address + 2) | call_tag; }
+    if (step == 2) { initial.pc_stack[depth + 1U] = (fixture::code_address + 7) | call_tag; }
+    if (step == 4) {
+      initial.pe[0].data[0][2] = 7U << 8;
+      initial.pe[0].astat = 0;
+      if (simd) {
+        initial.pe[1].data[0][2] = 9U << 8;
+        initial.pe[1].astat = 0;
+      }
+    }
+    if (step == 6) {
+      initial.pe[0].data[0][3] = 9U << 8;
+      if (simd) { initial.pe[1].data[0][3] = 9U << 8; }
+    }
+  }
+  const auto &boundary = call_boundaries[completed - 1];
+  initial.pc_stack_pointer = static_cast<std::uint8_t>(depth + boundary.depth);
+  if (completed >= 2) {
+    initial.pe[0].stky &= ~stack_empty;
+    if (initial.pc_stack_pointer == 0) { initial.pe[0].stky |= stack_empty; }
+  }
+  initial.pc = fixture::code_address + boundary.pc;
+  initial.faddr = initial.pc + 4;
+  initial.daddr = initial.pc + 2;
+  initial.emuclk += boundary.cycles;
+  return initial;
+}
+
+void static_calls() {
+  constexpr std::uint64_t call = 1ULL << 39;
+  constexpr std::uint64_t rts = 0x0a3e00000000;
+  constexpr std::uint32_t stack_empty = 1U << 22;
+  constexpr std::uint32_t initial_sticky_x = 0xa5000240;
+  constexpr std::uint32_t initial_sticky_y = 0x95012345;
+  const auto base = fixture::code_address;
+  const std::array words{fixture::immediate(0, 5),
+                         jump(true_condition, base + 6, false) | call,
+                         fixture::immediate(3, 9),
+                         jump(true_condition, base + 10, false),
+                         std::uint64_t{0},
+                         std::uint64_t{0},
+                         jump(true_condition, base + 9, false) | call,
+                         fixture::add(2, 0, 1),
+                         rts,
+                         rts,
+                         std::uint64_t{0}};
+  fixture::Program program(words);
+  for (const auto mode : {sharc::ExecutionMode::strict, sharc::ExecutionMode::fast_fp32}) {
+    const auto native = sharc::Core::compile(program.code, {.mode = mode, .callbacks = {}});
+    for (const bool simd : {false, true}) {
+      for (const unsigned depth : {0U, 2U}) {
+        sharc::Core core(program.memory(), mode);
+        auto initial = initial_registers();
+        initial.mode1 = unsigned{simd} << simd_bit;
+        initial.pc_stack_pointer = static_cast<std::uint8_t>(depth);
+        initial.pe[0].data[0][1] = 2U << 8;
+        initial.pe[1].data[0][1] = 4U << 8;
+        initial.pe[0].stky = initial_sticky_x | (depth == 0 ? stack_empty : 0);
+        initial.pe[1].stky = initial_sticky_y;
+        for (std::size_t i = 0; i < initial.pc_stack.size(); ++i) {
+          initial.pc_stack[i] = static_cast<std::uint32_t>(i);
+        }
+        core.set_registers(initial);
+        (void)core.install(native, fixture::Program::variant_id);
+        const auto saved = core.save();
+        for (std::size_t count = 1; count <= call_boundaries.size(); ++count) {
+          core.restore(saved);
+          const auto result = core.run(count);
+          check(!result.has_fault &&
+                    result.progress ==
+                        sharc::Progress{.instructions = count,
+                                        .base_cycles = call_boundaries[count - 1].cycles} &&
+                    core.registers() == call_state(initial, count),
+                "nested static CALL/RTS differs at an instruction boundary");
+        }
+        for (unsigned deadline = 1; deadline <= call_boundaries.back().cycles; ++deadline) {
+          core.restore(saved);
+          const auto *found = std::ranges::find_if(
+              call_boundaries, [deadline](const auto &entry) { return entry.cycles >= deadline; });
+          const auto count = static_cast<std::size_t>(found - call_boundaries.begin()) + 1;
+          const auto result = core.run_until(deadline);
+          check(!result.has_fault && core.registers() == call_state(initial, count),
+                "nested static CALL/RTS crossed the wrong cycle boundary");
+        }
+      }
+    }
+  }
+}
+
+void verify_stack_predicate(const fixture::BranchCase &predicate,
+                            fixture::Program &program,
+                            const sharc::NativeImage &native,
+                            sharc::ExecutionMode mode,
+                            bool returning) {
+  constexpr std::uint32_t call_tag = 1U << 24;
+  constexpr std::uint32_t stack_empty = 1U << 22;
+  constexpr std::uint32_t old_sticky = 0xa5000240;
+  sharc::Core core(program.memory(), mode);
+  auto expected = initial_registers();
+  expected.mode1 = unsigned{predicate.simd} << simd_bit;
+  expected.pe[0].astat = predicate.astat[0];
+  expected.pe[1].astat = predicate.astat[1];
+  expected.pe[0].stky = old_sticky | (returning ? 0 : stack_empty);
+  expected.pe[1].stky = old_sticky;
+  expected.pc_stack_pointer = returning ? 1 : 0;
+  if (returning) { expected.pc_stack[0] = (fixture::code_address + 2) | call_tag; }
+  core.set_registers(expected);
+  (void)core.install(native, fixture::Program::variant_id);
+  const auto saved = core.save();
+  expected.pc += predicate.taken ? 2U : 1U;
+  expected.faddr = expected.pc + 4;
+  expected.daddr = expected.pc + 2;
+  const sharc::Progress progress{.instructions = 1, .base_cycles = predicate.taken ? 4U : 1U};
+  expected.emuclk += progress.base_cycles;
+  if (predicate.taken) {
+    if (returning) {
+      expected.pc_stack_pointer = 0;
+      expected.pe[0].stky |= stack_empty;
+    } else {
+      expected.pc_stack_pointer = 1;
+      expected.pc_stack[0] = (fixture::code_address + 1) | call_tag;
+      expected.pe[0].stky &= ~stack_empty;
+    }
+  }
+  const auto result = core.run(1);
+  check(!result.has_fault && result.progress == progress && core.registers() == expected,
+        "CALL/RTS predicate changed the wrong lane, stack, flags or target");
+  core.restore(saved);
+  const auto bounded = core.run_until(1);
+  check(!bounded.has_fault && bounded.progress == progress && core.registers() == expected,
+        "CALL/RTS predicate crossed a cycle bound before completing its stack effect");
+}
+
+void conditional_stack() {
+  constexpr std::uint64_t call = 1ULL << 39;
+  constexpr std::uint64_t rts_eq = 0x0a0000000000;
+  const std::array operations{
+      jump(0, fixture::code_address + 2, false) | call, jump(0, 2, true) | call, rts_eq};
+  for (const auto operation : operations) {
+    const std::array words{operation, std::uint64_t{0}, std::uint64_t{0}};
+    fixture::Program program(words);
+    program.code.variants[0].entries.push_back(fixture::code_address + 2);
+    for (const auto mode : {sharc::ExecutionMode::strict, sharc::ExecutionMode::fast_fp32}) {
+      const auto native = sharc::Core::compile(program.code, {.mode = mode, .callbacks = {}});
+      for (const auto &predicate : fixture::branch_cases) {
+        if (predicate.condition != 0 || predicate.saturate) { continue; }
+        verify_stack_predicate(predicate, program, native, mode, operation == rts_eq);
+      }
+    }
   }
 }
 } // namespace
@@ -189,5 +367,7 @@ void control_flow() {
   wrapped_target();
   long_native_loop();
   rejected_branch_forms();
+  static_calls();
+  conditional_stack();
 }
 } // namespace fixture

@@ -51,6 +51,7 @@ constexpr unsigned minimum = 0x61, maximum = 0x62, clip = 0x63, dual_add_subtrac
 constexpr unsigned immediate_move_type = 17;
 constexpr unsigned nop_type = 21;
 constexpr unsigned direct_branch_type = 8;
+constexpr unsigned return_branch_type = 11;
 constexpr std::uint64_t relative_branch = std::uint64_t{1} << 40;
 constexpr std::uint64_t call_branch = std::uint64_t{1} << 39;
 constexpr std::uint64_t abort_branch = std::uint64_t{1} << 38;
@@ -114,11 +115,11 @@ void validate_branch(const Instruction &instruction, std::string_view identity) 
   if ((instruction.word & ~allowed) != 0) {
     reject(instruction, identity, FaultReason::invalid_encoding, "reserved direct-branch bits");
   }
-  if ((instruction.word & modifiers) != 0) {
+  if ((instruction.word & (modifiers & ~call_branch)) != 0) {
     reject(instruction,
            identity,
            FaultReason::unsupported_instruction,
-           "call, delayed, loop-abort or interrupt-clear branch is not lowered");
+           "delayed, loop-abort or interrupt-clear branch is not lowered");
   }
   validate_condition(instruction, identity);
 }
@@ -126,6 +127,25 @@ void validate_branch(const Instruction &instruction, std::string_view identity) 
 std::uint32_t branch_target(const Instruction &instruction) {
   const auto base = (instruction.word & relative_branch) != 0 ? instruction.address : 0;
   return (base + static_cast<std::uint32_t>(instruction.word)) & maximum_pc;
+}
+
+void validate_return(const Instruction &instruction, std::string_view identity) {
+  constexpr unsigned opcode_shift = 40;
+  constexpr auto prefix = std::uint64_t{0x0b} << opcode_shift;
+  constexpr auto modifiers = std::uint64_t{7} << 24;
+  constexpr auto allowed =
+      prefix | (std::uint64_t{true_condition} << condition_shift) | modifiers | 0x7fffff;
+  if ((instruction.word & ~allowed) != 0) {
+    reject(instruction, identity, FaultReason::invalid_encoding, "reserved return bits");
+  }
+  if ((instruction.word >> opcode_shift) != 0x0a || (instruction.word & modifiers) != 0 ||
+      instruction.compute.kind != ComputeKind::none) {
+    reject(instruction,
+           identity,
+           FaultReason::unsupported_instruction,
+           "RTI, modified return or parallel return compute is not lowered");
+  }
+  validate_condition(instruction, identity);
 }
 
 void validate(const Instruction &instruction, std::string_view identity) {
@@ -138,6 +158,10 @@ void validate(const Instruction &instruction, std::string_view identity) {
   if (instruction.type == nop_type && instruction.word == 0) { return; }
   if (instruction.type == direct_branch_type) {
     validate_branch(instruction, identity);
+    return;
+  }
+  if (instruction.type == return_branch_type) {
+    validate_return(instruction, identity);
     return;
   }
   if (instruction.type == immediate_move_type) {
@@ -189,7 +213,10 @@ constexpr std::size_t instructions_retired_value = cycle_remaining_value + 1;
 constexpr std::size_t cycles_retired_value = instructions_retired_value + 1;
 constexpr std::size_t credit_value = cycles_retired_value + 1;
 constexpr std::size_t hazard_value = credit_value + 1;
-constexpr std::size_t state_value_count = hazard_value + 1;
+constexpr std::size_t pc_stack_value = hazard_value + 1;
+constexpr std::size_t pc_stack_depth_value = pc_stack_value + 1;
+constexpr std::size_t interrupt_latch_value = pc_stack_depth_value + 1;
+constexpr std::size_t state_value_count = interrupt_latch_value + 1;
 using Values = std::array<llvm::Value *, state_value_count>;
 
 struct Node {
@@ -255,6 +282,11 @@ private:
     return llvm::FixedVectorType::get(llvm::IntegerType::get(module_.getContext(), bits), 2);
   }
 
+  llvm::Type *stack_type() const {
+    return llvm::FixedVectorType::get(llvm::Type::getInt32Ty(module_.getContext()),
+                                      Registers::pc_stack_capacity);
+  }
+
   llvm::Constant *vector(unsigned bits, std::uint64_t value) const {
     return llvm::ConstantVector::getSplat(
         llvm::ElementCount::getFixed(2),
@@ -302,6 +334,8 @@ private:
       if (i < instruction_remaining_value) { type = vector_type(32); }
       if (i < status_value) { type = vector_type(64); }
       if (i == hazard_value) { type = builder_.getInt1Ty(); }
+      if (i == pc_stack_value) { type = stack_type(); }
+      if (i == pc_stack_depth_value || i == interrupt_latch_value) { type = builder_.getInt32Ty(); }
       result.phi[i] = start.CreatePHI(type, 2);
     }
     return result;
@@ -331,6 +365,11 @@ private:
   void finish(Values values, std::uint32_t next);
   void credit(Values &values, llvm::Value *count, llvm::Value *cycles, bool partial);
   void complete(Values values, const Instruction &op, bool partial);
+  void stack_guard(const Values &values, const Instruction &op, llvm::Value *allowed, bool partial);
+  void stack_status(Values &values);
+  void call(Values &values, const Instruction &op, bool partial);
+  llvm::Value *pop(Values &values, const Instruction &op, bool partial);
+  void return_to_caller(Values values, llvm::Value *target);
   std::vector<BlockCost> block_costs() const;
   void emit_exit();
 
@@ -348,6 +387,7 @@ private:
   std::vector<Node> admission_, fast_, partial_;
   std::set<unsigned> written_;
   bool flags_written_{};
+  bool stack_written_{};
   Node exit_;
   llvm::PHINode *exit_pc_{}, *exit_reason_{};
 };
@@ -538,7 +578,7 @@ Arithmetic Lowering::status_result(const Values &values,
 }
 
 void Lowering::instruction(Values &values, const Instruction &op) {
-  if (op.type != direct_branch_type) {
+  if (op.type != direct_branch_type && op.type != return_branch_type) {
     values[hazard_value] = builder_.getInt1(op.compute.kind != ComputeKind::none);
   }
   if (op.type == immediate_move_type) {
@@ -575,6 +615,112 @@ void Lowering::instruction(Values &values, const Instruction &op) {
   flags_written_ = true;
 }
 
+void Lowering::stack_guard(const Values &values,
+                           const Instruction &op,
+                           llvm::Value *allowed,
+                           bool partial) {
+  auto *admitted = llvm::BasicBlock::Create(module_.getContext(), "stack.admitted", function_);
+  auto *refused = llvm::BasicBlock::Create(module_.getContext(), "cold.stack", function_);
+  builder_.CreateCondBr(
+      allowed,
+      admitted,
+      refused,
+      llvm::MDBuilder(module_.getContext()).createBranchWeights(common_weight, 1));
+  builder_.SetInsertPoint(refused);
+  auto prefix = values;
+  if (!partial) {
+    auto *completed = builder_.CreateSub(values[credit_value], builder_.getInt64(1));
+    credit(prefix, completed, completed, false);
+  }
+  exit(prefix, builder_.getInt32(op.address), NativeExit::unsupported_stack);
+  builder_.SetInsertPoint(admitted);
+}
+
+void Lowering::stack_status(Values &values) {
+  constexpr std::uint32_t full = 1U << 21;
+  constexpr std::uint32_t empty = 1U << 22;
+  auto *depth = values[pc_stack_depth_value];
+  auto *status = builder_.CreateExtractElement(values[sticky_value], builder_.getInt32(0));
+  status = builder_.CreateAnd(status, builder_.getInt32(~(full | empty)));
+  status =
+      builder_.CreateOr(status,
+                        builder_.CreateSelect(builder_.CreateICmpEQ(depth, builder_.getInt32(0)),
+                                              builder_.getInt32(empty),
+                                              builder_.getInt32(0)));
+  status = builder_.CreateOr(
+      status,
+      builder_.CreateSelect(
+          builder_.CreateICmpEQ(depth, builder_.getInt32(Registers::pc_stack_capacity)),
+          builder_.getInt32(full),
+          builder_.getInt32(0)));
+  values[sticky_value] =
+      builder_.CreateInsertElement(values[sticky_value], status, builder_.getInt32(0));
+  flags_written_ = true;
+}
+
+void Lowering::call(Values &values, const Instruction &op, bool partial) {
+  constexpr std::uint32_t call_tag = 1U << 24;
+  constexpr unsigned almost_full = Registers::pc_stack_capacity - 1;
+  constexpr std::uint32_t stack_overflow_interrupt = 1U << 3;
+  auto *depth = values[pc_stack_depth_value];
+  stack_guard(values,
+              op,
+              builder_.CreateICmpULT(depth, builder_.getInt32(Registers::pc_stack_capacity)),
+              partial);
+  values[pc_stack_value] = builder_.CreateInsertElement(
+      values[pc_stack_value], builder_.getInt32(((op.address + 1) & maximum_pc) | call_tag), depth);
+  depth = builder_.CreateAdd(depth, builder_.getInt32(1));
+  values[pc_stack_depth_value] = depth;
+  values[interrupt_latch_value] = builder_.CreateOr(
+      values[interrupt_latch_value],
+      builder_.CreateSelect(builder_.CreateICmpEQ(depth, builder_.getInt32(almost_full)),
+                            builder_.getInt32(stack_overflow_interrupt),
+                            builder_.getInt32(0)));
+  stack_status(values);
+}
+
+llvm::Value *Lowering::pop(Values &values, const Instruction &op, bool partial) {
+  // PCSTK bit 25 records loop termination or interrupt continuation (A-10).
+  constexpr std::uint32_t sequencer_tag = 1U << 25;
+  auto *depth = values[pc_stack_depth_value];
+  stack_guard(values,
+              op,
+              builder_.CreateAnd(
+                  builder_.CreateICmpNE(depth, builder_.getInt32(0)),
+                  builder_.CreateICmpULE(depth, builder_.getInt32(Registers::pc_stack_capacity))),
+              partial);
+  auto *popped_depth = builder_.CreateSub(depth, builder_.getInt32(1));
+  auto *top = builder_.CreateExtractElement(values[pc_stack_value], popped_depth);
+  stack_guard(values,
+              op,
+              builder_.CreateICmpEQ(builder_.CreateAnd(top, builder_.getInt32(sequencer_tag)),
+                                    builder_.getInt32(0)),
+              partial);
+  values[pc_stack_depth_value] = popped_depth;
+  stack_status(values);
+  return builder_.CreateAnd(top, builder_.getInt32(maximum_pc));
+}
+
+void Lowering::return_to_caller(Values values, llvm::Value *target) {
+  auto *unknown = llvm::BasicBlock::Create(module_.getContext(), "cold.return", function_);
+  auto *dispatch = builder_.CreateSwitch(target, unknown);
+  std::set<std::uint32_t> returns;
+  for (const auto &op : instructions_) {
+    if (op.type == direct_branch_type && (op.word & call_branch) != 0) {
+      returns.insert((op.address + 1) & maximum_pc);
+    }
+  }
+  for (const auto address : returns) {
+    const auto found = addresses_.find(address);
+    if (found == addresses_.end()) { continue; }
+    auto &destination = admission_[found->second];
+    destination.incoming(values, builder_.GetInsertBlock());
+    dispatch->addCase(builder_.getInt32(address), destination.block);
+  }
+  builder_.SetInsertPoint(unknown);
+  exit(values, target, NativeExit::indirect);
+}
+
 void Lowering::credit(Values &values, llvm::Value *count, llvm::Value *cycles, bool partial) {
   values[instruction_remaining_value] =
       builder_.CreateSub(values[instruction_remaining_value], count);
@@ -593,7 +739,7 @@ void Lowering::credit(Values &values, llvm::Value *count, llvm::Value *cycles, b
 void Lowering::complete(Values values, const Instruction &op, bool partial) {
   auto *count = partial ? builder_.getInt64(1) : values[credit_value];
   const auto next = (op.address + 1) & maximum_pc;
-  if (op.type != direct_branch_type) {
+  if (op.type != direct_branch_type && op.type != return_branch_type) {
     credit(values, count, count, partial);
     finish(values, next);
     return;
@@ -606,7 +752,6 @@ void Lowering::complete(Values values, const Instruction &op, bool partial) {
                     ? builder_.getInt64(0)
                     : builder_.CreateZExt(values[hazard_value], builder_.getInt64Ty());
   auto *cycles = builder_.CreateAdd(count, stall);
-  values[hazard_value] = builder_.getFalse();
   auto *taken = builder_.CreateExtractElement(lanes, builder_.getInt32(0));
   if ((context_ & simd_mode) != 0) {
     taken = builder_.CreateAnd(taken, builder_.CreateExtractElement(lanes, builder_.getInt32(1)));
@@ -616,10 +761,20 @@ void Lowering::complete(Values values, const Instruction &op, bool partial) {
   builder_.CreateCondBr(taken, branch, fallthrough);
   builder_.SetInsertPoint(branch);
   auto branch_values = values;
+  if (op.type == direct_branch_type && (op.word & call_branch) != 0) {
+    call(branch_values, op, partial);
+  }
+  auto *target = op.type == return_branch_type ? pop(branch_values, op, partial) : nullptr;
+  branch_values[hazard_value] = builder_.getFalse();
   credit(
       branch_values, count, builder_.CreateAdd(cycles, builder_.getInt64(branch_penalty)), partial);
-  finish(branch_values, branch_target(op));
+  if (target != nullptr) {
+    return_to_caller(branch_values, target);
+  } else {
+    finish(branch_values, branch_target(op));
+  }
   builder_.SetInsertPoint(fallthrough);
+  values[hazard_value] = builder_.getFalse();
   credit(values, count, cycles, partial);
   finish(values, next);
 }
@@ -659,6 +814,15 @@ void Lowering::emit_exit() {
             stky_slot + lane);
     }
   }
+  if (stack_written_) {
+    for (unsigned index = 0; index < Registers::pc_stack_capacity; ++index) {
+      store(builder_.CreateExtractElement(values[pc_stack_value], builder_.getInt32(index)),
+            stack_slot + index);
+    }
+    store(builder_.CreateTrunc(values[pc_stack_depth_value], builder_.getInt8Ty()),
+          stack_depth_slot);
+    store(values[interrupt_latch_value], interrupt_latch_slot);
+  }
   store(exit_pc_, pc_slot);
   auto *retired = builder_.CreateICmpNE(values[instructions_retired_value], builder_.getInt64(0));
   auto *fetch = builder_.CreateAnd(builder_.CreateAdd(exit_pc_, builder_.getInt32(4)),
@@ -690,7 +854,7 @@ std::vector<BlockCost> Lowering::block_costs() const {
   for (std::size_t i = instructions_.size(); i != 0; --i) {
     const auto index = i - 1;
     const auto &op = instructions_[index];
-    if (op.type == direct_branch_type) {
+    if (op.type == direct_branch_type || op.type == return_branch_type) {
       result[index].cycles += branch_penalty;
       if (((op.word >> condition_shift) & true_condition) != true_condition) {
         ++result[index].cycles;
@@ -707,6 +871,10 @@ std::vector<BlockCost> Lowering::block_costs() const {
 }
 
 void Lowering::emit() {
+  stack_written_ = std::ranges::any_of(instructions_, [](const auto &op) {
+    return op.type == return_branch_type ||
+           (op.type == direct_branch_type && (op.word & call_branch) != 0);
+  });
   auto *entry = llvm::BasicBlock::Create(module_.getContext(), "entry", function_);
   exit_ = node("cold.exit");
   llvm::IRBuilder<> exit_builder(exit_.block);
@@ -737,6 +905,18 @@ void Lowering::emit() {
   }
   initial_clock_ = load(64, clock_slot);
   initial[hazard_value] = builder_.CreateICmpNE(load(8, hazard_slot), builder_.getInt8(0));
+  initial[pc_stack_value] = llvm::PoisonValue::get(stack_type());
+  initial[pc_stack_depth_value] = builder_.getInt32(0);
+  initial[interrupt_latch_value] = builder_.getInt32(0);
+  if (stack_written_) {
+    for (unsigned index = 0; index < Registers::pc_stack_capacity; ++index) {
+      initial[pc_stack_value] = builder_.CreateInsertElement(
+          initial[pc_stack_value], load(32, stack_slot + index), builder_.getInt32(index));
+    }
+    initial[pc_stack_depth_value] =
+        builder_.CreateZExt(load(8, stack_depth_slot), builder_.getInt32Ty());
+    initial[interrupt_latch_value] = load(32, interrupt_latch_slot);
+  }
   initial_fetch_ = load(32, faddr_slot);
   initial_decode_ = load(32, daddr_slot);
   auto *pc = load(32, pc_slot);
@@ -809,7 +989,9 @@ void Lowering::emit() {
 std::uint32_t context_mask(const std::vector<Instruction> &instructions) {
   std::uint32_t mask{};
   for (const auto &instruction : instructions) {
-    if (instruction.type == direct_branch_type) { mask |= simd_mode | saturation_mode; }
+    if (instruction.type == direct_branch_type || instruction.type == return_branch_type) {
+      mask |= simd_mode | saturation_mode;
+    }
     if (instruction.type == immediate_move_type) {
       mask |= low_bank_mode | high_bank_mode | simd_mode;
     }
@@ -835,7 +1017,14 @@ std::vector<Instruction> connected_code(const std::vector<Instruction> &code, st
     result.push_back(op);
     if (op.type == direct_branch_type) {
       pending.push_back(branch_target(op));
-      if (((op.word >> condition_shift) & true_condition) == true_condition) { continue; }
+      if ((op.word & call_branch) == 0 &&
+          ((op.word >> condition_shift) & true_condition) == true_condition) {
+        continue;
+      }
+    }
+    if (op.type == return_branch_type &&
+        ((op.word >> condition_shift) & true_condition) == true_condition) {
+      continue;
     }
     pending.push_back((op.address + 1) & maximum_pc);
   }
