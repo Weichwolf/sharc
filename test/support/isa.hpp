@@ -16,6 +16,7 @@ enum class Width : std::uint8_t { short_word = 16, wide_word = 32, full_word = 4
 inline constexpr std::uint32_t code_address = 0x100;
 void control_flow();
 void computed_control_flow();
+void register_transfers();
 void memory_access();
 void dag_addressing();
 

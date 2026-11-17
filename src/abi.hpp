@@ -23,7 +23,7 @@ enum UnitArgument : std::uint8_t {
   unit_pc = 6,
   unit_root = 7,
   unit_mode = 8,
-  unit_hazard = 9,
+  unit_pipeline = 9,
   unit_reason = 10,
   unit_data = 11,
   unit_status = unit_data + pinned_registers,

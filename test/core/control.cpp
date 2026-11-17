@@ -3,10 +3,12 @@
 #include "../support/isa.hpp"
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <exception>
 #include <iostream>
 #include <sharc/core.hpp>
+#include <sharc/memory.hpp>
 
 namespace {
 using fixture::check;
@@ -356,6 +358,117 @@ void stack_interlock() {
           "CALL/RTS interlock did not survive an exact owner bound");
   }
 }
+
+void stalled_stack_refusal() {
+  constexpr auto base = fixture::code_address;
+  constexpr unsigned b0_code = 0x40;
+  constexpr std::uint32_t ram_address = 0x90000;
+  constexpr std::uint32_t ram_id = 11;
+  constexpr std::uint32_t full = 1U << 21;
+  constexpr std::uint32_t value = 0x12345678;
+  constexpr std::uint64_t load_r1_i0 = 0xa00100000000;
+  constexpr std::uint64_t call = 0x06be00000000;
+  std::array<std::byte, 4> ram{};
+  for (unsigned byte = 0; byte < ram.size(); ++byte) {
+    ram[byte] = static_cast<std::byte>(value >> (byte * 8));
+  }
+  const std::array words{
+      fixture::immediate(b0_code, 0), load_r1_i0, call | (base + 3), std::uint64_t{0}};
+  fixture::Program program(words);
+  program.code.variants[0].layout.regions.push_back({.space = sharc::MemorySpace::data,
+                                                     .view = sharc::MemoryView::normal_word,
+                                                     .first = ram_address,
+                                                     .count = 1,
+                                                     .storage_id = ram_id,
+                                                     .byte_offset = 0,
+                                                     .byte_stride = 4,
+                                                     .readable = true,
+                                                     .writable = false,
+                                                     .initialized = true});
+  auto memory = program.memory();
+  memory.regions.push_back({.storage_id = ram_id, .bytes = ram, .generation = 1});
+  for (const auto mode : {sharc::ExecutionMode::strict, sharc::ExecutionMode::fast_fp32}) {
+    const auto native = sharc::Core::compile(program.code, {.mode = mode, .callbacks = {}});
+    for (const bool split : {false, true}) {
+      sharc::Core core(memory, mode);
+      sharc::Core resumed(memory, mode);
+      sharc::Registers expected;
+      expected.pc = base;
+      expected.pc_stack_pointer = sharc::Registers::pc_stack_capacity;
+      expected.pe[0].stky = full;
+      expected.dag[0][0] = {.index = ram_address, .modifier = 0, .length = 0, .base = 1};
+      core.set_registers(expected);
+      (void)core.install(native, fixture::Program::variant_id);
+      (void)resumed.install(native, fixture::Program::variant_id);
+      if (split) { check(!core.run(1).has_fault, "DAG-load refusal prefix failed"); }
+      resumed.restore(core.save());
+      const auto result = resumed.run(4);
+      expected.dag[0][0].base = 0;
+      expected.pe[0].data[0][1] = std::uint64_t{value} << 8;
+      expected.pc += 2;
+      expected.faddr = expected.pc + 4;
+      expected.daddr = expected.pc + 2;
+      expected.emuclk = 4;
+      check(result.has_fault && result.fault.reason == sharc::FaultReason::unsupported_feature &&
+                result.fault.address == base + 2 && resumed.registers() == expected &&
+                result.progress == sharc::Progress{.instructions = split ? 1U : 2U,
+                                                   .base_cycles = split ? 3U : 4U},
+            "stack refusal dropped retired DAG stalls or committed part of the failing CALL");
+    }
+  }
+}
+
+void unretired_branch_stalls() {
+  constexpr unsigned i8_code = 0x18;
+  constexpr std::uint64_t call_eq = 0x088000000000;
+  constexpr std::uint64_t rts_eq = 0x0a0000000000;
+  constexpr std::uint32_t full = 1U << 21;
+  constexpr std::uint32_t empty = 1U << 22;
+
+  struct Refused {
+    std::uint64_t prefix{}, branch{};
+    bool returning{}, load{};
+  };
+
+  const std::array cases{
+      Refused{.prefix = fixture::add(0, 0, 0), .branch = call_eq},
+      Refused{.prefix = fixture::add(0, 0, 0), .branch = rts_eq, .returning = true},
+      Refused{.prefix = fixture::immediate(i8_code, fixture::code_address + 2),
+              .branch = call_eq,
+              .load = true}};
+  for (const auto &row : cases) {
+    const std::array words{row.prefix, row.branch, std::uint64_t{0}};
+    fixture::Program program(words);
+    for (const auto mode : {sharc::ExecutionMode::strict, sharc::ExecutionMode::fast_fp32}) {
+      const auto native = sharc::Core::compile(program.code, {.mode = mode, .callbacks = {}});
+      sharc::Core core(program.memory(), mode);
+      sharc::Registers expected;
+      expected.pc = fixture::code_address;
+      expected.pe[0].astat = unsigned{row.load};
+      expected.pe[0].stky = row.returning ? empty : full;
+      expected.pc_stack_pointer = row.returning ? 0 : sharc::Registers::pc_stack_capacity;
+      core.set_registers(expected);
+      (void)core.install(native, fixture::Program::variant_id);
+      const auto saved = core.save();
+      expected.pe[0].astat = 1;
+      if (row.load) { expected.dag[0][8].index = fixture::code_address + 2; }
+      ++expected.pc;
+      expected.faddr = expected.pc + 4;
+      expected.daddr = expected.pc + 2;
+      expected.emuclk = 1;
+      const auto result = core.run(3);
+      check(result.has_fault && core.registers() == expected &&
+                result.progress == sharc::Progress{.instructions = 1, .base_cycles = 1},
+            "refused CALL/RTS charged an unretired instruction's pending stalls");
+      core.restore(saved);
+      check(!core.run(1).has_fault, "refused branch prefix failed");
+      const auto tail = core.run(1);
+      check(tail.has_fault && tail.progress == sharc::Progress{} && core.registers() == expected,
+            "refused CALL/RTS changed its exact owner-bound prefix");
+    }
+  }
+}
+
 } // namespace
 
 int main() try {
@@ -367,6 +480,8 @@ int main() try {
   unsupported_returns();
   skipped_full_call();
   stack_interlock();
+  stalled_stack_refusal();
+  unretired_branch_stalls();
 } catch (const std::exception &error) {
 
   std::cerr << error.what() << '\n';

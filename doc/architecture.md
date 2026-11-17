@@ -99,6 +99,12 @@ declared entries. The selected caller root survives an exact return bound and
 its snapshot. A shared reload and spill handle the pinned set; an explicit
 `SHARC_POISON_NATIVE_STATE` build verifies that its old Core fields stay untouched
 while native code runs. This build selection changes prepared-code identity.
+Used I/M/L/B fields remain SSA within each unit; unused DAG PHIs are omitted.
+A packed 32-bit pipeline argument carries the preceding-compute interlock and
+two physical DAG-load dependency tags under the existing native signature.
+Owner exits and snapshots preserve the same history. Fixed-cost loop admission
+proves empty incoming load history and propagates that fact into its body;
+acyclic grants reserve possible stalls and account the actual instruction costs.
 Cross-unit flag recipes, complete PM/DM virtual mappings, runtime data callbacks
 and their host fault handlers remain implementation work. See private issues
 blofeld-src #36/#37 and lead-a1-src #2 for coordination.

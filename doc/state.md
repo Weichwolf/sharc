@@ -47,8 +47,9 @@ every PC-stack cell, including popped entries; changing a return cell while
 stopped is observed by the guarded native return. Restore replaces that
 state, including clearing a later fault. It does not replace consumer memory or
 bindings. `set_registers` preserves hidden continuation when PC is unchanged;
-replacing PC starts a fresh declared entry and clears its preceding-compute
-history. The current execution implementation has no pending instruction,
+replacing PC starts a fresh declared entry and clears its pipeline history.
+Snapshots retain the preceding-compute interlock and two recent physical DAG
+register-load tags, including their remaining dependency distance. The current execution implementation has no pending instruction,
 branch, mode-register write or code transfer; their hidden continuation must be
 added to snapshots together with the corresponding execution implementation.
 Interrupted/delayed execution snapshots are not qualified yet.

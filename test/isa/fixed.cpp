@@ -124,6 +124,7 @@ void verify(const fixture::FixedCase &expected,
 } // namespace
 
 int main() try {
+  fixture::register_transfers();
   fixture::control_flow();
   fixture::computed_control_flow();
   fixture::memory_access();

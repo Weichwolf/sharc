@@ -13,8 +13,8 @@ is claimed.
 | Arithmetic and SIMD | PEx/PEy, fixed point, 32-/40-bit float, rounding, modes, flags and exceptions | Partial: fixed ALU and bank/SIMD execution |
 | Strict numerical mode (default) | Exact guest 32-/40-bit behavior, RND32, conversion exceptions and native-path identity | Unimplemented |
 | FastFP32 numerical mode (opt-in) | Independent approximation expectations, rounding/flags, unchanged raw moves/integer behavior, separate translations | Unimplemented |
-| Parallel operations | Old operands, memory aliases, register exchanges and ordered partial effects | Unimplemented |
-| Address generation and memory | Both DAGs, modulo/reverse addressing, PM/DM and physical view aliases | Partial: type 15 normal-word pre-indexing and type 19 immediate modify/reverse |
+| Parallel operations | Old operands, memory aliases, register exchanges and ordered partial effects | Partial: raw register moves/swaps with supported fixed ALU writeback |
+| Address generation and memory | Both DAGs, modulo/reverse addressing, PM/DM and physical view aliases | Partial: normal-word pre-indexing, immediate modify/reverse and DAG register-load dependencies |
 | Sequencer and control | Delayed flow, DO/loop endpoints, LR, stacks, reset and interrupts | Partial: non-delayed direct/indirect flow, calls/returns and branch stalls |
 | Chip-profile boundaries | ADSP-21489 memory/vector parameters and explicit I/O ownership | Unimplemented |
 | JIT coherence and hosts | Self-modifying aliases, natural loops, precise exits, x86-64 and ARM64 | Unimplemented |
@@ -58,7 +58,7 @@ or compile. Artifacts include bitcode and mode-unit metadata, a compiler/input
 identity and an integrity checksum. `load` parses and verifies those artifacts
 without lowering. The two public headers expose no LLVM types or register layout.
 
-Classic ISA support currently includes NOP, immediate moves into R0–R15, and
+Classic ISA support currently includes NOP, immediate moves into data/DAG registers, and
 conditional compute with the 21 fixed ALU opcodes ADD/SUB, carry/borrow forms,
 AVG, CMP/COMP, PASS, NEG, INC/DEC, ABS, AND/OR/XOR/NOT, MIN/MAX and CLIP. Fixed
 dual ADD/SUB with distinct outputs is lowered but lacks installed ISA qualification.
@@ -105,9 +105,43 @@ all I8–I15/M8–M15 selector fields, independent DAG quarters, displacement ex
 and wrap, EQ lane combinations with/without ELSE, complete call/return prefixes,
 cycle bounds, cross-Core snapshots, interlocks and refusal before parallel effects.
 `test/core/native.cpp` also exercises a cached, consumer-linked indirect call.
-Universal-register loads and their DAG dependency stalls, other parallel compute
-classes, delayed flow and architectural stack exceptions remain open. This is
+System-register transfers, other parallel compute classes, delayed flow and
+architectural stack exceptions remain open. This is
 preparation for K4, not a completed or measured K4 kernel.
+
+Classic type 5 transfers raw data among R/S and I/M/L/B registers, including
+cross-PE data moves and raw40 register swaps, with supported single-function fixed
+ALU computation. Both effects read the old operands and predicates; admitted UREG
+writes take priority over ALU data while the ALU flags and sticky effects survive.
+Complementary data destinations use their own lane predicates; a shared DAG
+destination uses PEx only. This follows PRM 2.4 tables 4-39/4-44 and the discussion
+on 4-102–4-103; the type-5 example on 9-24 instead describes an AND predicate.
+That inconsistency remains unverified on a primary implementation and prevents
+claiming full Strict qualification for this case. Immediate type 17 also writes
+S0–S15 and all DAG fields; raw transfers do not round in FastFP32.
+
+DAG loads retain two recent physical-register dependency tags across owner
+bounds, native transfers and snapshots. Address generation after I/B/L loads of
+the same index stalls two cycles, or one with an intervening unrelated cycle;
+M dependencies require the same M register (PRM 4-111–4-116). Nominal cycles
+include the actual stall and a deadline finishes the entire instruction. Branch
+bubbles drain that history; concurrent Decode/Address interlocks use the longest
+stall. Acyclic grants reserve the worst case and account actual cycles. Current
+fixed-cost loop grants require empty incoming DAG load history and no DAG loads
+in the loop; other cases use the same lowering in the cold exact path until
+proved cyclic dependency costs are available. Standalone MODIFY/BITREV does not
+create a UREG-load tag; its existing consumer-timing qualification gap below
+remains open.
+
+`test/isa/register.cpp` compares complete register state for every prefix, both
+numeric identities, all DAG fields and register selector fields, independent DAG
+quarter/data bank configurations, conditional SISD/SIMD moves/swaps, extension
+bytes and old-operand/ALU-priority cases. Memory and indirect-branch fixtures check
+zero/one/two intervening instructions, matching and unrelated I/M/L/B loads,
+consecutive pending loads, conditional loads, overlapping compute/branch stalls,
+cycle deadlines and cross-Core snapshots. Cached consumer-linked IR also loads
+B/L/I and consumes them in a circular MODIFY. This is ISA evidence; K4 remains
+unimplemented and unmeasured.
 
 Classic type 15 transfers use direct normal-word PM/DM layouts, pre-indexed
 32-bit displacements, physical DAG/data banks, explicit R/S registers, SIMD and

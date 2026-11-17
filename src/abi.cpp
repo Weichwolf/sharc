@@ -90,7 +90,7 @@ NativeAbi::NativeAbi(llvm::Module &module,
                                   builder.getInt32Ty(),
                                   builder.getInt32Ty(),
                                   builder.getInt32Ty(),
-                                  builder.getInt1Ty(),
+                                  builder.getInt32Ty(),
                                   builder.getInt64Ty()};
   types.insert(
       types.end(), pinned_registers, llvm::FixedVectorType::get(builder.getInt64Ty(), lanes));
@@ -144,8 +144,7 @@ void NativeAbi::emit_reload() {
   args[unit_mode] = load(builder.getInt32Ty(), mode_slot);
   args[unit_pc] = load(builder.getInt32Ty(), pc_slot);
   args[unit_root] = reload_->getArg(3);
-  args[unit_hazard] =
-      builder.CreateICmpNE(load(builder.getInt8Ty(), hazard_slot), builder.getInt8(0));
+  args[unit_pipeline] = load(builder.getInt32Ty(), pipeline_slot);
   args[unit_reason] = builder.getInt64(0);
   args[unit_retired_instructions] = builder.getInt64(0);
   args[unit_retired_cycles] = builder.getInt64(0);
@@ -229,7 +228,7 @@ void NativeAbi::emit_spill() {
             builder.CreateLoad(builder.getInt64Ty(), pointer(builder, pointers, clock_slot)),
             spill_->getArg(unit_retired_cycles)),
         clock_slot);
-  write(builder.CreateZExt(spill_->getArg(unit_hazard), builder.getInt8Ty()), hazard_slot);
+  write(spill_->getArg(unit_pipeline), pipeline_slot);
   for (const auto [slot, arg] : {std::pair{retired_instructions, unit_retired_instructions},
                                  std::pair{retired_cycles, unit_retired_cycles},
                                  std::pair{exit_reason, unit_reason},

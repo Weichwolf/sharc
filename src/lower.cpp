@@ -54,6 +54,11 @@ constexpr unsigned bit_and = 0x40, bit_or = 0x41, bit_xor = 0x42, bit_not = 0x43
 constexpr unsigned minimum = 0x61, maximum = 0x62, clip = 0x63, dual_add_subtract = 0x70;
 } // namespace alu
 
+constexpr unsigned shadow_register_first = 0x50;
+constexpr unsigned system_register_first = 0x60;
+constexpr unsigned ureg_mask = 127, byte_mask = 255;
+constexpr unsigned history_older_mask = 0xff00;
+constexpr unsigned register_move_type = 5;
 constexpr unsigned immediate_move_type = 17;
 constexpr unsigned nop_type = 21;
 constexpr unsigned direct_branch_type = 8;
@@ -146,6 +151,52 @@ IndexModify index_modify(const Instruction &instruction) {
           .reverse = (instruction.word & reverse) != 0};
 }
 
+struct PipelineEffects {
+  llvm::Value *stall{}, *tag{};
+};
+
+struct RegisterMove {
+  unsigned source{}, destination{};
+  bool swap{};
+};
+
+RegisterMove register_move(const Instruction &op) {
+  constexpr unsigned source_high_shift = 38;
+  constexpr unsigned source_low_shift = 31;
+  constexpr unsigned destination_shift = 23;
+  constexpr auto swap_flag = std::uint64_t{1} << 43;
+  if ((op.word & swap_flag) != 0) {
+    return {.source =
+                shadow_register_first + static_cast<unsigned>((op.word >> source_high_shift) & 15),
+            .destination = static_cast<unsigned>((op.word >> destination_shift) & 15),
+            .swap = true};
+  }
+  return {.source = static_cast<unsigned>(((op.word >> source_high_shift) & true_condition) << 2) |
+                    static_cast<unsigned>((op.word >> source_low_shift) & 3),
+          .destination = static_cast<unsigned>((op.word >> destination_shift) & byte_mask),
+          .swap = (op.word & swap_flag) != 0};
+}
+
+bool data_register(unsigned reg) {
+  return reg < 16 || (reg >= shadow_register_first && reg < system_register_first);
+}
+
+bool dag_register(unsigned reg) {
+  return reg >= 0x10 && reg < shadow_register_first;
+}
+
+unsigned dag_number(unsigned reg) {
+  return reg - 0x10;
+}
+
+unsigned loaded_register(const Instruction &op) {
+  if (op.type == register_move_type) { return register_move(op).destination; }
+  if (op.type == immediate_move_type) {
+    return static_cast<unsigned>((op.word >> immediate_register_shift) & ureg_mask);
+  }
+  return 0;
+}
+
 bool branch(const Instruction &op) {
   return op.type == direct_branch_type || op.type == computed_branch_type ||
          op.type == return_branch_type;
@@ -226,6 +277,25 @@ void validate_computed_branch(const Instruction &instruction, std::string_view i
   validate_condition(instruction, identity);
 }
 
+void validate_register_move(const Instruction &instruction, std::string_view identity) {
+  const auto move = register_move(instruction);
+  constexpr auto swap_allowed = std::uint64_t{0x78} << 40 | (std::uint64_t{15} << 38) |
+                                (std::uint64_t{31} << condition_shift) | (std::uint64_t{15} << 23) |
+                                0x7fffff;
+  if (move.swap && (instruction.word & ~swap_allowed) != 0) {
+    reject(instruction, identity, FaultReason::invalid_encoding, "reserved register-swap bits");
+  }
+  if ((!data_register(move.source) && !dag_register(move.source)) ||
+      (!data_register(move.destination) && !dag_register(move.destination)) ||
+      !supported_compute(instruction.compute)) {
+    reject(instruction,
+           identity,
+           FaultReason::unsupported_instruction,
+           "system register or parallel compute is not lowered");
+  }
+  validate_condition(instruction, identity);
+}
+
 void validate_return(const Instruction &instruction, std::string_view identity) {
   constexpr unsigned opcode_shift = 40;
   constexpr auto prefix = std::uint64_t{0x0b} << opcode_shift;
@@ -259,6 +329,21 @@ void validate_memory_move(const Instruction &instruction, std::string_view ident
          "forced long-word or non-data-register memory transfer is not lowered");
 }
 
+void validate_immediate_move(const Instruction &instruction, std::string_view identity) {
+  constexpr std::uint64_t reserved_immediate_bit = std::uint64_t{1} << 39;
+  if ((instruction.word & reserved_immediate_bit) != 0) {
+    reject(instruction, identity, FaultReason::invalid_encoding, "reserved ISA immediate-move bit");
+  }
+  const auto reg = (instruction.word >> immediate_register_shift) & 0x7f;
+  if (data_register(static_cast<unsigned>(reg)) || dag_register(static_cast<unsigned>(reg))) {
+    return;
+  }
+  reject(instruction,
+         identity,
+         FaultReason::unsupported_instruction,
+         "this universal-register immediate move is not lowered");
+}
+
 void validate(const Instruction &instruction, std::string_view identity) {
   if (instruction.instruction_set != InstructionSet::isa) {
     reject(instruction,
@@ -268,6 +353,10 @@ void validate(const Instruction &instruction, std::string_view identity) {
   }
   if (instruction.type == nop_type && instruction.word == 0) { return; }
   if (instruction.type == index_modify_type) { return; }
+  if (instruction.type == register_move_type) {
+    validate_register_move(instruction, identity);
+    return;
+  }
   if (instruction.type == direct_branch_type) {
     validate_branch(instruction, identity);
     return;
@@ -285,17 +374,8 @@ void validate(const Instruction &instruction, std::string_view identity) {
     return;
   }
   if (instruction.type == immediate_move_type) {
-    constexpr std::uint64_t reserved_immediate_bit = std::uint64_t{1} << 39;
-    if ((instruction.word & reserved_immediate_bit) != 0) {
-      reject(
-          instruction, identity, FaultReason::invalid_encoding, "reserved ISA immediate-move bit");
-    }
-    const auto reg = (instruction.word >> immediate_register_shift) & 0x7f;
-    if (reg < 16) { return; }
-    reject(instruction,
-           identity,
-           FaultReason::unsupported_instruction,
-           "this universal-register immediate move is not lowered");
+    validate_immediate_move(instruction, identity);
+    return;
   }
   if (instruction.type == 2) {
     constexpr auto allowed =
@@ -333,14 +413,19 @@ constexpr std::size_t instructions_retired_value = cycle_remaining_value + 1;
 constexpr std::size_t cycles_retired_value = instructions_retired_value + 1;
 constexpr std::size_t credit_value = cycles_retired_value + 1;
 constexpr std::size_t hazard_value = credit_value + 1;
-constexpr std::size_t pc_stack_value = hazard_value + 1;
+constexpr std::size_t extra_cycles_value = hazard_value + 1;
+constexpr std::size_t pc_stack_value = extra_cycles_value + 1;
 constexpr std::size_t pc_stack_depth_value = pc_stack_value + 1;
 constexpr std::size_t interrupt_latch_value = pc_stack_depth_value + 1;
 constexpr std::size_t loop_grant_value = interrupt_latch_value + 1;
 constexpr std::size_t loop_remaining_value = loop_grant_value + 1;
 constexpr std::size_t tail_value = loop_remaining_value + 1;
-constexpr std::size_t index_value = tail_value + 1;
-constexpr std::size_t state_value_count = index_value + 16;
+constexpr std::size_t dag_history_value = tail_value + 1;
+constexpr std::size_t index_value = dag_history_value + 1;
+constexpr std::size_t modifier_value = index_value + 16;
+constexpr std::size_t length_value = modifier_value + 16;
+constexpr std::size_t base_value = length_value + 16;
+constexpr std::size_t state_value_count = base_value + 16;
 using Values = std::array<llvm::Value *, state_value_count>;
 
 struct Node {
@@ -354,7 +439,9 @@ struct Node {
   }
 
   void incoming(const Values &values, llvm::BasicBlock *predecessor) const {
-    for (std::size_t i = 0; i < values.size(); ++i) { phi[i]->addIncoming(values[i], predecessor); }
+    for (std::size_t i = 0; i < values.size(); ++i) {
+      if (phi[i] != nullptr) { phi[i]->addIncoming(values[i], predecessor); }
+    }
   }
 };
 
@@ -449,12 +536,13 @@ private:
     result.block = llvm::BasicBlock::Create(module_.getContext(), name, function_);
     llvm::IRBuilder<> start(result.block);
     for (std::size_t i = 0; i < state_value_count; ++i) {
+      if (i >= index_value && dag_[i - index_value] == nullptr) { continue; }
       llvm::Type *type = builder_.getInt64Ty();
       if (i < instruction_remaining_value) { type = vector_type(32); }
       if (i < status_value) { type = vector_type(64); }
       if (i == hazard_value || i == tail_value) { type = builder_.getInt1Ty(); }
       if (i == pc_stack_value) { type = stack_type(); }
-      if (i >= index_value) { type = builder_.getInt32Ty(); }
+      if (i >= dag_history_value) { type = builder_.getInt32Ty(); }
       if (i == pc_stack_depth_value || i == interrupt_latch_value) { type = builder_.getInt32Ty(); }
       result.phi[i] = start.CreatePHI(type, 2);
     }
@@ -495,7 +583,11 @@ private:
                       bool partial);
   void finish(Values values, std::uint32_t next, bool partial);
   void credit(Values &values, llvm::Value *count, llvm::Value *cycles, bool partial);
-  void complete(Values values, const Instruction &op, bool partial, llvm::Value *lanes);
+  void complete(Values values,
+                const Instruction &op,
+                bool partial,
+                llvm::Value *lanes,
+                PipelineEffects pipeline);
   llvm::Value *branch_lanes(const Values &values, const Instruction &op, bool partial);
   llvm::Value *branch_taken(llvm::Value *lanes);
   void stack_guard(const Values &values, const Instruction &op, llvm::Value *allowed, bool partial);
@@ -506,7 +598,13 @@ private:
   std::vector<BlockCost> block_costs() const;
   void emit_exit();
   void load_indices();
-  void load_index(unsigned index);
+  void load_dag(unsigned reg);
+  llvm::Value *read_register(const Values &values, unsigned reg);
+  void write_register(Values &values, unsigned reg, llvm::Value *raw, llvm::Value *selected);
+  void register_instruction(Values &values, const Instruction &op, const Values &before);
+  llvm::Value *pipeline_stall(const Values &values, const Instruction &op);
+  llvm::Value *loaded_tag(const Values &values, const Instruction &op);
+  void retire_pipeline(Values &values, PipelineEffects effects);
   void plan_memory();
   std::pair<llvm::Value *, llvm::Value *> plan_pointer(const MemoryMove &move,
                                                        llvm::Value *address);
@@ -530,8 +628,8 @@ private:
   llvm::Value *memory_admitted_{};
   std::set<unsigned> written_;
   std::set<unsigned> y_written_;
-  std::array<llvm::Value *, 16> indices_{}, lengths_{}, bases_{}, modifiers_{};
-  std::set<unsigned> index_written_;
+  std::array<llvm::Value *, 64> dag_{};
+  std::set<unsigned> dag_written_;
   bool dag_status_written_{};
   std::vector<BlockCost> costs_;
   std::map<std::size_t, std::size_t> loop_headers_;
@@ -726,6 +824,120 @@ Arithmetic Lowering::status_result(const Values &values,
   return {.raw = raw, .status = status, .sticky = sticky};
 }
 
+llvm::Value *Lowering::read_register(const Values &values, unsigned reg) {
+  if (dag_register(reg)) {
+    auto *word = builder_.CreateShl(
+        builder_.CreateZExt(values[index_value + dag_number(reg)], builder_.getInt64Ty()),
+        builder_.getInt64(raw_extension_bits));
+    return pair(word, word, 64);
+  }
+  auto *raw = values[reg & 15];
+  return reg < 16 ? raw : builder_.CreateShuffleVector(raw, {1, 0});
+}
+
+void Lowering::write_register(Values &values,
+                              unsigned reg,
+                              llvm::Value *raw,
+                              llvm::Value *selected) {
+  if (dag_register(reg)) {
+    const auto slot = index_value + dag_number(reg);
+    auto *word = builder_.CreateTrunc(
+        builder_.CreateLShr(builder_.CreateExtractElement(raw, builder_.getInt32(0)),
+                            builder_.getInt64(raw_extension_bits)),
+        builder_.getInt32Ty());
+    values[slot] = builder_.CreateSelect(
+        builder_.CreateExtractElement(selected, builder_.getInt32(0)), word, values[slot]);
+    return;
+  }
+  if (reg >= 16) {
+    raw = builder_.CreateShuffleVector(raw, {1, 0});
+    selected = builder_.CreateShuffleVector(selected, {1, 0});
+    y_written_.insert(reg & 15);
+  }
+  values[reg & 15] = builder_.CreateSelect(selected, raw, values[reg & 15]);
+  written_.insert(reg & 15);
+}
+
+void Lowering::register_instruction(Values &values, const Instruction &op, const Values &before) {
+  const auto move = register_move(op);
+  auto *selected =
+      condition(before, static_cast<unsigned>((op.word >> condition_shift) & true_condition));
+  if (!move.swap) {
+    write_register(values, move.destination, read_register(before, move.source), selected);
+    return;
+  }
+  auto *x = builder_.CreateExtractElement(selected, builder_.getInt32(0));
+  auto *y = (context_ & simd_mode) != 0
+                ? builder_.CreateExtractElement(selected, builder_.getInt32(1))
+                : x;
+  write_register(values,
+                 move.destination,
+                 read_register(before, move.source),
+                 pair(x, builder_.getFalse(), 1));
+  write_register(values,
+                 move.source,
+                 read_register(before, move.destination),
+                 pair(y, builder_.getFalse(), 1));
+}
+
+llvm::Value *Lowering::loaded_tag(const Values &values, const Instruction &op) {
+  const auto reg = loaded_register(op);
+  if (!dag_register(reg)) { return builder_.getInt32(0); }
+  const auto index = reg & 15;
+  const auto bank = (context_ & dag_bank_mode(index)) != 0 ? 1U : 0U;
+  const auto tag = 1 + index + (bank * 16) + (reg >= 0x20 && reg < 0x30 ? 32U : 0U);
+  auto *selected =
+      condition(values,
+                op.type == immediate_move_type
+                    ? true_condition
+                    : static_cast<unsigned>((op.word >> condition_shift) & true_condition));
+  return builder_.CreateSelect(builder_.CreateExtractElement(selected, builder_.getInt32(0)),
+                               builder_.getInt32(tag),
+                               builder_.getInt32(0));
+}
+
+llvm::Value *Lowering::pipeline_stall(const Values &values, const Instruction &op) {
+  llvm::Value *stall = builder_.getInt64(0);
+  std::vector<unsigned> dependencies;
+  if (op.type == memory_move_type) { dependencies.push_back(memory_move(op).index); }
+  if (op.type == index_modify_type) { dependencies.push_back(index_modify(op).source); }
+  if (indirect_branch(op)) {
+    dependencies.push_back(branch_index(op));
+    dependencies.push_back(16 + branch_modifier(op));
+  }
+  auto *previous = builder_.CreateAnd(values[dag_history_value], builder_.getInt32(byte_mask));
+  auto *earlier = builder_.CreateLShr(values[dag_history_value], builder_.getInt32(8));
+  llvm::Value *recent_match = builder_.getFalse();
+  llvm::Value *earlier_match = builder_.getFalse();
+  for (const auto dependency : dependencies) {
+    const auto index = dependency & 15;
+    const auto bank = (context_ & dag_bank_mode(index)) != 0 ? 1U : 0U;
+    auto *tag = builder_.getInt32(1 + index + (bank * 16) + (dependency >= 16 ? 32U : 0U));
+    recent_match = builder_.CreateOr(recent_match, builder_.CreateICmpEQ(previous, tag));
+    earlier_match = builder_.CreateOr(earlier_match, builder_.CreateICmpEQ(earlier, tag));
+  }
+  stall = builder_.CreateSelect(recent_match,
+                                builder_.getInt64(2),
+                                builder_.CreateSelect(earlier_match, builder_.getInt64(1), stall));
+  if (branch(op) && ((op.word >> condition_shift) & true_condition) != true_condition) {
+    // Concurrent Decode/Address hazards overlap, rather than adding sequential stalls.
+    auto *compute = builder_.CreateZExt(values[hazard_value], builder_.getInt64Ty());
+    stall = builder_.CreateSelect(builder_.CreateICmpUGT(compute, stall), compute, stall);
+  }
+  return stall;
+}
+
+void Lowering::retire_pipeline(Values &values, PipelineEffects effects) {
+  const auto [stall, tag] = effects;
+  auto *history =
+      builder_.CreateAnd(builder_.CreateShl(values[dag_history_value], builder_.getInt32(8)),
+                         builder_.getInt32(history_older_mask));
+  history = builder_.CreateSelect(
+      builder_.CreateICmpEQ(stall, builder_.getInt64(0)), history, builder_.getInt32(0));
+  values[dag_history_value] = builder_.CreateOr(history, tag);
+  values[extra_cycles_value] = builder_.CreateAdd(values[extra_cycles_value], stall);
+}
+
 void Lowering::instruction(Values &values, const Instruction &op, bool partial) {
   if (op.type == memory_move_type) {
     memory_instruction(values, op, partial);
@@ -736,19 +948,22 @@ void Lowering::instruction(Values &values, const Instruction &op, bool partial) 
     values[hazard_value] = builder_.getInt1(op.compute.kind != ComputeKind::none);
   }
   if (op.type == immediate_move_type) {
-    const auto reg = static_cast<unsigned>((op.word >> immediate_register_shift) & 15);
+    const auto reg = loaded_register(op);
     auto *raw = vector(
         64, static_cast<std::uint64_t>(static_cast<std::uint32_t>(op.word)) << raw_extension_bits);
-    values[reg] = builder_.CreateSelect(condition(values, true_condition), raw, values[reg]);
-    written_.insert(reg);
+    write_register(values, reg, raw, condition(values, true_condition));
     return;
   }
   if (op.type == index_modify_type) {
     modify_instruction(values, op);
     return;
   }
+  const auto before = values;
   const auto &compute = op.compute;
-  if (compute.kind == ComputeKind::none) { return; }
+  if (compute.kind == ComputeKind::none) {
+    if (op.type == register_move_type) { register_instruction(values, op, before); }
+    return;
+  }
   auto *selected =
       condition(values, static_cast<unsigned>((op.word >> condition_shift) & true_condition));
   if (op.type == computed_branch_type) {
@@ -778,6 +993,7 @@ void Lowering::instruction(Values &values, const Instruction &op, bool partial) 
   }
   values[status_value] = builder_.CreateSelect(selected, result.status, values[status_value]);
   values[sticky_value] = builder_.CreateSelect(selected, result.sticky, values[sticky_value]);
+  if (op.type == register_move_type) { register_instruction(values, op, before); }
 }
 
 void Lowering::memory_failure(const Values &values,
@@ -799,7 +1015,7 @@ void Lowering::memory_failure(const Values &values,
   if (!partial) {
     auto *count = builder_.CreateSub(
         values[credit_value], builder_.getInt64(costs_[addresses_.at(op.address)].instructions));
-    credit(prefix, count, count, false);
+    credit(prefix, count, builder_.CreateAdd(count, values[extra_cycles_value]), false);
   }
   exit(prefix, builder_.getInt32(op.address), reason);
 }
@@ -808,8 +1024,8 @@ void Lowering::modify_instruction(Values &values, const Instruction &op) {
   constexpr unsigned first_sticky_bit = 17;
   constexpr unsigned first_interrupt_bit = 20;
   const auto modify = index_modify(op);
-  auto *length = lengths_[modify.source];
-  auto *base = bases_[modify.source];
+  auto *length = values[length_value + modify.source];
+  auto *base = values[base_value + modify.source];
   const auto immediate = static_cast<std::uint32_t>(op.word);
   const bool negative = (immediate >> 31) != 0;
   auto *sum = builder_.CreateAdd(values[index_value + modify.source], builder_.getInt32(immediate));
@@ -980,7 +1196,7 @@ void Lowering::stack_guard(const Values &values,
   auto prefix = values;
   if (!partial) {
     auto *completed = builder_.CreateSub(values[credit_value], builder_.getInt64(1));
-    credit(prefix, completed, completed, false);
+    credit(prefix, completed, builder_.CreateAdd(completed, values[extra_cycles_value]), false);
   }
   exit(prefix, builder_.getInt32(op.address), NativeExit::unsupported_stack);
   builder_.SetInsertPoint(admitted);
@@ -1083,6 +1299,7 @@ void Lowering::credit(Values &values, llvm::Value *count, llvm::Value *cycles, b
   values[instructions_retired_value] =
       builder_.CreateAdd(values[instructions_retired_value], count);
   values[cycles_retired_value] = builder_.CreateAdd(values[cycles_retired_value], cycles);
+  values[extra_cycles_value] = builder_.getInt64(0);
 }
 
 llvm::Value *Lowering::branch_taken(llvm::Value *lanes) {
@@ -1106,7 +1323,11 @@ llvm::Value *Lowering::branch_lanes(const Values &values, const Instruction &op,
   return lanes;
 }
 
-void Lowering::complete(Values values, const Instruction &op, bool partial, llvm::Value *lanes) {
+void Lowering::complete(Values values,
+                        const Instruction &op,
+                        bool partial,
+                        llvm::Value *lanes,
+                        PipelineEffects pipeline) {
   if (!partial && loop_ends_.contains(addresses_.at(op.address))) {
     complete_loop(values, op);
     return;
@@ -1114,16 +1335,12 @@ void Lowering::complete(Values values, const Instruction &op, bool partial, llvm
   auto *count = partial ? builder_.getInt64(1) : values[credit_value];
   const auto next = (op.address + 1) & maximum_pc;
   if (!branch(op)) {
-    credit(values, count, count, partial);
+    credit(values, count, builder_.CreateAdd(count, values[extra_cycles_value]), partial);
     finish(values, next, partial);
     return;
   }
-  // Conditional branches need the preceding compute's flags in Address, before
-  // Execute writes them back. The interlock survives owner bounds (4-115).
-  auto *stall = ((op.word >> condition_shift) & true_condition) == true_condition
-                    ? builder_.getInt64(0)
-                    : builder_.CreateZExt(values[hazard_value], builder_.getInt64Ty());
-  auto *cycles = builder_.CreateAdd(count, stall);
+  auto *cycles =
+      builder_.CreateAdd(builder_.CreateAdd(count, values[extra_cycles_value]), pipeline.stall);
   auto *taken = branch_taken(lanes);
   auto *branch = llvm::BasicBlock::Create(module_.getContext(), "jump", function_);
   auto *fallthrough = llvm::BasicBlock::Create(module_.getContext(), "fallthrough", function_);
@@ -1132,14 +1349,16 @@ void Lowering::complete(Values values, const Instruction &op, bool partial, llvm
   auto branch_values = values;
   if (call_branch_instruction(op)) { call(branch_values, op, partial); }
   auto *target = op.type == return_branch_type ? pop(branch_values, op, partial) : nullptr;
+  retire_pipeline(branch_values, pipeline);
   branch_values[hazard_value] = builder_.getFalse();
+  branch_values[dag_history_value] = builder_.getInt32(0);
   credit(
       branch_values, count, builder_.CreateAdd(cycles, builder_.getInt64(branch_penalty)), partial);
   if (target != nullptr) {
     return_to_caller(branch_values, target, partial);
   } else if (indirect_branch(op)) {
-    auto *address =
-        builder_.CreateAdd(values[index_value + branch_index(op)], modifiers_[branch_modifier(op)]);
+    auto *address = builder_.CreateAdd(values[index_value + branch_index(op)],
+                                       values[modifier_value + branch_modifier(op)]);
     exit(branch_values,
          builder_.CreateAnd(address, builder_.getInt32(maximum_pc)),
          NativeExit::indirect);
@@ -1147,6 +1366,7 @@ void Lowering::complete(Values values, const Instruction &op, bool partial, llvm
     finish(branch_values, branch_target(op), partial);
   }
   builder_.SetInsertPoint(fallthrough);
+  retire_pipeline(values, pipeline);
   values[hazard_value] = builder_.getInt1(op.compute.kind != ComputeKind::none);
   credit(values, count, cycles, partial);
   finish(values, next, partial);
@@ -1187,9 +1407,9 @@ void Lowering::emit_exit() {
       store(builder_.CreateExtractElement(values[reg], builder_.getInt32(1)), data_slot(1, reg));
     }
   }
-  for (const auto index : index_written_) {
-    const auto bank = (context_ & dag_bank_mode(index)) != 0 ? 1U : 0U;
-    store(values[index_value + index], dag_slot(bank, index));
+  for (const auto index : dag_written_) {
+    const auto bank = (context_ & dag_bank_mode(index & 15)) != 0 ? 1U : 0U;
+    store(values[index_value + index], dag_slot(bank, index & 15, index / 16));
   }
   if (stack_written_) {
     for (unsigned index = 0; index < Registers::pc_stack_capacity; ++index) {
@@ -1202,17 +1422,19 @@ void Lowering::emit_exit() {
   if (stack_written_ || dag_status_written_) {
     store(values[interrupt_latch_value], interrupt_latch_slot);
   }
-  std::vector<llvm::Value *> args{function_->getArg(unit_pointers),
-                                  function_->getArg(unit_controls),
-                                  values[instruction_remaining_value],
-                                  values[cycle_remaining_value],
-                                  values[instructions_retired_value],
-                                  values[cycles_retired_value],
-                                  exit_pc_,
-                                  builder_.getInt32(entry_address_),
-                                  function_->getArg(unit_mode),
-                                  values[hazard_value],
-                                  exit_reason_};
+  std::vector<llvm::Value *> args{
+      function_->getArg(unit_pointers),
+      function_->getArg(unit_controls),
+      values[instruction_remaining_value],
+      values[cycle_remaining_value],
+      values[instructions_retired_value],
+      values[cycles_retired_value],
+      exit_pc_,
+      builder_.getInt32(entry_address_),
+      function_->getArg(unit_mode),
+      builder_.CreateOr(builder_.CreateZExt(values[hazard_value], builder_.getInt32Ty()),
+                        builder_.CreateShl(values[dag_history_value], builder_.getInt32(1))),
+      exit_reason_};
   for (unsigned reg = 0; reg < pinned_registers; ++reg) { args.push_back(values[reg]); }
   args.push_back(values[status_value]);
   args.push_back(values[sticky_value]);
@@ -1248,33 +1470,37 @@ std::vector<BlockCost> Lowering::block_costs() const {
   return result;
 }
 
-void Lowering::load_index(unsigned index) {
-  if (indices_[index] != nullptr) { return; }
-  const auto bank = (context_ & dag_bank_mode(index)) != 0 ? 1U : 0U;
-  indices_[index] = load(32, dag_slot(bank, index));
+void Lowering::load_dag(unsigned reg) {
+  if (dag_[reg] != nullptr) { return; }
+  const auto bank = (context_ & dag_bank_mode(reg & 15)) != 0 ? 1U : 0U;
+  dag_[reg] = load(32, dag_slot(bank, reg & 15, reg / 16));
 }
 
 void Lowering::load_indices() {
   for (const auto &op : instructions_) {
-    if (op.type == index_modify_type) { index_written_.insert(index_modify(op).destination); }
-  }
-  for (const auto &op : instructions_) {
-    if (indirect_branch(op)) {
-      const auto index = branch_index(op);
-      const auto modifier = branch_modifier(op);
-      load_index(index);
-      const auto modifier_bank = (context_ & dag_bank_mode(modifier)) != 0 ? 1U : 0U;
-      modifiers_[modifier] = load(32, dag_slot(modifier_bank, modifier, 1));
+    const auto destination = loaded_register(op);
+    if (dag_register(destination)) { dag_written_.insert(dag_number(destination)); }
+    if (op.type == register_move_type) {
+      const auto move = register_move(op);
+      for (const auto reg : {move.source, move.destination}) {
+        if (dag_register(reg)) { load_dag(dag_number(reg)); }
+      }
     }
-    if (op.type != memory_move_type && op.type != index_modify_type) { continue; }
-    const auto source =
-        op.type == memory_move_type ? memory_move(op).index : index_modify(op).source;
-    const auto destination = op.type == memory_move_type ? source : index_modify(op).destination;
-    for (const auto index : {source, destination}) { load_index(index); }
-    if (op.type == index_modify_type && lengths_[source] == nullptr) {
-      const auto bank = (context_ & dag_bank_mode(source)) != 0 ? 1U : 0U;
-      lengths_[source] = load(32, dag_slot(bank, source, 2));
-      bases_[source] = load(32, dag_slot(bank, source, 3));
+    if (op.type == immediate_move_type && dag_register(destination)) {
+      load_dag(dag_number(destination));
+    }
+    if (indirect_branch(op)) {
+      load_dag(branch_index(op));
+      load_dag(16 + branch_modifier(op));
+    }
+    if (op.type == memory_move_type) { load_dag(memory_move(op).index); }
+    if (op.type == index_modify_type) {
+      const auto modify = index_modify(op);
+      dag_written_.insert(modify.destination);
+      for (const auto reg :
+           {modify.source, modify.destination, 32 + modify.source, 48 + modify.source}) {
+        load_dag(reg);
+      }
     }
   }
 }
@@ -1292,7 +1518,7 @@ void Lowering::plan_loops() {
     bool linear = true;
     for (std::size_t i = start; i < end; ++i) {
       linear = linear && instructions_[i].address + 1 == instructions_[i + 1].address &&
-               !branch(instructions_[i]);
+               !branch(instructions_[i]) && !dag_register(loaded_register(instructions_[i]));
     }
     if (!linear) { continue; }
     const bool stall = conditional && instructions_[end - 1].compute.kind != ComputeKind::none;
@@ -1304,6 +1530,7 @@ void Lowering::plan_loops() {
 }
 
 void Lowering::complete_loop(Values values, const Instruction &op) {
+  values[extra_cycles_value] = builder_.getInt64(0);
   const auto end = addresses_.at(op.address);
   const auto start = addresses_.at(branch_target(op));
   const auto cost = loop_ends_.at(end);
@@ -1377,7 +1604,7 @@ void Lowering::plan_memory() {
   for (const auto &op : instructions_) {
     if (op.type != memory_move_type) { continue; }
     const auto move = memory_move(op);
-    if (index_written_.contains(move.index)) {
+    if (dag_written_.contains(move.index)) {
       if (!plan_changing_memory(op)) { memory_admitted_ = builder_.getFalse(); }
       continue;
     }
@@ -1387,7 +1614,7 @@ void Lowering::plan_memory() {
     auto &plan = memory_plan_[op.address];
     for (unsigned transfer = 0; transfer < transfers; ++transfer) {
       auto *address = builder_.CreateAdd(
-          indices_[move.index], builder_.getInt32(static_cast<std::uint32_t>(op.word) + transfer));
+          dag_[move.index], builder_.getInt32(static_cast<std::uint32_t>(op.word) + transfer));
       const auto [host, valid] = plan_pointer(move, address);
       plan.pointers[transfer] = host;
       memory_admitted_ = builder_.CreateAnd(memory_admitted_, valid);
@@ -1438,6 +1665,9 @@ std::vector<std::optional<BlockCost>> Lowering::unit_costs() const {
     }
     ++suffix.instructions;
     ++suffix.cycles;
+    if (op.type == memory_move_type || op.type == index_modify_type || indirect_branch(op)) {
+      suffix.cycles += 2;
+    }
     if (is_branch) {
       suffix.cycles += branch_penalty;
       if (((op.word >> condition_shift) & true_condition) != true_condition) { ++suffix.cycles; }
@@ -1466,8 +1696,10 @@ void Lowering::emit_instruction(std::size_t i, const std::optional<BlockCost> &g
         builder_.CreateSelect(builder_.CreateICmpULT(instructions, cycles), instructions, cycles);
     values[loop_grant_value] = turns;
     values[loop_remaining_value] = turns;
-    admitted =
-        builder_.CreateAnd(memory_admitted_, builder_.CreateICmpNE(turns, builder_.getInt64(0)));
+    admitted = builder_.CreateAnd(
+        memory_admitted_,
+        builder_.CreateAnd(builder_.CreateICmpEQ(values[dag_history_value], builder_.getInt32(0)),
+                           builder_.CreateICmpNE(turns, builder_.getInt64(0))));
   } else if (grant.has_value()) {
     admitted = builder_.CreateAnd(
         memory_admitted_,
@@ -1476,7 +1708,10 @@ void Lowering::emit_instruction(std::size_t i, const std::optional<BlockCost> &g
                            builder_.CreateICmpUGE(values[cycle_remaining_value],
                                                   builder_.getInt64(grant->cycles))));
   }
-  fast_entry_[i].incoming(values, admission_[i].block);
+  auto hot = values;
+  // A fixed-cost loop grant proves that no incoming DAG load is pending.
+  if (loop != loop_headers_.end()) { hot[dag_history_value] = builder_.getInt32(0); }
+  fast_entry_[i].incoming(hot, admission_[i].block);
   auto tail = values;
   tail[tail_value] = builder_.getInt1(loop != loop_headers_.end() || grant.has_value());
   partial_[i].incoming(tail, admission_[i].block);
@@ -1488,15 +1723,19 @@ void Lowering::emit_instruction(std::size_t i, const std::optional<BlockCost> &g
   builder_.SetInsertPoint(fast_entry_[i].block);
   values = fast_entry_[i].values();
   values[credit_value] = builder_.getInt64(costs_[i].instructions);
+  values[extra_cycles_value] = builder_.getInt64(0);
   jump(fast_[i], values);
   builder_.SetInsertPoint(fast_[i].block);
   values = fast_[i].values();
   auto *lanes = branch_lanes(values, op, false);
+  auto pipeline =
+      PipelineEffects{.stall = pipeline_stall(values, op), .tag = loaded_tag(values, op)};
   instruction(values, op, false);
+  if (!branch(op)) { retire_pipeline(values, pipeline); }
   if (costs_[i].instructions > 1) {
     jump(fast_[i + 1], values);
   } else {
-    complete(values, op, false, lanes);
+    complete(values, op, false, lanes, pipeline);
   }
   builder_.SetInsertPoint(partial_[i].block);
   values = partial_[i].values();
@@ -1512,12 +1751,17 @@ void Lowering::emit_instruction(std::size_t i, const std::optional<BlockCost> &g
   exit(values, builder_.getInt32(op.address), NativeExit::bound);
   builder_.SetInsertPoint(execute);
   lanes = branch_lanes(values, op, true);
+  pipeline = {.stall = pipeline_stall(values, op), .tag = loaded_tag(values, op)};
   instruction(values, op, true);
+  if (!branch(op)) { retire_pipeline(values, pipeline); }
   if (costs_[i].instructions > 1) {
-    credit(values, builder_.getInt64(1), builder_.getInt64(1), true);
+    credit(values,
+           builder_.getInt64(1),
+           builder_.CreateAdd(builder_.getInt64(1), values[extra_cycles_value]),
+           true);
     jump(partial_[i + 1], values);
   } else {
-    complete(values, op, true, lanes);
+    complete(values, op, true, lanes, pipeline);
   }
 }
 
@@ -1529,6 +1773,8 @@ void Lowering::emit() {
     return op.type == index_modify_type && (index_modify(op).source & 7) == 7;
   });
   auto *entry = llvm::BasicBlock::Create(module_.getContext(), "entry", function_);
+  builder_.SetInsertPoint(entry);
+  load_indices();
   exit_ = node("cold.exit");
   llvm::IRBuilder<> exit_builder(exit_.block);
   exit_pc_ = exit_builder.CreatePHI(builder_.getInt32Ty(), 2);
@@ -1543,7 +1789,6 @@ void Lowering::emit() {
   costs_ = block_costs();
   plan_loops();
   builder_.SetInsertPoint(entry);
-  load_indices();
   plan_memory();
   const auto grants = unit_costs();
   Values initial{};
@@ -1562,13 +1807,16 @@ void Lowering::emit() {
   initial[loop_grant_value] = builder_.getInt64(0);
   initial[loop_remaining_value] = builder_.getInt64(0);
   initial[tail_value] = builder_.getFalse();
-  initial[hazard_value] = function_->getArg(unit_hazard);
+  auto *pipeline = function_->getArg(unit_pipeline);
+  initial[hazard_value] = builder_.CreateICmpNE(builder_.CreateAnd(pipeline, builder_.getInt32(1)),
+                                                builder_.getInt32(0));
+  initial[dag_history_value] = builder_.CreateLShr(pipeline, builder_.getInt32(1));
+  initial[extra_cycles_value] = builder_.getInt64(0);
   initial[pc_stack_value] = llvm::PoisonValue::get(stack_type());
   initial[pc_stack_depth_value] = builder_.getInt32(0);
   initial[interrupt_latch_value] = builder_.getInt32(0);
-  for (unsigned index = 0; index < indices_.size(); ++index) {
-    initial[index_value + index] =
-        indices_[index] != nullptr ? indices_[index] : builder_.getInt32(0);
+  for (unsigned index = 0; index < dag_.size(); ++index) {
+    initial[index_value + index] = dag_[index] != nullptr ? dag_[index] : builder_.getInt32(0);
   }
   if (stack_written_) {
     for (unsigned index = 0; index < Registers::pc_stack_capacity; ++index) {
@@ -1604,6 +1852,19 @@ void Lowering::emit() {
   emit_exit();
 }
 
+std::uint32_t register_context(const Instruction &instruction) {
+  std::uint32_t mask = simd_mode;
+  const auto source =
+      instruction.type == register_move_type ? register_move(instruction).source : 0U;
+  const auto destination = loaded_register(instruction);
+  for (const auto reg : {source, destination}) {
+    if (dag_register(reg)) { mask |= dag_bank_mode(reg & 15); }
+    if (data_register(reg)) { mask |= ((reg & 15) < 8 ? low_bank_mode : high_bank_mode); }
+  }
+  mask |= simd_mode;
+  return mask;
+}
+
 std::uint32_t instruction_context(const Instruction &instruction) {
   std::uint32_t mask{low_bank_mode};
   if (instruction.type == index_modify_type) {
@@ -1616,6 +1877,9 @@ std::uint32_t instruction_context(const Instruction &instruction) {
     mask |= dag_bank_mode(move.index) | simd_mode | (move.reg < 8 ? low_bank_mode : high_bank_mode);
     if (!move.write && move.index == 1) { mask |= broadcast1_mode; }
     if (!move.write && move.index == 9) { mask |= broadcast9_mode; }
+  }
+  if (instruction.type == register_move_type || instruction.type == immediate_move_type) {
+    mask |= register_context(instruction);
   }
   if (branch(instruction)) { mask |= simd_mode | saturation_mode; }
   if (indirect_branch(instruction)) {

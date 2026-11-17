@@ -226,8 +226,8 @@ std::vector<sharc::Registers> call_states() {
   return states;
 }
 
-void cross_unit_call() {
-  const std::array words{indirect(8, 8) | (std::uint64_t{1} << 39),
+void cross_unit_call(bool relative_call) {
+  const std::array words{(relative_call ? relative(4) : indirect(8, 8)) | (std::uint64_t{1} << 39),
                          fixture::immediate(0, 9),
                          indirect(9, 9),
                          std::uint64_t{0},
@@ -396,7 +396,8 @@ void computed_control_flow() {
   selectors();
   displacements();
   parallel_predicates();
-  cross_unit_call();
+  cross_unit_call(false);
+  cross_unit_call(true);
   full_parallel_call();
   parallel_interlock();
   refused_forms();

@@ -98,7 +98,7 @@ struct Core::Impl {
     pointers[detail::faddr_slot] = &state.registers.faddr;
     pointers[detail::daddr_slot] = &state.registers.daddr;
     pointers[detail::clock_slot] = &state.registers.emuclk;
-    pointers[detail::hazard_slot] = &previous_compute;
+    pointers[detail::pipeline_slot] = &pipeline_history;
     pointers[detail::mode_slot] = &state.registers.mode1;
     for (std::size_t index = 0; index < Registers::pc_stack_capacity; ++index) {
       pointers[detail::stack_slot + index] = &state.registers.pc_stack[index];
@@ -199,7 +199,7 @@ struct Core::Impl {
   State state;
   bool yield_requested{};
   bool executing{};
-  std::uint8_t previous_compute{};
+  std::uint32_t pipeline_history{};
   std::shared_ptr<const NativeImage::Impl> installed;
   std::uint32_t variant{};
   std::optional<Resume> resume;
@@ -211,7 +211,7 @@ struct Snapshot::Impl {
   State state;
   bool yield_requested{};
   std::optional<Resume> resume;
-  std::uint8_t previous_compute{};
+  std::uint32_t pipeline_history{};
 };
 
 Core::Core(Memory memory, ExecutionMode mode)
@@ -382,7 +382,7 @@ void Core::set_registers(const Registers &registers) {
   }
   if (registers.pc != impl_->state.registers.pc) {
     impl_->resume.reset();
-    impl_->previous_compute = 0;
+    impl_->pipeline_history = 0;
   }
   impl_->state.registers = registers;
 }
@@ -399,7 +399,7 @@ Snapshot Core::save() const {
                      .state = impl_->state,
                      .yield_requested = impl_->yield_requested,
                      .resume = impl_->resume,
-                     .previous_compute = impl_->previous_compute});
+                     .pipeline_history = impl_->pipeline_history});
   return snapshot;
 }
 
@@ -411,7 +411,7 @@ void Core::restore(const Snapshot &snapshot) {
   impl_->state = snapshot.impl_->state;
   impl_->yield_requested = snapshot.impl_->yield_requested;
   impl_->resume = snapshot.impl_->resume;
-  impl_->previous_compute = snapshot.impl_->previous_compute;
+  impl_->pipeline_history = snapshot.impl_->pipeline_history;
 }
 
 RunResult Core::Impl::execute(std::uint64_t instructions, std::uint64_t cycles) {

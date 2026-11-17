@@ -498,7 +498,13 @@ void cached_dag() {
   constexpr unsigned interrupt_bit = 20;
   constexpr std::uint32_t base = 0x2340;
   constexpr std::uint32_t length = 17;
-  const std::array words{modify_i7};
+  constexpr unsigned i7_code = 0x17;
+  constexpr unsigned l7_code = 0x37;
+  constexpr unsigned b7_code = 0x47;
+  const std::array words{fixture::immediate(b7_code, base),
+                         fixture::immediate(l7_code, length),
+                         fixture::immediate(i7_code, base + length - 1),
+                         modify_i7};
   fixture::Program program(words);
   const auto semantic = sharc::Core::lower(program.code);
   const auto loaded = sharc::Core::load(program.code, {}, semantic.artifact());
@@ -506,20 +512,21 @@ void cached_dag() {
   sharc::Core core(program.memory());
   auto expected = initial_registers();
   expected.mode1 = (1U << circular_bit) | (1U << bank_bit);
-  expected.dag[1][7] = {.index = base + length - 1, .modifier = 0, .length = length, .base = base};
+  expected.dag[1][7] = {};
   core.set_registers(expected);
   (void)core.install(native, fixture::Program::variant_id);
-  const auto result = core.run(1);
-  expected.dag[1][7].index = base;
+  const auto result = core.run(4);
+  expected.dag[1][7] = {.index = base, .modifier = 0, .length = length, .base = base};
   expected.pe[0].stky |= 1U << sticky_bit;
   expected.irptl |= 1U << interrupt_bit;
-  ++expected.pc;
+  expected.pc += 4;
   expected.faddr = expected.pc + 4;
   expected.daddr = expected.pc + 2;
-  ++expected.emuclk;
-  check(!result.has_fault && core.registers() == expected &&
-            result.progress == sharc::Progress{.instructions = 1, .base_cycles = 1},
-        "cached consumer-bound DAG update lost MODE1, flags or register-bank metadata");
+  expected.emuclk += 6;
+  check(
+      !result.has_fault && core.registers() == expected &&
+          result.progress == sharc::Progress{.instructions = 4, .base_cycles = 6},
+      "cached consumer-bound DAG load/update lost dependency cycles, mode, flags or bank metadata");
 }
 
 } // namespace
