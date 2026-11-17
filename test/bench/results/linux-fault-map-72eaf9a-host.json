@@ -1,0 +1,80 @@
+{
+  "measured_revision": "72eaf9a7c1c7a89c9c34c9689e9646d45befb843",
+  "clean_main_at_measurement": true,
+  "receipt_utc": "2026-11-17T12:28:04.053649+00:00",
+  "host": {
+    "cpu": "Intel(R) Core(TM) i5-10400 CPU @ 2.90GHz",
+    "platform": "Linux-6.12.117+deb13-amd64-x86_64-with-glibc2.41",
+    "machine": "x86_64",
+    "logical_cpus": 6,
+    "affinity_cpu": 4,
+    "page_size": 4096,
+    "perf_event_paranoid": 2
+  },
+  "compiler": "Clang 19.1.7",
+  "configuration": "Release, SHARC_POISON_NATIVE_STATE=OFF",
+  "compiler_identity": "sharc-preparation-v1-llvm19.1.7-9676253cfde8f1ee4c7e39b80d843a84e7fd980c5fda3a5eb092a195608ef7f1",
+  "reference_options": [
+    "-O3",
+    "-DNDEBUG",
+    "-std=c++23",
+    "-fno-lto",
+    "-march=native"
+  ],
+  "counter_scope": "per-thread instructions:u and cycles:u, pinned unscaled group; Core::run plus userspace clock/control wrapper",
+  "time_scope": "Core::run only; paired separate non-LTO Clang O3 reference",
+  "own_concurrent_build_test_probe": false,
+  "external_activity": "Other core development may have continued; sibling processes were untouched. Host was not isolated.",
+  "reference_object_sha256": "90940543a1ffca39a0701dbf8085f9b743824f3f6d1c844afcff4952f4a7c4f5",
+  "source_files": {
+    "CMakeLists.txt": "9de1798c6faa6f6ed19a130e06a278533025fa9680e14ecf2ab192acdd78dcac",
+    "include/sharc/README.md": "20b84fb428ac7e0c2fc1d5e46ef215c8ccff72e4ec8024b36e33073aa57b63be",
+    "include/sharc/core.hpp": "aa61ee41c6bedb3c4b5b1af3bca34b0d72c8fc8cbb0a71809d4709038f45bbae",
+    "include/sharc/memory.hpp": "088892ec869413f16e0ce4076c8b2f56961a2678293bde9ba8b5ef654abf1019",
+    "src/README.md": "98dc09601c5317a35425520d28ff0f725786edc96768beac684ca701f1642d9e",
+    "src/abi.cpp": "338d7c8bb55d513780ec3e4b7d83e27fb1fc941f2a47d402850971d56e1f86a1",
+    "src/abi.hpp": "4461e14b1ef2bfe99f23bc9c199493cfb613161dd05eb554c0a7c0c0b83c7221",
+    "src/compute.cpp": "5b1bf8acbbb9e2ade89ccc62b5af49b2f4f086aa3a4093457d903f5972ae4ba5",
+    "src/core.cpp": "872a03d4ae12033583b9f13b180b67f8fbefec954348f093f4dfcd32fd143245",
+    "src/decode.cpp": "4b5783de388b16b5289f3a7ea4c5c07152d8970ae04bc659943a8346d475bd74",
+    "src/decode.hpp": "1c36774626e1abb0d54bce69cb6c8e71a3947ee86b81d19725adc2d95cccf2a5",
+    "src/image.cpp": "0964233bda0d7064c93f560fcccfb17158a66989304954ff85bd21ad1d8a9801",
+    "src/lower.cpp": "f4cbfc3be7392d51a1c1c5d2578aaec5261b8da54916b793d7c384b1bc3123e3",
+    "src/memory.cpp": "6d0828a3f71f2426b6a3e5ca49cca24b56a7d28331c04acdebf052e02c53ee1f",
+    "src/native.hpp": "b0cd0e8d4a0f833108ad94202edcfd8b19c5487d5908e364d239a4849ac9905f",
+    "test/bench/control_expectations.py": "1b8c3f221be6fb5e433c8150e6266cd5446aaca85ed9e5e82bf00aa98cea2a16",
+    "test/bench/counters.hpp": "2b413afc24a51dcbcdbdc01fb52f1e00f1ca6ca257959e2def48d376f9bcebd5",
+    "test/bench/k4.asm": "c9e4e196ca459da2bba456972487e97e8586fabfefb4e45530588a69d69a1c07",
+    "test/bench/k4.cpp": "e2085f4c49a27d76cd097dc4fbac90755d5076a2b7a946c90999e280d7b068b4",
+    "test/bench/k5.asm": "caca4aa2218b23ef4cb01472d12201aea9067ebf672f0d9daf5e27f46dcd62e1",
+    "test/bench/k5.cpp": "153191bee9f85a9b0ad1a66020f6d1731473a2a173ca4efc38e990bc242d371e",
+    "test/bench/reference.cpp": "c302cd30de3b89a0e530388754cd9b01c0ce51cfcd32e9e88292d89e8498f217",
+    "test/bench/reference.hpp": "e8af9190d7c80215b6deebecf3e86d5fa587776adf6d25df2b78cac7c15c6e59",
+    "test/bench/runner.hpp": "08b4ca216e895047aece8debe1e2a99484fcea50d4a742851be7310c8716b071",
+    "test/bench/summarize.py": "adefa70bd1b81429e351d655c1758db83dbbff465147cef6d0b3b19118a16fd3",
+    "test/support/isa.hpp": "8194a85d5c4b303c7ac807253b6d9cb242a24864e9c1072341dc2ac1b436a52f",
+    "test/support/check.hpp": "30a233e7313650e1a627a0d948f8b3bcce7d0dd1844b577935581f6c26e25e62"
+  },
+  "raw_driver_jsonl_sha256": "2ac77fa2af89a0f8c0a5e0afef8f45f3a4bd1931d21daeb6fed0d042d5e1c800",
+  "process_exit_code": 0,
+  "all_run_output_and_progress_checks_passed": true,
+  "unscaled_hardware_groups": 12,
+  "limitations": [
+    "Integer workload only",
+    "S3 and full Strict profile qualification incomplete",
+    "K1-K3 and K6 remain open",
+    "macOS ARM64 untested"
+  ],
+  "benchmarks": {
+    "K4": {
+      "command": "taskset -c 4 build/sharc_k4_bench --measure",
+      "benchmark_binary_sha256": "3fc0b935c49c7a7d1a84aa9cc1208e5e99dee10ae2b639076d595e422cff1f0f",
+      "expected_output_sha256": "490294093fdf6b9e10740daa992391bae19396c6e78bff448f035b4e7ca37f25"
+    },
+    "K5": {
+      "command": "taskset -c 4 build/sharc_k5_bench --measure",
+      "benchmark_binary_sha256": "437c64ea6bf21885b7bb297460636ddc4708f6bcdf5999efac012219cd3a1b86",
+      "expected_output_sha256": "e84b69ed409029f1af79718d2a57b8c0ab264a77e3979a939cb39b8087bdc589"
+    }
+  }
+}

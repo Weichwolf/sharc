@@ -130,3 +130,7 @@ K4 and K5 are integer workloads: the two numerical modes have the same arithmeti
 contract here. Separate measurements do not claim a floating-point speedup,
 floating qualification, or consumer whole-instrument throughput. The first [Linux K5 baseline](results/linux-k5.md) includes raw counts,
 min/median/max metrics and the host/source receipt.
+
+The [fault-map qualification](results/linux-fault-map.md) records the temporary
+RTDyld regression at `be24705` and its correction at `72eaf9a`, with both kernels
+and both numerical modes, full warm ranges and source/binary receipts.
