@@ -1,4 +1,4 @@
-# Independent Strict numerical reference (S2 in progress)
+# Independent Strict numerical reference
 
 `test/support/reference.py` is authored independently for expectation generation.
 It imports only Python's standard library. Production neither imports it nor
@@ -8,7 +8,11 @@ processor execution loop or manufacturer program asset. The reference origin is
 the pinned SHARC Processor Programming Reference 2.4 in
 `reference-manifest.json`, especially chapters 3 and 11, appendix A and appendix C.
 
-S2 remains in progress; this does not establish Strict execution coverage.
+S2 supplies independent compute expectations without production lowering. That
+reference-generation milestone is complete at the scope listed here; numerical
+qualification and installed-image execution coverage remain separate requirements.
+Further reference cases accompany instruction coverage rather than a standalone
+reference processor. See issue #2.
 
 | Component | Current scope |
 |---|---|
@@ -133,9 +137,10 @@ These are checks of the expectation generator, not a new CTest layer and not a
 replacement execution path for ISA tests. They do not call a fake Core or execute
 an interpreter. Installed-image ISA tests will need complete independent results,
 including all lane flags and ordered effects, before any corresponding coverage
-row can be accepted. Existing Core tests still check preparation/refusal only.
+row can be accepted. Current installed-image coverage is limited to the fixed
+ALU and direct-branch subsets listed in `isa-coverage.md`.
 
-## Unqualified cases and remaining S2 work
+## Unqualified numerical cases
 
 `Unqualified` prevents the generator from silently supplying a guessed expectation.
 Currently explicit refusals include:
@@ -166,7 +171,7 @@ Currently explicit refusals include:
   undefined; no invented full-result expectation is emitted.
 - Operations outside the currently implemented numerical functions.
 
-Still required: the unqualified floating, conversion, packing and seed details
+Still required for complete numerical coverage: the floating, conversion, packing and seed details
 above, OR-shift status, and
 parallel memory ordering, other conditional transfer admission and mode/register-bank
 composition beyond admitted raw writes. Qualified arithmetic and writeback
@@ -176,8 +181,27 @@ integer cast. No partial flag mask is used to claim a complete instruction resul
 
 Normal-range rounding validation does not prove the unqualified underflow boundary,
 seed tables, instruction semantics, compiled native results or a supported-host
-performance result. Every execution row in `isa-coverage.md` remains unimplemented.
-S2 still precedes native lowering; coordination is tracked in issue #2.
+performance result. The separately qualified initial native subset is recorded in
+`isa-coverage.md`; it does not complete this reference.
+These gaps remain visible during native lowering; coordination is tracked in issue #2.
+
+## Unverified against a primary source
+
+The following probes remain open in issue #3. When an instruction is implemented
+without a primary observation, its documented behavior and any choice where the
+manual is silent must be recorded here and marked in its independent fixtures.
+Such a choice does not establish bit-exact profile coverage. No floating native
+operation or replacement seed table is implemented in this increment.
+
+| Boundary awaiting observation | Authored probe |
+|---|---|
+| NaN result extension and extension-only payload under RND32 | PASS raw40 `0x7fc0000000` and `0x7f80000001`, RND32 clear/set |
+| AN/MN for NaN/negative zero and conversion sentinels | PASS negative zero; zero times -1; NaN ADD/MUL; unsaturated FIX infinity; LOGB NaN |
+| Rounding just below minimum normal | Multiply `0x0080000000` by `0x3f7fffffff` in 40-bit mode and `0x3f7fffff00` in 32-bit mode |
+| FPACK inexact result, upper storage and flags | Pack half-way inputs into a nonzero destination; vary TRUNC, RND32 and SSE |
+| MANT with nonzero extension under RND32 | MANT raw40 `0x3f80000001`, RND32 clear/set |
+| Ordinary reciprocal and reciprocal-square-root seed entries | Capture every input mantissa bin and both square-root exponent parities; retain exact raw40 outputs |
+| Remaining shifter status boundaries | Zero-source OR-shift into nonzero destination; BTST position -1; sign-extended empty fields |
 
 ## Primary observation tools
 

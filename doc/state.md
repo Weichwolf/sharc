@@ -40,9 +40,13 @@ No host C++ object layout is a file or generated-code ABI.
 
 `State` adds cumulative instruction/base-cycle progress, instruction set, execution
 state and a latched fault. `Snapshot` is an immutable owning copy of the current
-state and yield request, tagged with the numerical mode. Restore replaces that
+state, yield request, prepared continuation identity/entry/address and preceding-compute
+history, tagged with the numerical mode. The latter preserves the conditional
+branch interlock across run bounds and snapshots. Restore replaces that
 state, including clearing a later fault. It does not replace consumer memory or
-bindings. The current preparation-only implementation has no pending instruction,
+bindings. `set_registers` preserves hidden continuation when PC is unchanged;
+replacing PC starts a fresh declared entry and clears its preceding-compute
+history. The current execution implementation has no pending instruction,
 branch, mode-register write or code transfer; their hidden continuation must be
 added to snapshots together with the corresponding execution implementation.
 Interrupted/delayed execution snapshots are not qualified yet.
@@ -50,5 +54,7 @@ Interrupted/delayed execution snapshots are not qualified yet.
 Peripheral interrupt routing (PICR), SRU, DMA and peripheral timers remain consumer
 state. TAP emulation controls and physical instruction-cache contents are not
 implemented. Delayed register visibility, instruction pipeline observations,
-loop reentry, interrupt eligibility/shadows, timer evolution, reset values and all
-execution semantics remain open. These are not covered by storage round trips.
+loop reentry, interrupt eligibility/shadows, timer evolution and reset values
+remain open. Straight-line ISA and non-delayed direct jumps update PC, FADDR,
+DADDR and EMUCLK;
+this does not qualify delayed transfers or arbitrary pipeline observations.

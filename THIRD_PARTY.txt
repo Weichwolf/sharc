@@ -10,7 +10,7 @@ Instruments Incorporated as identified in each file. They are untracked local
 reference material, are not redistributed here and are not covered by this GPL.
 doc/reference-manifest.json records their exact origins and identities.
 
-LLVM 19 is linked for Support (SHA-256); native code generation is not yet
-implemented. LLVM is licensed under Apache-2.0 WITH LLVM-exception; no LLVM
+LLVM 19 supplies SHA-256, LLVM IR/bitcode, optimization and ORC native compilation.
+LLVM is licensed under Apache-2.0 WITH LLVM-exception; no LLVM
 source is vendored. See https://llvm.org/LICENSE.txt. No emulator instruction
 semantics were imported.

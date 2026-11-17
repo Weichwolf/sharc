@@ -10,13 +10,17 @@ acceptance and [doc/architecture.md](doc/architecture.md) for the target design.
 
 ## Current state
 
-The S1 preparation implementation provides the two public headers, the `sharc::core`
+The preparation implementation provides the two public headers, the `sharc::core`
 build target, ISA/VISA format and compute-field decoding, preparation diagnostics
-and raw architectural state/snapshot storage. The CMake package installs the
-`sharc::core` target and exactly two public headers. Every instruction still refuses
-lowering explicitly. No native execution or benchmark result exists. See
+and raw architectural state/snapshot storage. Initial LLVM lowering executes
+classic ISA register-immediate moves, fixed ALU operations, direct jumps and NOP through
+installed images, with separate mode identities, artifact caching and snapshots.
+Other instruction families refuse lowering explicitly. The CMake package installs
+the `sharc::core` target and exactly two public headers. The S2 independent
+expectation-generation milestone is complete; numerical gaps and the remaining
+S3 native execution are explicit, and no benchmark result exists. See
 [coverage](doc/isa-coverage.md), [state storage](doc/state.md) and the
-in-progress [independent numeric reference](doc/numeric-reference.md).
+[independent numeric reference](doc/numeric-reference.md).
 
 ```sh
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=clang++-19
@@ -24,7 +28,8 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-Requirements: C++23, LLVM 19.1, CMake 3.25 and Ninja. The tests work offline
+Requirements: C++23, LLVM 19.1, CMake 3.25 and Ninja; Python 3 for tests.
+The tests work offline
 without local reference manuals. An installed CMake consumer is checked by CTest.
 Linux x86-64 is tested; macOS ARM64 is untested.
 
@@ -34,7 +39,8 @@ Strict will preserve SHARC 32-/40-bit behavior and remain the default. The
 explicit opt-in FastFP32 mode will limit floating computations to binary32 for
 consumers that accept precision differences. It preserves raw storage, integer
 semantics and instruction order, and does not enable unrestricted compiler
-fast-math. Both modes are planned; neither is implemented yet. See the
+fast-math. Installed integer programs run under both mode identities; floating
+computation in either mode remains unimplemented. See the
 [numerical contracts](doc/architecture.md#floating-point-execution-modes).
 
 ## Reference material

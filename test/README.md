@@ -2,26 +2,23 @@
 
 Exactly three verification layers follow `doc/core-contract.md`:
 
-- `isa/`: instruction programs executed through declared, installed LLVM images,
-  with independently calculated expected results. No execution coverage yet.
-- `core/`: public preparation and lifecycle boundaries. The initial tests exercise
-  format/compute recognition, declared PC boundaries, reserved-opcode rejection,
-  raw state storage, snapshot replacement and an installed CMake consumer. They
-  do not call private decoder functions.
-- `bench/`: K1–K6 with complete output checks and separate Strict/FastFP32 results.
+- `isa/`: authored installed-image instruction programs, with independent fixed
+  ALU and paired-status branch expectations under Strict/FastFP32 identities.
+- `core/`: public preparation and lifecycle boundaries, artifacts, consumer-linked
+  IR, exact run bounds, raw state, snapshots, installation and code validation.
+- `bench/`: K1–K6 with complete output and separate numerical-mode measurements.
   No kernels are implemented yet.
 
-`support/isa.hpp` authors numerical instruction fields independently of production.
-Preparation rejection tests deliberately use `Core::lower`; there is no successful
-execution path or installed image in this increment. They prove structural format
-recognition and explicit refusal, not legal compute operands or ISA semantics.
-State storage round trips are lifecycle checks, not arithmetic expectations.
+`support/isa.hpp` authors instruction fields independently of production. Rejection
+fixtures use public `Core::lower`; execution fixtures use declared, installed
+LLVM images. There is no private decoder or instruction-capture test interface.
 
-Build and tests require no manuals, manufacturer code, network or device firmware.
+`support/reference.py` supplies the S2 integer/rational oracle. Run
+`python3 test/support/generate_expectations.py` to validate and export expectations.
+This generation step is not a fourth test layer or ISA acceptance. Value-only
+floating records and unqualified cases cannot establish complete instruction
+coverage. See `doc/numeric-reference.md` for its domain and remaining gaps.
 
-`support/reference.py` is the independent S2 numerical reference, currently partial.
-Run `python3 test/support/generate_expectations.py` to validate its anchored and
-rational rounding expectations. This is oracle generation/validation, not a fourth
-verification layer or ISA acceptance. Floating value-only records and unqualified
-cases must gain complete instruction expectations before installed-image tests
-can establish coverage. See `doc/numeric-reference.md`.
+Builds and tests require no manuals, manufacturer code, network or device firmware.
+The installed CMake consumer uses only the two public headers and executes its
+own instruction program. Linux x86-64 is tested; macOS ARM64 remains untested.

@@ -12,6 +12,7 @@
 
 namespace {
 constexpr unsigned full_width = 48, wide_width = 32;
+constexpr unsigned immediate_move_type = 17, nop_type = 21;
 constexpr std::uint64_t classic_branch = 0xc00000001123;
 constexpr std::uint16_t compact_immediate_head = 0x0f81;
 constexpr std::uint16_t immediate_high = 0x1234, immediate_low = 0xabcd;
@@ -33,7 +34,7 @@ sharc::Fault refusal(const sharc::CodeImage &image, const sharc::CompileOptions 
           "diagnostic lacks PC");
     return error.fault();
   }
-  check(false, "no instruction has lowering in this increment");
+  check(false, "an instruction expected to refuse preparation was lowered");
   return {};
 }
 
@@ -94,10 +95,18 @@ void formats() {
     const auto name = "type " + std::to_string(item.type) + suffix;
     check(fault.detail.starts_with(name), "wrong instruction class");
     if (item.bits == full_width) {
-      const auto classic = refusal(fixture::image(InstructionSet::isa, item.word));
-      check(classic.reason == FaultReason::unsupported_instruction &&
-                classic.instruction_bits == full_width && classic.detail.starts_with(name),
-            "classic format disagrees with its full-width VISA form");
+      const auto image = fixture::image(InstructionSet::isa, item.word);
+      if (item.type == 2 || item.type == 8 || item.type == immediate_move_type ||
+          item.type == nop_type) {
+        const auto semantic = Core::lower(image);
+        check(!semantic.bitcode().empty() && !semantic.exports().empty(),
+              "supported classic form has no semantic image");
+      } else {
+        const auto classic = refusal(image);
+        check(classic.reason == FaultReason::unsupported_instruction &&
+                  classic.instruction_bits == full_width && classic.detail.starts_with(name),
+              "classic format disagrees with its full-width VISA form");
+      }
     }
   }
   auto fault = refusal(fixture::image(InstructionSet::isa, classic_branch));
@@ -144,7 +153,7 @@ void boundaries() {
   image = fixture::image(InstructionSet::visa, {0x0001, 0x0200});
   check(refusal(image).address == next_classic_pc, "short instruction consumed an extra parcel");
   image = fixture::image(InstructionSet::isa, {0, 0, 0}, last_pc);
-  check(refusal(image).reason == FaultReason::unsupported_instruction, "last ISA PC refused");
+  check(!Core::lower(image).bitcode().empty(), "last ISA PC refused");
   image.variants.front().spans.front().instruction_set = InstructionSet::visa;
   check(refusal(image).reason == FaultReason::invalid_image, "VISA PC range overflow accepted");
 }
@@ -179,21 +188,24 @@ void declarations() {
 
 void identities() {
   auto image = fixture::image(InstructionSet::isa, fixture::add(1, 2, 3));
-  const auto original = refusal(image).identity;
-  check(original.size() == 64 && original == refusal(image).identity, "unstable input identity");
+  const std::string original(Core::lower(image).identity());
+  check(original.size() == 64 && original == Core::lower(image).identity(),
+        "unstable input identity");
   sharc::CompileOptions options;
   options.mode = sharc::ExecutionMode::fast_fp32;
-  check(original != refusal(image, options).identity, "numerical modes share identity");
+  check(original != Core::lower(image, options).identity(), "numerical modes share identity");
   options = {};
   options.callbacks = {{.role = "read", .symbol = "consumer_read"}};
-  check(original != refusal(image, options).identity, "callback symbol absent from identity");
+  check(original != Core::lower(image, options).identity(), "callback symbol absent from identity");
   image.variants.front().layout.regions.push_back({});
-  check(original != refusal(image).identity, "memory layout absent from identity");
+  check(original != Core::lower(image).identity(), "memory layout absent from identity");
   image.variants.front().layout.regions.clear();
   image.variants.front().spans.front().parcels.back() ^= 1;
-  check(original != refusal(image).identity, "code contents absent from identity");
-  fixture::throws<sharc::PreparationError>([&] { (void)Core::compile(image); },
-                                           "compile bypassed unsupported lowering");
+  check(original != Core::lower(image).identity(), "code contents absent from identity");
+  constexpr std::uint64_t floating_add = 0x013e00081123;
+  fixture::throws<sharc::PreparationError>(
+      [&] { (void)Core::compile(fixture::image(InstructionSet::isa, floating_add)); },
+      "compile bypassed unsupported lowering");
   fixture::throws<sharc::PreparationError>([&] { (void)Core::load(image, {}, {}); },
                                            "empty artifact accepted");
 }

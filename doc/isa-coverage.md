@@ -1,20 +1,21 @@
 # ISA and implementation coverage
 
-Every execution row remains **unimplemented**. The S1 foundation recognizes
-top-level formats during preparation; that does not establish operand legality,
-compute semantics or installed-image execution coverage. S1 covers the
-preparation/storage boundary; native execution is still absent.
+Coverage is partial. Format recognition during preparation does not establish
+operand legality or execution coverage. Initial installed LLVM images execute a
+classic ISA subset described below. S2 expectation generation is complete at its
+stated scope; full numerical qualification and S3 native execution are incomplete; no complete profile or benchmark acceptance
+is claimed.
 
 | Area | Required evidence | Status |
 |---|---|---|
-| Classic 48-bit ISA | Every documented instruction class, condition, legal operand and parallel form | Unimplemented |
+| Classic 48-bit ISA | Every documented instruction class, condition, legal operand and parallel form | Partial: register-immediate, fixed ALU, direct jump, NOP |
 | VISA 16/32/48 | All compact encodings, fetch boundaries, PC units and mode transitions | Unimplemented |
-| Arithmetic and SIMD | PEx/PEy, fixed point, 32-/40-bit float, rounding, modes, flags and exceptions | Unimplemented |
+| Arithmetic and SIMD | PEx/PEy, fixed point, 32-/40-bit float, rounding, modes, flags and exceptions | Partial: fixed ALU and bank/SIMD execution |
 | Strict numerical mode (default) | Exact guest 32-/40-bit behavior, RND32, conversion exceptions and native-path identity | Unimplemented |
 | FastFP32 numerical mode (opt-in) | Independent approximation expectations, rounding/flags, unchanged raw moves/integer behavior, separate translations | Unimplemented |
 | Parallel operations | Old operands, memory aliases, register exchanges and ordered partial effects | Unimplemented |
 | Address generation and memory | Both DAGs, modulo/reverse addressing, PM/DM and physical view aliases | Unimplemented |
-| Sequencer and control | Delayed flow, DO/loop endpoints, LR, stacks, reset and interrupts | Unimplemented |
+| Sequencer and control | Delayed flow, DO/loop endpoints, LR, stacks, reset and interrupts | Partial: direct non-delayed jumps and compute-to-branch stalls |
 | Chip-profile boundaries | ADSP-21489 memory/vector parameters and explicit I/O ownership | Unimplemented |
 | JIT coherence and hosts | Self-modifying aliases, natural loops, precise exits, x86-64 and ARM64 | Unimplemented |
 
@@ -33,8 +34,9 @@ invalid modifiers and class collisions through the same public preparation path.
 The decoder normalizes these compute fields while retaining raw encoding and
 ISA/VISA identity. The detailed inventory is in [encoding.md](encoding.md).
 
-All recognized instructions still fail preparation with identity, variant, PC,
-raw encoding, width and an explicit unsupported-lowering reason.
+Recognized instructions outside the implemented subset fail preparation with
+identity, variant, PC, raw encoding, width and an explicit unsupported-lowering
+reason.
 
 `test/core/state.cpp` checks raw banks, DAGs, stacks, state replacement, snapshot
 mode compatibility and clearing a later unprepared-execution fault. These are
@@ -46,17 +48,66 @@ top-level ISA/VISA and compute decoding, independent preparation fixtures, and
 the programmer-visible state definition. Operand-level transfer restrictions,
 ordered effects and hidden delayed/interrupt continuation still need native-path
 implementation and installed-image qualification in S3/S4. They are not claimed
-as execution coverage. S2 is in progress as described below and still precedes S3.
+as execution coverage. S2 expectation generation is documented separately below.
 
-Linux x86-64: Clang/LLVM 19.1.7 Release build, four CTest checks (preparation,
-compute, state and installed consumer), clang-format and clang-tidy clean. A
-source export without manuals or Git metadata builds and passes the same four
-checks. Only the public headers are installed; no LLVM types leak through them.
-macOS ARM64: untested. Hardware user counters `instructions:u,cycles:u` were
-accessible with perf_event_paranoid=2; no guest benchmark measurements exist.
-No native execution, complete ISA, real-time or benchmark claim.
+## Initial native execution (S3 incomplete)
 
-## S2 independent expectations (in progress)
+`Core::lower` emits unoptimized LLVM bitcode. The standalone compiler uses LLVM
+O3 and eagerly resolves every export before installation; `run` does not decode
+or compile. Artifacts include bitcode and mode-unit metadata, a compiler/input
+identity and an integrity checksum. `load` parses and verifies those artifacts
+without lowering. The two public headers expose no LLVM types or register layout.
+
+Classic ISA support currently includes NOP, immediate moves into R0–R15, and
+conditional compute with the 21 fixed ALU opcodes ADD/SUB, carry/borrow forms,
+AVG, CMP/COMP, PASS, NEG, INC/DEC, ABS, AND/OR/XOR/NOT, MIN/MAX and CLIP. Fixed
+dual ADD/SUB with distinct outputs is lowered but lacks installed ISA qualification.
+Direct non-delayed absolute and PC-relative jumps use both-lane AND predicates in
+SIMD, link known successors inside one LLVM function and preserve backward edges.
+Taken jumps cost four nominal base cycles; a conditional jump immediately after
+a compute adds one interlock cycle, including when not taken (Programming
+Reference 2.4, 4-19–4-21 and 4-115–4-116). The preceding-compute history is SSA
+state, stored at exits and included in snapshots. Cycle bounds may cross the
+deadline to finish the current instruction; cycle credit cannot wrap under zero.
+External-flag and loop conditions refuse preparation. VISA, floating computation,
+multiplier, shifter, guest memory, calls/returns, delayed jumps, hardware loops, timer, reset and
+interrupt entry remain unimplemented. `interrupt_ready` reports false.
+
+`test/isa/fixed.cpp` obtains 116 paired-lane expectations from the independent
+Python reference and executes them under both numerical identities, both register
+halves, four physical bank selections and SISD/SIMD. It compares complete visible
+register state after exact partial bounds and fully admitted blocks. This is
+integer execution in FastFP32, not qualification of its floating contract.
+`test/isa/control.cpp` consumes 2,944 independent paired-status/condition cases
+under absolute/relative targets and both numerical identities. It checks full
+visible state after instruction and cycle bounds, scalar and SIMD predicates,
+24-bit address wrapping and an authored backward loop's flags and cycle costs.
+`test/core/control.cpp` checks precise missing-target faults and replay in another
+Core, including a snapshot between the compute and conditional branch. A million-iteration native
+control loop checks progress and EMUCLK carry without recursive guest transfers.
+Reserved branch fields refuse preparation; legal but unimplemented modifiers
+refuse explicitly. These are ISA checks, not K4 benchmark results.
+Each prepared unit starts at one declared entry and includes its reachable direct
+control flow. Distinct entries receive independent units; a saved continuation
+retains its originating entry. Normal entry links directly into that flow; only
+cold continuation resumes dispatch on PC. Artifact metadata preserves the entry
+identity across loading and binding. Disconnected and overlapping entry paths,
+owner PC replacement and cross-Core artifact-bound replay compare complete state.
+
+`test/core/native.cpp` checks cache round trips/refusal, consumer-linked LLVM IR,
+precise bounds and undeclared exits, stopped installation, code validation,
+memory rebinding and snapshot replay in another Core. The installed CMake
+consumer executes its own literal instruction program.
+
+Linux x86-64: Clang/LLVM 19.1.7 Release; the seven CTest checks pass, including an
+installed consumer executing native instructions. clang-format and clang-tidy
+are clean. A source export without manuals or Git metadata builds and passes the
+same seven checks. macOS ARM64 remains untested. Hardware user counters
+`instructions:u,cycles:u` are accessible with perf_event_paranoid=2. K1–K6,
+hardware performance results and goal sanitizer
+qualification remain open. This is the first S3 implementation increment; the S3 milestone remains open.
+
+## S2 independent expectations (complete milestone, numerical gaps retained)
 
 `test/support/reference.py` supplies a separate exact integer/rational numeric
 model. `generate_expectations.py` checks 279 numeric/conversion/accumulator/shifter
@@ -104,11 +155,11 @@ each half has its own predicate. Authored ADD/swap expectations preserve old AZ
 selection and new ALU flags even when a swap replaces the ALU data result.
 This is expectation generation, not installed-image swap coverage.
 
-S2 is **not complete**. The model explicitly refuses unqualified NaN/near-underflow
+The S2 generation criterion is met; the model explicitly refuses unqualified NaN/near-underflow
 boundaries and conversion sentinel flags. Remaining exceptional floating status, computations,
 OR-shift status, complete FPACK, full conditional execution/bank composition and parallel memory
 ordering expectations are still required. See
 [numeric-reference.md](numeric-reference.md) for the exact scope, source sections
 and gaps. Oracle validation is not installed-image ISA execution coverage. No
-production lowering, native-image execution or benchmark implementation has been
-added by this increment.
+complete numerical or profile acceptance follows from these oracle checks.
+Native coverage is limited to the separate subset above; benchmarks remain open.

@@ -217,9 +217,89 @@ def explicit_gaps():
         raise AssertionError("an unqualified expectation was silently generated")
 
 
+def branch_header():
+    """Generate status predicates after validating their independent truth tables."""
+    opcodes = {"eq": 0, "lt": 1, "le": 2, "ac": 3, "av": 4, "mv": 5, "ms": 6,
+               "sv": 7, "sz": 8, "tf": 13, "sf": 14, "ne": 16, "ge": 17,
+               "gt": 18, "always": 31}
+    opcodes.update({"not_" + name: opcode + 16 for name, opcode in list(opcodes.items())
+                    if name in condition_expectations.FLAG_BITS})
+    inputs = []
+    for status in range(16):
+        astat = (status & 7) | ((status & 8) << 7)
+        inputs.append((astat, astat ^ 0x407))
+    inputs.extend((0, bit) for bit in condition_expectations.FLAG_BITS.values())
+    inputs.extend((bit, 0) for bit in condition_expectations.FLAG_BITS.values())
+    rows = []
+    for name, opcode in opcodes.items():
+        for x, y in inputs:
+            for saturate in (False, True):
+                for simd in (False, True):
+                    expected = condition_expectations.lane_condition(
+                        name, (x, y), saturate=saturate, simd=simd).branch
+                    rows.append(f"BranchCase{{{opcode}, {str(saturate).lower()}, "
+                                f"{str(simd).lower()}, {{0x{x:x}, 0x{y:x}}}, {str(expected).lower()}" + "}")
+    return """
+struct BranchCase {
+  unsigned condition;
+  bool saturate, simd;
+  std::array<std::uint32_t, 2> astat;
+  bool taken;
+};
+inline constexpr std::array<BranchCase, """ + str(len(rows)) + "> branch_cases{\n" + ",\n".join(rows) + "\n};\n"
+
+
+def fixed_header(path):
+    """Export independent numeric results for installed-image ISA fixtures."""
+    opcodes = {"add": 0x01, "sub": 0x02, "adc": 0x05, "sbc": 0x06, "avg": 0x09,
+               "cmp": 0x0A, "cmpu": 0x0B, "pass": 0x21, "neg": 0x22, "addc": 0x25,
+               "subc": 0x26, "inc": 0x29, "dec": 0x2A, "abs": 0x30, "and": 0x40,
+               "or": 0x41, "xor": 0x42, "not": 0x43, "min": 0x61, "max": 0x62, "clip": 0x63}
+    rows = []
+    for name, operation, left, right, options, anchored in FIXED:
+        require(fixed(operation, left, right, **options), anchored, name)
+        for saturate in (False, True):
+            for truncate in (False, True):
+                old_astat = (options.get("astat", 0), options.get("astat", 0) ^ 0xA5000408)
+                old_stky = (options.get("stky", 0), options.get("stky", 0) ^ 0x220)
+                results = [fixed(operation, x, y, astat=a, stky=s,
+                                 saturate=saturate, truncate=truncate)
+                           for x, y, a, s in zip((left, right), (right, left), old_astat, old_stky)]
+                def array(values):
+                    return "{" + ", ".join(f"0x{value:x}ULL" for value in values) + "}"
+                rows.append("{" + ", ".join((json.dumps(name), str(opcodes[operation]),
+                            str(saturate).lower(), str(truncate).lower(),
+                            str(results[0].raw is not None).lower(), array((left, right)),
+                            array((right, left)), array(old_astat), array(old_stky),
+                            array(result.raw or 0 for result in results),
+                            array(result.astat for result in results),
+                            array(result.stky for result in results))) + "}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("""// SPDX-License-Identifier: GPL-3.0-only
+// Generated from the independent integer/rational reference. No production imports.
+#pragma once
+#include <array>
+#include <cstdint>
+#include <string_view>
+namespace fixture {
+struct FixedCase {
+  std::string_view name;
+  unsigned opcode;
+  bool saturate, truncate, writes;
+  std::array<std::uint64_t, 2> left, right;
+  std::array<std::uint32_t, 2> old_astat, old_stky;
+  std::array<std::uint64_t, 2> raw;
+  std::array<std::uint32_t, 2> astat, stky;
+};
+inline constexpr std::array fixed_cases{
+""" + ",\n".join("FixedCase" + row for row in rows) + "\n};\n" +
+                    branch_header() + "} // namespace fixture\n")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, help="write qualified numeric cases as JSON")
+    parser.add_argument("--fixed-header", type=Path, help="write independent installed-image fixed expectations")
     arguments = parser.parse_args()
     records = anchored_cases()
     records.extend(multiplier_expectations.anchors())
@@ -254,6 +334,8 @@ def main():
     multiplier_count = multiplier_expectations.product_lattice()
     lattice_count = rounding_lattice()
     explicit_gaps()
+    if arguments.fixed_header:
+        fixed_header(arguments.fixed_header)
     if arguments.output:
         payload = {"contract": "strict-numeric-foundation-v1", "isa_execution_coverage": False,
                    "cases": records}

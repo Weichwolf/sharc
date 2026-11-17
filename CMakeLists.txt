@@ -16,7 +16,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # The preparation identity follows source contents, including uncommitted edits.
-set(identity_input "${LLVM_PACKAGE_VERSION};${CMAKE_CXX_COMPILER_ID};${CMAKE_CXX_COMPILER_VERSION}")
+set(identity_input "${LLVM_PACKAGE_VERSION};${CMAKE_CXX_COMPILER_ID};${CMAKE_CXX_COMPILER_VERSION};${CMAKE_SYSTEM_NAME};${CMAKE_SYSTEM_PROCESSOR};${CMAKE_SIZEOF_VOID_P}")
 file(GLOB_RECURSE identity_sources CONFIGURE_DEPENDS src/*.cpp src/*.hpp include/*.hpp)
 list(APPEND identity_sources "${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.txt")
 foreach(source IN LISTS identity_sources)
@@ -28,7 +28,7 @@ string(SHA256 compiler_hash "${identity_input}")
 file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/generated/compiler_identity.hpp"
   CONTENT "// SPDX-License-Identifier: GPL-3.0-only\n#pragma once\n#define SHARC_COMPILER_IDENTITY \"sharc-preparation-v1-llvm${LLVM_PACKAGE_VERSION}-${compiler_hash}\"\n")
 
-add_library(sharc_core src/core.cpp src/decode.cpp src/compute.cpp)
+add_library(sharc_core src/core.cpp src/decode.cpp src/compute.cpp src/image.cpp src/lower.cpp)
 add_library(sharc::core ALIAS sharc_core)
 set_target_properties(sharc_core PROPERTIES EXPORT_NAME core)
 target_compile_features(sharc_core PUBLIC cxx_std_23)
@@ -37,7 +37,7 @@ target_include_directories(sharc_core PUBLIC
   "$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>"
   PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
 target_include_directories(sharc_core SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS})
-llvm_map_components_to_libnames(llvm_libraries Support)
+llvm_map_components_to_libnames(llvm_libraries Support Core BitReader BitWriter OrcJIT native nativecodegen Passes Object)
 target_link_libraries(sharc_core PRIVATE ${llvm_libraries})
 target_compile_options(sharc_core PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion -Werror)
 
@@ -56,12 +56,27 @@ install(EXPORT sharcTargets NAMESPACE sharc:: DESTINATION "${package_dir}")
 
 include(CTest)
 if(BUILD_TESTING)
-  foreach(suite IN ITEMS preparation state compute)
+  find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  file(GLOB reference_sources CONFIGURE_DEPENDS test/support/*.py)
+  set(fixed_expectations "${CMAKE_CURRENT_BINARY_DIR}/generated/fixed_cases.hpp")
+  add_custom_command(OUTPUT "${fixed_expectations}"
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/test/support/generate_expectations.py"
+      --fixed-header "${fixed_expectations}"
+    DEPENDS ${reference_sources}
+    VERBATIM)
+  add_executable(sharc_isa_test test/isa/fixed.cpp test/isa/control.cpp "${fixed_expectations}")
+  target_link_libraries(sharc_isa_test PRIVATE sharc::core)
+  target_include_directories(sharc_isa_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
+  target_compile_options(sharc_isa_test PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion -Werror)
+  add_test(NAME isa COMMAND sharc_isa_test)
+  foreach(suite IN ITEMS preparation state compute native control)
     add_executable(sharc_${suite}_test test/core/${suite}.cpp)
     target_link_libraries(sharc_${suite}_test PRIVATE sharc::core)
     target_compile_options(sharc_${suite}_test PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion -Werror)
     add_test(NAME ${suite} COMMAND sharc_${suite}_test)
   endforeach()
+  target_include_directories(sharc_native_test SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS})
+  target_link_libraries(sharc_native_test PRIVATE ${llvm_libraries})
   add_test(NAME installed_consumer COMMAND "${CMAKE_COMMAND}"
     "-Dcore_build=${CMAKE_CURRENT_BINARY_DIR}"
     "-Dconsumer_source=${CMAKE_CURRENT_SOURCE_DIR}/test/core/consumer"

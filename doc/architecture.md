@@ -1,9 +1,9 @@
 # Target architecture
 
-This is the implementation target, not a claim of existing execution. The S1
-implementation contains the public declarations, raw architectural storage,
-instruction-format recognition and compute-field normalization. No lowering or
-native execution is implemented yet; see [isa-coverage.md](isa-coverage.md) for current evidence.
+This is the implementation target, not a claim of complete execution. Initial
+LLVM lowering executes a limited classic ISA subset. Numerical qualification,
+complete control flow, memory instructions and the complete profile remain
+open; see [isa-coverage.md](isa-coverage.md) for current evidence.
 
 ```text
 consumer: CodeImage + CompileOptions -> Core::lower -> SemanticImage (LLVM bitcode)
@@ -75,6 +75,14 @@ These rules come from whole-instrument measurements of the Blofeld emulator
    retired arithmetically up to the run bound; keep the lowering able to prove a
    pass is a fixed point (blofeld-src #35).
 
+A unit has one declared entry into connected control flow. Known calls and
+returns, loop setup/body/end and both conditional successors belong in that
+flow; bounds, events and indirect transfers leave through cold exits. Counted
+loops with a proved fixed iteration cost should obtain a whole-iteration grant
+from the remaining bound and account at the exit. Guard returns against an
+altered architectural return address. These requirements also apply as calls
+and hardware loops are added to the initial native subset.
+
 Hoist checks only with a valid alias or permission proof. Keep the host stack
 bounded across guest loops. Host SIMD is used only where guest dependencies and
 the numerical contract are proved and the benefit is measured.
@@ -110,8 +118,9 @@ claim SHARC+ compatibility or identical behavior across every older SHARC device
 
 ## Floating-point execution modes
 
-Both modes below are planned implementation requirements. Neither is implemented
-yet. Consumers explicitly choose a mode when creating a Core; the selection stays
+Both floating contracts below remain implementation requirements. Integer
+execution already separates their prepared identities. Consumers explicitly
+choose a mode when creating a Core; the selection stays
 fixed for that Core's lifetime. Strict is the default. Include the mode in the prepared-code and cache identities so native code cannot
 cross numerical contracts. Keep the existing minimal public-header shape; do not add a public
 backend selector or per-instruction mode switch.

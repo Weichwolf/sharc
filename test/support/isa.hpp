@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <initializer_list>
 #include <sharc/core.hpp>
+#include <sharc/memory.hpp>
+#include <span>
 #include <stdexcept>
 #include <utility>
+#include <vector>
 
 namespace fixture {
 enum class Width : std::uint8_t { short_word = 16, wide_word = 32, full_word = 48 };
 inline constexpr std::uint32_t code_address = 0x100;
+void control_flow();
 
 // Independently authored numerical encodings. No production decoder is included.
 inline void append(sharc::CodeSpan &span, std::uint64_t word, Width width = Width::full_word) {
@@ -53,4 +58,36 @@ image(sharc::InstructionSet set, std::uint64_t word, Width width = Width::full_w
   append(result.variants.front().spans.front(), word, width);
   return result;
 }
+
+struct Program {
+  static constexpr std::uint32_t variant_id = 7, storage_id = 9;
+  static constexpr unsigned word_bytes = 6, byte_bits = 8;
+  sharc::CodeImage code;
+  std::vector<std::byte> bytes;
+
+  explicit Program(std::span<const std::uint64_t> words, std::uint32_t address = code_address)
+      : code(image(sharc::InstructionSet::isa, {}, address)) {
+    auto &variant = code.variants[0];
+    for (const auto word : words) {
+      append(variant.spans[0], word);
+      for (unsigned byte = 0; byte < word_bytes; ++byte) {
+        bytes.push_back(static_cast<std::byte>(word >> (byte * byte_bits)));
+      }
+    }
+    variant.layout.regions.push_back({.space = sharc::MemorySpace::program,
+                                      .view = sharc::MemoryView::instruction,
+                                      .first = address,
+                                      .count = words.size(),
+                                      .storage_id = storage_id,
+                                      .byte_offset = 0,
+                                      .byte_stride = word_bytes,
+                                      .readable = true,
+                                      .writable = false,
+                                      .initialized = true});
+  }
+
+  sharc::Memory memory() {
+    return {.regions = {{.storage_id = storage_id, .bytes = bytes, .generation = 1}}, .io = {}};
+  }
+};
 } // namespace fixture

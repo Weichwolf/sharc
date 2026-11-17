@@ -53,7 +53,10 @@ constexpr std::array cases{
 
 void verify(const sharc::CodeImage &image, bool legal, std::string_view name) {
   try {
-    (void)sharc::Core::lower(image);
+    const auto semantic = sharc::Core::lower(image);
+    fixture::check(legal && !semantic.bitcode().empty() && !semantic.exports().empty(),
+                   "illegal or empty COMPUTE preparation accepted");
+    return;
   } catch (const sharc::PreparationError &error) {
     const auto &fault = error.fault();
     const auto expected =
@@ -67,7 +70,6 @@ void verify(const sharc::CodeImage &image, bool legal, std::string_view name) {
     }
     return;
   }
-  fixture::check(false, "COMPUTE executed before native lowering exists");
 }
 
 void computations() {
