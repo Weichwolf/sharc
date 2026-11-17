@@ -18,20 +18,25 @@
 #include <llvm/DebugInfo/DWARF/DWARFContext.h>
 #include <llvm/DebugInfo/DWARF/DWARFDebugLine.h>
 #include <llvm/DebugInfo/DWARF/DWARFUnit.h>
+#include <llvm/ExecutionEngine/JITLink/JITLink.h>
 #include <llvm/ExecutionEngine/Orc/Core.h>
+#include <llvm/ExecutionEngine/Orc/DebugObjectManagerPlugin.h>
+#include <llvm/ExecutionEngine/Orc/EPCDebugObjectRegistrar.h>
 #include <llvm/ExecutionEngine/Orc/JITTargetMachineBuilder.h>
 #include <llvm/ExecutionEngine/Orc/LLJIT.h>
-#include <llvm/ExecutionEngine/Orc/Layer.h>
+#include <llvm/ExecutionEngine/Orc/ObjectLinkingLayer.h>
 #include <llvm/ExecutionEngine/Orc/RTDyldObjectLinkingLayer.h>
+#include <llvm/ExecutionEngine/Orc/Shared/ExecutorAddress.h>
+#include <llvm/ExecutionEngine/Orc/Shared/MemoryFlags.h>
 #include <llvm/ExecutionEngine/Orc/ThreadSafeModule.h>
 #include <llvm/ExecutionEngine/RuntimeDyld.h>
-#include <llvm/ExecutionEngine/SectionMemoryManager.h>
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/PassManager.h>
 #include <llvm/IR/Verifier.h>
 #include <llvm/Object/ObjectFile.h>
 #include <llvm/Passes/PassBuilder.h>
+#include <llvm/Support/Casting.h>
 #include <llvm/Support/CodeGen.h>
 #include <llvm/Support/Error.h>
 #include <llvm/Support/MemoryBufferRef.h>
@@ -183,12 +188,16 @@ struct LinkedMap {
           {.address = addresses.getSectionLoadAddress(section), .size = section.getSize()});
       bytes += static_cast<std::size_t>(section.getSize());
     }
+    lines(object, &addresses);
+  }
+
+  void lines(const llvm::object::ObjectFile &object, const llvm::LoadedObjectInfo *addresses) {
     const auto diagnostic = [&](llvm::Error failure) {
       error += llvm::toString(std::move(failure));
     };
     auto debug = llvm::DWARFContext::create(object,
                                             llvm::DWARFContext::ProcessDebugRelocations::Process,
-                                            &addresses,
+                                            addresses,
                                             "",
                                             diagnostic,
                                             diagnostic);
@@ -218,6 +227,54 @@ struct LinkedMap {
       }
     }
   }
+};
+
+class LineRegistrar final : public llvm::orc::DebugObjectRegistrar {
+public:
+  explicit LineRegistrar(std::shared_ptr<LinkedMap> map) : map_(std::move(map)) {}
+
+  llvm::Error registerDebugObject(llvm::orc::ExecutorAddrRange memory,
+                                  bool /*auto_register_code*/) override {
+    auto object = llvm::object::ObjectFile::createObjectFile(
+        {llvm::StringRef(memory.Start.toPtr<const char *>(), memory.size()), "sharc.debug"});
+    if (!object) { return object.takeError(); }
+    map_->lines(**object, nullptr);
+    return llvm::Error::success();
+  }
+
+private:
+  std::shared_ptr<LinkedMap> map_;
+};
+
+class LinkMapPlugin final : public llvm::orc::DebugObjectManagerPlugin {
+public:
+  LinkMapPlugin(llvm::orc::ExecutionSession &session, std::shared_ptr<LinkedMap> map)
+      : llvm::orc::DebugObjectManagerPlugin(
+            session, std::make_unique<LineRegistrar>(map), true, false),
+        map_(std::move(map)) {}
+
+  void modifyPassConfig(llvm::orc::MaterializationResponsibility &responsibility,
+                        llvm::jitlink::LinkGraph &graph,
+                        llvm::jitlink::PassConfiguration &passes) override {
+    llvm::orc::DebugObjectManagerPlugin::modifyPassConfig(responsibility, graph, passes);
+    passes.PostAllocationPasses.emplace_back([map = map_](llvm::jitlink::LinkGraph &linked) {
+      for (const auto &section : linked.sections()) {
+        if ((static_cast<unsigned>(section.getMemProt()) &
+             static_cast<unsigned>(llvm::orc::MemProt::Exec)) == 0) {
+          continue;
+        }
+        const llvm::jitlink::SectionRange range(section);
+        if (range.getSize() == 0) { continue; }
+        map->text_ranges.push_back(
+            {.address = range.getStart().getValue(), .size = range.getSize()});
+        map->bytes += range.getSize();
+      }
+      return llvm::Error::success();
+    });
+  }
+
+private:
+  std::shared_ptr<LinkedMap> map_;
 };
 
 std::uint64_t code_word(const CodeVariant &variant,
@@ -380,25 +437,25 @@ CompiledSymbols compile_image(const PreparedImage &image) {
   auto machine = target->createTargetMachine();
   if (!machine) { compiler_error(image, machine.takeError()); }
   auto linked = std::make_shared<LinkedMap>();
-  auto created =
-      llvm::orc::LLJITBuilder()
-          .setJITTargetMachineBuilder(std::move(*target))
-          .setObjectLinkingLayerCreator(
-              [linked](llvm::orc::ExecutionSession &session, const llvm::Triple &)
-                  -> llvm::Expected<std::unique_ptr<llvm::orc::ObjectLayer>> {
-                auto layer = std::make_unique<llvm::orc::RTDyldObjectLinkingLayer>(
-                    session, [] { return std::make_unique<llvm::SectionMemoryManager>(); });
-                layer->setNotifyLoaded(
-                    [linked](llvm::orc::MaterializationResponsibility &,
-                             const llvm::object::ObjectFile &object,
-                             const llvm::RuntimeDyld::LoadedObjectInfo &addresses) {
-                      linked->loaded(object, addresses);
-                    });
-                return layer;
-              })
-          .create();
+  auto created = llvm::orc::LLJITBuilder().setJITTargetMachineBuilder(std::move(*target)).create();
   if (!created) { compiler_error(image, created.takeError()); }
   auto jit = std::shared_ptr<llvm::orc::LLJIT>(std::move(*created));
+  auto &layer = jit->getObjLinkingLayer();
+  if (auto *jitlink = llvm::dyn_cast<llvm::orc::ObjectLinkingLayer>(&layer)) {
+    jitlink->addPlugin(std::make_shared<LinkMapPlugin>(jit->getExecutionSession(), linked));
+  } else if (auto *rtdyld = llvm::dyn_cast<llvm::orc::RTDyldObjectLinkingLayer>(&layer)) {
+    rtdyld->setNotifyLoaded([linked](llvm::orc::MaterializationResponsibility &,
+                                     const llvm::object::ObjectFile &object,
+                                     const llvm::RuntimeDyld::LoadedObjectInfo &addresses) {
+      linked->loaded(object, addresses);
+    });
+  } else {
+    refuse(FaultReason::unsupported_feature,
+           image.identity,
+           0,
+           0,
+           "native linker does not expose linked sections");
+  }
   auto context = std::make_unique<llvm::LLVMContext>();
   auto module = parse_module(image, *context);
   module->setDataLayout(jit->getDataLayout());

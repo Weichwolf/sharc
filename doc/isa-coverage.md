@@ -65,6 +65,10 @@ line tables. Guest locations use file `sharc-variant-<id>` and line `PC + 1`;
 compiler-generated locations use line zero. Independent consumer linking tests
 cover PC zero, the highest classic PC, full 32-bit variant IDs and malformed
 maps, and compare native text with debug information stripped before O3.
+The standalone compiler retains LLVM's default linker; JITLink supplies its
+allocated executable sections and relocated debug objects, with RTDyld load
+notifications supported separately. Fault attribution does not select a different
+native code model.
 Direct/Exact memory-mode selection and the terminal `host_fault` adapter are
 still unimplemented; this is not complete v9 execution support.
 
