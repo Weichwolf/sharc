@@ -235,7 +235,16 @@ struct LoopShape {
 
   [[nodiscard]] bool arithmetic() const { return !counted() && term != true_condition; }
 
-  [[nodiscard]] bool short_body() const { return length <= loop_fetch_distance; }
+  [[nodiscard]] bool short_body() const {
+    return length < loop_fetch_distance || (counted() && length == loop_fetch_distance);
+  }
+
+  [[nodiscard]] std::uint32_t condition_pc() const {
+    if (length == 1 || length == 2) { return end; }
+    return (end - loop_decode_distance) & maximum_pc;
+  }
+
+  [[nodiscard]] unsigned short_condition_tail() const { return length == 1 ? 3U : length; }
 
   [[nodiscard]] unsigned short_threshold() const {
     constexpr std::array thresholds{4U, 2U, 2U, 1U};
@@ -244,8 +253,8 @@ struct LoopShape {
 
   [[nodiscard]] std::uint32_t address_word() const {
     const auto counted_type = length < loop_fetch_distance ? length * 2U : long_counted_loop_kind;
-    return end | (term << immediate_count_shift) |
-           ((counted() ? counted_type : 0U) << loop_type_shift);
+    const auto type = counted() ? counted_type : static_cast<unsigned>(length == 1);
+    return end | (term << immediate_count_shift) | (type << loop_type_shift);
   }
 };
 
@@ -299,10 +308,6 @@ void validate_loop(const Instruction &op, std::string_view identity) {
   constexpr auto negative_offset = 1U << 23;
   if (shape.length == 0 || shape.length >= negative_offset) {
     reject(op, identity, FaultReason::invalid_encoding, "DO endpoint must follow the setup");
-  }
-  if (shape.short_body() && !shape.counted()) {
-    reject(
-        op, identity, FaultReason::unsupported_instruction, "short arithmetic DO is unqualified");
   }
   if (register_count(op)) {
     constexpr auto reserved = (1ULL << 39) | (std::uint64_t{byte_mask} << immediate_count_shift);
@@ -806,12 +811,20 @@ private:
   void write_short_addresses(ShortLookahead addresses, llvm::Value *live);
   llvm::Value *short_flag(llvm::Value *descriptor, std::uint64_t mask);
   void setup_short_loop(const LoopShape &shape, llvm::Value *count);
-  void
-  short_loop_retirement(Values values, const Instruction &op, const LoopShape &shape, bool partial);
+  void short_loop_retirement(Values values,
+                             const Instruction &op,
+                             const LoopShape &shape,
+                             llvm::Value *old_status,
+                             bool partial);
   void short_loop_counter(Values &values,
                           const Instruction &op,
                           const LoopShape &shape,
                           llvm::Value *descriptor);
+  llvm::Value *short_loop_test(Values &values,
+                               const Instruction &op,
+                               const LoopShape &shape,
+                               llvm::Value *old_status);
+  llvm::Value *short_loop_refill(const LoopShape &shape, llvm::Value *done);
   llvm::Value *
   short_stage(const LoopShape &shape, const Instruction &op, llvm::Value *left, unsigned lag);
   void short_loop_observation(const Instruction &op, const LoopShape &shape, llvm::Value *left);
@@ -1766,7 +1779,7 @@ void Lowering::plan_hardware_loops(const LoopMap &shapes) {
     if (addresses_.contains(end)) { hardware_ends_.emplace(end, shape); }
     const auto fetch = (end - loop_fetch_distance) & maximum_pc;
     if (addresses_.contains(fetch)) { loop_fetches_.emplace(fetch, shape); }
-    const auto test = (end - loop_decode_distance) & maximum_pc;
+    const auto test = shape.condition_pc();
     if (shape.arithmetic() && addresses_.contains(test)) { loop_tests_.emplace(test, shape); }
   }
 }
@@ -1837,18 +1850,23 @@ void Lowering::setup_short_loop(const LoopShape &shape, llvm::Value *count) {
   constexpr std::array fetch_offsets{0U, 1U, 1U, 3U};
   constexpr std::array decode_offsets{0U, 1U, 2U, 1U};
   const auto index = shape.length - 1;
-  auto *zero = builder_.CreateICmpEQ(count, builder_.getInt32(0));
-  auto *iterations = builder_.CreateSelect(
-      zero, builder_.getInt64(unsigned_limit), builder_.CreateZExt(count, builder_.getInt64Ty()));
-  write_short(short_remaining, builder_.CreateMul(iterations, builder_.getInt64(shape.length)));
-  auto *compact =
-      builder_.CreateAnd(builder_.CreateNot(zero),
-                         builder_.CreateICmpULT(count, builder_.getInt32(shape.short_threshold())));
-  write_short(short_descriptor,
-              builder_.CreateOr(builder_.getInt64(shape.end | short_startup),
-                                builder_.CreateSelect(compact,
-                                                      builder_.getInt64(short_compact_count),
-                                                      builder_.getInt64(0))));
+  llvm::Value *remaining = builder_.getInt64(short_unbounded);
+  llvm::Value *descriptor = builder_.getInt64(shape.end | short_startup);
+  if (shape.counted()) {
+    auto *zero = builder_.CreateICmpEQ(count, builder_.getInt32(0));
+    auto *iterations = builder_.CreateSelect(
+        zero, builder_.getInt64(unsigned_limit), builder_.CreateZExt(count, builder_.getInt64Ty()));
+    remaining = builder_.CreateMul(iterations, builder_.getInt64(shape.length));
+    auto *compact = builder_.CreateAnd(
+        builder_.CreateNot(zero),
+        builder_.CreateICmpULT(count, builder_.getInt32(shape.short_threshold())));
+    descriptor = builder_.CreateOr(descriptor,
+                                   builder_.CreateSelect(compact,
+                                                         builder_.getInt64(short_compact_count),
+                                                         builder_.getInt64(0)));
+  }
+  write_short(short_remaining, remaining);
+  write_short(short_descriptor, descriptor);
   write_short_addresses({.fetch = builder_.getInt64(shape.start + fetch_offsets[index]),
                          .decode = builder_.getInt64(shape.start + decode_offsets[index])},
                         builder_.getTrue());
@@ -1896,6 +1914,41 @@ void Lowering::short_loop_counter(Values &values,
   values = next.values();
 }
 
+llvm::Value *Lowering::short_loop_test(Values &values,
+                                       const Instruction &op,
+                                       const LoopShape &shape,
+                                       llvm::Value *old_status) {
+  auto *remaining = short_word(short_remaining);
+  auto *unbounded = builder_.CreateICmpEQ(remaining, builder_.getInt64(short_unbounded));
+  auto *left = builder_.CreateSelect(
+      unbounded, remaining, builder_.CreateSub(remaining, builder_.getInt64(1)));
+  if (!shape.arithmetic() || op.address != shape.condition_pc()) { return left; }
+  auto before = values;
+  before[status_value] = old_status;
+  auto *satisfied = branch_taken(condition(before, shape.term));
+  if (shape.length == 1) {
+    // The single-word loop samples on the startup bubble as well.
+    auto *startup = short_flag(short_word(short_descriptor), short_startup);
+    satisfied = builder_.CreateOr(
+        satisfied, builder_.CreateAnd(startup, branch_taken(condition(values, shape.term))));
+  }
+  const auto frame = active_loop(values, shape);
+  auto *done = builder_.CreateAnd(builder_.CreateAnd(frame.matches, unbounded), satisfied);
+  auto *pop = llvm::BasicBlock::Create(module_.getContext(), "short.condition.pop", function_);
+  auto next = node("short.condition.continue");
+  next.incoming(values, builder_.GetInsertBlock());
+  builder_.CreateCondBr(done, pop, next.block);
+  builder_.SetInsertPoint(pop);
+  loop_pop(values, frame);
+  jump(next, values);
+  builder_.SetInsertPoint(next.block);
+  values = next.values();
+  // The sample commits the rest of this pass and the documented extra passes.
+  const auto current_suffix = (shape.end - op.address) & maximum_pc;
+  return builder_.CreateSelect(
+      done, builder_.getInt64(current_suffix + shape.short_condition_tail()), left);
+}
+
 llvm::Value *Lowering::short_stage(const LoopShape &shape,
                                    const Instruction &op,
                                    llvm::Value *left,
@@ -1910,6 +1963,17 @@ llvm::Value *Lowering::short_stage(const LoopShape &shape,
 void Lowering::short_loop_observation(const Instruction &op,
                                       const LoopShape &shape,
                                       llvm::Value *left) {
+  if (!shape.counted()) {
+    auto *repeat = builder_.getInt64(short_unbounded);
+    auto *fetch = short_stage(shape, op, repeat, loop_fetch_distance);
+    auto *decode = short_stage(shape, op, repeat, loop_decode_distance);
+    auto *redirect = builder_.CreateICmpULE(left, builder_.getInt64(loop_decode_distance));
+    fetch =
+        builder_.CreateSelect(redirect, short_stage(shape, op, left, loop_decode_distance), fetch);
+    write_short_addresses({.fetch = fetch, .decode = decode},
+                          builder_.CreateICmpNE(left, builder_.getInt64(0)));
+    return;
+  }
   auto *descriptor = short_word(short_descriptor);
   auto *fetch = short_stage(shape, op, left, loop_fetch_distance);
   auto *decode =
@@ -1939,9 +2003,27 @@ void Lowering::short_loop_observation(const Instruction &op,
   write_short_addresses({.fetch = fetch, .decode = decode}, live);
 }
 
+llvm::Value *Lowering::short_loop_refill(const LoopShape &shape, llvm::Value *done) {
+  auto *descriptor = short_word(short_descriptor);
+  llvm::Value *refill = builder_.getInt64(0);
+  if (shape.counted()) {
+    auto *compact = short_flag(descriptor, short_compact_count);
+    refill = builder_.CreateSelect(builder_.CreateAnd(compact, done),
+                                   builder_.getInt64(shape.length == 2 ? 2 : 3),
+                                   builder_.getInt64(0));
+  } else if (shape.arithmetic()) {
+    refill =
+        builder_.CreateSelect(done, builder_.getInt64(loop_decode_distance), builder_.getInt64(0));
+  }
+  if (shape.length == 3) { return refill; }
+  auto *startup = short_flag(descriptor, short_startup);
+  return builder_.CreateAdd(refill, builder_.CreateZExt(startup, builder_.getInt64Ty()));
+}
+
 void Lowering::short_loop_retirement(Values values,
                                      const Instruction &op,
                                      const LoopShape &shape,
+                                     llvm::Value *old_status,
                                      bool partial) {
   auto *remaining = short_word(short_remaining);
   auto *descriptor = short_word(short_descriptor);
@@ -1953,17 +2035,15 @@ void Lowering::short_loop_retirement(Values values,
   auto *ordinary = llvm::BasicBlock::Create(module_.getContext(), "short.inactive", function_);
   builder_.CreateCondBr(active, advance, ordinary);
   builder_.SetInsertPoint(advance);
-  short_loop_counter(values, op, shape, descriptor);
-  auto *left = builder_.CreateSub(remaining, builder_.getInt64(1));
-  auto *done = builder_.CreateICmpEQ(left, builder_.getInt64(0));
-  auto *startup = short_flag(descriptor, short_startup);
-  auto *compact = short_flag(descriptor, short_compact_count);
-  auto *refill = builder_.CreateSelect(builder_.CreateAnd(compact, done),
-                                       builder_.getInt64(shape.length == 2 ? 2 : 3),
-                                       builder_.getInt64(0));
-  if (shape.length != 3) {
-    refill = builder_.CreateAdd(refill, builder_.CreateZExt(startup, builder_.getInt64Ty()));
+  llvm::Value *left = nullptr;
+  if (shape.counted()) {
+    short_loop_counter(values, op, shape, descriptor);
+    left = builder_.CreateSub(remaining, builder_.getInt64(1));
+  } else {
+    left = short_loop_test(values, op, shape, old_status);
   }
+  auto *done = builder_.CreateICmpEQ(left, builder_.getInt64(0));
+  auto *refill = short_loop_refill(shape, done);
   auto *stalled = builder_.CreateICmpNE(refill, builder_.getInt64(0));
   values[hazard_value] = builder_.CreateAnd(values[hazard_value], builder_.CreateNot(stalled));
   auto *older =
@@ -2154,7 +2234,9 @@ void Lowering::loop_retirement(Values &values,
                                llvm::Value *old_status,
                                bool partial) {
   const auto body = short_bodies_.find(op.address);
-  if (body != short_bodies_.end()) { short_loop_retirement(values, op, body->second, partial); }
+  if (body != short_bodies_.end()) {
+    short_loop_retirement(values, op, body->second, old_status, partial);
+  }
   const auto end = hardware_ends_.find(op.address);
   if (end != hardware_ends_.end()) { loop_refill(values, op); }
   const auto fetch = loop_fetches_.find(op.address);
@@ -2193,7 +2275,7 @@ void Lowering::admit_hardware_turns(const Values &values, const LoopShape &shape
   auto *length = builder_.getInt64(shape.length);
   auto *instructions = builder_.CreateUDiv(values[instruction_remaining_value], length);
   auto *available_cycles = values[cycle_remaining_value];
-  if (shape.arithmetic()) {
+  if (shape.arithmetic() && !shape.short_body()) {
     // At most one terminating turn in this grant owes a two-cycle refill.
     available_cycles = builder_.CreateBinaryIntrinsic(
         llvm::Intrinsic::usub_sat, available_cycles, builder_.getInt64(loop_decode_distance));
@@ -2202,13 +2284,14 @@ void Lowering::admit_hardware_turns(const Values &values, const LoopShape &shape
   auto *turns = builder_.CreateBinaryIntrinsic(llvm::Intrinsic::umin, instructions, cycles);
   llvm::Value *count = nullptr;
   llvm::Value *steady = builder_.getTrue();
+  if (shape.short_body()) {
+    steady = builder_.CreateNot(short_flag(short_word(short_descriptor), short_startup));
+  }
   if (shape.counted()) {
     count = builder_.CreateLoad(builder_.getInt32Ty(), loop_cell(loop_counter_slot, frame.index));
     // A raw zero represents 2^32 turns. The final turn always takes the exact path.
     llvm::Value *before_last = nullptr;
     if (shape.short_body()) {
-      auto *descriptor = short_word(short_descriptor);
-      steady = builder_.CreateNot(short_flag(descriptor, short_startup));
       // Leave the fetch that pops the frame and starts draining buffered words to the exact path.
       before_last = builder_.CreateBinaryIntrinsic(
           llvm::Intrinsic::usub_sat, count, builder_.getInt32(shape.short_threshold()));
@@ -2247,11 +2330,10 @@ void Lowering::emit_hardware_turns(const Node &body,
   values[extra_cycles_value] = builder_.getInt64(0);
   const auto words = std::span(instructions_).subspan(start, shape.length);
   llvm::Value *done = builder_.getFalse();
-  const auto condition_pc = (shape.end - loop_decode_distance) & maximum_pc;
   for (const auto &op : words) {
     builder_.SetCurrentDebugLocation(
         llvm::DILocation::get(module_.getContext(), op.address + 1, 0, function_->getSubprogram()));
-    if (shape.arithmetic() && op.address == condition_pc) {
+    if (shape.arithmetic() && op.address == shape.condition_pc()) {
       done = branch_taken(condition(values, shape.term));
     }
     instruction(values, op, false);
@@ -2271,7 +2353,7 @@ void Lowering::emit_hardware_turns(const Node &body,
     auto *updated = builder_.CreateSub(count, builder_.CreateTrunc(turns, builder_.getInt32Ty()));
     builder_.CreateStore(updated, loop_cell(loop_counter_slot, frame.index));
   }
-  if (shape.short_body()) {
+  if (shape.short_body() && shape.counted()) {
     // At a steady header, a whole turn leaves FADDR and DADDR at the same body addresses.
     write_short(short_remaining, builder_.CreateSub(short_word(short_remaining), retired));
   }
@@ -2290,6 +2372,14 @@ void Lowering::emit_hardware_turns(const Node &body,
   jump(partial_[start], tail);
   builder_.SetInsertPoint(finished);
   loop_pop(values, frame);
+  if (shape.short_body()) {
+    auto *buffered = builder_.getInt64(shape.short_condition_tail());
+    write_short(short_remaining, buffered);
+    short_loop_observation(words.back(), shape, buffered);
+    credit(values, retired, retired, false);
+    jump(partial_[start], values);
+    return;
+  }
   values[hazard_value] = builder_.getFalse();
   credit(
       values, retired, builder_.CreateAdd(retired, builder_.getInt64(loop_decode_distance)), false);

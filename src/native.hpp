@@ -58,6 +58,7 @@ enum ShortLoopWord : std::uint8_t {
 
 inline constexpr std::uint64_t short_startup = 1ULL << 24;
 inline constexpr std::uint64_t short_compact_count = 1ULL << 25;
+inline constexpr std::uint64_t short_unbounded = ~std::uint64_t{0};
 inline constexpr unsigned short_decode_shift = 24;
 inline constexpr std::uint64_t short_addresses_live = 1ULL << 48;
 inline constexpr std::uint32_t before_first_delay_slot = 1U << 25;

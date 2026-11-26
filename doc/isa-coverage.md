@@ -15,7 +15,7 @@ is claimed.
 | FastFP32 numerical mode (opt-in) | Independent approximation expectations, rounding/flags, unchanged raw moves/integer behavior, separate translations | Unimplemented |
 | Parallel operations | Old operands, memory aliases, register exchanges and ordered partial effects | Partial: raw register moves/swaps with supported fixed ALU writeback |
 | Address generation and memory | Both DAGs, modulo/reverse addressing, PM/DM and physical view aliases | Partial: normal-word pre-indexing, immediate modify/reverse and DAG register-load dependencies |
-| Sequencer and control | Delayed flow, DO/loop endpoints, LR, stacks, reset and interrupts | Partial: classic direct/indirect transfers, two delay slots, counted hardware DO, long arithmetic DO and counted nesting |
+| Sequencer and control | Delayed flow, DO/loop endpoints, LR, stacks, reset and interrupts | Partial: classic direct/indirect transfers, two delay slots, classic hardware DO and counted nesting |
 | Chip-profile boundaries | ADSP-21489 memory/vector parameters and explicit I/O ownership | Unimplemented |
 | JIT coherence and hosts | Self-modifying aliases, natural loops, precise exits, x86-64 and ARM64 | Unimplemented |
 
@@ -176,8 +176,17 @@ instructions after the loop and PC stacks pop. The short-loop fixtures cover
 startup and drain cycles, the count thresholds for fetch redirection, retained
 stack cells, fetch and decode addresses, and snapshot replay after an early
 pop. Eligible steady turns execute in the same bounded LLVM loop as long
-counted bodies. Short arithmetic DO, overlapping loop lookahead, branches near
-the endpoint and LR remain open.
+counted bodies.
+
+Short condition-terminated DO has separate sample points for one-, two- and
+three-word bodies. It preserves the remaining pass or iterations after the stack
+pop and charges the two-clock arithmetic refill at the final retirement. The
+four-word arithmetic loop uses the regular five-stage fetch schedule. Authored
+tests cover old ASTAT sampling, a flag changing on either word of a two-word
+loop, SIMD lane agreement, FOREVER, exact bounds and cross-Core replay.
+Short arithmetic fetch and decode observations derive from the documented
+sample points and five-stage pipeline. They have no hardware trace comparison.
+Overlapping loop lookahead, branches near the endpoint and LR remain open.
 
 Classic type 5 transfers raw data among R/S and I/M/L/B registers, including
 cross-PE data moves and raw40 register swaps, with supported single-function fixed

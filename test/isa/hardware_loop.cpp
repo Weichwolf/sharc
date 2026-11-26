@@ -5,6 +5,7 @@
 
 #include <array>
 #include <cstdint>
+#include <limits>
 #include <sharc/core.hpp>
 #include <span>
 #include <vector>
@@ -25,6 +26,7 @@ constexpr std::uint32_t loop_overflow = 1U << 25;
 constexpr std::uint32_t old_lcntr = 0x13579bdf;
 constexpr unsigned raw_shift = 8;
 constexpr unsigned count_shift = 24;
+constexpr std::uint32_t az = 1, an = 4, ac = 8;
 
 struct Timeline {
   sharc::Registers registers;
@@ -305,10 +307,200 @@ void multiword_short_loops() {
   short_counted_case(4, 1, after_jump, jump_to_successor);
 }
 
+struct ShortAddress {
+  unsigned pc, fetch, decode;
+};
+
+void short_boundary(Timeline &trace, ShortAddress address, unsigned cycles = 1) {
+  trace.boundary(base + address.pc, cycles);
+  trace.registers.faddr = base + address.fetch;
+  trace.registers.daddr = base + address.decode;
+  trace.record();
+}
+
+void entered_arithmetic(Timeline &trace, ShortAddress address, std::uint32_t loop_address) {
+  entered(trace, {.address = loop_address, .count = old_lcntr});
+  trace.registers.faddr = base + address.fetch;
+  trace.registers.daddr = base + address.decode;
+  trace.prefixes.back().registers = trace.registers;
+}
+
+void verify_short_arithmetic(fixture::Program &program,
+                             const sharc::Registers &initial,
+                             const Timeline &trace) {
+  for (const auto mode : fixture::numeric_modes) {
+    const auto native = fixture::compile(program.code, mode);
+    sharc::Core core(program.memory(), mode);
+    sharc::Core replay(program.memory(), mode);
+    fixture::install(core, native, initial);
+    (void)replay.install(native, fixture::Program::variant_id);
+    fixture::verify_prefixes(core, replay, trace.prefixes);
+  }
+}
+
+void single_word_arithmetic() {
+  constexpr std::array words{do_eq | 1, fixture::add(0, 0, 1), std::uint64_t{0}};
+  constexpr auto arithmetic_type = 1U << 29;
+  constexpr auto minus_one = std::numeric_limits<std::uint32_t>::max();
+  fixture::Program program(words);
+  for (const auto initial_count : {1U, 2U}) {
+    auto initial = starting();
+    initial.pe[0].data[0][0] = std::uint64_t{initial_count} << raw_shift;
+    initial.pe[0].data[0][1] = std::uint64_t{minus_one} << raw_shift;
+    Timeline trace{.registers = initial, .prefixes = {}};
+    auto &lane = trace.registers.pe[0];
+    entered_arithmetic(trace, {.pc = 1, .fetch = 1, .decode = 1}, arithmetic_type | (base + 1));
+    if (initial_count == 2) {
+      lane.data[0][0] = 1U << raw_shift;
+      lane.astat = ac;
+      short_boundary(trace, {.pc = 1, .fetch = 1, .decode = 1}, 2);
+      lane.data[0][0] = 0;
+      lane.astat = az | ac;
+      short_boundary(trace, {.pc = 1, .fetch = 1, .decode = 1});
+    }
+    // The one-word form samples every clock. A result from its first word
+    // can be sampled on the fill bubble before any buffered turn retires.
+    lane.data[0][0] = initial_count == 1 ? 0 : std::uint64_t{minus_one} << raw_shift;
+    lane.astat = initial_count == 1 ? az | ac : an;
+    popped(trace.registers);
+    short_boundary(trace, {.pc = 1, .fetch = 1, .decode = 1}, initial_count == 1 ? 2U : 1U);
+    const auto first_buffered = initial_count == 1 ? minus_one : minus_one - 1;
+    lane.astat = initial_count == 1 ? an : an | ac;
+    lane.data[0][0] = std::uint64_t{first_buffered} << raw_shift;
+    short_boundary(trace, {.pc = 1, .fetch = 2, .decode = 1});
+    lane.data[0][0] = std::uint64_t{first_buffered - 1} << raw_shift;
+    lane.astat = an | ac;
+    short_boundary(trace, {.pc = 1, .fetch = 3, .decode = 1});
+    lane.data[0][0] = std::uint64_t{first_buffered - 2} << raw_shift;
+    short_boundary(trace, {.pc = 2, .fetch = 6, .decode = 4}, 3);
+    verify_short_arithmetic(program, initial, trace);
+  }
+}
+
+void two_word_arithmetic() {
+  const auto zero = fixture::add(0, 3, 3);
+  const auto nonzero = fixture::add(2, 1, 1);
+  for (const bool first_sets_zero : {true, false}) {
+    const std::array words{do_eq | 2,
+                           first_sets_zero ? zero : std::uint64_t{0},
+                           first_sets_zero ? nonzero : zero,
+                           std::uint64_t{0}};
+    fixture::Program program(words);
+    auto initial = starting();
+    initial.pe[0].data[0][0] = initial.pe[0].data[0][1] = 1U << raw_shift;
+    Timeline trace{.registers = initial, .prefixes = {}};
+    auto &lane = trace.registers.pe[0];
+    entered_arithmetic(trace, {.pc = 1, .fetch = 2, .decode = 2}, base + 2);
+    if (first_sets_zero) {
+      lane.data[0][0] = 0;
+      lane.astat = az;
+    }
+    short_boundary(trace, {.pc = 2, .fetch = 2, .decode = 2}, 2);
+    if (first_sets_zero) {
+      lane.data[0][2] = 2U << raw_shift;
+      lane.astat = 0;
+    } else {
+      // The fresh flags of the last word miss this sample. A full pass
+      // finishes before the next sample pops the stacks.
+      lane.data[0][0] = 0;
+      lane.astat = az;
+      short_boundary(trace, {.pc = 1, .fetch = 1, .decode = 1});
+      short_boundary(trace, {.pc = 2, .fetch = 2, .decode = 2});
+    }
+    popped(trace.registers);
+    short_boundary(trace, {.pc = 1, .fetch = 3, .decode = 1});
+    if (first_sets_zero) { lane.astat = az; }
+    short_boundary(trace, {.pc = 2, .fetch = 4, .decode = 2});
+    if (first_sets_zero) { lane.astat = 0; }
+    short_boundary(trace, {.pc = 3, .fetch = 7, .decode = 5}, 3);
+    verify_short_arithmetic(program, initial, trace);
+  }
+}
+
+void three_word_arithmetic() {
+  constexpr std::array words{
+      do_eq | 3, fixture::add(2, 1, 1), std::uint64_t{0}, fixture::add(0, 3, 3), std::uint64_t{0}};
+  constexpr auto simd = 1U << 21;
+  fixture::Program program(words);
+  for (const bool both_zero : {true, false}) {
+    auto initial = starting();
+    initial.mode1 = simd;
+    for (auto &lane : initial.pe) { lane.data[0][1] = 1U << raw_shift; }
+    initial.pe[1].data[0][3] = both_zero ? 0 : 1U << raw_shift;
+    Timeline trace{.registers = initial, .prefixes = {}};
+    auto &state = trace.registers;
+    entered_arithmetic(trace, {.pc = 1, .fetch = 2, .decode = 3}, base + 3);
+    for (auto &lane : state.pe) { lane.data[0][2] = 2U << raw_shift; }
+    short_boundary(trace, {.pc = 2, .fetch = 3, .decode = 1});
+    short_boundary(trace, {.pc = 3, .fetch = 1, .decode = 2});
+    state.pe[0].astat = az;
+    state.pe[1].astat = both_zero ? az : 0;
+    state.pe[1].data[0][0] = both_zero ? 0 : 2U << raw_shift;
+    short_boundary(trace, {.pc = 1, .fetch = 2, .decode = 3});
+    // Fetch1 names B+1 while B executes. B's new flags cannot undo
+    // the decision, and the rest of this pass and one further pass retire.
+    for (auto &lane : state.pe) { lane.astat = 0; }
+    if (both_zero) { popped(state); }
+    short_boundary(trace, {.pc = 2, .fetch = 3, .decode = 1});
+    short_boundary(trace, {.pc = 3, .fetch = 1, .decode = 2});
+    state.pe[0].astat = az;
+    state.pe[1].astat = both_zero ? az : 0;
+    short_boundary(trace, {.pc = 1, .fetch = 2, .decode = 3});
+    if (both_zero) {
+      for (auto &lane : state.pe) { lane.astat = 0; }
+      short_boundary(trace, {.pc = 2, .fetch = 4, .decode = 1});
+      short_boundary(trace, {.pc = 3, .fetch = 5, .decode = 2});
+      for (auto &lane : state.pe) { lane.astat = az; }
+      short_boundary(trace, {.pc = 4, .fetch = 8, .decode = 6}, 3);
+    }
+    verify_short_arithmetic(program, initial, trace);
+  }
+}
+
+void four_word_arithmetic() {
+  constexpr std::array words{do_eq | 4,
+                             fixture::add(0, 3, 3),
+                             fixture::add(2, 1, 1),
+                             std::uint64_t{0},
+                             std::uint64_t{0},
+                             std::uint64_t{0}};
+  fixture::Program program(words);
+  auto initial = starting();
+  initial.pe[0].data[0][1] = 1U << raw_shift;
+  Timeline trace{.registers = initial, .prefixes = {}};
+  auto &lane = trace.registers.pe[0];
+  entered_arithmetic(trace, {.pc = 1, .fetch = 1, .decode = 3}, base + 4);
+  lane.astat = az;
+  short_boundary(trace, {.pc = 2, .fetch = 2, .decode = 4});
+  lane.astat = 0;
+  lane.data[0][2] = 2U << raw_shift;
+  popped(trace.registers);
+  short_boundary(trace, {.pc = 3, .fetch = 5, .decode = 1});
+  short_boundary(trace, {.pc = 4, .fetch = 6, .decode = 2});
+  short_boundary(trace, {.pc = 5, .fetch = 9, .decode = 7}, 3);
+  verify_short_arithmetic(program, initial, trace);
+}
+
+void short_forever_do() {
+  constexpr std::uint64_t setup = 0x0e3e00000002;
+  constexpr std::uint32_t forever_address = 0x1f000000;
+  constexpr std::array words{setup, fixture::add(0, 0, 1), std::uint64_t{0}, std::uint64_t{0}};
+  fixture::Program program(words);
+  auto initial = starting();
+  initial.pe[0].data[0][1] = 1U << raw_shift;
+  Timeline trace{.registers = initial, .prefixes = {}};
+  entered_arithmetic(trace, {.pc = 1, .fetch = 2, .decode = 2}, forever_address | (base + 2));
+  for (unsigned turn = 1; turn <= 3; ++turn) {
+    trace.registers.pe[0].data[0][0] = std::uint64_t{turn} << raw_shift;
+    short_boundary(trace, {.pc = 2, .fetch = 2, .decode = 2}, turn == 1 ? 2U : 1U);
+    short_boundary(trace, {.pc = 1, .fetch = 1, .decode = 1});
+  }
+  verify_short_arithmetic(program, initial, trace);
+}
+
 Timeline arithmetic_prefix(sharc::Registers registers, bool both_zero) {
   constexpr auto begin = base + 1;
   constexpr auto end = base + 6;
-  constexpr std::uint32_t az = 1;
   Timeline trace{.registers = registers, .prefixes = {}};
   entered(trace, {.address = end, .count = old_lcntr});
   auto &state = trace.registers;
@@ -576,6 +768,11 @@ void fixture::hardware_loop_control_flow() {
   counted_forms();
   single_word_loops();
   multiword_short_loops();
+  single_word_arithmetic();
+  two_word_arithmetic();
+  three_word_arithmetic();
+  four_word_arithmetic();
+  short_forever_do();
   arithmetic_do();
   forever_do();
   nested_do();

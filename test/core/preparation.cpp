@@ -102,12 +102,12 @@ void formats() {
         const auto semantic = Core::lower(image);
         check(!semantic.bitcode().empty() && !semantic.exports().empty(),
               "supported classic form has no semantic image");
-      } else if (item.type == 12) {
+      } else if (item.type == 12 || item.type == 13) {
         const auto classic = refusal(image);
         check(classic.reason == FaultReason::undeclared_entry &&
                   classic.instruction_bits == full_width && classic.instruction == item.word &&
                   classic.detail.starts_with(name),
-              "classic counted DO with a missing body lost its format or fault attribution");
+              "classic DO with a missing body lost its format or fault attribution");
       } else {
         const auto classic = refusal(image);
         check(classic.reason == FaultReason::unsupported_instruction &&
