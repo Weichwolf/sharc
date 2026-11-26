@@ -93,7 +93,8 @@ altered architectural return address. These requirements also apply as calls
 and hardware loops are added to the initial native subset.
 
 The current native ABI passes R0–R5 and their paired raw values, both ASTAT/STKY
-pairs, execution bounds and progress as arguments. Other data registers and the
+pairs, remaining budgets and any final instruction's cycle overrun as arguments.
+The owner exit derives progress from the initial budgets. Other data registers and the
 PC-stack depth remain SSA within a connected unit and are materialized at unit
 exits. CALL and RTS access individual cells in the owner’s PC stack. Taken
 returns end the current grant and admit the checked continuation. Indirect
@@ -109,6 +110,10 @@ two physical DAG-load dependency tags under the existing native signature.
 Owner exits and snapshots preserve the same history. Fixed-cost loop admission
 proves empty incoming load history and propagates that fact into its body;
 acyclic grants reserve possible stalls and account the actual instruction costs.
+Within an admitted block, an unconditional ALU overwrite can make earlier
+ordinary ALU flags dead. Carry consumers, comparison history, sticky bits and
+exact prefixes retain their architectural effects. Register-bank contexts
+include the high bank when a decoded operand can access it.
 Complete normal-word PM/DM views support separate lent read/write reservations,
 optional mirrored tails, explicit Direct preparation and a
 terminal host-fault adapter; see [memory.md](memory.md). Cross-unit flag recipes,

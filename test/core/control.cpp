@@ -104,6 +104,53 @@ void missing_target() {
         "missing branch target did not preserve the completed prefix");
 }
 
+void observed_alu_status() {
+  constexpr std::uint64_t add_with_carry = 0x013e00005211;
+  constexpr std::uint64_t compare = 0x013e0000a021;
+  constexpr std::uint64_t raw_max = 0xffffffff00ULL;
+  constexpr std::uint32_t old_history = 0x20000000;
+  constexpr std::uint32_t new_history = 0x90000000;
+  constexpr std::uint32_t inactive_astat = 0x95012345;
+  constexpr std::uint32_t carry_and_zero = 9;
+  const std::array words{fixture::add(0, 0, 1), add_with_carry, compare, fixture::add(3, 1, 1)};
+  fixture::Program program(words);
+  const auto native = sharc::Core::compile(program.code);
+  sharc::Core core(program.memory());
+  (void)core.install(native, fixture::Program::variant_id);
+
+  sharc::Registers initial;
+  initial.pc = fixture::code_address;
+  initial.pe[0].data[0][0] = raw_max;
+  initial.pe[0].data[0][1] = 0x100;
+  initial.pe[0].astat = old_history;
+  initial.pe[1].astat = inactive_astat;
+  core.set_registers(initial);
+  const auto before = core.save();
+
+  auto expected = initial;
+  expected.pc += static_cast<std::uint32_t>(words.size());
+  expected.faddr = expected.pc + 4;
+  expected.daddr = expected.pc + 2;
+  expected.emuclk = words.size();
+  expected.pe[0].data[0][0] = 0;
+  expected.pe[0].data[0][2] = 3U << 8;
+  expected.pe[0].data[0][3] = 0x200;
+  expected.pe[0].astat = new_history;
+  const auto complete = core.run(words.size());
+  check(!complete.has_fault && core.registers() == expected,
+        "admitted ALU sequence lost carry input or comparison history");
+
+  core.restore(before);
+  const auto prefix = core.run_until(1);
+  check(!prefix.has_fault &&
+            prefix.progress == sharc::Progress{.instructions = 1, .base_cycles = 1} &&
+            core.registers().pe[0].astat == (old_history | carry_and_zero),
+        "exact prefix did not publish the resolved ALU flags");
+  const auto suffix = core.run(words.size() - 1);
+  check(!suffix.has_fault && core.registers() == expected,
+        "resumed ALU sequence changed carry input or comparison history");
+}
+
 void call_snapshot() {
   constexpr auto base = fixture::code_address;
   constexpr std::uint64_t call = 0x06be00000000;
@@ -474,6 +521,7 @@ void unretired_branch_stalls() {
 int main() try {
   branch_boundaries();
   missing_target();
+  observed_alu_status();
   call_snapshot();
   refused_stack_prefix();
   call_stack_status();

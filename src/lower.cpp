@@ -63,6 +63,7 @@ constexpr unsigned system_register_first = 0x60;
 constexpr unsigned ureg_mask = 127, byte_mask = 255;
 constexpr unsigned history_older_mask = 0xff00;
 constexpr unsigned rotate_opcode = 0x08;
+constexpr unsigned conditional_compute_type = 2;
 constexpr unsigned immediate_shift_type = 6;
 constexpr unsigned register_move_type = 5;
 constexpr unsigned immediate_move_type = 17;
@@ -393,7 +394,7 @@ void validate(const Instruction &instruction, std::string_view identity) {
     validate_immediate_shift(instruction, identity);
     return;
   }
-  if (instruction.type == 2) {
+  if (instruction.type == conditional_compute_type) {
     constexpr auto allowed =
         (std::uint64_t{1} << 40) | (std::uint64_t{true_condition} << condition_shift) | 0x7fffff;
     if ((instruction.word & ~allowed) != 0) {
@@ -425,9 +426,8 @@ constexpr std::size_t status_value = 16;
 constexpr std::size_t sticky_value = status_value + 1;
 constexpr std::size_t instruction_remaining_value = sticky_value + 1;
 constexpr std::size_t cycle_remaining_value = instruction_remaining_value + 1;
-constexpr std::size_t instructions_retired_value = cycle_remaining_value + 1;
-constexpr std::size_t cycles_retired_value = instructions_retired_value + 1;
-constexpr std::size_t credit_value = cycles_retired_value + 1;
+constexpr std::size_t cycle_overrun_value = cycle_remaining_value + 1;
+constexpr std::size_t credit_value = cycle_overrun_value + 1;
 constexpr std::size_t hazard_value = credit_value + 1;
 constexpr std::size_t extra_cycles_value = hazard_value + 1;
 constexpr std::size_t pc_stack_depth_value = extra_cycles_value + 1;
@@ -621,6 +621,7 @@ private:
 
   llvm::Value *condition(const Values &values, unsigned code);
   Arithmetic arithmetic(const Values &values, const Compute &compute, unsigned opcode);
+  FixedResult word_step(llvm::Value *input, bool decrement);
   Arithmetic rotation(const Values &values, const Compute &compute);
   Arithmetic status_result(const Values &values,
                            const FixedResult &result,
@@ -666,7 +667,8 @@ private:
   void plan_memory();
   std::pair<llvm::Value *, llvm::Value *> plan_pointer(const MemoryMove &move,
                                                        llvm::Value *address);
-  void emit_instruction(std::size_t i, const std::optional<BlockCost> &grant);
+  void emit_instruction(std::size_t i, const std::optional<BlockCost> &grant, bool dead_status);
+  [[nodiscard]] std::vector<bool> dead_alu_status() const;
   void plan_loops();
   void complete_loop(Values values, const Instruction &op);
   std::vector<std::optional<BlockCost>> unit_costs() const;
@@ -769,23 +771,19 @@ Arithmetic Lowering::arithmetic(const Values &values, const Compute &compute, un
       break;
     }
     case alu::add_carry_only:
-    case alu::subtract_borrow:
-    case alu::increment:
-    case alu::decrement: {
-      llvm::Value *extra = carry_in;
-      if (opcode == alu::subtract_borrow) { extra = builder_.CreateSub(carry_in, vector(64, 1)); }
-      if (opcode == alu::increment) { extra = vector(64, 1); }
-      if (opcode == alu::decrement) {
-        extra = vector(64, std::numeric_limits<std::uint64_t>::max());
-      }
+    case alu::subtract_borrow: {
+      const bool subtract = opcode == alu::subtract_borrow;
+      auto *extra = subtract ? builder_.CreateSub(carry_in, vector(64, 1)) : carry_in;
       value = builder_.CreateAdd(sx, extra);
       auto *unsigned_value = builder_.CreateAdd(ux, extra);
-      carry = opcode == alu::subtract_borrow || opcode == alu::decrement
-                  ? builder_.CreateICmpSGE(unsigned_value, vector(64, 0))
-                  : builder_.CreateICmpUGE(unsigned_value, vector(64, unsigned_limit));
+      carry = subtract ? builder_.CreateICmpSGE(unsigned_value, vector(64, 0))
+                       : builder_.CreateICmpUGE(unsigned_value, vector(64, unsigned_limit));
       range_check = true;
       break;
     }
+    case alu::increment:
+    case alu::decrement:
+      return status_result(values, word_step(x, opcode == alu::decrement), x, y, opcode);
     case alu::negate:
       value = builder_.CreateNeg(sx);
       carry = builder_.CreateICmpEQ(x, vector(32, 0));
@@ -844,6 +842,22 @@ Arithmetic Lowering::arithmetic(const Values &values, const Compute &compute, un
   }
   return status_result(
       values, {.value = value, .carry = carry, .overflow = overflow, .sign = sign}, x, y, opcode);
+}
+
+FixedResult Lowering::word_step(llvm::Value *input, bool decrement) {
+  auto *limit = vector(32, decrement ? static_cast<std::uint32_t>(fixed_minimum) : fixed_maximum);
+  auto *one = vector(32, 1);
+  auto *word = decrement ? builder_.CreateSub(input, one) : builder_.CreateAdd(input, one);
+  auto *overflow = builder_.CreateICmpEQ(input, limit);
+  auto *carry =
+      decrement
+          ? builder_.CreateICmpNE(input, vector(32, 0))
+          : builder_.CreateICmpEQ(input, vector(32, std::numeric_limits<std::uint32_t>::max()));
+  if ((context_ & saturation_mode) != 0) { word = builder_.CreateSelect(overflow, limit, word); }
+  return {.value = builder_.CreateZExt(word, vector_type(64)),
+          .carry = carry,
+          .overflow = overflow,
+          .sign = vector(1, 0)};
 }
 
 Arithmetic Lowering::status_result(const Values &values,
@@ -1380,13 +1394,11 @@ void Lowering::credit(Values &values, llvm::Value *count, llvm::Value *cycles, b
   auto *available = values[cycle_remaining_value];
   auto *remaining = builder_.CreateSub(available, cycles);
   if (partial) {
-    remaining = builder_.CreateSelect(
-        builder_.CreateICmpUGE(available, cycles), remaining, builder_.getInt64(0));
+    remaining = builder_.CreateBinaryIntrinsic(llvm::Intrinsic::usub_sat, available, cycles);
+    values[cycle_overrun_value] =
+        builder_.CreateBinaryIntrinsic(llvm::Intrinsic::usub_sat, cycles, available);
   }
   values[cycle_remaining_value] = remaining;
-  values[instructions_retired_value] =
-      builder_.CreateAdd(values[instructions_retired_value], count);
-  values[cycles_retired_value] = builder_.CreateAdd(values[cycles_retired_value], cycles);
   values[extra_cycles_value] = builder_.getInt64(0);
 }
 
@@ -1511,8 +1523,7 @@ void Lowering::emit_exit() {
       function_->getArg(unit_controls),
       values[instruction_remaining_value],
       values[cycle_remaining_value],
-      values[instructions_retired_value],
-      values[cycles_retired_value],
+      values[cycle_overrun_value],
       exit_pc_,
       builder_.getInt32(entry_address_),
       function_->getArg(unit_mode),
@@ -1760,7 +1771,31 @@ std::vector<std::optional<BlockCost>> Lowering::unit_costs() const {
   return result;
 }
 
-void Lowering::emit_instruction(std::size_t i, const std::optional<BlockCost> &grant) {
+std::vector<bool> Lowering::dead_alu_status() const {
+  std::vector<bool> dead(instructions_.size());
+  bool overwritten = false;
+  for (auto end = instructions_.size(); end != 0; --end) {
+    const auto i = end - 1;
+    const auto &op = instructions_[i];
+    if (costs_[i].instructions == 1) { overwritten = false; }
+    if (op.type == conditional_compute_type && op.compute.kind == ComputeKind::alu &&
+        ((op.word >> condition_shift) & true_condition) == true_condition) {
+      const auto opcode = op.compute.opcode;
+      // Compare history outlives the ordinary ALU flags.
+      dead[i] = overwritten && opcode != alu::compare && opcode != alu::compare_unsigned;
+      overwritten = opcode != alu::add_carry && opcode != alu::subtract_carry &&
+                    opcode != alu::add_carry_only && opcode != alu::subtract_borrow;
+    } else if (op.type != nop_type && op.type != immediate_move_type &&
+               op.type != index_modify_type && op.type != memory_move_type) {
+      overwritten = false;
+    }
+  }
+  return dead;
+}
+
+void Lowering::emit_instruction(std::size_t i,
+                                const std::optional<BlockCost> &grant,
+                                bool dead_status) {
   const auto &op = instructions_[i];
   builder_.SetCurrentDebugLocation(
       llvm::DILocation::get(module_.getContext(), op.address + 1, 0, function_->getSubprogram()));
@@ -1812,7 +1847,10 @@ void Lowering::emit_instruction(std::size_t i, const std::optional<BlockCost> &g
   auto *lanes = branch_lanes(values, op, false);
   auto pipeline =
       PipelineEffects{.stall = pipeline_stall(values, op), .tag = loaded_tag(values, op)};
+  auto *old_status = values[status_value];
   instruction(values, op, false);
+  // Admitted memory accesses have no resumable exit inside this block.
+  if (dead_status) { values[status_value] = old_status; }
   if (!branch(op)) { retire_pipeline(values, pipeline); }
   if (costs_[i].instructions > 1) {
     jump(fast_[i + 1], values);
@@ -1883,8 +1921,7 @@ void Lowering::emit() {
   initial[sticky_value] = function_->getArg(unit_sticky);
   initial[instruction_remaining_value] = function_->getArg(unit_instructions);
   initial[cycle_remaining_value] = function_->getArg(unit_cycles);
-  initial[instructions_retired_value] = function_->getArg(unit_retired_instructions);
-  initial[cycles_retired_value] = function_->getArg(unit_retired_cycles);
+  initial[cycle_overrun_value] = function_->getArg(unit_cycle_overrun);
   initial[credit_value] = builder_.getInt64(0);
   initial[loop_grant_value] = builder_.getInt64(0);
   initial[loop_remaining_value] = builder_.getInt64(0);
@@ -1925,7 +1962,10 @@ void Lowering::emit() {
   }
   builder_.SetInsertPoint(unknown);
   exit(initial, pc, NativeExit::undeclared);
-  for (std::size_t i = 0; i < instructions_.size(); ++i) { emit_instruction(i, grants[i]); }
+  const auto dead_status = dead_alu_status();
+  for (std::size_t i = 0; i < instructions_.size(); ++i) {
+    emit_instruction(i, grants[i], dead_status[i]);
+  }
   builder_.SetCurrentDebugLocation({});
   emit_exit();
 }
@@ -1939,7 +1979,6 @@ std::uint32_t register_context(const Instruction &instruction) {
     if (dag_register(reg)) { mask |= dag_bank_mode(reg & 15); }
     if (data_register(reg)) { mask |= ((reg & 15) < 8 ? low_bank_mode : high_bank_mode); }
   }
-  mask |= simd_mode;
   return mask;
 }
 
@@ -1963,11 +2002,13 @@ std::uint32_t instruction_context(const Instruction &instruction) {
   if (indirect_branch(instruction)) {
     mask |= dag_bank_mode(branch_index(instruction)) | dag_bank_mode(branch_modifier(instruction));
   }
-  if (instruction.type == immediate_move_type) {
-    mask |= low_bank_mode | high_bank_mode | simd_mode;
-  }
   if (instruction.compute.kind == ComputeKind::none) { return mask; }
-  mask |= low_bank_mode | high_bank_mode | simd_mode | saturation_mode;
+  mask |= simd_mode | saturation_mode;
+  const auto high_register = [](std::uint8_t reg) { return reg >= 8; };
+  if (std::ranges::any_of(instruction.compute.inputs, high_register) ||
+      std::ranges::any_of(instruction.compute.outputs, high_register)) {
+    mask |= high_bank_mode;
+  }
   if (instruction.compute.opcode == alu::average) { mask |= truncation_mode; }
   return mask;
 }

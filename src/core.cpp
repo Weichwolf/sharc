@@ -567,8 +567,8 @@ RunResult Core::Impl::execute(std::uint64_t instructions, std::uint64_t cycles) 
     const auto index = prepared_unit();
     if (!index) { return failure(FaultReason::unsupported_feature, "no prepared MODE1 context"); }
     detail::ControlWords control{};
-    control[detail::remaining_instructions] = instructions - progress.instructions;
-    control[detail::remaining_cycles] = cycle_budget;
+    control[detail::instruction_budget] = instructions - progress.instructions;
+    control[detail::cycle_budget] = cycle_budget;
     state.execution = ExecutionState::running;
     if (!enter(*index, control)) { return host_failure(progress); }
     const Progress retired{.instructions = control[detail::retired_instructions],
