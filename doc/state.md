@@ -67,6 +67,9 @@ A qualified CALL saves a suspended terminating tail with its PC-stack entry.
 For a delayed `RTS (LR)`, the tail becomes active after the two return slots.
 A CALL occupying an admitted long-loop endpoint consumes the loop decision
 and pushes the selected successor, including the loop header on a repeat.
+When a CALL redirects before a pending long-loop sample reaches Fetch1,
+the snapshot retains that event until the return refill. A delayed return
+preserves it across both slots and applies it at the redirect.
 An admitted `JUMP (LA)` removes the loop frame at the jump. A counted tail
 that has already popped identifies the completed frame until an abort or the
 original endpoint retires. With DB, the two slots execute after the stack effect.

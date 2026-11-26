@@ -199,6 +199,16 @@ loop backedge or exit refill. Installed-image fixtures cover both backedge
 and exit returns through the connected and separate prepared entries.
 The endpoint CALL timing is derived from the branch and loop pipeline
 tables. Comparison with a hardware trace remains open.
+An immediate CALL at the instruction whose retirement would sample the
+end fetch or arithmetic condition defers that sample to the return refill.
+The ordinary RTS form admits a return to the first, still-unsampled end
+fetch. A deferred arithmetic condition uses the callee flags, including
+the final `RTS (DB, LR)` slot. A false CALL samples on the ordinary loop
+path. Installed-image tests cover counter timing, direct and separate
+DAG2 callee entries, SIMD lane disagreement, both return slots and
+snapshot replay. The sample executes at the prepared return address
+before admitting another guest instruction. The combined timing follows
+the documented pipeline and awaits hardware comparison.
 Classic JUMP (LA) handles qualified long-loop exits through absolute,
 PC-relative and DAG2 targets, with either immediate transfer or two delay
 slots. A false predicate leaves the hardware loop's outstanding decision
@@ -221,8 +231,8 @@ short child fill. Tests exercise counted bodies of one through four words,
 a short arithmetic child, a late arithmetic parent sample and snapshot
 replay with both active and already-popped frames. The overlap timing is
 derived from the documented pipeline observations.
-Calls coinciding with a loop sample, short-loop calls, short outer loops
-and branches in the overlapping child refill remain open.
+Short-loop calls, short outer loops and branches in the overlapping child
+refill remain open.
 
 Classic type 5 transfers raw data among R/S and I/M/L/B registers, including
 cross-PE data moves and raw40 register swaps, with supported single-function fixed

@@ -1248,6 +1248,185 @@ void counted_call_reentry() {
   }
 }
 
+void sample_return_slots(Timeline &trace, unsigned resume) {
+  short_boundary(trace, {.pc = 10, .fetch = resume + 1, .decode = 12});
+  trace.registers.pe[0].data[0][2] = 7U << raw_shift;
+  short_boundary(trace, {.pc = 11, .fetch = resume + 2, .decode = resume});
+}
+
+enum class CountedSampleCall : std::uint8_t { plain, direct, delayed, predicated };
+
+void counted_sample_call(CountedSampleCall form) {
+  constexpr auto sub = base + 8;
+  constexpr std::uint64_t call_dag2_eq = 0x088000000000;
+  const bool late_return =
+      form == CountedSampleCall::delayed || form == CountedSampleCall::predicated;
+  const bool conditional = form == CountedSampleCall::predicated;
+  const auto indirect = conditional ? call_dag2_eq : call_dag2;
+  std::array<std::uint64_t, 14> words{};
+  words[0] = do_immediate | (std::uint64_t{2} << count_shift) | 5;
+  words[1] = late_return ? indirect : call_direct | sub;
+  words[6] = jump_direct | (base + 13);
+  words[8] = fixture::add(0, 0, 1);
+  words[9] = rts | (form == CountedSampleCall::plain ? 0 : lr) | (late_return ? db : 0);
+  words[10] = fixture::immediate(2, 7);
+  fixture::Program program(words);
+  program.code.variants[0].entries.push_back(sub);
+  auto initial = starting();
+  initial.dag[0][8].index = sub;
+  initial.pe[0].data[0][1] = 1U << raw_shift;
+  initial.pe[0].astat = conditional ? az : 0;
+  Timeline trace{.registers = initial, .prefixes = {}};
+  auto &state = trace.registers;
+  state.lcntr = 2;
+  entered(trace, {.address = counted_address | (base + 5), .count = 2});
+  for (const bool repeats : {true, false}) {
+    const bool calls = !conditional || repeats;
+    unsigned clocks = 1;
+    if (calls) {
+      // At E-4 a taken CALL redirects before the pending end fetch. The
+      // count stays resident throughout the subroutine and any return slots.
+      entered_call(trace, {.target = sub, .raw_return = call_tag | (base + 2)});
+      state.pe[0].data[0][0] += 1U << raw_shift;
+      state.pe[0].astat = 0;
+      trace.boundary(sub + 1);
+      trace.record();
+      popped_call(state);
+      if (late_return) { sample_return_slots(trace, 2); }
+      clocks = late_return ? 2U : 4U;
+    }
+    parent_count_sample(trace, repeats);
+    counted_call_boundary(trace, 2, repeats, clocks);
+    for (unsigned pc = 3; pc <= 5; ++pc) { counted_call_boundary(trace, pc, repeats, 1); }
+    trace.boundary(base + (repeats ? 1U : 6U));
+    trace.record();
+  }
+  verify_timeline(program, initial, trace);
+}
+
+void counted_sample_before_second_call() {
+  constexpr auto sub = base + 8;
+  std::array<std::uint64_t, 10> words{};
+  words[0] = do_immediate | (std::uint64_t{1} << count_shift) | 5;
+  words[1] = call_direct | sub;
+  words[2] = call_direct | sub;
+  words[6] = jump_direct | (base + 9);
+  words[8] = rts | lr;
+  fixture::Program program(words);
+  const auto initial = starting();
+  Timeline trace{.registers = initial, .prefixes = {}};
+  trace.registers.lcntr = 1;
+  entered(trace, {.address = counted_address | (base + 5), .count = 1});
+  entered_call(trace, {.target = sub, .raw_return = call_tag | (base + 2)});
+  popped_call(trace.registers);
+  parent_count_sample(trace, false);
+  counted_call_boundary(trace, 2, false, 4);
+  // The deferred exit leaves the same tag as an end fetch completed in place.
+  entered_call(trace, {.target = sub, .raw_return = call_tag | termination_tag | (base + 3)});
+  popped_call(trace.registers);
+  for (unsigned pc = 3; pc <= 6; ++pc) {
+    counted_call_boundary(trace, pc, false, pc == 3 ? 4U : 1U);
+  }
+  verify_timeline(program, initial, trace);
+}
+
+enum class ArithmeticSampleCall : std::uint8_t {
+  immediate,
+  delayed,
+  repeated,
+  skipped,
+  split_simd
+};
+
+void arithmetic_sample_call(ArithmeticSampleCall form) {
+  constexpr auto sub = base + 8;
+  constexpr std::uint64_t call_ne = 0x06a000000000;
+  constexpr auto simd = 1U << 21;
+  const bool skipped = form == ArithmeticSampleCall::skipped;
+  const bool late_return = form == ArithmeticSampleCall::delayed;
+  const bool split = form == ArithmeticSampleCall::split_simd;
+  const bool repeats = form == ArithmeticSampleCall::repeated || split;
+  const bool sub_sets_zero = split || (!late_return && !repeats);
+  std::array<std::uint64_t, 14> words{};
+  words[0] = do_eq | 5;
+  words[3] = (skipped ? call_ne : call_direct) | sub;
+  if (split) { words[3] = call_dag2; }
+  words[6] = jump_direct | (base + 13);
+  words[8] = sub_sets_zero ? fixture::add(0, 3, 3) : fixture::add(0, 1, 1);
+  words[9] = rts | lr | (late_return ? db : 0);
+  words[10] = fixture::immediate(2, 7);
+  words[11] = fixture::add(0, 3, 3);
+  fixture::Program program(words);
+  auto initial = starting();
+  initial.pe[0].astat = skipped || repeats ? az : 0;
+  initial.pe[0].data[0][1] = 1U << raw_shift;
+  if (split) {
+    program.code.variants[0].entries.push_back(sub);
+    program.code.variants[0].entries.push_back(base + 4);
+    initial.mode1 = simd;
+    initial.dag[0][8].index = sub;
+    initial.pe[1].data[0][3] = 1U << raw_shift;
+  }
+  Timeline trace{.registers = initial, .prefixes = {}};
+  auto &state = trace.registers;
+  entered(trace, {.address = base + 5, .count = old_lcntr});
+  short_boundary(trace, {.pc = 2, .fetch = 1, .decode = 4});
+  short_boundary(trace, {.pc = 3, .fetch = 2, .decode = 5});
+  unsigned clocks = 1;
+  if (!skipped) {
+    entered_call(trace, {.target = sub, .raw_return = call_tag | (base + 4)});
+    state.pe[0].data[0][0] = sub_sets_zero ? 0 : 2U << raw_shift;
+    state.pe[0].astat = sub_sets_zero ? az : 0;
+    state.pe[1].data[0][0] = initial.pe[1].data[0][3] * 2U;
+    trace.boundary(sub + 1);
+    trace.record();
+    popped_call(state);
+    if (late_return) {
+      sample_return_slots(trace, 4);
+      state.pe[0].data[0][0] = 0;
+      state.pe[0].astat = az;
+    }
+    clocks = late_return ? 2U : 4U;
+  }
+  // The restored fetch reaches the second loop word using ASTAT from
+  // the callee or the second return slot. A false CALL samples in place.
+  if (!repeats) { popped(state); }
+  short_boundary(trace, {.pc = 4, .fetch = repeats ? 3U : 6U, .decode = 1}, clocks);
+  short_boundary(trace, {.pc = 5, .fetch = repeats ? 4U : 7U, .decode = 2});
+  trace.boundary(base + (repeats ? 1U : 6U), repeats ? 1U : 3U);
+  trace.record();
+  verify_timeline(program, initial, trace);
+}
+
+void arithmetic_fetch_call() {
+  constexpr auto sub = base + 8;
+  std::array<std::uint64_t, 11> words{};
+  words[0] = do_eq | 5;
+  words[1] = call_direct | sub;
+  words[6] = jump_direct | (base + 10);
+  words[8] = fixture::add(0, 0, 0);
+  words[9] = rts | lr;
+  fixture::Program program(words);
+  const auto initial = starting();
+  Timeline trace{.registers = initial, .prefixes = {}};
+  entered(trace, {.address = base + 5, .count = old_lcntr});
+  entered_call(trace, {.target = sub, .raw_return = call_tag | (base + 2)});
+  trace.registers.pe[0].astat = az;
+  trace.boundary(sub + 1);
+  trace.record();
+  popped_call(trace.registers);
+  // Returning from E-4 first selects the speculative backedge. The
+  // arithmetic condition is sampled later, at the ordinary E-2 phase.
+  short_boundary(trace, {.pc = 2, .fetch = 1, .decode = 4}, 4);
+  short_boundary(trace, {.pc = 3, .fetch = 2, .decode = 5});
+  popped(trace.registers);
+  short_boundary(trace, {.pc = 4, .fetch = 6, .decode = 1});
+  short_boundary(trace, {.pc = 5, .fetch = 7, .decode = 2});
+  trace.boundary(base + 6, 3);
+  trace.record();
+  verify_timeline(program, initial, trace);
+}
+
 void conditional_endpoint_call(bool call_if_nonzero) {
   constexpr auto start = base + 1;
   constexpr auto end = base + 5;
@@ -1632,6 +1811,17 @@ void fixture::hardware_loop_control_flow() {
   short_child_after_parent_fetch();
   nested_short_do();
   counted_call_reentry();
+  counted_sample_call(CountedSampleCall::plain);
+  counted_sample_call(CountedSampleCall::direct);
+  counted_sample_call(CountedSampleCall::delayed);
+  counted_sample_call(CountedSampleCall::predicated);
+  counted_sample_before_second_call();
+  arithmetic_sample_call(ArithmeticSampleCall::immediate);
+  arithmetic_sample_call(ArithmeticSampleCall::delayed);
+  arithmetic_sample_call(ArithmeticSampleCall::repeated);
+  arithmetic_sample_call(ArithmeticSampleCall::skipped);
+  arithmetic_sample_call(ArithmeticSampleCall::split_simd);
+  arithmetic_fetch_call();
   conditional_endpoint_call(false);
   conditional_endpoint_call(true);
   arithmetic_call_reentry();

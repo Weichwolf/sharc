@@ -139,12 +139,11 @@ struct LoopPipeline {
   std::uint64_t counted_tail{};
   std::array<std::uint64_t, detail::short_state_words> short_loop{};
   std::array<std::uint64_t, Registers::pc_stack_capacity> calls{};
-  std::uint64_t delayed_tail{};
+  std::uint64_t return_tail{};
 
   [[nodiscard]] bool active() const {
     return short_loop[detail::short_remaining] != 0 || refill != 0 || counted_tail != 0 ||
-           delayed_tail != 0 ||
-           std::ranges::any_of(frames, [](auto frame) { return frame != 0; }) ||
+           return_tail != 0 || std::ranges::any_of(frames, [](auto frame) { return frame != 0; }) ||
            std::ranges::any_of(calls, [](auto call) { return call != 0; });
   }
 
@@ -238,7 +237,7 @@ struct Core::Impl {
     pointers[detail::loop_refill_slot] = &loops.refill;
     pointers[detail::short_loop_slot] = loops.short_loop.data();
     pointers[detail::loop_call_slot] = loops.calls.data();
-    pointers[detail::delayed_loop_tail_slot] = &loops.delayed_tail;
+    pointers[detail::return_loop_tail_slot] = &loops.return_tail;
     pointers[detail::counted_tail_slot] = &loops.counted_tail;
     pointers[detail::interrupt_latch_slot] = &state.registers.irptl;
     for (unsigned bank = 0; bank < 2; ++bank) {
