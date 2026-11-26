@@ -31,7 +31,22 @@ inline constexpr std::size_t dag_index_slot = interrupt_latch_slot + 1;
 inline constexpr std::size_t dag_fields = 4;
 inline constexpr std::size_t mode_slot = dag_index_slot + (32 * dag_fields);
 inline constexpr std::size_t delayed_target_slot = mode_slot + 1;
-inline constexpr std::size_t register_pointer_count = delayed_target_slot + 1;
+inline constexpr std::size_t loop_address_slot = delayed_target_slot + 1;
+inline constexpr std::size_t loop_counter_slot = loop_address_slot + 1;
+inline constexpr std::size_t loop_address_depth_slot = loop_counter_slot + 1;
+inline constexpr std::size_t loop_counter_depth_slot = loop_address_depth_slot + 1;
+inline constexpr std::size_t lcntr_slot = loop_counter_depth_slot + 1;
+inline constexpr std::size_t loop_frames_slot = lcntr_slot + 1;
+inline constexpr std::size_t loop_refill_slot = loop_frames_slot + 1;
+inline constexpr std::size_t register_pointer_count = loop_refill_slot + 1;
+inline constexpr unsigned loop_stack_capacity = 6;
+inline constexpr std::uint32_t loop_pc_index_mask = 31;
+inline constexpr std::uint32_t loop_frame_live = 1U << 5;
+inline constexpr std::uint32_t loop_repeat_scheduled = 1U << 6;
+inline constexpr unsigned loop_fetch_distance = 4;
+inline constexpr unsigned loop_decode_distance = 2;
+inline constexpr unsigned loop_refill_end_shift = 24;
+inline constexpr std::uint64_t loop_refill_live = 1ULL << 48;
 inline constexpr std::uint32_t before_first_delay_slot = 1U << 25;
 inline constexpr std::uint32_t before_second_delay_slot = 1U << 24;
 inline constexpr std::uint32_t dag1_high_mode = 1U << 3;
@@ -78,7 +93,8 @@ enum class NativeExit : std::uint8_t {
   unsupported_memory,
   access_fault,
   code_alias,
-  returned
+  returned,
+  unsupported_loop_stack
 };
 using NativeEntry = void (*)(void **, std::uint64_t *);
 using RegisterPointers = std::vector<void *>;

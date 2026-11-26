@@ -1,17 +1,18 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #include "../support/check.hpp"
 #include "../support/isa.hpp"
+#include "../support/prefix.hpp"
 
-#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <sharc/core.hpp>
-#include <span>
 #include <vector>
 
 namespace {
 using fixture::check;
+using fixture::Prefix;
+using fixture::verify_prefixes;
 constexpr auto base = fixture::code_address;
 constexpr std::uint64_t db = 0x000004000000;
 constexpr std::uint64_t jump_eq = 0x060000000000, jump_ne = 0x062000000000;
@@ -21,38 +22,6 @@ constexpr std::uint64_t rts = 0x0a3e00000000;
 constexpr std::uint32_t pc_mask = 0xffffff, call_tag = 1U << 24, empty = 1U << 22;
 constexpr std::uint32_t simd_bit = 1U << 21, az = 1;
 constexpr unsigned raw_shift = 8;
-
-struct Prefix {
-  sharc::Registers registers;
-  std::uint64_t cycles;
-};
-
-void verify_prefixes(sharc::Core &core, sharc::Core &replay, std::span<const Prefix> prefixes) {
-  const auto start = core.save();
-  for (std::size_t i = 0; i < prefixes.size(); ++i) {
-    core.restore(start);
-    const auto result = core.run(i + 1);
-    const auto &[registers, cycles] = prefixes[i];
-    check(fixture::completed(result, i + 1, cycles) && core.registers() == registers,
-          "delayed transfer differs at an instruction bound");
-    replay.restore(core.save());
-    if (i + 1 < prefixes.size()) {
-      const auto &next = prefixes[i + 1];
-      check(fixture::completed(replay.run(1), 1, next.cycles - cycles) &&
-                replay.registers() == next.registers,
-            "cross-Core snapshot lost a pending delayed transfer");
-    }
-  }
-  for (std::uint64_t deadline = 1; deadline <= prefixes.back().cycles; ++deadline) {
-    core.restore(start);
-    const auto found = std::ranges::find_if(
-        prefixes, [deadline](const Prefix &prefix) { return prefix.cycles >= deadline; });
-    const auto count = static_cast<std::uint64_t>(found - prefixes.begin()) + 1;
-    check(fixture::completed(core.run_until(deadline), count, found->cycles) &&
-              core.registers() == found->registers,
-          "cycle deadline observed the wrong delay slot, refill cycle or target");
-  }
-}
 
 struct Transfer {
   std::uint32_t branch_pc, target;

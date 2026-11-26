@@ -54,6 +54,12 @@ phase. Cross-Core replay preserves the destination even when a slot changes a
 contributing DAG register. Pending interrupts, mode-register writes and
 declared code transfers still need execution and snapshot qualification.
 
+For admitted long DO forms, snapshots retain the PC-stack ownership of each
+hardware loop frame and its fetch decision. They also retain the pending
+arithmetic refill after an early stack pop. A counted DO loads LCNTR once.
+The current count then evolves on the loop counter stack while LCNTR
+continues to hold the setup value.
+
 Peripheral interrupt routing (PICR), SRU, DMA and peripheral timers remain consumer
 state. TAP emulation controls and physical instruction-cache contents are not
 implemented. Instruction pipeline observations beyond the admitted classic

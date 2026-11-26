@@ -15,7 +15,7 @@ is claimed.
 | FastFP32 numerical mode (opt-in) | Independent approximation expectations, rounding/flags, unchanged raw moves/integer behavior, separate translations | Unimplemented |
 | Parallel operations | Old operands, memory aliases, register exchanges and ordered partial effects | Partial: raw register moves/swaps with supported fixed ALU writeback |
 | Address generation and memory | Both DAGs, modulo/reverse addressing, PM/DM and physical view aliases | Partial: normal-word pre-indexing, immediate modify/reverse and DAG register-load dependencies |
-| Sequencer and control | Delayed flow, DO/loop endpoints, LR, stacks, reset and interrupts | Partial: classic direct/indirect jumps and calls, plain RTS, two delay slots and branch stalls |
+| Sequencer and control | Delayed flow, DO/loop endpoints, LR, stacks, reset and interrupts | Partial: classic direct/indirect transfers, two delay slots, long hardware DO and nested counted DO |
 | Chip-profile boundaries | ADSP-21489 memory/vector parameters and explicit I/O ownership | Unimplemented |
 | JIT coherence and hosts | Self-modifying aliases, natural loops, precise exits, x86-64 and ARM64 | Unimplemented |
 
@@ -110,7 +110,7 @@ Reference 2.4, 4-19–4-21 and 4-115–4-116). The preceding-compute history is 
 state, stored at exits and included in snapshots. Cycle bounds may cross the
 deadline to finish the current instruction; cycle credit cannot wrap under zero.
 External-flag and loop conditions refuse preparation. VISA, floating computation,
-multiplier, remaining shifter and memory forms, hardware loops, timer, reset and
+multiplier, remaining shifter and memory forms, timer, reset and
 interrupt entry remain unimplemented. `interrupt_ready` reports false.
 
 Non-delayed direct CALL and plain conditional RTS keep static call targets and
@@ -160,6 +160,17 @@ parallel computation and rejects other branches in slots. The ISA tests in
 `test/isa/delay.cpp` cover instruction and cycle prefixes, cross-Core replay,
 absolute, relative and DAG2 calls, 24-bit PC wrap, stack refusal and a slot
 memory fault. RTI and loop reentry remain open.
+
+Long classic DO bodies of at least five words support immediate and admitted
+register counts, LCNTR, arithmetic termination and FOREVER. Counted loops
+update the current counter when the end word reaches Fetch1. On the final
+turn the stack can pop several words ahead of the end. Arithmetic loops
+test both lanes in SIMD and account for the trailing pipeline refill.
+Counted nesting and complete-turn LLVM grants for eligible counted,
+arithmetic and FOREVER bodies are exercised through the public interface. Tests cover zero
+count wrap, retained stack cells, exact instruction and cycle prefixes,
+cross-Core replay and fault attribution. Short DO, overlapping arithmetic
+loop lookahead and branches near the endpoint remain open with LR.
 
 Classic type 5 transfers raw data among R/S and I/M/L/B registers, including
 cross-PE data moves and raw40 register swaps, with supported single-function fixed
