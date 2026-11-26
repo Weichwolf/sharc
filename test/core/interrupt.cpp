@@ -57,7 +57,13 @@ void nested_service(sharc::Core &core,
   core.interrupt(irq2);
   check(core.state() == entry, "interrupt entry differed across replay");
   const auto accepted = core.save();
-  check(fixture::completed(core.run_until(after_inner_entry + 1), 1, 1), "IRQ2 body failed");
+  auto relatched = core.registers();
+  relatched.irptl |= irq2_mask;
+  relatched.lirptl |= p6_latch;
+  core.set_registers(relatched);
+  check(fixture::completed(core.run_until(after_inner_entry + 1), 1, 1) &&
+            (core.registers().irptl & irq2_mask) == 0 && (core.registers().lirptl & p6_latch) == 0,
+        "active nested interrupt sources were relatched during service");
   auto invalid = core.registers();
   const auto before_rti = core.save();
   invalid.status_depth = 0;
@@ -297,6 +303,50 @@ void irq_shadow_after_do() {
           "snapshot lost its short loop startup shadow");
   }
 }
+
+void irq_shadow_after_short_count_expires() {
+  struct Loop {
+    unsigned length, count;
+    std::uint64_t first_sample_boundary, eligible;
+  };
+
+  // Programming Reference Tables 4-17, 4-23 and 4-25. DO retires at cycle one.
+  constexpr std::array rows{
+      Loop{.length = 1, .count = 5, .first_sample_boundary = 3, .eligible = 6},
+      Loop{.length = 2, .count = 2, .first_sample_boundary = 3, .eligible = 5},
+      Loop{.length = 3, .count = 2, .first_sample_boundary = 2, .eligible = 5}};
+  constexpr std::uint64_t do_immediate = 0x0c0000000000;
+  constexpr unsigned count_shift = 24;
+  const std::array handler{rti};
+  for (const auto &row : rows) {
+    std::array<std::uint64_t, 8> main{};
+    main[0] = do_immediate | (std::uint64_t{row.count} << count_shift) | row.length;
+    fixture::Program program(main);
+    program.add_span(irq2.vector, handler);
+    program.code.variants.front().interrupt_vectors = {irq2};
+    const auto native = sharc::Core::compile(program.code);
+    sharc::Core core(program.memory());
+    (void)core.install(native, fixture::Program::variant_id);
+    core.reset(base);
+    auto registers = core.registers();
+    registers.mode1 = interrupt_enable;
+    registers.imask |= irq2_mask;
+    core.set_registers(registers);
+    check(!core.run_until(row.first_sample_boundary).has_fault &&
+              core.state().progress.base_cycles == row.first_sample_boundary &&
+              !core.interrupt_ready(irq2),
+          "short counted loop did not defer vector entry when its counter expired");
+    const auto expires = core.save();
+    check(!core.run_until(row.eligible - 1).has_fault && !core.interrupt_ready(irq2) &&
+              !core.run_until(row.eligible).has_fault && core.interrupt_ready(irq2),
+          "counter expiry shadow did not cover its documented three following clocks");
+    const auto eligible = core.state();
+    core.restore(expires);
+    check(!core.interrupt_ready(irq2) && !core.run_until(row.eligible).has_fault &&
+              core.interrupt_ready(irq2) && core.state() == eligible,
+          "snapshot or different run grants changed the counter expiry shadow");
+  }
+}
 } // namespace
 
 int main() {
@@ -307,5 +357,6 @@ int main() {
     }
     irq_stack_limits();
     irq_shadow_after_do();
+    irq_shadow_after_short_count_expires();
   });
 }

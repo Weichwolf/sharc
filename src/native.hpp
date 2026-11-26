@@ -48,7 +48,9 @@ inline constexpr std::size_t short_parent_tail_slot = short_counted_tail_slot + 
 inline constexpr std::size_t suspended_call_state_slot = short_parent_tail_slot + 1;
 inline constexpr std::size_t interrupt_frame_slot = suspended_call_state_slot + 1;
 inline constexpr std::size_t status_depth_slot = interrupt_frame_slot + 1;
-inline constexpr std::size_t register_pointer_count = status_depth_slot + 1;
+inline constexpr std::size_t progress_cycle_slot = status_depth_slot + 1;
+inline constexpr std::size_t interrupt_deadline_slot = progress_cycle_slot + 1;
+inline constexpr std::size_t register_pointer_count = interrupt_deadline_slot + 1;
 // Three short-buffer words, the arithmetic refill, and all counted tails.
 inline constexpr unsigned suspended_call_state_words = 4 + loop_stack_capacity + 2;
 inline constexpr std::uint32_t loop_pc_index_mask = 31;

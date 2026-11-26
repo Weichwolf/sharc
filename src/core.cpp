@@ -143,6 +143,7 @@ struct LoopPipeline {
   std::array<std::uint64_t, Registers::pc_stack_capacity * detail::suspended_call_state_words>
       suspended_calls{};
   std::uint64_t return_tail{};
+  std::uint64_t interrupt_deadline{};
 
   [[nodiscard]] bool active() const {
     return short_loop[detail::short_remaining] != 0 ||
@@ -236,6 +237,8 @@ constexpr std::uint32_t pc_stack_empty = 1U << 22;
 constexpr std::uint32_t status_stack_empty = 1U << 24;
 constexpr std::uint32_t timer_enable = 1U << 5;
 constexpr unsigned vector_refill_cycles = 4;
+constexpr unsigned lirptl_enable_shift = 10;
+constexpr unsigned lirptl_pointer_shift = 20;
 
 struct InterruptLine {
   std::uint32_t latch, enable, active;
@@ -268,8 +271,6 @@ InterruptLine interrupt_line(unsigned source) noexcept {
   constexpr unsigned p17 = 28;
   constexpr unsigned cb7 = 30;
   if ((source >= p6 && source < p14) || (source >= p17 && source < cb7)) {
-    constexpr unsigned lirptl_enable_shift = 10;
-    constexpr unsigned lirptl_pointer_shift = 20;
     const auto index = source < p14 ? source - p6 : (p14 - p6) + (source - p17);
     const auto bit = 1U << index;
     return {.latch = bit,
@@ -280,6 +281,12 @@ InterruptLine interrupt_line(unsigned source) noexcept {
   const auto skipped = (source >= p14 ? p14 - p6 : 0U) + (source >= cb7 ? cb7 - p17 : 0U);
   const auto bit = 1U << (source - skipped);
   return {.latch = bit, .enable = bit, .active = bit};
+}
+
+void clear_in_service_latches(Registers &registers) noexcept {
+  constexpr std::uint32_t extended_latch_mask = (1U << lirptl_enable_shift) - 1;
+  registers.irptl &= ~registers.imaskp;
+  registers.lirptl &= ~((registers.lirptl >> lirptl_pointer_shift) & extended_latch_mask);
 }
 
 bool saves_interrupt_status(unsigned source) noexcept {
@@ -338,6 +345,8 @@ struct Core::Impl {
     pointers[detail::interrupt_latch_slot] = &state.registers.irptl;
     pointers[detail::interrupt_frame_slot] = &interrupt_frame_guard;
     pointers[detail::status_depth_slot] = &state.registers.status_depth;
+    pointers[detail::progress_cycle_slot] = &state.progress.base_cycles;
+    pointers[detail::interrupt_deadline_slot] = &loops.interrupt_deadline;
     for (unsigned bank = 0; bank < 2; ++bank) {
       for (unsigned index = 0; index < 16; ++index) {
         auto &dag = state.registers.dag[bank][index];
@@ -686,6 +695,7 @@ bool Core::interrupt_ready(const InterruptRequest &request) const noexcept {
   if (impl_->executing || !impl_->installed || state.has_fault ||
       state.instruction_set != InstructionSet::isa || (registers.mode2 & timer_enable) != 0 ||
       impl_->delayed_target != 0 || impl_->loops.blocks_interrupt_at_setup(registers) ||
+      state.progress.base_cycles < impl_->loops.interrupt_deadline ||
       request.source < first_maskable || request.source == reserved ||
       request.source >= detail::interrupt_source_count ||
       (registers.mode1 & interrupt_enable) == 0 ||
@@ -748,6 +758,7 @@ void Core::interrupt(const InterruptRequest &request) {
     registers.pe[0].stky &= ~status_stack_empty;
   }
   interrupt_line(request.source).set_service(registers, true);
+  clear_in_service_latches(registers);
   registers.pc = request.vector;
   registers.daddr = (request.vector + detail::loop_decode_distance) & detail::maximum_pc;
   registers.faddr = (request.vector + detail::loop_fetch_distance) & detail::maximum_pc;
@@ -903,6 +914,8 @@ void Core::Impl::return_from_interrupt() {
     if (registers.status_depth == 0) { registers.pe[0].stky |= status_stack_empty; }
   }
   resume = std::move(frame.resume);
+  frame.loops.interrupt_deadline =
+      std::max(frame.loops.interrupt_deadline, loops.interrupt_deadline);
   loops = frame.loops;
   loops.observe(registers);
   interrupt_frames.pop_back();
@@ -922,6 +935,7 @@ bool Core::Impl::enter(std::size_t index, detail::ControlWords &control) {
 void Core::Impl::observe_pipeline(Progress retired) {
   if (retired.instructions == 0) { return; }
   auto &registers = state.registers;
+  if (!interrupt_frames.empty()) { clear_in_service_latches(registers); }
   if (delayed_target == 0) {
     if (registers.loop_address_depth != 0 || loops.refill != 0 ||
         loops.short_loop[detail::short_addresses] != 0) {

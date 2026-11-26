@@ -955,6 +955,9 @@ private:
   void finish_instruction(Values values, const Instruction &op, std::uint32_t next, bool partial);
   void readmit(const Values &values, std::uint32_t next);
   void credit(Values &values, llvm::Value *count, llvm::Value *cycles, bool partial);
+  void block_interrupt_after_short_sample(const Values &values,
+                                          llvm::Value *late_sample,
+                                          bool after_credit);
   void advance_lce(llvm::Value *cycles, std::size_t slot);
   llvm::Value *lce_age(llvm::Value *tail);
   void complete(Values values,
@@ -2461,6 +2464,29 @@ void Lowering::credit(Values &values, llvm::Value *count, llvm::Value *cycles, b
   values[extra_cycles_value] = builder_.getInt64(0);
 }
 
+void Lowering::block_interrupt_after_short_sample(const Values &values,
+                                                  llvm::Value *late_sample,
+                                                  bool after_credit) {
+  auto *budget = builder_.CreateGEP(
+      builder_.getInt64Ty(), function_->getArg(unit_controls), builder_.getInt64(cycle_budget));
+  auto *spent = builder_.CreateSub(builder_.CreateLoad(builder_.getInt64Ty(), budget),
+                                   values[cycle_remaining_value]);
+  auto *now = builder_.CreateAdd(load(64, progress_cycle_slot),
+                                 builder_.CreateAdd(spent, values[cycle_overrun_value]));
+  // The sample itself and its three following clocks inhibit service (4-39).
+  auto *clocks = builder_.getInt64(loop_fetch_distance);
+  if (after_credit) {
+    clocks = builder_.getInt64(loop_fetch_distance - 1);
+  } else {
+    now = builder_.CreateAdd(now, values[extra_cycles_value]);
+    now = builder_.CreateAdd(now, builder_.CreateZExt(late_sample, builder_.getInt64Ty()));
+  }
+  auto *deadline = builder_.CreateAdd(now, clocks);
+  store(builder_.CreateBinaryIntrinsic(
+            llvm::Intrinsic::umax, load(64, interrupt_deadline_slot), deadline),
+        interrupt_deadline_slot);
+}
+
 llvm::Value *Lowering::lce_age(llvm::Value *tail) {
   auto *masked = builder_.CreateAnd(tail, builder_.getInt64(lce_age_mask));
   return builder_.CreateLShr(masked, builder_.getInt64(lce_age_shift));
@@ -3008,6 +3034,15 @@ void Lowering::short_loop_counter(Values &values,
   builder_.CreateCondBr(terminate, pop, next.block);
   builder_.SetInsertPoint(pop);
   loop_pop(values, frame);
+  if (!variant_.interrupt_vectors.empty() && shape.length < loop_fetch_distance) {
+    // In the startup of a one-word DO the held fetch can sample twice.
+    // If the first decrement reaches the threshold, expiry is on the bubble.
+    auto *late_sample =
+        steady_fetch && !after_credit
+            ? builder_.CreateAnd(startup, builder_.CreateICmpUGT(current, threshold))
+            : builder_.getFalse();
+    block_interrupt_after_short_sample(values, late_sample, after_credit);
+  }
   if (lce_endpoints_.contains(shape.end)) {
     llvm::Value *age = builder_.getInt64(1);
     if (shape.length != 3 && !after_credit) {
