@@ -22,6 +22,7 @@ constexpr std::uint64_t do_eq = 0x0e0000000000;
 constexpr std::uint64_t call_direct = 0x06be00000000, call_dag2 = 0x08be00000000;
 constexpr std::uint64_t jump_direct = 0x063e00000000, rts = 0x0a3e00000000;
 constexpr std::uint64_t lr = 1ULL << 24, db = 1ULL << 26;
+constexpr std::uint64_t la = 1ULL << 38;
 constexpr std::uint32_t call_tag = 1U << 24, termination_tag = 1U << 25;
 constexpr std::uint32_t pc_empty = 1U << 22, loop_empty = 1U << 26;
 constexpr std::uint32_t counted_address = 0xef000000;
@@ -880,6 +881,203 @@ void arithmetic_call_reentry() {
         "an ordinary RTS consumed a suspended hardware loop");
 }
 
+void predicated_loop_abort() {
+  constexpr auto setup = do_immediate | (std::uint64_t{2} << count_shift) | 6;
+  constexpr auto target = base + 8;
+  constexpr std::uint64_t jump_eq = 0x060000000000;
+  std::array<std::uint64_t, 9> words{};
+  words[0] = setup;
+  words[2] = jump_eq | la | target;
+  words[5] = fixture::add(0, 3, 3);
+  fixture::Program program(words);
+  const auto initial = starting();
+  Timeline trace{.registers = initial, .prefixes = {}};
+  auto &state = trace.registers;
+  state.lcntr = 2;
+  entered(trace, {.address = counted_address | (base + 6), .count = 2});
+  short_boundary(trace, {.pc = 2, .fetch = 6, .decode = 4});
+  // With the predicate false, Execute still retires the Fetch1 count sample.
+  state.loop_counter_stack[0] = 1;
+  short_boundary(trace, {.pc = 3, .fetch = 1, .decode = 5});
+  short_boundary(trace, {.pc = 4, .fetch = 2, .decode = 6});
+  short_boundary(trace, {.pc = 5, .fetch = 3, .decode = 1});
+  state.pe[0].astat = az;
+  short_boundary(trace, {.pc = 6, .fetch = 4, .decode = 2});
+  short_boundary(trace, {.pc = 1, .fetch = 5, .decode = 3});
+  short_boundary(trace, {.pc = 2, .fetch = 6, .decode = 4});
+  // The taken jump discards this fetch and pops the live loop.
+  popped(state);
+  trace.boundary(target, 4);
+  trace.record();
+  verify_timeline(program, initial, trace);
+}
+
+void arithmetic_loop_abort() {
+  constexpr std::uint64_t do_ne = 0x0e2000000000;
+  constexpr std::uint64_t jump_eq = 0x060000000000;
+  constexpr auto target = base + 8;
+  constexpr std::uint32_t ne_laddr = 0x10000000;
+  std::array<std::uint64_t, 9> words{};
+  words[0] = do_ne | 5;
+  words[3] = jump_eq | la | target;
+  fixture::Program program(words);
+  for (const bool taken : {true, false}) {
+    auto initial = starting();
+    initial.pe[0].astat = taken ? az : 0;
+    Timeline trace{.registers = initial, .prefixes = {}};
+    entered(trace, {.address = ne_laddr | (base + 5), .count = old_lcntr});
+    short_boundary(trace, {.pc = 2, .fetch = 1, .decode = 4});
+    short_boundary(trace, {.pc = 3, .fetch = 2, .decode = 5});
+    popped(trace.registers);
+    if (taken) {
+      trace.boundary(target, 4);
+      trace.record();
+    } else {
+      // The false EQ branch leaves the outstanding NE loop test to retire.
+      short_boundary(trace, {.pc = 4, .fetch = 6, .decode = 1});
+      short_boundary(trace, {.pc = 5, .fetch = 7, .decode = 2});
+      trace.boundary(base + 6, 3);
+      trace.record();
+    }
+    verify_timeline(program, initial, trace);
+  }
+}
+
+void check_loop_abort_fault(sharc::Core &core, std::uint64_t instruction) {
+  const auto before = core.registers();
+  const auto result = core.run(1);
+  check(result.has_fault && result.fault.reason == sharc::FaultReason::unsupported_feature &&
+            result.fault.address == before.pc && result.fault.instruction == instruction &&
+            result.fault.detail.contains("JUMP (LA)") && result.progress == sharc::Progress{} &&
+            core.registers() == before,
+        "disallowed LA target or stack changed architectural state");
+}
+
+void nested_loop_abort() {
+  constexpr Range outer{.start = base + 1, .end = base + 14};
+  constexpr auto inner_start = base + 3;
+  constexpr auto inner_end = base + 7;
+  constexpr auto abort_word = 5U;
+  constexpr auto setup = do_immediate | (std::uint64_t{2} << count_shift) | 14;
+  constexpr auto inner_setup = do_immediate | (std::uint64_t{1} << count_shift) | 5;
+  std::array<std::uint64_t, 16> words{};
+  words[0] = setup;
+  words[2] = inner_setup;
+  words[abort_word] = jump_direct | la | db | (base + 10);
+  words[6] = fixture::add(0, 0, 1);
+  words[7] = fixture::add(2, 2, 1);
+  fixture::Program program(words);
+  auto initial = starting();
+  initial.pe[0].data[0][1] = 1U << raw_shift;
+  Timeline trace{.registers = initial, .prefixes = {}};
+  auto &state = trace.registers;
+  state.lcntr = 2;
+  entered(trace, {.address = counted_address | outer.end, .count = 2});
+  for (const bool repeats : {true, false}) {
+    trace.boundary(base + 2);
+    trace.record();
+    state.lcntr = 1;
+    state.loop_address_depth = state.loop_counter_depth = state.pc_stack_pointer = 2;
+    state.pc_stack[1] = inner_start;
+    state.loop_address_stack[1] = counted_address | inner_end;
+    state.loop_counter_stack[1] = 1;
+    trace.boundary(inner_start);
+    trace.record();
+    state.loop_counter_stack[1] = 0;
+    state.loop_address_depth = state.loop_counter_depth = state.pc_stack_pointer = 1;
+    trace.boundary(inner_start + 1);
+    trace.record();
+    trace.boundary(base + abort_word);
+    trace.record();
+
+    // The child already popped at Fetch1. LA leaves the parent's frame
+    // intact and the two delayed slots still retire in order.
+    short_boundary(trace, {.pc = 6, .fetch = 11, .decode = 8});
+    state.pe[0].data[0][0] += 1U << raw_shift;
+    short_boundary(trace, {.pc = 7, .fetch = 12, .decode = 10});
+    state.pe[0].data[0][2] += 1U << raw_shift;
+    trace.boundary(base + 10, 2);
+    trace.record();
+    --state.loop_counter_stack[0];
+    if (!repeats) { popped(state); }
+    tail(trace, outer, repeats);
+  }
+  verify_timeline(program, initial, trace);
+
+  constexpr auto escape_both = jump_direct | la | db | (base + 15);
+  constexpr auto to_arithmetic_end = jump_direct | la | db | outer.end;
+  for (const auto invalid_jump : {escape_both, to_arithmetic_end}) {
+    words[0] = invalid_jump == escape_both ? setup : do_eq | 14;
+    words[abort_word] = invalid_jump;
+    fixture::Program invalid(words);
+    const auto native = sharc::Core::compile(invalid.code);
+    sharc::Core core(invalid.memory());
+    fixture::install(core, native, initial);
+    constexpr auto before_abort = 5U;
+    check(fixture::completed(core.run(before_abort), before_abort, before_abort),
+          "nested branch fault fixture did not reach LA");
+    check_loop_abort_fault(core, invalid_jump);
+  }
+}
+
+void computed_loop_abort() {
+  constexpr auto setup = do_immediate | (std::uint64_t{2} << count_shift) | 5;
+  constexpr std::uint64_t jump_dag2 = 0x083e00000000;
+  constexpr std::uint64_t relative = 1ULL << 40;
+  constexpr unsigned displacement_shift = 27;
+  constexpr auto target = base + 8;
+  constexpr auto dag_jump = jump_dag2 | la | (fixture::add(0, 1, 1) & 0x7fffff);
+  constexpr auto rel_jump = dag_jump | relative | (std::uint64_t{7} << displacement_shift);
+  for (const auto jump : {dag_jump, rel_jump}) {
+    std::array<std::uint64_t, 9> words{};
+    words[0] = setup;
+    words[1] = jump;
+    fixture::Program program(words);
+    program.code.variants[0].entries.push_back(target);
+    auto initial = starting();
+    initial.pe[0].data[0][1] = 1U << raw_shift;
+    initial.dag[0][8].index = target - 1;
+    initial.dag[0][8].modifier = 1;
+    Timeline trace{.registers = initial, .prefixes = {}};
+    trace.registers.lcntr = 2;
+    entered(trace, {.address = counted_address | (base + 5), .count = 2});
+    popped(trace.registers);
+    trace.registers.pe[0].data[0][0] = 2U << raw_shift;
+    trace.boundary(target, 4);
+    trace.record();
+    verify_timeline(program, initial, trace);
+    if (jump == rel_jump) { continue; }
+
+    const auto native = sharc::Core::compile(program.code);
+    sharc::Core core(program.memory());
+    initial.dag[0][8].index = base + 1;
+    fixture::install(core, native, initial);
+    check(fixture::completed(core.run(1), 1, 1), "indirect branch fault fixture did not enter DO");
+    check_loop_abort_fault(core, jump);
+  }
+}
+
+void refused_loop_abort() {
+  constexpr auto setup = do_immediate | (std::uint64_t{2} << count_shift) | 5;
+  constexpr auto inside = jump_direct | la | (base + 3);
+  std::array<std::uint64_t, 8> words{};
+  words[0] = setup;
+  words[1] = inside;
+  const fixture::Program bad_target(words);
+  const auto target_fault = fixture::refusal(bad_target.code, "LA can target its own loop");
+  check(target_fault.reason == sharc::FaultReason::invalid_encoding &&
+            target_fault.address == base + 1 && target_fault.instruction == inside,
+        "invalid LA target lacked instruction attribution");
+
+  constexpr auto call_with_abort = call_direct | la | (base + 7);
+  words[1] = call_with_abort;
+  const fixture::Program bad_modifier(words);
+  const auto modifier_fault = fixture::refusal(bad_modifier.code, "CALL can use LA");
+  check(modifier_fault.reason == sharc::FaultReason::invalid_encoding &&
+            modifier_fault.address == base + 1 && modifier_fault.instruction == call_with_abort,
+        "invalid CALL modifier lacked instruction attribution");
+}
+
 void refused_do() {
   constexpr auto setup = do_immediate | (std::uint64_t{1} << count_shift) | 5;
   const std::array words{setup,
@@ -950,6 +1148,11 @@ void fixture::hardware_loop_control_flow() {
   nested_short_do();
   counted_call_reentry();
   arithmetic_call_reentry();
+  predicated_loop_abort();
+  arithmetic_loop_abort();
+  nested_loop_abort();
+  computed_loop_abort();
+  refused_loop_abort();
   refused_do();
   skipped_fetch_boundary();
 }

@@ -61,6 +61,9 @@ A counted DO loads LCNTR once. The current count then evolves on the loop
 counter stack while LCNTR continues to hold the setup value.
 A qualified CALL saves a suspended terminating tail with its PC-stack entry.
 For a delayed `RTS (LR)`, the tail becomes active after the two return slots.
+An admitted `JUMP (LA)` removes the loop frame at the jump. A counted tail
+that has already popped identifies the completed frame until an abort or the
+original endpoint retires. With DB, the two slots execute after the stack effect.
 
 Peripheral interrupt routing (PICR), SRU, DMA and peripheral timers remain consumer
 state. TAP emulation controls and physical instruction-cache contents are not

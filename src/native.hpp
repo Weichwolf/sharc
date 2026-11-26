@@ -115,7 +115,8 @@ enum class NativeExit : std::uint8_t {
   code_alias,
   returned,
   unsupported_loop_stack,
-  unsupported_loop_reentry
+  unsupported_loop_reentry,
+  invalid_loop_abort
 };
 using NativeEntry = void (*)(void **, std::uint64_t *);
 using RegisterPointers = std::vector<void *>;

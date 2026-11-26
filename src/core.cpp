@@ -300,6 +300,13 @@ struct Core::Impl {
         result.fault.instruction_bits = detail::full_instruction_bits;
         state.fault = result.fault;
         break;
+      case detail::NativeExit::invalid_loop_abort:
+        result = fail(FaultReason::unsupported_feature,
+                      "JUMP (LA) requires a valid exit from the innermost loop");
+        result.fault.instruction = control[detail::fault_instruction];
+        result.fault.instruction_bits = detail::full_instruction_bits;
+        state.fault = result.fault;
+        break;
       case detail::NativeExit::undeclared:
         result = fail(FaultReason::undeclared_entry, "execution reached an undeclared instruction");
         break;

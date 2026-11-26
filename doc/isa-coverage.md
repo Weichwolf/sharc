@@ -192,8 +192,15 @@ tag when the loop terminates during the call's address stage. Tests cover
 continued and terminating counted turns, a DAG2 call into a separate prepared
 entry, delayed return slots, suspension of an arithmetic refill while the callee
 runs its own DO, and a precise fault for an ordinary RTS on a suspended tail.
-Remaining endpoint placements, short-loop calls, loop abort and overlapping
-loop lookahead are open.
+Classic JUMP (LA) handles qualified long-loop exits through absolute,
+PC-relative and DAG2 targets, with either immediate transfer or two delay
+slots. A false predicate leaves the hardware loop's outstanding decision
+active. A taken exit uses the active frame or the already-popped counted
+tail, preserving the parent frame. Authored tests cover precise refusal for
+targets inside the current loop, exits across two levels and exits to the
+endpoint of an arithmetic parent.
+Remaining endpoint placements, short-loop calls and overlapping loop
+lookahead are open.
 
 Classic type 5 transfers raw data among R/S and I/M/L/B registers, including
 cross-PE data moves and raw40 register swaps, with supported single-function fixed

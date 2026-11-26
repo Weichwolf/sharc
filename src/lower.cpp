@@ -204,6 +204,11 @@ bool call_branch_instruction(const Instruction &op) {
          (op.word & call_branch) != 0;
 }
 
+bool loop_abort(const Instruction &op) {
+  return (op.type == direct_branch_type || op.type == computed_branch_type) &&
+         (op.word & abort_branch) != 0;
+}
+
 bool indirect_branch(const Instruction &op) {
   return op.type == computed_branch_type && (op.word & relative_branch) == 0;
 }
@@ -232,6 +237,7 @@ struct LoopShape {
   std::uint32_t start{}, end{};
   unsigned length{}, term{};
   bool has_reentry{};
+  bool has_tail_abort{};
 
   [[nodiscard]] bool counted() const { return term == loop_counter_expired; }
 
@@ -247,6 +253,10 @@ struct LoopShape {
   }
 
   [[nodiscard]] unsigned short_condition_tail() const { return length == 1 ? 3U : length; }
+
+  [[nodiscard]] bool contains(std::uint32_t pc) const {
+    return ((pc - start) & maximum_pc) < length;
+  }
 
   [[nodiscard]] unsigned short_threshold() const {
     constexpr std::array thresholds{4U, 2U, 2U, 1U};
@@ -265,6 +275,7 @@ using LoopMap = std::map<std::uint32_t, LoopShape>;
 struct LoopPlan {
   LoopMap shapes;
   LoopMap reentry_calls;
+  LoopMap aborts;
 };
 
 LoopShape loop_shape(const Instruction &op) {
@@ -337,6 +348,12 @@ void validate_loop(const Instruction &op, std::string_view identity) {
   }
 }
 
+void validate_loop_abort_modifier(const Instruction &op, std::string_view identity) {
+  if (loop_abort(op) && (op.word & (call_branch | clear_interrupt_branch)) != 0) {
+    reject(op, identity, FaultReason::invalid_encoding, "LA requires a jump without CI");
+  }
+}
+
 void validate_branch(const Instruction &instruction, std::string_view identity) {
   constexpr auto modifiers = call_branch | abort_branch | delayed_branch | clear_interrupt_branch;
   constexpr auto allowed = (std::uint64_t{7} << 40) |
@@ -345,11 +362,12 @@ void validate_branch(const Instruction &instruction, std::string_view identity) 
   if ((instruction.word & ~allowed) != 0) {
     reject(instruction, identity, FaultReason::invalid_encoding, "reserved direct-branch bits");
   }
-  if ((instruction.word & (abort_branch | clear_interrupt_branch)) != 0) {
+  validate_loop_abort_modifier(instruction, identity);
+  if ((instruction.word & clear_interrupt_branch) != 0) {
     reject(instruction,
            identity,
            FaultReason::unsupported_instruction,
-           "loop-abort or interrupt-clear branch is not lowered");
+           "interrupt-clear branch is not lowered");
   }
   validate_condition(instruction, identity);
 }
@@ -372,8 +390,8 @@ void validate_computed_branch(const Instruction &instruction, std::string_view i
   if ((instruction.word & reserved) != 0) {
     reject(instruction, identity, FaultReason::invalid_encoding, "reserved computed-branch bit");
   }
-  if ((instruction.word & (abort_branch | clear_interrupt_branch)) != 0 ||
-      !supported_compute(instruction.compute)) {
+  validate_loop_abort_modifier(instruction, identity);
+  if ((instruction.word & clear_interrupt_branch) != 0 || !supported_compute(instruction.compute)) {
     reject(instruction,
            identity,
            FaultReason::unsupported_instruction,
@@ -642,13 +660,14 @@ public:
            const CodeVariant &variant,
            std::vector<Instruction> instructions,
            const NativeUnit &unit,
-           const LoopMap &reentry_calls)
+           const LoopPlan &loops)
       : module_(module),
         memory_mode_(memory_mode),
         abi_(abi),
         unit_(unit),
         variant_(variant),
-        reentry_calls_(reentry_calls),
+        reentry_calls_(loops.reentry_calls),
+        aborts_(loops.aborts),
         instructions_(std::move(instructions)),
         entry_address_(unit.entry),
         context_(unit.context),
@@ -793,7 +812,8 @@ private:
                 const Instruction &op,
                 bool partial,
                 llvm::Value *lanes,
-                PipelineEffects pipeline);
+                PipelineEffects pipeline,
+                llvm::Value *old_status);
   void delayed_slot(const Values &values, const Instruction &op, bool partial);
   void redirect(Values values, const Instruction &op, llvm::Value *target, bool partial);
   [[nodiscard]] bool delay_boundary(std::uint32_t pc) const;
@@ -807,6 +827,13 @@ private:
                            const LoopShape &shape);
   void loop_push(Values &values, const Instruction &op, bool partial);
   void loop_pop(Values &values, const LoopFrame &frame);
+  void
+  guard_loop_abort(const Values &values, const Instruction &op, llvm::Value *lanes, bool partial);
+  void retire_loop_abort(Values &values, const LoopShape &shape);
+  llvm::Value *jump_target(const Values &values, const Instruction &op);
+  llvm::Value *counted_tail_matches(const LoopShape &shape);
+  llvm::Value *
+  abort_target_in_parent(llvm::Value *target, const Values &values, llvm::Value *already_exited);
   void loop_status(Values &values, llvm::Value *depth);
   [[nodiscard]] LoopFrame active_loop(const Values &values, const LoopShape &shape);
   void loop_fetch(Values &values, const LoopShape &shape);
@@ -885,6 +912,7 @@ private:
   const NativeUnit &unit_;
   const CodeVariant &variant_;
   const LoopMap &reentry_calls_;
+  const LoopMap &aborts_;
   std::vector<Instruction> instructions_;
   std::uint32_t entry_address_;
   std::uint32_t context_;
@@ -1523,7 +1551,7 @@ void Lowering::stack_guard(const Values &values,
     credit(prefix, completed, builder_.CreateAdd(completed, values[extra_cycles_value]), false);
   }
   if (reason == NativeExit::unsupported_loop_stack ||
-      reason == NativeExit::unsupported_loop_reentry) {
+      reason == NativeExit::unsupported_loop_reentry || reason == NativeExit::invalid_loop_abort) {
     auto *word = builder_.CreateGEP(builder_.getInt64Ty(),
                                     function_->getArg(unit_controls),
                                     builder_.getInt64(fault_instruction));
@@ -1702,14 +1730,23 @@ llvm::Value *Lowering::branch_lanes(const Values &values, const Instruction &op,
     stack_guard(
         values, op, builder_.CreateOr(builder_.CreateNot(branch_taken(lanes)), room), partial);
   }
+  if (loop_abort(op)) { guard_loop_abort(values, op, lanes, partial); }
   return lanes;
+}
+
+llvm::Value *Lowering::jump_target(const Values &values, const Instruction &op) {
+  if (!indirect_branch(op)) { return builder_.getInt32(branch_target(op)); }
+  auto *address = builder_.CreateAdd(values[index_value + branch_index(op)],
+                                     values[modifier_value + branch_modifier(op)]);
+  return builder_.CreateAnd(address, builder_.getInt32(maximum_pc));
 }
 
 void Lowering::complete(Values values,
                         const Instruction &op,
                         bool partial,
                         llvm::Value *lanes,
-                        PipelineEffects pipeline) {
+                        PipelineEffects pipeline,
+                        llvm::Value *old_status) {
   if (!partial && loop_ends_.contains(addresses_.at(op.address))) {
     complete_loop(values, op);
     return;
@@ -1732,13 +1769,10 @@ void Lowering::complete(Values values,
   builder_.SetInsertPoint(branch);
   auto branch_values = values;
   if (call_branch_instruction(op)) { call(branch_values, op, partial); }
+  if (loop_abort(op)) { retire_loop_abort(branch_values, aborts_.at(op.address)); }
   auto *target = op.type == return_branch_type ? pop(branch_values, op, partial) : nullptr;
   retire_short_observation(op.address);
-  if (indirect_branch(op)) {
-    auto *address = builder_.CreateAdd(values[index_value + branch_index(op)],
-                                       values[modifier_value + branch_modifier(op)]);
-    target = builder_.CreateAnd(address, builder_.getInt32(maximum_pc));
-  }
+  if (indirect_branch(op)) { target = jump_target(values, op); }
   retire_pipeline(branch_values, pipeline);
   if (delayed(op)) {
     if (target == nullptr) { target = builder_.getInt32(branch_target(op)); }
@@ -1760,6 +1794,7 @@ void Lowering::complete(Values values,
   retire_short_observation(op.address);
   retire_pipeline(values, pipeline);
   values[hazard_value] = builder_.getInt1(op.compute.kind != ComputeKind::none);
+  if (loop_abort(op)) { loop_retirement(values, op, old_status, partial); }
   credit(values, count, cycles, partial);
   finish(values, next, partial);
 }
@@ -1833,7 +1868,7 @@ bool Lowering::delay_boundary(std::uint32_t pc) const {
 bool Lowering::sequencer_boundary(std::uint32_t pc) const {
   return delay_boundary(pc) || loop_setups_.contains(pc) || loop_fetches_.contains(pc) ||
          loop_tests_.contains(pc) || hardware_ends_.contains(pc) || hardware_grants_.contains(pc) ||
-         short_bodies_.contains(pc) || short_successors_.contains(pc);
+         short_bodies_.contains(pc) || short_successors_.contains(pc) || aborts_.contains(pc);
 }
 
 void Lowering::plan_hardware_loops(const LoopMap &shapes) {
@@ -2193,6 +2228,92 @@ void Lowering::loop_pop(Values &values, const LoopFrame &frame) {
   loop_status(values, frame.index);
 }
 
+llvm::Value *Lowering::counted_tail_matches(const LoopShape &shape) {
+  if (!shape.counted()) { return builder_.getFalse(); }
+  const auto tail =
+      counted_loop_tail | (std::uint64_t{shape.end} << loop_refill_end_shift) | shape.start;
+  return builder_.CreateICmpEQ(load(64, loop_refill_slot), builder_.getInt64(tail));
+}
+
+llvm::Value *Lowering::abort_target_in_parent(llvm::Value *target,
+                                              const Values &values,
+                                              llvm::Value *already_exited) {
+  auto *remove = builder_.CreateZExt(builder_.CreateNot(already_exited), builder_.getInt32Ty());
+  auto *depth = builder_.CreateSub(
+      builder_.CreateZExt(load(8, loop_address_depth_slot), builder_.getInt32Ty()), remove);
+  auto *occupied =
+      builder_.CreateAnd(builder_.CreateICmpNE(depth, builder_.getInt32(0)),
+                         builder_.CreateICmpULE(depth, builder_.getInt32(loop_stack_capacity)));
+  auto *index = builder_.CreateSelect(
+      occupied, builder_.CreateSub(depth, builder_.getInt32(1)), builder_.getInt32(0));
+  auto *metadata = builder_.CreateLoad(builder_.getInt32Ty(), loop_cell(loop_frames_slot, index));
+  auto *parent_pc_slot = builder_.CreateAnd(metadata, builder_.getInt32(loop_pc_index_mask));
+  auto *parent_pc_depth = builder_.CreateAdd(parent_pc_slot, builder_.getInt32(1));
+  auto *remaining_pc_depth = builder_.CreateSub(values[pc_stack_depth_value], remove);
+  // A hardware loop in a caller is suspended behind a CALL stack slot.
+  auto *same_scope = builder_.CreateICmpEQ(parent_pc_depth, remaining_pc_depth);
+  auto *live = builder_.CreateICmpNE(
+      builder_.CreateAnd(metadata, builder_.getInt32(loop_frame_live)), builder_.getInt32(0));
+  auto *parent = builder_.CreateAnd(occupied, builder_.CreateAnd(same_scope, live));
+  auto *start = builder_.CreateLoad(builder_.getInt32Ty(), stack_cell(parent_pc_slot));
+  auto *end = builder_.CreateLoad(builder_.getInt32Ty(), loop_cell(loop_address_slot, index));
+  auto *mask = builder_.getInt32(maximum_pc);
+  auto *offset = builder_.CreateAnd(builder_.CreateSub(target, start), mask);
+  auto *last = builder_.CreateAnd(builder_.CreateSub(end, start), mask);
+  auto *term =
+      builder_.CreateAnd(builder_.CreateLShr(end, builder_.getInt32(immediate_count_shift)),
+                         builder_.getInt32(true_condition));
+  auto *arithmetic =
+      builder_.CreateAnd(builder_.CreateICmpNE(term, builder_.getInt32(loop_counter_expired)),
+                         builder_.CreateICmpNE(term, builder_.getInt32(true_condition)));
+  // A nested LA cannot skip to the endpoint of an arithmetic parent.
+  auto *within = builder_.CreateOr(
+      builder_.CreateICmpULT(offset, last),
+      builder_.CreateAnd(builder_.CreateNot(arithmetic), builder_.CreateICmpEQ(offset, last)));
+  return builder_.CreateOr(builder_.CreateNot(parent), within);
+}
+
+void Lowering::guard_loop_abort(const Values &values,
+                                const Instruction &op,
+                                llvm::Value *lanes,
+                                bool partial) {
+  const auto &shape = aborts_.at(op.address);
+  const auto frame = active_loop(values, shape);
+  auto *already_exited = counted_tail_matches(shape);
+  auto *target = jump_target(values, op);
+  auto *offset = builder_.CreateAnd(builder_.CreateSub(target, builder_.getInt32(shape.start)),
+                                    builder_.getInt32(maximum_pc));
+  auto *outside = builder_.CreateICmpUGE(offset, builder_.getInt32(shape.length));
+  auto *one_level =
+      builder_.CreateAnd(outside, abort_target_in_parent(target, values, already_exited));
+  auto *stack_matches =
+      builder_.CreateICmpEQ(load(8, loop_address_depth_slot), load(8, loop_counter_depth_slot));
+  auto *owned = builder_.CreateAnd(stack_matches, builder_.CreateOr(frame.matches, already_exited));
+  auto *allowed = builder_.CreateOr(builder_.CreateNot(branch_taken(lanes)),
+                                    builder_.CreateAnd(owned, one_level));
+  stack_guard(values, op, allowed, partial, NativeExit::invalid_loop_abort);
+}
+
+void Lowering::retire_loop_abort(Values &values, const LoopShape &shape) {
+  const auto frame = active_loop(values, shape);
+  auto *pop = llvm::BasicBlock::Create(module_.getContext(), "loop.abort.pop", function_);
+  auto next = node("loop.abort.continue");
+  next.incoming(values, builder_.GetInsertBlock());
+  builder_.CreateCondBr(frame.matches, pop, next.block);
+  builder_.SetInsertPoint(pop);
+  loop_pop(values, frame);
+  jump(next, values);
+  builder_.SetInsertPoint(next.block);
+  values = next.values();
+  if (shape.counted()) {
+    // If the count already popped this loop, consume its tail without
+    // popping the parent or applying the discarded loop's redirect.
+    store(builder_.CreateSelect(
+              counted_tail_matches(shape), builder_.getInt64(0), load(64, loop_refill_slot)),
+          loop_refill_slot);
+  }
+}
+
 void Lowering::loop_fetch(Values &values, const LoopShape &shape) {
   const auto frame = active_loop(values, shape);
   auto *pending = builder_.CreateAnd(frame.metadata, builder_.getInt32(loop_repeat_scheduled));
@@ -2216,7 +2337,7 @@ void Lowering::loop_fetch(Values &values, const LoopShape &shape) {
     builder_.SetInsertPoint(terminate);
     auto popped = values;
     loop_pop(popped, frame);
-    if (shape.has_reentry) {
+    if (shape.has_reentry || shape.has_tail_abort) {
       const auto tail =
           counted_loop_tail | (std::uint64_t{shape.end} << loop_refill_end_shift) | shape.start;
       store(builder_.getInt64(tail), loop_refill_slot);
@@ -2867,7 +2988,7 @@ void Lowering::emit_instruction(std::size_t i,
   if (costs_[i].instructions > 1) {
     jump(fast_[i + 1], values);
   } else {
-    complete(values, op, false, lanes, pipeline);
+    complete(values, op, false, lanes, pipeline, old_status);
   }
   builder_.SetInsertPoint(partial_[i].block);
   values = partial_[i].values();
@@ -2899,7 +3020,7 @@ void Lowering::emit_instruction(std::size_t i,
            true);
     jump(partial_[i + 1], values);
   } else {
-    complete(values, op, true, lanes, pipeline);
+    complete(values, op, true, lanes, pipeline, old_status);
   }
 }
 
@@ -3100,6 +3221,32 @@ void validate_loop_call(LoopPlan &plan,
   shape.has_reentry = true;
 }
 
+void validate_nested_loop(const LoopShape &outer,
+                          const Instruction &op,
+                          unsigned remaining,
+                          std::string_view identity) {
+  const auto child = loop_shape(op);
+  if (child.length >= remaining) {
+    reject(op, identity, FaultReason::invalid_encoding, "nested DO crosses or shares its endpoint");
+  }
+  const auto gap = remaining - child.length;
+  if (outer.short_body() || (child.short_body() && gap <= loop_fetch_distance)) {
+    reject(op,
+           identity,
+           FaultReason::unsupported_instruction,
+           "nested short-loop overlap is unqualified");
+  }
+  if (outer.arithmetic() && gap < loop_decode_distance) {
+    reject(op, identity, FaultReason::invalid_encoding, "arithmetic DO endpoints are too close");
+  }
+  if (child.arithmetic() && gap <= loop_fetch_distance) {
+    reject(op,
+           identity,
+           FaultReason::unsupported_instruction,
+           "overlapping nested arithmetic loop lookahead is unqualified");
+  }
+}
+
 void validate_loop_body(const InstructionMap &code,
                         const Instruction &setup,
                         LoopPlan &plan,
@@ -3112,37 +3259,43 @@ void validate_loop_body(const InstructionMap &code,
     }
     const auto &op = *assigned->second;
     const auto remaining = shape.length - offset;
-    if (branch(op) && remaining <= loop_fetch_distance) {
+    if (loop_abort(op)) {
+      const auto owner = plan.aborts.find(op.address);
+      if (owner == plan.aborts.end() || shape.length < owner->second.length) {
+        plan.aborts.insert_or_assign(op.address, shape);
+      }
+    } else if (branch(op) && remaining <= loop_fetch_distance) {
       validate_loop_call(plan, shape, op, remaining, identity);
     }
-    if (!loop_setup(op)) { continue; }
-    const auto child = loop_shape(op);
-    if (child.length >= remaining) {
-      reject(
-          op, identity, FaultReason::invalid_encoding, "nested DO crosses or shares its endpoint");
-    }
-    const auto gap = remaining - child.length;
-    if (shape.short_body() || (child.short_body() && gap <= loop_fetch_distance)) {
-      reject(op,
-             identity,
-             FaultReason::unsupported_instruction,
-             "nested short-loop overlap is unqualified");
-    }
-    if (shape.arithmetic() && gap < loop_decode_distance) {
-      reject(op, identity, FaultReason::invalid_encoding, "arithmetic DO endpoints are too close");
-    }
-    if (child.arithmetic() && gap <= loop_fetch_distance) {
-      reject(op,
-             identity,
-             FaultReason::unsupported_instruction,
-             "overlapping nested arithmetic loop lookahead is unqualified");
-    }
+    if (loop_setup(op)) { validate_nested_loop(shape, op, remaining, identity); }
   }
   if (!plan.shapes.emplace(shape.end, shape).second) {
     reject(setup,
            identity,
            FaultReason::invalid_encoding,
            "multiple DO instructions share an endpoint");
+  }
+}
+
+void validate_loop_aborts(const InstructionMap &code, LoopPlan &plan, std::string_view identity) {
+  for (const auto &[pc, op] : code) {
+    if (!loop_abort(*op)) { continue; }
+    const auto site = plan.aborts.find(pc);
+    if (site == plan.aborts.end()) {
+      reject(*op, identity, FaultReason::unsupported_instruction, "LA has no declared DO body");
+    }
+    const auto &shape = site->second;
+    const auto remaining = (shape.end - pc) & maximum_pc;
+    if (shape.short_body() || remaining < loop_decode_distance) {
+      reject(*op,
+             identity,
+             FaultReason::unsupported_instruction,
+             "LA at this DO endpoint is unqualified");
+    }
+    if (!indirect_branch(*op) && shape.contains(branch_target(*op))) {
+      reject(*op, identity, FaultReason::invalid_encoding, "LA target is inside its loop");
+    }
+    if (remaining < loop_fetch_distance) { plan.shapes.at(shape.end).has_tail_abort = true; }
   }
 }
 
@@ -3153,6 +3306,7 @@ LoopPlan validate_loop_bodies(const InstructionMap &code, std::string_view ident
     if (!loop_setup(op)) { continue; }
     validate_loop_body(code, op, plan, identity);
   }
+  validate_loop_aborts(code, plan, identity);
   return plan;
 }
 
@@ -3276,7 +3430,7 @@ std::shared_ptr<const PreparedImage> lower_image(const CodeImage &image,
              *variant,
              connected_code(variant_code.at(unit.variant), plan.shapes, unit.entry),
              unit,
-             plan.reentry_calls)
+             plan)
         .emit(plan.shapes);
   }
   finalize_debug(module, debug);
