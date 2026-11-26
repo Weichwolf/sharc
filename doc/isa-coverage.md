@@ -15,7 +15,7 @@ is claimed.
 | FastFP32 numerical mode (opt-in) | Independent approximation expectations, rounding/flags, unchanged raw moves/integer behavior, separate translations | Unimplemented |
 | Parallel operations | Old operands, memory aliases, register exchanges and ordered partial effects | Partial: raw register moves/swaps with supported fixed ALU writeback |
 | Address generation and memory | Both DAGs, modulo/reverse addressing, PM/DM and physical view aliases | Partial: normal-word pre-indexing, immediate modify/reverse and DAG register-load dependencies |
-| Sequencer and control | Delayed flow, DO/loop endpoints, LR, stacks, reset and interrupts | Partial: classic direct/indirect transfers, two delay slots, long hardware DO and nested counted DO |
+| Sequencer and control | Delayed flow, DO/loop endpoints, LR, stacks, reset and interrupts | Partial: classic direct/indirect transfers, two delay slots, counted hardware DO, long arithmetic DO and counted nesting |
 | Chip-profile boundaries | ADSP-21489 memory/vector parameters and explicit I/O ownership | Unimplemented |
 | JIT coherence and hosts | Self-modifying aliases, natural loops, precise exits, x86-64 and ARM64 | Unimplemented |
 
@@ -169,8 +169,15 @@ test both lanes in SIMD and account for the trailing pipeline refill.
 Counted nesting and complete-turn LLVM grants for eligible counted,
 arithmetic and FOREVER bodies are exercised through the public interface. Tests cover zero
 count wrap, retained stack cells, exact instruction and cycle prefixes,
-cross-Core replay and fault attribution. Short DO, overlapping arithmetic
-loop lookahead and branches near the endpoint remain open with LR.
+cross-Core replay and fault attribution.
+
+Counted classic DO bodies of one through four words retain buffered
+instructions after the loop and PC stacks pop. The short-loop fixtures cover
+startup and drain cycles, the count thresholds for fetch redirection, retained
+stack cells, fetch and decode addresses, and snapshot replay after an early
+pop. Eligible steady turns execute in the same bounded LLVM loop as long
+counted bodies. Short arithmetic DO, overlapping loop lookahead, branches near
+the endpoint and LR remain open.
 
 Classic type 5 transfers raw data among R/S and I/M/L/B registers, including
 cross-PE data moves and raw40 register swaps, with supported single-function fixed

@@ -136,12 +136,15 @@ struct Resume {
 struct LoopPipeline {
   std::array<std::uint32_t, detail::loop_stack_capacity> frames{};
   std::uint64_t refill{};
+  std::array<std::uint64_t, detail::short_state_words> short_loop{};
 
   [[nodiscard]] bool active() const {
-    return refill != 0 || std::ranges::any_of(frames, [](auto frame) { return frame != 0; });
+    return short_loop[detail::short_remaining] != 0 || refill != 0 ||
+           std::ranges::any_of(frames, [](auto frame) { return frame != 0; });
   }
 
   void observe(Registers &registers) const {
+    if (observe_short(registers)) { return; }
     const auto pc = registers.pc;
     if (observe_refill(registers, pc)) { return; }
     for (auto depth = registers.loop_address_depth; depth != 0; --depth) {
@@ -161,6 +164,21 @@ struct LoopPipeline {
   }
 
 private:
+  bool observe_short(Registers &registers) const {
+    const auto addresses = short_loop[detail::short_addresses];
+    if ((addresses & detail::short_addresses_live) == 0) { return false; }
+    const auto end =
+        static_cast<std::uint32_t>(short_loop[detail::short_descriptor]) & detail::maximum_pc;
+    if (short_loop[detail::short_remaining] == 0 &&
+        registers.pc != ((end + 1) & detail::maximum_pc)) {
+      return false;
+    }
+    registers.faddr = static_cast<std::uint32_t>(addresses) & detail::maximum_pc;
+    registers.daddr =
+        static_cast<std::uint32_t>(addresses >> detail::short_decode_shift) & detail::maximum_pc;
+    return true;
+  }
+
   bool observe_refill(Registers &registers, std::uint32_t pc) const {
     if ((refill & detail::loop_refill_live) == 0) { return false; }
     const auto start = static_cast<std::uint32_t>(refill) & detail::maximum_pc;
@@ -203,6 +221,7 @@ struct Core::Impl {
     pointers[detail::lcntr_slot] = &state.registers.lcntr;
     pointers[detail::loop_frames_slot] = loops.frames.data();
     pointers[detail::loop_refill_slot] = &loops.refill;
+    pointers[detail::short_loop_slot] = loops.short_loop.data();
     pointers[detail::interrupt_latch_slot] = &state.registers.irptl;
     for (unsigned bank = 0; bank < 2; ++bank) {
       for (unsigned index = 0; index < 16; ++index) {
@@ -602,7 +621,10 @@ void Core::Impl::observe_pipeline(Progress retired) {
   if (retired.instructions == 0) { return; }
   auto &registers = state.registers;
   if (delayed_target == 0) {
-    if (registers.loop_address_depth != 0 || loops.refill != 0) { loops.observe(registers); }
+    if (registers.loop_address_depth != 0 || loops.refill != 0 ||
+        loops.short_loop[detail::short_addresses] != 0) {
+      loops.observe(registers);
+    }
     return;
   }
   const auto target = delayed_target & detail::maximum_pc;

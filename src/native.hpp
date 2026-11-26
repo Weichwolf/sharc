@@ -38,7 +38,8 @@ inline constexpr std::size_t loop_counter_depth_slot = loop_address_depth_slot +
 inline constexpr std::size_t lcntr_slot = loop_counter_depth_slot + 1;
 inline constexpr std::size_t loop_frames_slot = lcntr_slot + 1;
 inline constexpr std::size_t loop_refill_slot = loop_frames_slot + 1;
-inline constexpr std::size_t register_pointer_count = loop_refill_slot + 1;
+inline constexpr std::size_t short_loop_slot = loop_refill_slot + 1;
+inline constexpr std::size_t register_pointer_count = short_loop_slot + 1;
 inline constexpr unsigned loop_stack_capacity = 6;
 inline constexpr std::uint32_t loop_pc_index_mask = 31;
 inline constexpr std::uint32_t loop_frame_live = 1U << 5;
@@ -47,6 +48,18 @@ inline constexpr unsigned loop_fetch_distance = 4;
 inline constexpr unsigned loop_decode_distance = 2;
 inline constexpr unsigned loop_refill_end_shift = 24;
 inline constexpr std::uint64_t loop_refill_live = 1ULL << 48;
+
+enum ShortLoopWord : std::uint8_t {
+  short_remaining,
+  short_descriptor,
+  short_addresses,
+  short_state_words
+};
+
+inline constexpr std::uint64_t short_startup = 1ULL << 24;
+inline constexpr std::uint64_t short_compact_count = 1ULL << 25;
+inline constexpr unsigned short_decode_shift = 24;
+inline constexpr std::uint64_t short_addresses_live = 1ULL << 48;
 inline constexpr std::uint32_t before_first_delay_slot = 1U << 25;
 inline constexpr std::uint32_t before_second_delay_slot = 1U << 24;
 inline constexpr std::uint32_t dag1_high_mode = 1U << 3;

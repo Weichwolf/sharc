@@ -235,9 +235,17 @@ struct LoopShape {
 
   [[nodiscard]] bool arithmetic() const { return !counted() && term != true_condition; }
 
+  [[nodiscard]] bool short_body() const { return length <= loop_fetch_distance; }
+
+  [[nodiscard]] unsigned short_threshold() const {
+    constexpr std::array thresholds{4U, 2U, 2U, 1U};
+    return thresholds[length - 1];
+  }
+
   [[nodiscard]] std::uint32_t address_word() const {
-    const auto type = counted() ? long_counted_loop_kind : 0U;
-    return end | (term << immediate_count_shift) | (type << loop_type_shift);
+    const auto counted_type = length < loop_fetch_distance ? length * 2U : long_counted_loop_kind;
+    return end | (term << immediate_count_shift) |
+           ((counted() ? counted_type : 0U) << loop_type_shift);
   }
 };
 
@@ -292,9 +300,9 @@ void validate_loop(const Instruction &op, std::string_view identity) {
   if (shape.length == 0 || shape.length >= negative_offset) {
     reject(op, identity, FaultReason::invalid_encoding, "DO endpoint must follow the setup");
   }
-  if (shape.length <= loop_fetch_distance) {
+  if (shape.short_body() && !shape.counted()) {
     reject(
-        op, identity, FaultReason::unsupported_instruction, "short-loop lookahead is unqualified");
+        op, identity, FaultReason::unsupported_instruction, "short arithmetic DO is unqualified");
   }
   if (register_count(op)) {
     constexpr auto reserved = (1ULL << 39) | (std::uint64_t{byte_mask} << immediate_count_shift);
@@ -679,6 +687,19 @@ private:
     return builder_.CreateInBoundsGEP(builder_.getInt32Ty(), pointer(slot), index);
   }
 
+  llvm::Value *short_cell(ShortLoopWord slot) {
+    return builder_.CreateInBoundsGEP(
+        builder_.getInt64Ty(), pointer(short_loop_slot), builder_.getInt64(slot));
+  }
+
+  llvm::Value *short_word(ShortLoopWord slot) {
+    return builder_.CreateLoad(builder_.getInt64Ty(), short_cell(slot));
+  }
+
+  void write_short(ShortLoopWord slot, llvm::Value *word) {
+    builder_.CreateStore(word, short_cell(slot));
+  }
+
   std::size_t data_slot(unsigned lane, unsigned reg) const {
     const auto bank_bit = reg < 8 ? low_bank_mode : high_bank_mode;
     const auto bank = (context_ & bank_bit) != 0 ? 1U : 0U;
@@ -763,7 +784,7 @@ private:
   [[nodiscard]] bool delay_boundary(std::uint32_t pc) const;
   [[nodiscard]] bool sequencer_boundary(std::uint32_t pc) const;
   void plan_hardware_loops(const LoopMap &shapes);
-  void plan_hardware_grants();
+  void plan_hardware_grants(const LoopMap &shapes);
   void admit_hardware_turns(const Values &values, const LoopShape &shape);
   void emit_hardware_turns(const Node &body,
                            const LoopFrame &frame,
@@ -777,6 +798,24 @@ private:
   void loop_test(Values &values, const LoopShape &shape, llvm::Value *old_status);
   void loop_refill(Values &values, const Instruction &op);
   void check_loop_end(const Values &values, const Instruction &op, bool partial);
+
+  struct ShortLookahead {
+    llvm::Value *fetch{}, *decode{};
+  };
+
+  void write_short_addresses(ShortLookahead addresses, llvm::Value *live);
+  llvm::Value *short_flag(llvm::Value *descriptor, std::uint64_t mask);
+  void setup_short_loop(const LoopShape &shape, llvm::Value *count);
+  void
+  short_loop_retirement(Values values, const Instruction &op, const LoopShape &shape, bool partial);
+  void short_loop_counter(Values &values,
+                          const Instruction &op,
+                          const LoopShape &shape,
+                          llvm::Value *descriptor);
+  llvm::Value *
+  short_stage(const LoopShape &shape, const Instruction &op, llvm::Value *left, unsigned lag);
+  void short_loop_observation(const Instruction &op, const LoopShape &shape, llvm::Value *left);
+  void retire_short_observation(std::uint32_t pc);
   void loop_backedge(const Values &values, const LoopShape &shape, bool partial);
   void
   loop_retirement(Values &values, const Instruction &op, llvm::Value *old_status, bool partial);
@@ -825,7 +864,8 @@ private:
   std::set<std::uint32_t> delay_slots_;
   std::map<std::uint32_t, const Instruction *> delay_ends_;
   std::map<std::uint32_t, LoopShape> loop_fetches_, loop_tests_, hardware_ends_;
-  std::map<std::uint32_t, LoopShape> hardware_grants_;
+  std::map<std::uint32_t, LoopShape> hardware_grants_, short_bodies_;
+  std::set<std::uint32_t> short_successors_;
   std::set<std::uint32_t> loop_setups_;
   std::vector<Node> admission_, fast_entry_, fast_, partial_;
   std::map<std::uint32_t, MemoryPlan> memory_plan_;
@@ -1597,6 +1637,7 @@ void Lowering::complete(Values values,
   auto *count = partial ? builder_.getInt64(1) : values[credit_value];
   const auto next = next_pc(op);
   if (!branch(op)) {
+    retire_short_observation(op.address);
     delayed_slot(values, op, partial);
     credit(values, count, builder_.CreateAdd(count, values[extra_cycles_value]), partial);
     finish(values, next, partial);
@@ -1612,6 +1653,7 @@ void Lowering::complete(Values values,
   auto branch_values = values;
   if (call_branch_instruction(op)) { call(branch_values, op, partial); }
   auto *target = op.type == return_branch_type ? pop(branch_values, op, partial) : nullptr;
+  retire_short_observation(op.address);
   if (indirect_branch(op)) {
     auto *address = builder_.CreateAdd(values[index_value + branch_index(op)],
                                        values[modifier_value + branch_modifier(op)]);
@@ -1635,6 +1677,7 @@ void Lowering::complete(Values values,
     redirect(branch_values, op, target, partial);
   }
   builder_.SetInsertPoint(fallthrough);
+  retire_short_observation(op.address);
   retire_pipeline(values, pipeline);
   values[hazard_value] = builder_.getInt1(op.compute.kind != ComputeKind::none);
   credit(values, count, cycles, partial);
@@ -1703,7 +1746,8 @@ bool Lowering::delay_boundary(std::uint32_t pc) const {
 
 bool Lowering::sequencer_boundary(std::uint32_t pc) const {
   return delay_boundary(pc) || loop_setups_.contains(pc) || loop_fetches_.contains(pc) ||
-         loop_tests_.contains(pc) || hardware_ends_.contains(pc) || hardware_grants_.contains(pc);
+         loop_tests_.contains(pc) || hardware_ends_.contains(pc) || hardware_grants_.contains(pc) ||
+         short_bodies_.contains(pc) || short_successors_.contains(pc);
 }
 
 void Lowering::plan_hardware_loops(const LoopMap &shapes) {
@@ -1711,6 +1755,14 @@ void Lowering::plan_hardware_loops(const LoopMap &shapes) {
     if (loop_setup(op)) { loop_setups_.insert(op.address); }
   }
   for (const auto &[end, shape] : shapes) {
+    if (shape.short_body()) {
+      for (unsigned i = 0; i < shape.length; ++i) {
+        const auto pc = (shape.start + i) & maximum_pc;
+        if (addresses_.contains(pc)) { short_bodies_.emplace(pc, shape); }
+      }
+      if (shape.length == loop_fetch_distance) { short_successors_.insert((end + 1) & maximum_pc); }
+      continue;
+    }
     if (addresses_.contains(end)) { hardware_ends_.emplace(end, shape); }
     const auto fetch = (end - loop_fetch_distance) & maximum_pc;
     if (addresses_.contains(fetch)) { loop_fetches_.emplace(fetch, shape); }
@@ -1724,9 +1776,14 @@ void Lowering::loop_push(Values &values, const Instruction &op, bool partial) {
   auto *counter_depth =
       builder_.CreateZExt(load(8, loop_counter_depth_slot), builder_.getInt32Ty());
   auto *const pc_depth = values[pc_stack_depth_value];
+  const auto shape = loop_shape(op);
   auto *room = builder_.CreateAnd(
       builder_.CreateICmpULT(depth, builder_.getInt32(loop_stack_capacity)),
       builder_.CreateICmpULT(pc_depth, builder_.getInt32(Registers::pc_stack_capacity)));
+  if (shape.short_body()) {
+    room = builder_.CreateAnd(
+        room, builder_.CreateICmpEQ(short_word(short_remaining), builder_.getInt64(0)));
+  }
   stack_guard(values,
               op,
               builder_.CreateAnd(room, builder_.CreateICmpEQ(depth, counter_depth)),
@@ -1744,7 +1801,7 @@ void Lowering::loop_push(Values &values, const Instruction &op, bool partial) {
     }
     store(count, lcntr_slot);
   }
-  const auto shape = loop_shape(op);
+  if (shape.short_body()) { setup_short_loop(shape, count); }
   builder_.CreateStore(builder_.getInt32(shape.address_word()),
                        loop_cell(loop_address_slot, depth));
   builder_.CreateStore(count, loop_cell(loop_counter_slot, depth));
@@ -1756,6 +1813,183 @@ void Lowering::loop_push(Values &values, const Instruction &op, bool partial) {
   store(raw_depth, loop_counter_depth_slot);
   push_pc(values, builder_.getInt32(shape.start));
   loop_status(values, next_depth);
+}
+
+llvm::Value *Lowering::short_flag(llvm::Value *descriptor, std::uint64_t mask) {
+  return builder_.CreateICmpNE(builder_.CreateAnd(descriptor, builder_.getInt64(mask)),
+                               builder_.getInt64(0));
+}
+
+void Lowering::write_short_addresses(ShortLookahead addresses, llvm::Value *live) {
+  auto *packed = builder_.CreateOr(
+      builder_.CreateAnd(addresses.fetch, builder_.getInt64(maximum_pc)),
+      builder_.CreateShl(builder_.CreateAnd(addresses.decode, builder_.getInt64(maximum_pc)),
+                         builder_.getInt64(short_decode_shift)));
+  write_short(
+      short_addresses,
+      builder_.CreateSelect(live,
+                            builder_.CreateOr(packed, builder_.getInt64(short_addresses_live)),
+                            builder_.getInt64(0)));
+}
+
+void Lowering::setup_short_loop(const LoopShape &shape, llvm::Value *count) {
+  // The startup states hold or substitute prefetched words for the short bodies.
+  constexpr std::array fetch_offsets{0U, 1U, 1U, 3U};
+  constexpr std::array decode_offsets{0U, 1U, 2U, 1U};
+  const auto index = shape.length - 1;
+  auto *zero = builder_.CreateICmpEQ(count, builder_.getInt32(0));
+  auto *iterations = builder_.CreateSelect(
+      zero, builder_.getInt64(unsigned_limit), builder_.CreateZExt(count, builder_.getInt64Ty()));
+  write_short(short_remaining, builder_.CreateMul(iterations, builder_.getInt64(shape.length)));
+  auto *compact =
+      builder_.CreateAnd(builder_.CreateNot(zero),
+                         builder_.CreateICmpULT(count, builder_.getInt32(shape.short_threshold())));
+  write_short(short_descriptor,
+              builder_.CreateOr(builder_.getInt64(shape.end | short_startup),
+                                builder_.CreateSelect(compact,
+                                                      builder_.getInt64(short_compact_count),
+                                                      builder_.getInt64(0))));
+  write_short_addresses({.fetch = builder_.getInt64(shape.start + fetch_offsets[index]),
+                         .decode = builder_.getInt64(shape.start + decode_offsets[index])},
+                        builder_.getTrue());
+}
+
+void Lowering::short_loop_counter(Values &values,
+                                  const Instruction &op,
+                                  const LoopShape &shape,
+                                  llvm::Value *descriptor) {
+  const auto frame = active_loop(values, shape);
+  auto *startup = short_flag(descriptor, short_startup);
+  auto *compact = short_flag(descriptor, short_compact_count);
+  const auto second = (shape.start + 1) & maximum_pc;
+  if (shape.length == 3) { startup = builder_.CreateAnd(startup, builder_.CreateNot(compact)); }
+  // Once started, Fetch1 encounters the end when E executes (lengths 1/2/4),
+  // or when the second word executes (length 3). The startup can count a
+  // held end word before the ordinary rolling window is established.
+  const bool steady_fetch = op.address == (shape.length == 3 ? second : shape.end);
+  auto *attempts = builder_.CreateAdd(builder_.getInt32(steady_fetch ? 1 : 0),
+                                      builder_.CreateZExt(startup, builder_.getInt32Ty()));
+  auto *consider = llvm::BasicBlock::Create(module_.getContext(), "short.fetch.end", function_);
+  auto next = node("short.fetch.continue");
+  next.incoming(values, builder_.GetInsertBlock());
+  builder_.CreateCondBr(
+      builder_.CreateAnd(frame.matches, builder_.CreateICmpNE(attempts, builder_.getInt32(0))),
+      consider,
+      next.block);
+  builder_.SetInsertPoint(consider);
+  auto *cell = loop_cell(loop_counter_slot, frame.index);
+  auto *current = builder_.CreateLoad(builder_.getInt32Ty(), cell);
+  auto *threshold = builder_.CreateSelect(
+      compact, builder_.getInt32(1), builder_.getInt32(shape.short_threshold()));
+  auto *terminate = builder_.CreateICmpULT(builder_.CreateSub(current, threshold), attempts);
+  auto *updated = builder_.CreateSelect(terminate,
+                                        builder_.CreateSub(threshold, builder_.getInt32(1)),
+                                        builder_.CreateSub(current, attempts));
+  builder_.CreateStore(updated, cell);
+  auto *pop = llvm::BasicBlock::Create(module_.getContext(), "short.fetch.pop", function_);
+  next.incoming(values, builder_.GetInsertBlock());
+  builder_.CreateCondBr(terminate, pop, next.block);
+  builder_.SetInsertPoint(pop);
+  loop_pop(values, frame);
+  jump(next, values);
+  builder_.SetInsertPoint(next.block);
+  values = next.values();
+}
+
+llvm::Value *Lowering::short_stage(const LoopShape &shape,
+                                   const Instruction &op,
+                                   llvm::Value *left,
+                                   unsigned lag) {
+  const auto position = (op.address - shape.start + 1) & maximum_pc;
+  const auto body_pc = shape.start + ((position + lag) % shape.length);
+  auto *following = builder_.CreateSub(builder_.getInt64(shape.end + 1 + lag), left);
+  return builder_.CreateSelect(
+      builder_.CreateICmpUGT(left, builder_.getInt64(lag)), builder_.getInt64(body_pc), following);
+}
+
+void Lowering::short_loop_observation(const Instruction &op,
+                                      const LoopShape &shape,
+                                      llvm::Value *left) {
+  auto *descriptor = short_word(short_descriptor);
+  auto *fetch = short_stage(shape, op, left, loop_fetch_distance);
+  auto *decode =
+      short_stage(shape, op, left, shape.length == loop_fetch_distance ? 1U : loop_decode_distance);
+  auto *startup = short_flag(descriptor, short_startup);
+  auto *compact = short_flag(descriptor, short_compact_count);
+  if (shape.length == 1) {
+    auto *last = builder_.CreateICmpEQ(left, builder_.getInt64(1));
+    auto *compact_fetch = builder_.CreateSelect(
+        last, builder_.getInt64(shape.end + 1), builder_.getInt64(shape.start));
+    fetch = builder_.CreateSelect(compact, compact_fetch, fetch);
+    // A suppressed decode still names the held short-loop instruction.
+    decode = builder_.CreateSelect(compact, builder_.getInt64(shape.start), decode);
+  } else if (shape.length == 2) {
+    auto *compact_fill = builder_.CreateAnd(startup, compact);
+    decode = builder_.CreateSelect(compact_fill, builder_.getInt64(shape.end), decode);
+    fetch = builder_.CreateSelect(compact_fill, builder_.getInt64(shape.end + 2), fetch);
+  } else if (shape.length == 3) {
+    auto *compact_fetch = builder_.CreateSelect(
+        startup, builder_.getInt64(shape.end), builder_.getInt64(shape.end + 1));
+    fetch = builder_.CreateSelect(compact, compact_fetch, fetch);
+    decode = builder_.CreateSelect(compact, builder_.getInt64(shape.end), decode);
+  }
+  auto *live = shape.length == loop_fetch_distance
+                   ? static_cast<llvm::Value *>(builder_.getTrue())
+                   : builder_.CreateICmpNE(left, builder_.getInt64(0));
+  write_short_addresses({.fetch = fetch, .decode = decode}, live);
+}
+
+void Lowering::short_loop_retirement(Values values,
+                                     const Instruction &op,
+                                     const LoopShape &shape,
+                                     bool partial) {
+  auto *remaining = short_word(short_remaining);
+  auto *descriptor = short_word(short_descriptor);
+  auto *active = builder_.CreateAnd(
+      builder_.CreateICmpNE(remaining, builder_.getInt64(0)),
+      builder_.CreateICmpEQ(builder_.CreateAnd(descriptor, builder_.getInt64(maximum_pc)),
+                            builder_.getInt64(shape.end)));
+  auto *advance = llvm::BasicBlock::Create(module_.getContext(), "short.retire", function_);
+  auto *ordinary = llvm::BasicBlock::Create(module_.getContext(), "short.inactive", function_);
+  builder_.CreateCondBr(active, advance, ordinary);
+  builder_.SetInsertPoint(advance);
+  short_loop_counter(values, op, shape, descriptor);
+  auto *left = builder_.CreateSub(remaining, builder_.getInt64(1));
+  auto *done = builder_.CreateICmpEQ(left, builder_.getInt64(0));
+  auto *startup = short_flag(descriptor, short_startup);
+  auto *compact = short_flag(descriptor, short_compact_count);
+  auto *refill = builder_.CreateSelect(builder_.CreateAnd(compact, done),
+                                       builder_.getInt64(shape.length == 2 ? 2 : 3),
+                                       builder_.getInt64(0));
+  if (shape.length != 3) {
+    refill = builder_.CreateAdd(refill, builder_.CreateZExt(startup, builder_.getInt64Ty()));
+  }
+  auto *stalled = builder_.CreateICmpNE(refill, builder_.getInt64(0));
+  values[hazard_value] = builder_.CreateAnd(values[hazard_value], builder_.CreateNot(stalled));
+  auto *older =
+      builder_.CreateAnd(builder_.CreateShl(values[dag_history_value], builder_.getInt32(8)),
+                         builder_.getInt32(history_older_mask));
+  values[dag_history_value] = builder_.CreateSelect(
+      stalled,
+      builder_.CreateSelect(
+          builder_.CreateICmpEQ(refill, builder_.getInt64(1)), older, builder_.getInt32(0)),
+      values[dag_history_value]);
+  auto *cycles = builder_.CreateAdd(builder_.CreateAdd(builder_.getInt64(1), refill),
+                                    values[extra_cycles_value]);
+  credit(values, builder_.getInt64(1), cycles, partial);
+  write_short(short_remaining, left);
+  short_loop_observation(op, shape, left);
+  write_short(short_descriptor, builder_.CreateAnd(descriptor, builder_.getInt64(~short_startup)));
+  if (op.address == shape.end) {
+    auto *repeat = llvm::BasicBlock::Create(module_.getContext(), "short.repeat", function_);
+    auto *finished = llvm::BasicBlock::Create(module_.getContext(), "short.finished", function_);
+    builder_.CreateCondBr(done, finished, repeat);
+    builder_.SetInsertPoint(repeat);
+    finish(values, shape.start, partial);
+    builder_.SetInsertPoint(finished);
+  }
+  finish(values, next_pc(op), partial);
+  builder_.SetInsertPoint(ordinary);
 }
 
 void Lowering::loop_status(Values &values, llvm::Value *depth) {
@@ -1908,10 +2142,19 @@ void Lowering::loop_backedge(const Values &values, const LoopShape &shape, bool 
   builder_.SetInsertPoint(next);
 }
 
+void Lowering::retire_short_observation(std::uint32_t pc) {
+  if (!short_successors_.contains(pc)) { return; }
+  auto *live = builder_.CreateICmpNE(short_word(short_remaining), builder_.getInt64(0));
+  write_short(short_addresses,
+              builder_.CreateSelect(live, short_word(short_addresses), builder_.getInt64(0)));
+}
+
 void Lowering::loop_retirement(Values &values,
                                const Instruction &op,
                                llvm::Value *old_status,
                                bool partial) {
+  const auto body = short_bodies_.find(op.address);
+  if (body != short_bodies_.end()) { short_loop_retirement(values, op, body->second, partial); }
   const auto end = hardware_ends_.find(op.address);
   if (end != hardware_ends_.end()) { loop_refill(values, op); }
   const auto fetch = loop_fetches_.find(op.address);
@@ -1921,12 +2164,12 @@ void Lowering::loop_retirement(Values &values,
   if (end != hardware_ends_.end()) { loop_backedge(values, end->second, partial); }
 }
 
-void Lowering::plan_hardware_grants() {
-  for (const auto &[end, shape] : hardware_ends_) {
+void Lowering::plan_hardware_grants(const LoopMap &shapes) {
+  for (const auto &[end, shape] : shapes) {
     const auto start = addresses_.find(shape.start);
-    const auto last = addresses_.at(end);
-    if (start == addresses_.end() || last < start->second ||
-        last - start->second + 1 != shape.length) {
+    const auto last = addresses_.find(end);
+    if (start == addresses_.end() || last == addresses_.end() || last->second < start->second ||
+        last->second - start->second + 1 != shape.length) {
       continue;
     }
     const auto body = std::span(instructions_).subspan(start->second, shape.length);
@@ -1958,17 +2201,27 @@ void Lowering::admit_hardware_turns(const Values &values, const LoopShape &shape
   auto *cycles = builder_.CreateUDiv(available_cycles, length);
   auto *turns = builder_.CreateBinaryIntrinsic(llvm::Intrinsic::umin, instructions, cycles);
   llvm::Value *count = nullptr;
+  llvm::Value *steady = builder_.getTrue();
   if (shape.counted()) {
     count = builder_.CreateLoad(builder_.getInt32Ty(), loop_cell(loop_counter_slot, frame.index));
     // A raw zero represents 2^32 turns. The final turn always takes the exact path.
-    auto *before_last = builder_.CreateSub(count, builder_.getInt32(1));
+    llvm::Value *before_last = nullptr;
+    if (shape.short_body()) {
+      auto *descriptor = short_word(short_descriptor);
+      steady = builder_.CreateNot(short_flag(descriptor, short_startup));
+      // Leave the fetch that pops the frame and starts draining buffered words to the exact path.
+      before_last = builder_.CreateBinaryIntrinsic(
+          llvm::Intrinsic::usub_sat, count, builder_.getInt32(shape.short_threshold()));
+    } else {
+      before_last = builder_.CreateSub(count, builder_.getInt32(1));
+    }
     turns = builder_.CreateBinaryIntrinsic(
         llvm::Intrinsic::umin, turns, builder_.CreateZExt(before_last, builder_.getInt64Ty()));
   }
   auto *pending = builder_.CreateAnd(frame.metadata, builder_.getInt32(loop_repeat_scheduled));
-  auto *clean =
-      builder_.CreateAnd(builder_.CreateICmpEQ(pending, builder_.getInt32(0)),
-                         builder_.CreateICmpEQ(values[dag_history_value], builder_.getInt32(0)));
+  auto *clean = builder_.CreateAnd(
+      builder_.CreateAnd(steady, builder_.CreateICmpEQ(pending, builder_.getInt32(0))),
+      builder_.CreateICmpEQ(values[dag_history_value], builder_.getInt32(0)));
   auto *admitted = builder_.CreateAnd(
       builder_.CreateAnd(frame.matches, clean),
       builder_.CreateAnd(memory_admitted_, builder_.CreateICmpNE(turns, builder_.getInt64(0))));
@@ -2017,6 +2270,10 @@ void Lowering::emit_hardware_turns(const Node &body,
   if (count != nullptr) {
     auto *updated = builder_.CreateSub(count, builder_.CreateTrunc(turns, builder_.getInt32Ty()));
     builder_.CreateStore(updated, loop_cell(loop_counter_slot, frame.index));
+  }
+  if (shape.short_body()) {
+    // At a steady header, a whole turn leaves FADDR and DADDR at the same body addresses.
+    write_short(short_remaining, builder_.CreateSub(short_word(short_remaining), retired));
   }
   if (!shape.arithmetic()) {
     credit(values, retired, retired, false);
@@ -2503,9 +2760,10 @@ void Lowering::emit(const LoopMap &shapes) {
     partial_.push_back(node("cold.prefix." + std::to_string(i)));
   }
   plan_hardware_loops(shapes);
-  plan_hardware_grants();
-  stack_written_ = !loop_setups_.empty() || !hardware_ends_.empty() || !loop_fetches_.empty() ||
-                   !loop_tests_.empty() || std::ranges::any_of(instructions_, [](const auto &op) {
+  plan_hardware_grants(shapes);
+  stack_written_ = !short_bodies_.empty() || !loop_setups_.empty() || !hardware_ends_.empty() ||
+                   !loop_fetches_.empty() || !loop_tests_.empty() ||
+                   std::ranges::any_of(instructions_, [](const auto &op) {
                      return op.type == return_branch_type || call_branch_instruction(op);
                    });
   costs_ = block_costs();
@@ -2678,6 +2936,12 @@ void validate_loop_body(const InstructionMap &code,
           op, identity, FaultReason::invalid_encoding, "nested DO crosses or shares its endpoint");
     }
     const auto gap = remaining - child.length;
+    if (shape.short_body() || (child.short_body() && gap <= loop_fetch_distance)) {
+      reject(op,
+             identity,
+             FaultReason::unsupported_instruction,
+             "nested short-loop overlap is unqualified");
+    }
     if (shape.arithmetic() && gap < loop_decode_distance) {
       reject(op, identity, FaultReason::invalid_encoding, "arithmetic DO endpoints are too close");
     }

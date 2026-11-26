@@ -19,6 +19,7 @@ constexpr std::uint64_t do_i8 = 0x0d1800000000;
 constexpr std::uint64_t do_lce = 0x0e1e00000000;
 constexpr std::uint64_t do_eq = 0x0e0000000000;
 constexpr std::uint32_t counted_address = 0xef000000;
+constexpr std::uint32_t single_word_counted_address = 0x4f000000;
 constexpr std::uint32_t empty = (1U << 22) | (1U << 26);
 constexpr std::uint32_t loop_overflow = 1U << 25;
 constexpr std::uint32_t old_lcntr = 0x13579bdf;
@@ -149,6 +150,159 @@ void counted_forms() {
   registers.mode1 = alternate_dag2;
   registers.dag[1][8].index = count;
   counted_case(do_i8, registers, count);
+}
+
+struct ShortBoundary {
+  unsigned pc, fetch, decode;
+  unsigned cycles{1};
+  std::uint32_t count;
+  bool frame_live{};
+};
+
+void short_counted_case(unsigned length,
+                        std::uint32_t count,
+                        std::span<const ShortBoundary> boundaries,
+                        std::uint64_t successor = 0) {
+  constexpr std::array address_types{
+      single_word_counted_address, 0x8f000000U, 0xcf000000U, counted_address};
+  constexpr std::array setup_fetch{1U, 2U, 2U, 4U};
+  constexpr std::array setup_decode{1U, 2U, 3U, 2U};
+  std::vector<std::uint64_t> words(length + 2, fixture::add(0, 0, 1));
+  words.front() = do_immediate | (std::uint64_t{count} << count_shift) | length;
+  words.back() = successor;
+  fixture::Program program(words);
+  auto initial = starting();
+  initial.pe[0].data[0][1] = 1U << raw_shift;
+  Timeline trace{.registers = initial, .prefixes = {}};
+  trace.registers.lcntr = count;
+  entered(trace, {.address = address_types[length - 1] | (base + length), .count = count});
+  trace.registers.faddr = base + setup_fetch[length - 1];
+  trace.registers.daddr = base + setup_decode[length - 1];
+  trace.prefixes.back().registers = trace.registers;
+  for (const auto &expected : boundaries) {
+    if (trace.registers.pc != base + length + 1) {
+      trace.registers.pe[0].data[0][0] += 1U << raw_shift;
+    }
+    trace.boundary(base + expected.pc, expected.cycles);
+    trace.registers.faddr = base + expected.fetch;
+    trace.registers.daddr = base + expected.decode;
+    trace.registers.loop_counter_stack[0] = expected.count;
+    if (!expected.frame_live) { popped(trace.registers); }
+    trace.record();
+  }
+  for (const auto mode : fixture::numeric_modes) {
+    const auto native = fixture::compile(program.code, mode);
+    sharc::Core core(program.memory(), mode);
+    sharc::Core replay(program.memory(), mode);
+    fixture::install(core, native, initial);
+    (void)replay.install(native, fixture::Program::variant_id);
+    fixture::verify_prefixes(core, replay, trace.prefixes);
+  }
+}
+
+void single_word_loops() {
+  // Table 4-17: Fetch1 can leave the body four retirements before Execute.
+  constexpr std::array five{
+      ShortBoundary{.pc = 1, .fetch = 2, .decode = 1, .cycles = 2, .count = 3},
+      ShortBoundary{.pc = 1, .fetch = 3, .decode = 1, .count = 3},
+      ShortBoundary{.pc = 1, .fetch = 4, .decode = 2, .count = 3},
+      ShortBoundary{.pc = 1, .fetch = 5, .decode = 3, .count = 3},
+      ShortBoundary{.pc = 2, .fetch = 6, .decode = 4, .count = 3}};
+  short_counted_case(1, 5, five);
+  constexpr std::array four{
+      ShortBoundary{.pc = 1, .fetch = 3, .decode = 1, .cycles = 2, .count = 3},
+      five[2],
+      five[3],
+      five[4]};
+  short_counted_case(1, 4, four);
+  // Grants enter after the fill and stop before the fetch that pops the frame.
+  constexpr std::array nine{
+      ShortBoundary{.pc = 1, .fetch = 1, .decode = 1, .cycles = 2, .count = 7, .frame_live = true},
+      ShortBoundary{.pc = 1, .fetch = 1, .decode = 1, .count = 6, .frame_live = true},
+      ShortBoundary{.pc = 1, .fetch = 1, .decode = 1, .count = 5, .frame_live = true},
+      ShortBoundary{.pc = 1, .fetch = 1, .decode = 1, .count = 4, .frame_live = true},
+      ShortBoundary{.pc = 1, .fetch = 2, .decode = 1, .count = 3},
+      five[1],
+      five[2],
+      five[3],
+      five[4]};
+  short_counted_case(1, 9, nine);
+  // Tables 4-19 to 4-21: shorter counts drain through three empty clocks.
+  constexpr std::array three{
+      ShortBoundary{.pc = 1, .fetch = 1, .decode = 1, .cycles = 2, .count = 1, .frame_live = true},
+      ShortBoundary{.pc = 1, .fetch = 2, .decode = 1, .count = 0},
+      ShortBoundary{.pc = 2, .fetch = 6, .decode = 4, .cycles = 4, .count = 0}};
+  constexpr std::array two{ShortBoundary{.pc = 1, .fetch = 2, .decode = 1, .cycles = 2, .count = 0},
+                           three.back()};
+  constexpr std::array one{
+      ShortBoundary{.pc = 2, .fetch = 6, .decode = 4, .cycles = 5, .count = 0}};
+  constexpr std::array zero{
+      ShortBoundary{
+          .pc = 1, .fetch = 1, .decode = 1, .cycles = 2, .count = 0xfffffffe, .frame_live = true},
+      ShortBoundary{.pc = 1, .fetch = 1, .decode = 1, .count = 0xfffffffd, .frame_live = true}};
+  short_counted_case(1, 3, three);
+  short_counted_case(1, 2, two);
+  short_counted_case(1, 1, one);
+  short_counted_case(1, 0, zero);
+}
+
+void multiword_short_loops() {
+  // Tables 4-22 to 4-24: after the fill one word comes from the loop buffer.
+  constexpr std::array two_three{
+      ShortBoundary{.pc = 2, .fetch = 2, .decode = 2, .cycles = 2, .count = 2, .frame_live = true},
+      ShortBoundary{.pc = 1, .fetch = 3, .decode = 1, .count = 1},
+      ShortBoundary{.pc = 2, .fetch = 4, .decode = 2, .count = 1},
+      ShortBoundary{.pc = 1, .fetch = 5, .decode = 3, .count = 1},
+      ShortBoundary{.pc = 2, .fetch = 6, .decode = 4, .count = 1},
+      ShortBoundary{.pc = 3, .fetch = 7, .decode = 5, .count = 1}};
+  constexpr std::array two_two{
+      ShortBoundary{.pc = 2, .fetch = 4, .decode = 2, .cycles = 2, .count = 1},
+      two_three[3],
+      two_three[4],
+      two_three[5]};
+  constexpr std::array two_one{
+      ShortBoundary{.pc = 2, .fetch = 4, .decode = 2, .cycles = 2, .count = 0},
+      ShortBoundary{.pc = 3, .fetch = 7, .decode = 5, .cycles = 3, .count = 0}};
+  short_counted_case(2, 3, two_three);
+  short_counted_case(2, 2, two_two);
+  short_counted_case(2, 1, two_one);
+
+  // Tables 4-25 and 4-26: a three-word body does not stall on entry.
+  constexpr std::array three_two{ShortBoundary{.pc = 2, .fetch = 3, .decode = 1, .count = 1},
+                                 ShortBoundary{.pc = 3, .fetch = 4, .decode = 2, .count = 1},
+                                 ShortBoundary{.pc = 1, .fetch = 5, .decode = 3, .count = 1},
+                                 ShortBoundary{.pc = 2, .fetch = 6, .decode = 4, .count = 1},
+                                 ShortBoundary{.pc = 3, .fetch = 7, .decode = 5, .count = 1},
+                                 ShortBoundary{.pc = 4, .fetch = 8, .decode = 6, .count = 1}};
+  constexpr std::array three_one{
+      ShortBoundary{.pc = 2, .fetch = 3, .decode = 3, .count = 1, .frame_live = true},
+      ShortBoundary{.pc = 3, .fetch = 4, .decode = 3, .count = 0},
+      ShortBoundary{.pc = 4, .fetch = 8, .decode = 6, .cycles = 4, .count = 0}};
+  short_counted_case(3, 2, three_two);
+  short_counted_case(3, 1, three_one);
+
+  // Table 4-27 carries the held decode address through the last body word.
+  constexpr std::array four_one{
+      ShortBoundary{.pc = 2, .fetch = 6, .decode = 3, .cycles = 2, .count = 0},
+      ShortBoundary{.pc = 3, .fetch = 7, .decode = 4, .count = 0},
+      ShortBoundary{.pc = 4, .fetch = 8, .decode = 5, .count = 0},
+      ShortBoundary{.pc = 5, .fetch = 9, .decode = 6, .count = 0},
+      ShortBoundary{.pc = 6, .fetch = 10, .decode = 8, .count = 0}};
+  short_counted_case(4, 1, four_one);
+  constexpr std::array four_two{
+      ShortBoundary{.pc = 2, .fetch = 2, .decode = 3, .cycles = 2, .count = 1, .frame_live = true},
+      ShortBoundary{.pc = 3, .fetch = 3, .decode = 4, .count = 1, .frame_live = true},
+      ShortBoundary{.pc = 4, .fetch = 4, .decode = 1, .count = 1, .frame_live = true},
+      ShortBoundary{.pc = 1, .fetch = 5, .decode = 2, .count = 0},
+      ShortBoundary{.pc = 2, .fetch = 6, .decode = 3, .count = 0},
+      four_one[1],
+      four_one[2],
+      four_one[3]};
+  short_counted_case(4, 2, four_two);
+  auto after_jump = four_one;
+  after_jump.back() = ShortBoundary{.pc = 5, .fetch = 9, .decode = 7, .cycles = 4, .count = 0};
+  constexpr auto jump_to_successor = std::uint64_t{0x063e00000000} | (base + 5);
+  short_counted_case(4, 1, after_jump, jump_to_successor);
 }
 
 Timeline arithmetic_prefix(sharc::Registers registers, bool both_zero) {
@@ -309,6 +463,61 @@ void nested_do() {
   fixture::verify_prefixes(core, replay, trace.prefixes);
 }
 
+void nested_short_do() {
+  constexpr Range outer{.start = base + 1, .end = base + 7};
+  constexpr auto inner_word = base + 2;
+  constexpr auto outer_do = do_immediate | (std::uint64_t{2} << count_shift) | 7;
+  constexpr auto inner_do = do_immediate | (std::uint64_t{3} << count_shift) | 1;
+  std::array<std::uint64_t, 9> words{};
+  words[0] = outer_do;
+  words[1] = inner_do;
+  words[2] = fixture::add(0, 0, 1);
+  fixture::Program program(words);
+  const auto native = sharc::Core::compile(program.code);
+  sharc::Core core(program.memory());
+  sharc::Core replay(program.memory());
+  auto registers = starting();
+  registers.pe[0].data[0][1] = 1U << raw_shift;
+  fixture::install(core, native, registers);
+  (void)replay.install(native, fixture::Program::variant_id);
+  Timeline trace{.registers = registers, .prefixes = {}};
+  auto &state = trace.registers;
+  state.lcntr = 2;
+  entered(trace, {.address = counted_address | outer.end, .count = 2});
+  for (const bool repeats : {true, false}) {
+    state.lcntr = 3;
+    state.loop_address_depth = state.loop_counter_depth = state.pc_stack_pointer = 2;
+    state.pc_stack[1] = inner_word;
+    state.loop_address_stack[1] = single_word_counted_address | inner_word;
+    state.loop_counter_stack[1] = 3;
+    trace.boundary(inner_word);
+    state.faddr = state.daddr = inner_word;
+    trace.record();
+
+    auto &sum = state.pe[0].data[0][0];
+    sum += 1U << raw_shift;
+    state.loop_counter_stack[1] = 1;
+    trace.boundary(inner_word, 2);
+    state.faddr = state.daddr = inner_word;
+    trace.record();
+    sum += 1U << raw_shift;
+    state.loop_counter_stack[1] = 0;
+    state.loop_address_depth = state.loop_counter_depth = state.pc_stack_pointer = 1;
+    trace.boundary(inner_word);
+    state.faddr = inner_word + 1;
+    state.daddr = inner_word;
+    trace.record();
+    sum += 1U << raw_shift;
+    trace.boundary(inner_word + 1, 4);
+    trace.record();
+
+    --state.loop_counter_stack[0];
+    if (!repeats) { popped(state); }
+    tail(trace, outer, repeats);
+  }
+  fixture::verify_prefixes(core, replay, trace.prefixes);
+}
+
 void refused_do() {
   constexpr auto setup = do_immediate | (std::uint64_t{1} << count_shift) | 5;
   const std::array words{setup,
@@ -365,9 +574,12 @@ void skipped_fetch_boundary() {
 
 void fixture::hardware_loop_control_flow() {
   counted_forms();
+  single_word_loops();
+  multiword_short_loops();
   arithmetic_do();
   forever_do();
   nested_do();
+  nested_short_do();
   refused_do();
   skipped_fetch_boundary();
 }
