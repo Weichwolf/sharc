@@ -200,6 +200,35 @@ MemoryMove memory_move(const Instruction &instruction) {
           .write = (instruction.word & memory_write) != 0};
 }
 
+MemoryMoves memory_moves(const Instruction &instruction) {
+  if (instruction.type == memory_move_type) {
+    return {.transfers = {memory_move(instruction), {}}, .count = 1};
+  }
+  if (instruction.type != parallel_memory_type) { return {}; }
+  constexpr unsigned dm_direction = 44;
+  constexpr unsigned dm_index = 41;
+  constexpr unsigned dm_modifier = 38;
+  constexpr unsigned dm_register = 33;
+  constexpr unsigned pm_direction = 37;
+  constexpr unsigned pm_index = 30;
+  constexpr unsigned pm_modifier = 27;
+  constexpr unsigned pm_register = 23;
+  const auto field = [&](unsigned shift, unsigned mask) {
+    return static_cast<unsigned>((instruction.word >> shift) & mask);
+  };
+  const MemoryMove data{.index = field(dm_index, 7),
+                        .reg = field(dm_register, 15),
+                        .modifier = field(dm_modifier, 7),
+                        .space = MemorySpace::data,
+                        .write = field(dm_direction, 1) != 0};
+  const MemoryMove program{.index = 8 + field(pm_index, 7),
+                           .reg = field(pm_register, 15),
+                           .modifier = 8 + field(pm_modifier, 7),
+                           .space = MemorySpace::program,
+                           .write = field(pm_direction, 1) != 0};
+  return {.transfers = {data, program}, .count = 2};
+}
+
 void validate_options(const CompileOptions &options, std::string_view identity) {
   if (options.mode != ExecutionMode::strict && options.mode != ExecutionMode::fast_fp32) {
     refuse(FaultReason::invalid_image, identity, 0, 0, "unknown numerical mode");

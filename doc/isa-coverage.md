@@ -8,12 +8,12 @@ is claimed.
 
 | Area | Required evidence | Status |
 |---|---|---|
-| Classic 48-bit ISA | Every documented instruction class, condition, legal operand and parallel form | Partial: data/DAG transfers, fixed ALU/ROT, direct/indirect flow, normal-word pre-indexed memory, immediate DAG modify/reverse, NOP |
+| Classic 48-bit ISA | Every documented instruction class, condition, legal operand and parallel form | Partial: data/DAG transfers, fixed ALU/ROT, direct/indirect flow, normal-word pre-indexed and parallel post-indexed memory, immediate DAG modify/reverse, NOP |
 | VISA 16/32/48 | All compact encodings, fetch boundaries, PC units and mode transitions | Unimplemented |
 | Arithmetic and SIMD | PEx/PEy, fixed point, 32-/40-bit float, rounding, modes, flags and exceptions | Partial: fixed ALU, multiplier/MR, fixed multifunction, register-count ROT and bank/SIMD execution |
 | Strict numerical mode (default) | Exact guest 32-/40-bit behavior, RND32, conversion exceptions and native-path identity | Unimplemented |
 | FastFP32 numerical mode (opt-in) | Independent approximation expectations, rounding/flags, unchanged raw moves/integer behavior, separate translations | Unimplemented |
-| Parallel operations | Old operands, memory aliases, register exchanges and ordered partial effects | Partial: raw register moves/swaps with supported fixed ALU writeback |
+| Parallel operations | Old operands, memory aliases, register exchanges and ordered partial effects | Partial: raw register moves/swaps and type 1a normal-word PM/DM with supported fixed compute |
 | Address generation and memory | Both DAGs, modulo/reverse addressing, PM/DM and physical view aliases | Partial: normal-word pre-indexing, immediate modify/reverse and DAG register-load dependencies |
 | Sequencer and control | Delayed flow, DO/loop endpoints, LR, stacks, reset and interrupts | Partial: classic direct/indirect transfers, hardware DO and admitted reentry, reset, declared maskable vectors, admitted RTI and IDLE |
 | Chip-profile boundaries | ADSP-21489 memory/vector parameters and explicit I/O ownership | Unimplemented |
@@ -125,7 +125,16 @@ butterfly. Installed-image expectations check both lanes and numerical modes,
 accumulator limbs, separate ALU and multiplier flags, old operands and ALU
 write priority over the multiplier. The suite also checks per-lane predicate
 suppression and rejection of a tied pair of ALU destinations. Floating
-multifunction packets and parallel PM/DM transfer forms remain open.
+multifunction packets remain open.
+
+Classic type 1a pairs normal-word PM and DM loads/stores with supported fixed
+compute. Installed images exercise all four direction pairs, old operands,
+DM-before-PM bus effects through an alias, per-lane DM/PM/compute writeback
+priority, SISD broadcast, cross-bank modification and its DAG interlock,
+circular loads and overflow, and BR0/BR8 address reversal in SIMD. A checked
+refusal preserves the completed prefix before a missing PM lane. Linux
+protected-page fixtures exercise ordering and terminal fault attribution on
+both buses through the default and consumer-linked image providers.
 
 Classic `IDLE` stops at retirement under either run bound. Tests cover both
 numerical modes, frozen progression, reset and snapshot replay. IDLE in either
@@ -549,8 +558,9 @@ undefined data/pointer results rather than supplying a guessed complete state.
 Another 13,072 multifunction cases check dual-ALU flag unions, disjoint ALU/
 multiplier flags, old operands and accumulator effects. Authored paired-lane
 records include different old status/sticky bits and independent exceptions.
-Register-overlap maps are numerical expectation data for future installed-image
-fixtures; no instruction execution, memory ordering or SIMD control is claimed.
+The installed fixed multifunction fixture uses an independently generated subset
+of these numerical expectations. The remaining records do not qualify native
+execution.
 Another 133,832 FPACK field-only checks and 896 complete seed-special-case checks
 cover exact short values, exponent clipping, signed zeros, infinities and qualified
 invalid seed inputs. The 260 refused inexact PACK inputs, complete FPACK storage/
