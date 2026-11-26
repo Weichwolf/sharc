@@ -237,7 +237,7 @@ std::string input_identity(const CodeImage &image, const CompileOptions &options
       digest.number(request.source);
       digest.number(request.vector);
     }
-    digest.number(variant.layout.ordinary_regions ? 1 : 0);
+    digest.number(static_cast<std::uint64_t>(variant.layout.ordinary_regions));
     digest.number(variant.layout.regions.size());
     for (const auto &region : variant.layout.regions) {
       digest.number(static_cast<std::uint8_t>(region.space));
