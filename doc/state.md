@@ -65,11 +65,12 @@ A counted DO loads LCNTR once. The current count then evolves on the loop
 counter stack while LCNTR continues to hold the setup value.
 A qualified CALL saves a suspended terminating tail with its PC-stack entry.
 For a delayed `RTS (LR)`, the tail becomes active after the two return slots.
-A CALL on one of the last three words of a counted four-word loop keeps
-its buffered instruction count with the PC-stack entry. The callee can use
-its own loop buffer. The saved buffer is restored at the prepared return
-address. On a repeating endpoint CALL the return refill also samples the
-loop count before the header executes.
+Admitted CALLs in counted two-, three- and four-word loops keep the
+buffered instruction count with the PC-stack entry. The callee can use its
+own loop buffer. The saved buffer is restored at the prepared return
+address. On a repeating endpoint CALL in two- and four-word bodies the
+return refill samples the loop count before the header executes. In a
+three-word body the penultimate word already sampled the count.
 A CALL occupying an admitted long-loop endpoint consumes the loop decision
 and pushes the selected successor, including the loop header on a repeat.
 When a CALL redirects before a pending long-loop sample reaches Fetch1,

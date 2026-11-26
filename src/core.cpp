@@ -317,6 +317,12 @@ struct Core::Impl {
         result.fault.instruction_bits = detail::full_instruction_bits;
         state.fault = result.fault;
         break;
+      case detail::NativeExit::invalid_short_loop_call:
+        result = fail(FaultReason::unsupported_feature, "CALL in a two-word, single-iteration DO");
+        result.fault.instruction = control[detail::fault_instruction];
+        result.fault.instruction_bits = detail::full_instruction_bits;
+        state.fault = result.fault;
+        break;
       case detail::NativeExit::undeclared:
         result = fail(FaultReason::undeclared_entry, "execution reached an undeclared instruction");
         break;

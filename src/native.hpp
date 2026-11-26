@@ -66,6 +66,7 @@ enum ShortLoopWord : std::uint8_t {
 
 inline constexpr std::uint64_t short_startup = 1ULL << 24;
 inline constexpr std::uint64_t short_compact_count = 1ULL << 25;
+inline constexpr std::uint64_t short_call_exit = 1ULL << 26;
 inline constexpr std::uint64_t short_unbounded = ~std::uint64_t{0};
 inline constexpr unsigned short_decode_shift = 24;
 inline constexpr std::uint64_t short_addresses_live = 1ULL << 48;
@@ -118,7 +119,8 @@ enum class NativeExit : std::uint8_t {
   returned,
   unsupported_loop_stack,
   unsupported_loop_reentry,
-  invalid_loop_abort
+  invalid_loop_abort,
+  invalid_short_loop_call
 };
 using NativeEntry = void (*)(void **, std::uint64_t *);
 using RegisterPointers = std::vector<void *>;

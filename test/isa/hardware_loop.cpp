@@ -4,6 +4,7 @@
 #include "../support/prefix.hpp"
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <sharc/core.hpp>
@@ -1355,8 +1356,11 @@ void callee_short_loop(Timeline &trace) {
   trace.record();
 }
 
-unsigned short_call_round_trip(Timeline &trace, unsigned resume, bool delayed) {
-  entered_call(trace, {.target = short_call_sub, .raw_return = call_tag | (base + resume)});
+unsigned short_call_round_trip(Timeline &trace,
+                               unsigned resume,
+                               bool delayed,
+                               std::uint32_t tags = call_tag) {
+  entered_call(trace, {.target = short_call_sub, .raw_return = tags | (base + resume)});
   callee_short_loop(trace);
   popped_call(trace.registers);
   if (delayed) {
@@ -1468,6 +1472,132 @@ void four_word_endpoint_call(FourWordCall form) {
   trace.prefixes.back().registers = state;
   --state.loop_counter_stack[0];
   for (unsigned turn = 0; turn < 3; ++turn) { four_word_endpoint_turn(trace, form, turn); }
+  verify_timeline(program, initial, trace);
+}
+
+struct ShortEndpointTurn {
+  ShortAddress first, second{}, returned;
+};
+
+void counted_short_endpoint_call(unsigned width, bool delayed) {
+  constexpr std::array two_word{ShortEndpointTurn{.first = {.pc = 2, .fetch = 2, .decode = 2},
+                                                  .returned = {.pc = 1, .fetch = 1, .decode = 1}},
+                                ShortEndpointTurn{.first = {.pc = 2, .fetch = 2, .decode = 2},
+                                                  .returned = {.pc = 1, .fetch = 3, .decode = 1}},
+                                ShortEndpointTurn{.first = {.pc = 2, .fetch = 4, .decode = 2},
+                                                  .returned = {.pc = 1, .fetch = 5, .decode = 3}},
+                                ShortEndpointTurn{.first = {.pc = 2, .fetch = 6, .decode = 4},
+                                                  .returned = {.pc = 3, .fetch = 7, .decode = 5}}};
+  constexpr ShortEndpointTurn early_three{.first = {.pc = 2, .fetch = 3, .decode = 1},
+                                          .second = {.pc = 3, .fetch = 1, .decode = 2},
+                                          .returned = {.pc = 1, .fetch = 2, .decode = 3}};
+  constexpr std::array three_word{
+      early_three,
+      early_three,
+      ShortEndpointTurn{.first = {.pc = 2, .fetch = 3, .decode = 1},
+                        .second = {.pc = 3, .fetch = 4, .decode = 2},
+                        .returned = {.pc = 1, .fetch = 5, .decode = 3}},
+      ShortEndpointTurn{.first = {.pc = 2, .fetch = 6, .decode = 4},
+                        .second = {.pc = 3, .fetch = 7, .decode = 5},
+                        .returned = {.pc = 4, .fetch = 8, .decode = 6}}};
+  const auto &turns = width == 2 ? two_word : three_word;
+  std::array<std::uint64_t, 15> words{};
+  words[0] = do_immediate | (std::uint64_t{4} << count_shift) | width;
+  words[width] = delayed ? call_dag2 : call_direct | short_call_sub;
+  words[width + 1] = jump_direct | (base + 14);
+  words[8] = do_immediate | (std::uint64_t{1} << count_shift) | 1;
+  words[9] = fixture::add(0, 0, 1);
+  words[10] = rts | lr | (delayed ? db : 0);
+  words[11] = fixture::immediate(2, 7);
+  fixture::Program program(words);
+  program.code.variants.front().entries.push_back(short_call_sub);
+  auto initial = starting();
+  initial.dag[0][8].index = short_call_sub;
+  initial.pe[0].data[0][1] = 1U << raw_shift;
+  Timeline trace{.registers = initial, .prefixes = {}};
+  auto &state = trace.registers;
+  state.lcntr = 4;
+  entered(trace, {.address = short_counted_types[width - 1] | (base + width), .count = 4});
+  state.faddr = base + 2;
+  state.daddr = base + width;
+  trace.prefixes.back().registers = state;
+  --state.loop_counter_stack[0];
+  for (std::size_t i = 0; i < turns.size(); ++i) {
+    const auto &turn = turns[i];
+    const auto first_cycles = width == 2 && i == 0 ? 2U : 1U;
+    short_boundary(trace, turn.first, first_cycles);
+    if (width == 3) {
+      // This fetch has happened by the time E transfers to the callee.
+      if (i < 2) { parent_count_sample(trace, i == 0); }
+      short_boundary(trace, turn.second);
+    }
+    const auto tags = call_tag | (width == 3 && i == 1 ? termination_tag : 0);
+    const auto cycles = short_call_round_trip(trace, turn.returned.pc, delayed, tags);
+    // In a two-word body the fourth return fetch reaches E after the freeze.
+    if (width == 2 && i < 2) { parent_count_sample(trace, i == 0); }
+    short_boundary(trace, turn.returned, cycles);
+  }
+  verify_timeline(program, initial, trace);
+}
+
+void single_iteration_two_word_call() {
+  constexpr std::uint64_t call_eq = 0x068000000000;
+  constexpr auto call = call_eq | short_call_sub;
+  std::array<std::uint64_t, 9> words{};
+  words[0] = do_immediate | (std::uint64_t{1} << count_shift) | 2;
+  words[2] = call;
+  words[8] = rts | lr;
+  fixture::Program program(words);
+  auto initial = starting();
+  Timeline trace{.registers = initial, .prefixes = {}};
+  trace.registers.lcntr = 1;
+  entered(trace, {.address = short_counted_types[1] | (base + 2), .count = 1});
+  trace.registers.faddr = base + 2;
+  trace.registers.daddr = base + 2;
+  trace.prefixes.back().registers = trace.registers;
+  parent_count_sample(trace, false);
+  short_boundary(trace, {.pc = 2, .fetch = 4, .decode = 2}, 2);
+  const auto before = trace.registers;
+  trace.boundary(base + 3, 3);
+  trace.record();
+  verify_timeline(program, initial, trace);
+
+  initial.pe[0].astat = az;
+  const auto native = sharc::Core::compile(program.code);
+  sharc::Core core(program.memory());
+  fixture::install(core, native, initial);
+  check(fixture::completed(core.run(2), 2, before.emuclk),
+        "one-iteration short DO failed to enter");
+  auto at_call = before;
+  at_call.pe[0].astat = az;
+  const auto fault = core.run(1);
+  check(fault.has_fault && fault.fault.reason == sharc::FaultReason::unsupported_feature &&
+            fault.fault.address == base + 2 && fault.fault.instruction == call &&
+            fault.progress == sharc::Progress{} && core.registers() == at_call,
+        "taken CALL in one-iteration two-word DO failed to preserve the boundary");
+}
+
+void single_iteration_three_word_call() {
+  std::array<std::uint64_t, 9> words{};
+  words[0] = do_immediate | (std::uint64_t{1} << count_shift) | 3;
+  words[3] = call_direct | short_call_sub;
+  words[8] = rts | lr;
+  fixture::Program program(words);
+  const auto initial = starting();
+  Timeline trace{.registers = initial, .prefixes = {}};
+  trace.registers.lcntr = 1;
+  entered(trace, {.address = short_counted_types[2] | (base + 3), .count = 1});
+  trace.registers.faddr = base + 2;
+  trace.registers.daddr = base + 3;
+  trace.prefixes.back().registers = trace.registers;
+  short_boundary(trace, {.pc = 2, .fetch = 3, .decode = 3});
+  parent_count_sample(trace, false);
+  short_boundary(trace, {.pc = 3, .fetch = 4, .decode = 3});
+  // The taken CALL replaces the empty clocks of the compact loop's exit.
+  entered_call(trace,
+               {.target = short_call_sub, .raw_return = call_tag | termination_tag | (base + 4)});
+  popped_call(trace.registers);
+  short_boundary(trace, {.pc = 4, .fetch = 8, .decode = 6}, 4);
   verify_timeline(program, initial, trace);
 }
 
@@ -2009,6 +2139,12 @@ void fixture::hardware_loop_control_flow() {
   four_word_endpoint_call(FourWordCall::direct);
   four_word_endpoint_call(FourWordCall::delayed);
   four_word_endpoint_call(FourWordCall::predicated);
+  counted_short_endpoint_call(2, false);
+  counted_short_endpoint_call(2, true);
+  counted_short_endpoint_call(3, false);
+  counted_short_endpoint_call(3, true);
+  single_iteration_two_word_call();
+  single_iteration_three_word_call();
   refused_plain_short_loop_return();
   refused_overlapping_short_call();
   arithmetic_sample_call(ArithmeticSampleCall::immediate);

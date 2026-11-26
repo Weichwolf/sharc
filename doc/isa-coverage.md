@@ -195,6 +195,17 @@ restores a suspended buffer after both slots of a delayed return. The
 installed-image tests cover a popped loop frame, a live frame, the
 zero-encoded full count, false CALL predicates and snapshot replay. The
 combined CALL and refill timing awaits hardware comparison.
+Endpoint CALLs in counted two- and three-word bodies resume the remaining
+buffer at the loop header or return to the linear successor on the final
+pass. In a two-word body the return refill reaches the next counter sample
+after the frozen clocks. In a three-word body the penultimate word already
+sampled the count. A taken endpoint CALL in a single-iteration two-word
+body fails at the CALL boundary. A false predicate retires the ordinary
+loop tail. When a three-word body terminates with the endpoint CALL in
+Address, the saved PC carries the loop-termination tag. Fixtures cover
+direct and indirect calls, both return forms, buffered passes after a
+stack pop and snapshot replay. These combined pipeline observations await
+hardware comparison.
 Admitted immediate CALLs in the tail of a long DO preserve the sampled loop
 decision across `RTS (LR)` and `RTS (DB, LR)`. The PC stack records a separate
 tag when the loop terminates during the call's address stage. Tests cover
