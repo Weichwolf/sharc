@@ -1,18 +1,33 @@
 # Common benchmarks
 
-K4 and K5 are implemented. K1–K3 and K6 remain open; this is not complete S3 or a full
-profile performance result. The current driver targets Linux with Clang. macOS
-ARM64 and protected-page I/O are untested.
+K4 and K5 have checked Linux measurements. K1–K3, K6, macOS ARM64 and
+protected-page peripheral I/O remain open.
 
-The [terminal host-fault measurements](results/linux-host-fault.md) compare Exact,
-ordered Direct and an isolated unsound ordinary-access control on K4/K5.
-The [complete read/write view measurements](results/linux-complete-views.md)
-report the additional base cost on those same bindings.
-The [IR optimisation-level experiment](results/linux-optimization-levels.md)
-compares O1/O2/O3/Os with native code generation and the reference held fixed.
+## Current Linux results
 
-The [immediate ROT experiment](results/linux-immediate-rotate.md) used a
-different guest encoding from the register-count K4 baseline.
+Medians of three unscaled runs on an Intel i5-1135G7, pinned to logical CPU 3,
+with Clang/LLVM 19.1.7. K4 was measured for [PR #15](https://github.com/Weichwolf/sharc/pull/15)
+and K5 for [PR #16](https://github.com/Weichwolf/sharc/pull/16). Both workloads
+check complete output and precise progress in each numerical identity.
+
+| Kernel | Identity | Memory | Host inst./guest inst. | Host cycles/guest inst. | M guest inst./s | Guest/Clang O3 | Prepare s | Native bytes |
+|---|---|---|---:|---:|---:|---:|---:|---:|
+| K4 | Strict | exact | 24.278 | 5.683 | 657.9 | 39.33 | 5.823 | 361,783 |
+| K4 | FastFP32 | exact | 24.278 | 5.694 | 655.7 | 39.24 | 5.832 | 361,783 |
+| K4 | Strict | direct | 24.278 | 5.531 | 675.6 | 38.87 | 5.764 | 361,783 |
+| K4 | FastFP32 | direct | 24.278 | 5.545 | 675.5 | 39.16 | 5.661 | 361,783 |
+| K5 | Strict | exact | 7.720 | 2.037 | 1855.4 | 59.78 | 0.998 | 55,032 |
+| K5 | FastFP32 | exact | 7.720 | 2.033 | 1861.8 | 60.05 | 1.004 | 55,032 |
+| K5 | Strict | direct | 7.720 | 2.034 | 1862.6 | 59.50 | 1.015 | 55,037 |
+| K5 | FastFP32 | direct | 7.720 | 2.032 | 1864.8 | 57.05 | 1.009 | 55,037 |
+
+Keep raw JSONL, summaries and host receipts under `build/local/`. The baseline,
+cost attribution and before/after measurements are recorded in
+[K4 attribution](https://github.com/Weichwolf/sharc/issues/1#issuecomment-7191221986),
+[K4/K5 lowering](https://github.com/Weichwolf/sharc/issues/2#issuecomment-7191886769),
+and [K5 memory loans](https://github.com/Weichwolf/sharc/issues/3#issuecomment-7192058097).
+
+## Running the benchmarks
 
 Configure a Release build with Clang 19, then run:
 
@@ -83,9 +98,7 @@ instructions** and **39,845,886 base cycles**, the full register file, flags,
 all PC-stack cells, both final return words, table contents and surrounding
 guards. The complete normal-word DM reservation is made read-only after table
 initialization, so any unexpected write fails the process. Code storage is
-separate. This is a consumer all-RAM mapping; protected peripheral I/O remains
-open. The [first Linux K4 baseline](results/linux-k4.md) records both modes
-and a K5 comparison at the same published source revision.
+separate. The benchmark uses a consumer all-RAM mapping.
 
 ## K5 definition
 
@@ -149,11 +162,5 @@ and cycles per guest instruction, guest instructions/second, and each paired
 ratio to the native-reference time. Native bytes include all prepared mode
 contexts and cold paths, not only the executed context.
 
-K4 and K5 are integer workloads: the two numerical modes have the same arithmetic
-contract here. Separate measurements do not claim a floating-point speedup,
-floating qualification, or consumer whole-instrument throughput. The first [Linux K5 baseline](results/linux-k5.md) includes raw counts,
-min/median/max metrics and the host/source receipt.
-
-The [fault-map qualification](results/linux-fault-map.md) records the temporary
-RTDyld regression at `be24705` and its correction at `72eaf9a`, with both kernels
-and both numerical modes, full warm ranges and source/binary receipts.
+K4 and K5 execute integer workloads. Each numerical mode gets its own
+preparation identity and measurement.

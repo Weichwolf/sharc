@@ -279,23 +279,16 @@ and replays the return. Cached bitcode also executes a call/return after loading
 and binding through consumer-linked IR. Cached memory IR is also loaded and
 bound with alternate DAG/data banks and broadcast.
 
-Linux x86-64: Clang/LLVM 19.1.7 Release; the ten CTest checks pass, including an
+Linux x86-64: Clang/LLVM 19.1.7 Release; all 16 CTest checks pass, including an
 installed consumer executing native instructions. clang-format and clang-tidy
-are clean. A source export without manuals or Git metadata builds and passes the
-same checks. macOS ARM64 remains untested. The benchmark layer includes K4:
+are clean. macOS ARM64 remains untested. The benchmark layer includes K4:
 a table-driven eight-state machine with nested calls, register-count rotation,
 complete registers/table/stack output and exact progress in both identities.
-The [first Linux K4 baseline](../test/bench/results/linux-k4.md) reports
-both numeric identities with complete output and unscaled hardware counts.
-K5 checks
-a full 4096-word copy and running checksum repeated 512 times in each numerical
-mode, with complete output, guard bytes and exact progress checked. Its portable
-Clang O3 reference has separate source and no LTO. See `test/bench/README.md` for
-inputs, counts and measurement scope. Hardware user counters
-`instructions:u,cycles:u` are accessible with perf_event_paranoid=2. The first
-[Linux K5 measurements](../test/bench/results/linux-k5.md) publish both modes
-with complete output checks and unscaled hardware groups. K1–K3, K6 and goal sanitizer
-qualification remain open. This does not complete S3.
+K5 checks a full 4096-word copy and running checksum repeated 512 times under
+both numerical identities, including guard bytes and precise progress.
+See the [current benchmark results](../test/bench/README.md) for inputs,
+independent references and unscaled Linux hardware counts. K1–K3, K6 and
+goal sanitizer qualification remain open.
 
 ## S2 independent expectations (complete milestone, numerical gaps retained)
 

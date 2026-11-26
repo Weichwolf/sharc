@@ -7,8 +7,8 @@ Exactly three verification layers follow `doc/core-contract.md`:
   identities.
 - `core/`: public preparation and lifecycle boundaries, artifacts, consumer-linked
   IR, exact run bounds, raw state, snapshots, installation, code validation and memory binding/refusal.
-- `bench/`: K1–K6 with complete output and separate numerical-mode measurements.
-  No kernels are implemented yet.
+- `bench/`: checked K4 and K5 workloads with separate numerical-mode
+  measurements. K1–K3 and K6 remain open.
 
 `support/isa.hpp` authors instruction fields independently of production. Rejection
 fixtures use public `Core::lower`; execution fixtures use declared, installed
@@ -37,8 +37,7 @@ linear/circular arithmetic and canonical overflow latches. Moving-index memory
 controls exercise complete-space grants and exact sparse failures; the small
 copy/checksum control is not a common benchmark.
 
-`bench_k5` is the first common benchmark correctness case. It executes a complete
-4096-word copy/checksum workload exceeding ten million guest instructions in
-both numeric identities and checks all output, guards and progress. Hardware
-measurement is an explicit `--measure` run, separate from CTest. See
-`bench/README.md` for the reproducible protocol and the opaque Clang O3 reference.
+Both installed benchmark controls exceed ten million guest instructions and
+check complete results and progress. Run `--measure` for hardware counters and
+timings against the independent Clang O3 reference. See the
+[benchmark protocol and results](bench/README.md).

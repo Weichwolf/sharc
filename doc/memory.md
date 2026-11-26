@@ -164,4 +164,5 @@ snapshot replay. It checks actual protected-write faults in Direct and precise
 checked denials in Exact under both numerical identities.
 Cached consumer-bound IR and the installed
 two-header SDK also execute memory accesses. K4/K5 check both numerical and memory
-modes; published hardware results are recorded separately in `test/bench/results/`.
+modes. Published hardware measurements are in the
+[benchmark results](../test/bench/README.md).
