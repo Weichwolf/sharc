@@ -280,6 +280,8 @@ using LoopMap = std::map<std::uint32_t, LoopShape>;
 
 constexpr std::uint64_t return_loop_fetch = 1ULL << 50;
 constexpr std::uint64_t return_loop_condition = 1ULL << 51;
+constexpr unsigned counted_tail_index_shift = 52;
+constexpr std::uint64_t counted_tail_index_mask = 7ULL << counted_tail_index_shift;
 // A four-word loop can have at most 2^34-1 words left after a CALL.
 constexpr unsigned return_short_left_shift = 24;
 constexpr std::uint64_t return_short_left_mask = (unsigned_limit * loop_fetch_distance) - 1;
@@ -294,14 +296,6 @@ constexpr unsigned lce_branch_age = 3;
 constexpr auto lce_age_mask = std::uint64_t{lce_branch_age} << lce_age_shift;
 constexpr auto lce_before_credit = 1ULL << 61;
 constexpr auto lce_clock_mask = lce_age_mask | lce_before_credit;
-
-std::uint64_t counted_tail_word(const LoopShape &shape) {
-  return counted_loop_tail | (std::uint64_t{shape.end} << loop_refill_end_shift) | shape.start;
-}
-
-std::size_t counted_tail_slot_for(const LoopShape &shape) {
-  return shape.short_body() ? short_counted_tail_slot : counted_tail_slot;
-}
 
 std::uint64_t loop_return_payload(std::uint32_t call_pc, const LoopShape &shape) {
   if (shape.short_body()) { return return_short_loop | ((call_pc + 1) & maximum_pc); }
@@ -354,6 +348,8 @@ struct LoopPlan {
   LoopMap not_lce;
   std::set<std::uint32_t> lce_endpoints;
   std::set<std::size_t> lce_slots;
+  std::map<std::uint32_t, std::size_t> long_tail_indices;
+  std::size_t long_tail_count{};
 };
 
 LoopShape loop_shape(const Instruction &op) {
@@ -704,16 +700,17 @@ struct OverlappingLoopFetch {
   LoopShape parent;
 };
 
-bool overlapping_refill(const LoopShape &child, const LoopShape &parent) {
+bool overlapping_tail(const LoopShape &child, const LoopShape &parent) {
   const auto gap = (parent.end - child.end) & maximum_pc;
-  return child.arithmetic() && !child.short_body() && gap != 0 && gap <= loop_fetch_distance &&
-         parent.contains((child.start - 1) & maximum_pc);
+  return gap != 0 && gap <= loop_fetch_distance && parent.contains((child.start - 1) & maximum_pc);
+}
+
+bool overlapping_refill(const LoopShape &child, const LoopShape &parent) {
+  return child.arithmetic() && !child.short_body() && overlapping_tail(child, parent);
 }
 
 bool overlapping_short_tail(const LoopShape &child, const LoopShape &parent) {
-  const auto gap = (parent.end - child.end) & maximum_pc;
-  return child.short_body() && gap != 0 && gap <= loop_fetch_distance &&
-         parent.contains((child.start - 1) & maximum_pc);
+  return child.short_body() && overlapping_tail(child, parent);
 }
 
 void debug_scope(llvm::DIBuilder &debug, llvm::Function &function, const std::string &filename) {
@@ -766,6 +763,8 @@ public:
         not_lce_(loops.not_lce),
         lce_endpoints_(loops.lce_endpoints),
         lce_slots_(loops.lce_slots),
+        long_tail_indices_(loops.long_tail_indices),
+        long_tail_count_(loops.long_tail_count),
         instructions_(std::move(instructions)),
         entry_address_(unit.entry),
         context_(unit.context),
@@ -933,6 +932,8 @@ private:
   guard_loop_abort(const Values &values, const Instruction &op, llvm::Value *lanes, bool partial);
   void retire_loop_abort(Values &values, const LoopShape &shape);
   llvm::Value *jump_target(const Values &values, const Instruction &op);
+  [[nodiscard]] std::size_t counted_tail_slot_for(const LoopShape &shape) const;
+  [[nodiscard]] std::uint64_t counted_tail_word(const LoopShape &shape) const;
   llvm::Value *counted_tail_matches(const LoopShape &shape);
   void save_counted_tail(const LoopShape &shape, llvm::Value *age, bool returning);
   void clear_counted_tail(const LoopShape &shape, llvm::Value *enabled = nullptr);
@@ -1069,6 +1070,8 @@ private:
   const LoopMap &not_lce_;
   const std::set<std::uint32_t> &lce_endpoints_;
   const std::set<std::size_t> &lce_slots_;
+  const std::map<std::uint32_t, std::size_t> &long_tail_indices_;
+  std::size_t long_tail_count_;
   std::vector<Instruction> instructions_;
   std::uint32_t entry_address_;
   std::uint32_t context_;
@@ -1784,7 +1787,7 @@ void Lowering::call(Values &values, const Instruction &op, bool partial) {
 llvm::Value *
 Lowering::loop_call_address(const Values &values, const Instruction &op, const LoopShape &shape) {
   if (shape.short_body()) { return suspend_short_call(values, op, shape); }
-  const auto tail_slot = shape.counted() ? counted_tail_slot : loop_refill_slot;
+  const auto tail_slot = shape.counted() ? counted_tail_slot_for(shape) : loop_refill_slot;
   auto *pending = load(64, tail_slot);
   const auto signature = (std::uint64_t{shape.end} << loop_refill_end_shift) | shape.start |
                          (shape.counted() ? counted_loop_tail : loop_refill_live);
@@ -1935,12 +1938,20 @@ llvm::Value *Lowering::check_loop_return(const Values &values,
 }
 
 void Lowering::restore_loop_tail(llvm::Value *tail) {
-  for (const auto [flag, slot] : {std::pair{loop_refill_live, loop_refill_slot},
-                                  std::pair{counted_loop_tail, counted_tail_slot}}) {
-    auto *present = builder_.CreateICmpNE(builder_.CreateAnd(tail, builder_.getInt64(flag)),
-                                          builder_.getInt64(0));
+  auto *refill = short_flag(tail, loop_refill_live);
+  store(builder_.CreateSelect(refill, tail, load(64, loop_refill_slot)), loop_refill_slot);
+  auto *counted = short_flag(tail, counted_loop_tail);
+  for (std::size_t index = 0; index < long_tail_count_; ++index) {
+    const auto slot = counted_tail_slot + index;
+    auto *present = counted;
+    if (long_tail_count_ > 1) {
+      auto *saved = builder_.CreateAnd(tail, builder_.getInt64(counted_tail_index_mask));
+      auto *selected = builder_.CreateICmpEQ(
+          saved, builder_.getInt64(std::uint64_t{index} << counted_tail_index_shift));
+      present = builder_.CreateAnd(counted, selected);
+    }
     auto *restored = tail;
-    if (slot == counted_tail_slot && lce_slots_.contains(slot)) {
+    if (lce_slots_.contains(slot)) {
       auto *mature =
           builder_.CreateOr(builder_.CreateAnd(tail, builder_.getInt64(~lce_before_credit)),
                             builder_.getInt64(lce_age_mask));
@@ -2769,6 +2780,18 @@ void Lowering::loop_pop(Values &values, const LoopFrame &frame) {
   loop_status(values, frame.index);
 }
 
+std::size_t Lowering::counted_tail_slot_for(const LoopShape &shape) const {
+  if (shape.short_body()) { return short_counted_tail_slot; }
+  const auto index = long_tail_indices_.find(shape.end);
+  return counted_tail_slot + (index == long_tail_indices_.end() ? 0 : index->second);
+}
+
+std::uint64_t Lowering::counted_tail_word(const LoopShape &shape) const {
+  const auto index = shape.short_body() ? 0 : counted_tail_slot_for(shape) - counted_tail_slot;
+  return counted_loop_tail | (std::uint64_t{index} << counted_tail_index_shift) |
+         (std::uint64_t{shape.end} << loop_refill_end_shift) | shape.start;
+}
+
 llvm::Value *Lowering::counted_tail_matches(const LoopShape &shape) {
   if (!shape.counted()) { return builder_.getFalse(); }
   auto *saved = load(64, counted_tail_slot_for(shape));
@@ -3088,7 +3111,9 @@ void Lowering::plan_hardware_grants(const LoopMap &shapes) {
                  (op.address == shape.end || !hardware_ends_.contains(op.address)) &&
                  (fetch == loop_fetches_.end() || fetch->second.end == shape.end ||
                   overlapping_refill(shape, fetch->second) ||
-                  overlapping_short_tail(shape, fetch->second)) &&
+                  overlapping_short_tail(shape, fetch->second) ||
+                  (shape.counted() && fetch->second.counted() &&
+                   overlapping_tail(shape, fetch->second))) &&
                  op.type != index_modify_type && !dag_register(loaded_register(op));
         })) {
       continue;
@@ -3976,11 +4001,8 @@ void validate_not_lce(const InstructionMap &code, LoopPlan &plan, std::string_vi
              "NOT LCE outside an admitted counted DO tail");
     }
     const auto unqualified_overlap = [](const LoopShape &parent, const LoopShape &child) {
-      const auto gap = (parent.end - child.end) & maximum_pc;
-      const bool qualified_child = child.arithmetic() || (child.short_body() && child.counted());
-      return gap != 0 && gap <= loop_fetch_distance &&
-             parent.contains((child.start - 1) & maximum_pc) &&
-             (parent.short_body() || !qualified_child);
+      return overlapping_tail(child, parent) &&
+             (parent.short_body() || (!child.arithmetic() && !child.counted()));
     };
     const bool overlap = std::ranges::any_of(plan.shapes, [&](const auto &entry) {
       return unqualified_overlap(*owner, entry.second) || unqualified_overlap(entry.second, *owner);
@@ -3991,7 +4013,37 @@ void validate_not_lce(const InstructionMap &code, LoopPlan &plan, std::string_vi
     }
     plan.not_lce.emplace(pc, *owner);
     plan.lce_endpoints.insert(owner->end);
-    plan.lce_slots.insert(counted_tail_slot_for(*owner));
+  }
+}
+
+void plan_counted_tails(LoopPlan &plan) {
+  std::vector<const LoopShape *> ordered;
+  for (const auto &[end, shape] : plan.shapes) {
+    if (!shape.counted()) { continue; }
+    if (shape.short_body()) {
+      if (plan.lce_endpoints.contains(end)) { plan.lce_slots.insert(short_counted_tail_slot); }
+    } else if (shape.has_reentry || shape.has_tail_abort || plan.lce_endpoints.contains(end)) {
+      ordered.push_back(&shape);
+    }
+  }
+  // A long counted tail can coexist with an ancestor's tail while both drain.
+  // Only endpoints within four words can overlap, including across PC wrap.
+  std::ranges::sort(ordered, std::ranges::greater{}, &LoopShape::length);
+  for (const auto *shape : ordered) {
+    std::array<bool, loop_stack_capacity> used{};
+    for (unsigned gap = 1; gap <= loop_fetch_distance; ++gap) {
+      const auto parent = plan.long_tail_indices.find((shape->end + gap) & maximum_pc);
+      if (parent != plan.long_tail_indices.end() &&
+          overlapping_tail(*shape, plan.shapes.at(parent->first))) {
+        used[parent->second] = true;
+      }
+    }
+    const auto index = static_cast<std::size_t>(std::ranges::find(used, false) - used.begin());
+    plan.long_tail_indices.emplace(shape->end, index);
+    plan.long_tail_count = std::max(plan.long_tail_count, index + 1);
+    if (plan.lce_endpoints.contains(shape->end)) {
+      plan.lce_slots.insert(counted_tail_slot + index);
+    }
   }
 }
 
@@ -4004,6 +4056,7 @@ LoopPlan validate_loop_bodies(const InstructionMap &code, std::string_view ident
   }
   validate_loop_aborts(code, plan, identity);
   validate_not_lce(code, plan, identity);
+  plan_counted_tails(plan);
   return plan;
 }
 

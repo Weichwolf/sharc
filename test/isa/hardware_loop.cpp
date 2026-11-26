@@ -1603,6 +1603,109 @@ void counted_not_lce_compute() {
   verify_timeline(program, initial, trace);
 }
 
+constexpr Range inner_counted_tail{.start = base + 3, .end = base + 7};
+constexpr unsigned nested_tail_call = 5;
+constexpr unsigned nested_tail_sub = 14;
+
+enum class NestedTailReturn : std::uint8_t { none, immediate, delayed };
+
+void nested_counted_boundary(
+    Timeline &trace, Range loop, std::uint32_t pc, bool repeats, unsigned cycles = 1) {
+  trace.boundary(pc == loop.end + 1 && repeats ? loop.start : pc, cycles);
+  const auto distance = loop.end - pc;
+  if (repeats && distance < 4) { trace.registers.faddr = loop.start + 3 - distance; }
+  if (repeats && distance < 2) { trace.registers.daddr = loop.start + 1 - distance; }
+  trace.record();
+}
+
+void nested_tail_add(Timeline &trace, unsigned pc) {
+  trace.registers.pe[0].data[0][pc] += 1U << raw_shift;
+}
+
+unsigned nested_tail_call_and_return(Timeline &trace, NestedTailReturn form) {
+  constexpr auto resume = nested_tail_call + 1;
+  entered_call(trace, {.target = base + nested_tail_sub, .raw_return = call_tag | (base + resume)});
+  popped_call(trace.registers);
+  if (form == NestedTailReturn::immediate) { return 4; }
+  short_boundary(trace,
+                 {.pc = nested_tail_sub + 1, .fetch = resume + 1, .decode = nested_tail_sub + 3});
+  nested_tail_add(trace, 0);
+  short_boundary(trace, {.pc = nested_tail_sub + 2, .fetch = resume + 2, .decode = resume});
+  nested_tail_add(trace, 0);
+  return 2;
+}
+
+void nested_counted_child(Timeline &trace,
+                          Range parent,
+                          bool parent_repeats,
+                          NestedTailReturn form) {
+  auto &state = trace.registers;
+  constexpr auto child = inner_counted_tail;
+  state.loop_address_depth = state.loop_counter_depth = state.pc_stack_pointer = 2;
+  state.pc_stack[1] = child.start;
+  state.loop_address_stack[1] = counted_address | child.end;
+  state.loop_counter_stack[1] = 2;
+  trace.boundary(child.start);
+  trace.record();
+
+  for (const bool repeats : {true, false}) {
+    --state.loop_counter_stack[1];
+    if (!repeats) { leave_nested_child(state); }
+    nested_counted_boundary(trace, child, child.start + 1, repeats);
+    for (auto pc = child.start + 1; pc <= child.end; ++pc) {
+      if (!repeats && pc == parent.end - 4) { parent_count_sample(trace, parent_repeats); }
+      unsigned cycles = 1;
+      if (form != NestedTailReturn::none && pc == base + nested_tail_call) {
+        cycles = nested_tail_call_and_return(trace, form);
+      } else if (repeats || pc == child.start + 1) {
+        nested_tail_add(trace, pc - base);
+      }
+      nested_counted_boundary(
+          trace, repeats ? child : parent, pc + 1, repeats || parent_repeats, cycles);
+    }
+  }
+}
+
+void nested_counted_not_lce(unsigned gap, NestedTailReturn form = NestedTailReturn::none) {
+  constexpr auto child = inner_counted_tail;
+  constexpr auto two_iterations = do_immediate | (std::uint64_t{2} << count_shift);
+  const Range parent{.start = base + 1, .end = child.end + gap};
+  const bool call = form != NestedTailReturn::none;
+  std::vector<std::uint64_t> words(call ? nested_tail_sub + 3 : parent.end - base + 2);
+  words[0] = two_iterations | (parent.end - base);
+  words[2] = two_iterations | (child.end - child.start + 1);
+  for (auto pc = child.start + 1 - base; pc <= parent.end - base; ++pc) {
+    words[pc] = if_not_lce(fixture::add(pc, pc, 1));
+  }
+  if (call) {
+    // Address-stage predicates still see the pre-sample value on this word.
+    words[nested_tail_call] = if_not_lce(call_direct | (base + nested_tail_sub));
+    words[nested_tail_sub] = rts | lr;
+    if (form == NestedTailReturn::delayed) {
+      words[nested_tail_sub] |= db;
+      words[nested_tail_sub + 1] = fixture::add(0, 0, 1);
+      words[nested_tail_sub + 2] = fixture::add(0, 0, 1);
+    }
+  }
+  fixture::Program program(words);
+  if (call) { program.code.variants[0].entries.push_back(base + nested_tail_sub); }
+  auto initial = starting();
+  initial.pe[0].data[0][1] = 1U << raw_shift;
+  Timeline trace{.registers = initial, .prefixes = {}};
+  trace.registers.lcntr = 2;
+  entered(trace, {.address = counted_address | parent.end, .count = 2});
+  for (const bool repeats : {true, false}) {
+    trace.boundary(child.start - 1);
+    trace.record();
+    nested_counted_child(trace, parent, repeats, form);
+    for (auto pc = child.end + 1; pc <= parent.end; ++pc) {
+      if (repeats || pc == parent.end - 3) { nested_tail_add(trace, pc - base); }
+      nested_counted_boundary(trace, parent, pc + 1, repeats);
+    }
+  }
+  verify_timeline(program, initial, trace);
+}
+
 struct NotLceCall {
   unsigned site;
   bool stall;
@@ -2572,6 +2675,9 @@ void fixture::hardware_loop_control_flow() {
   counted_sample_call(CountedSampleCall::predicated);
   counted_sample_before_second_call();
   counted_not_lce_compute();
+  for (const auto gap : {1U, 2U, 3U, 4U}) { nested_counted_not_lce(gap); }
+  nested_counted_not_lce(4, NestedTailReturn::immediate);
+  nested_counted_not_lce(4, NestedTailReturn::delayed);
   counted_not_lce_call(2);
   counted_not_lce_call(3);
   counted_not_lce_call(4);

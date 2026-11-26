@@ -70,9 +70,11 @@ the clocks elapsed after its terminal fetch. This observation survives a
 stack pop, a return refill and a cross-Core snapshot. A short CALL saves
 the expiration observation with the remaining buffered words. The
 ordinary short body clears it when its last buffered word retires.
-The short and long counted tails have independent observations. A
-parent sample reached during a short drain or long arithmetic refill
-records the clocks from that fetch to the next retirement boundary.
+Overlapping counted tails have independent observations, including two long
+tails. Preparation assigns distinct storage to overlapping long tails. The
+saved CALL payload identifies the storage to restore after a return. A parent
+sample reached during a short drain or long arithmetic refill records the
+clocks from that fetch to the next retirement boundary.
 Admitted CALLs in counted two-, three- and four-word loops keep the
 buffered instruction count with the PC-stack entry. The callee can use its
 own loop buffer. The saved buffer is restored at the prepared return

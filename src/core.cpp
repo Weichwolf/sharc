@@ -136,15 +136,16 @@ struct Resume {
 struct LoopPipeline {
   std::array<std::uint32_t, detail::loop_stack_capacity> frames{};
   std::uint64_t refill{};
-  std::uint64_t counted_tail{};
+  std::array<std::uint64_t, detail::loop_stack_capacity> counted_tails{};
   std::uint64_t short_counted_tail{};
   std::array<std::uint64_t, detail::short_state_words> short_loop{};
   std::array<std::uint64_t, Registers::pc_stack_capacity> calls{};
   std::uint64_t return_tail{};
 
   [[nodiscard]] bool active() const {
-    return short_loop[detail::short_remaining] != 0 || refill != 0 || counted_tail != 0 ||
-           short_counted_tail != 0 || return_tail != 0 ||
+    return short_loop[detail::short_remaining] != 0 || refill != 0 || short_counted_tail != 0 ||
+           return_tail != 0 ||
+           std::ranges::any_of(counted_tails, [](auto tail) { return tail != 0; }) ||
            std::ranges::any_of(frames, [](auto frame) { return frame != 0; }) ||
            std::ranges::any_of(calls, [](auto call) { return call != 0; });
   }
@@ -240,7 +241,9 @@ struct Core::Impl {
     pointers[detail::short_loop_slot] = loops.short_loop.data();
     pointers[detail::loop_call_slot] = loops.calls.data();
     pointers[detail::return_loop_tail_slot] = &loops.return_tail;
-    pointers[detail::counted_tail_slot] = &loops.counted_tail;
+    for (std::size_t index = 0; index < loops.counted_tails.size(); ++index) {
+      pointers[detail::counted_tail_slot + index] = &loops.counted_tails[index];
+    }
     pointers[detail::short_counted_tail_slot] = &loops.short_counted_tail;
     pointers[detail::interrupt_latch_slot] = &state.registers.irptl;
     for (unsigned bank = 0; bank < 2; ++bank) {
