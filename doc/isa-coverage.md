@@ -114,8 +114,9 @@ multiplier, remaining shifter and memory forms, delayed jumps, hardware loops, t
 interrupt entry remain unimplemented. `interrupt_ready` reports false.
 
 Non-delayed direct CALL and plain conditional RTS keep static call targets and
-known return addresses inside the same SSA unit. The 30 PC-stack cells and depth
-remain live until an exit; popped cells retain their contents. CALL writes the
+known return addresses inside the same LLVM function. CALL and RTS access one
+architectural PC-stack cell at a time, with the depth in SSA until a unit exit.
+Popped cells retain their contents. CALL writes the
 return address with its CALL tag, updates PEx full/empty status and latches the
 almost-full interrupt at depth 29. A return address altered by the owner takes a
 cold path to another declared entry; owner dispatch uses a loop, not host recursion.
