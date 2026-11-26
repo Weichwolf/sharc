@@ -152,9 +152,7 @@ struct Core::Impl {
     pointers[detail::clock_slot] = &state.registers.emuclk;
     pointers[detail::pipeline_slot] = &pipeline_history;
     pointers[detail::mode_slot] = &state.registers.mode1;
-    for (std::size_t index = 0; index < Registers::pc_stack_capacity; ++index) {
-      pointers[detail::stack_slot + index] = &state.registers.pc_stack[index];
-    }
+    pointers[detail::stack_slot] = state.registers.pc_stack.data();
     pointers[detail::stack_depth_slot] = &state.registers.pc_stack_pointer;
     pointers[detail::interrupt_latch_slot] = &state.registers.irptl;
     for (unsigned bank = 0; bank < 2; ++bank) {

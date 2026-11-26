@@ -430,8 +430,7 @@ constexpr std::size_t cycles_retired_value = instructions_retired_value + 1;
 constexpr std::size_t credit_value = cycles_retired_value + 1;
 constexpr std::size_t hazard_value = credit_value + 1;
 constexpr std::size_t extra_cycles_value = hazard_value + 1;
-constexpr std::size_t pc_stack_value = extra_cycles_value + 1;
-constexpr std::size_t pc_stack_depth_value = pc_stack_value + 1;
+constexpr std::size_t pc_stack_depth_value = extra_cycles_value + 1;
 constexpr std::size_t interrupt_latch_value = pc_stack_depth_value + 1;
 constexpr std::size_t loop_grant_value = interrupt_latch_value + 1;
 constexpr std::size_t loop_remaining_value = loop_grant_value + 1;
@@ -548,11 +547,6 @@ private:
     return llvm::FixedVectorType::get(llvm::IntegerType::get(module_.getContext(), bits), 2);
   }
 
-  llvm::Type *stack_type() const {
-    return llvm::FixedVectorType::get(llvm::Type::getInt32Ty(module_.getContext()),
-                                      Registers::pc_stack_capacity);
-  }
-
   llvm::Constant *vector(unsigned bits, std::uint64_t value) const {
     return llvm::ConstantVector::getSplat(
         llvm::ElementCount::getFixed(2),
@@ -570,6 +564,10 @@ private:
   }
 
   void store(llvm::Value *value, std::size_t slot) { builder_.CreateStore(value, pointer(slot)); }
+
+  llvm::Value *stack_cell(llvm::Value *index) {
+    return builder_.CreateInBoundsGEP(builder_.getInt32Ty(), pointer(stack_slot), index);
+  }
 
   std::size_t data_slot(unsigned lane, unsigned reg) const {
     const auto bank_bit = reg < 8 ? low_bank_mode : high_bank_mode;
@@ -601,7 +599,6 @@ private:
       if (i < instruction_remaining_value) { type = vector_type(32); }
       if (i < status_value) { type = vector_type(64); }
       if (i == hazard_value || i == tail_value) { type = builder_.getInt1Ty(); }
-      if (i == pc_stack_value) { type = stack_type(); }
       if (i >= dag_history_value) { type = builder_.getInt32Ty(); }
       if (i == pc_stack_depth_value || i == interrupt_latch_value) { type = builder_.getInt32Ty(); }
       result.phi[i] = start.CreatePHI(type, 2);
@@ -1325,8 +1322,8 @@ void Lowering::call(Values &values, const Instruction &op, bool partial) {
                 builder_.CreateICmpULT(depth, builder_.getInt32(Registers::pc_stack_capacity)),
                 partial);
   }
-  values[pc_stack_value] = builder_.CreateInsertElement(
-      values[pc_stack_value], builder_.getInt32(((op.address + 1) & maximum_pc) | call_tag), depth);
+  builder_.CreateStore(builder_.getInt32(((op.address + 1) & maximum_pc) | call_tag),
+                       stack_cell(depth));
   depth = builder_.CreateAdd(depth, builder_.getInt32(1));
   values[pc_stack_depth_value] = depth;
   values[interrupt_latch_value] = builder_.CreateOr(
@@ -1348,7 +1345,7 @@ llvm::Value *Lowering::pop(Values &values, const Instruction &op, bool partial) 
                   builder_.CreateICmpULE(depth, builder_.getInt32(Registers::pc_stack_capacity))),
               partial);
   auto *popped_depth = builder_.CreateSub(depth, builder_.getInt32(1));
-  auto *top = builder_.CreateExtractElement(values[pc_stack_value], popped_depth);
+  auto *top = builder_.CreateLoad(builder_.getInt32Ty(), stack_cell(popped_depth));
   stack_guard(values,
               op,
               builder_.CreateICmpEQ(builder_.CreateAnd(top, builder_.getInt32(sequencer_tag)),
@@ -1369,7 +1366,7 @@ void Lowering::return_to_caller(Values values, llvm::Value *target, bool partial
   for (const auto address : returns) {
     const auto found = addresses_.find(address);
     if (found == addresses_.end()) { continue; }
-    auto &destination = partial ? partial_[found->second] : fast_entry_[found->second];
+    auto &destination = partial ? partial_[found->second] : admission_[found->second];
     destination.incoming(values, builder_.GetInsertBlock());
     dispatch->addCase(builder_.getInt32(address), destination.block);
   }
@@ -1503,10 +1500,6 @@ void Lowering::emit_exit() {
     store(values[index_value + index], dag_slot(bank, index & 15, index / 16));
   }
   if (stack_written_) {
-    for (unsigned index = 0; index < Registers::pc_stack_capacity; ++index) {
-      store(builder_.CreateExtractElement(values[pc_stack_value], builder_.getInt32(index)),
-            stack_slot + index);
-    }
     store(builder_.CreateTrunc(values[pc_stack_depth_value], builder_.getInt8Ty()),
           stack_depth_slot);
   }
@@ -1715,14 +1708,13 @@ void Lowering::plan_memory() {
   }
 }
 
-std::set<std::uint32_t> instruction_successors(const Instruction &op,
-                                               const std::set<std::uint32_t> &returns) {
+std::set<std::uint32_t> grant_successors(const Instruction &op) {
   const bool is_branch = branch(op);
   std::set<std::uint32_t> next;
   if ((op.type == direct_branch_type || op.type == computed_branch_type) && !indirect_branch(op)) {
     next.insert(branch_target(op));
   }
-  if (op.type == return_branch_type) { next.insert(returns.begin(), returns.end()); }
+  // A taken return ends this grant. Its checked continuation admits a new one.
   if (!is_branch || ((op.word >> condition_shift) & true_condition) != true_condition) {
     next.insert((op.address + 1) & maximum_pc);
   }
@@ -1732,17 +1724,13 @@ std::set<std::uint32_t> instruction_successors(const Instruction &op,
 std::vector<std::optional<BlockCost>> Lowering::unit_costs() const {
   std::vector<std::optional<BlockCost>> result(instructions_.size());
   std::vector<unsigned> visited(instructions_.size());
-  std::set<std::uint32_t> returns;
-  for (const auto &op : instructions_) {
-    if (call_branch_instruction(op)) { returns.insert((op.address + 1) & maximum_pc); }
-  }
   const std::function<std::optional<BlockCost>(std::size_t)> visit =
       [&](std::size_t i) -> std::optional<BlockCost> {
     if (visited[i] != 0) { return visited[i] == 2 ? result[i] : std::nullopt; }
     visited[i] = 1;
     const auto &op = instructions_[i];
     const bool is_branch = branch(op);
-    const auto next = instruction_successors(op, returns);
+    const auto next = grant_successors(op);
     BlockCost suffix{.instructions = 0, .cycles = 0};
     for (const auto address : next) {
       const auto found = addresses_.find(address);
@@ -1906,17 +1894,12 @@ void Lowering::emit() {
                                                 builder_.getInt32(0));
   initial[dag_history_value] = builder_.CreateLShr(pipeline, builder_.getInt32(1));
   initial[extra_cycles_value] = builder_.getInt64(0);
-  initial[pc_stack_value] = llvm::PoisonValue::get(stack_type());
   initial[pc_stack_depth_value] = builder_.getInt32(0);
   initial[interrupt_latch_value] = builder_.getInt32(0);
   for (unsigned index = 0; index < dag_.size(); ++index) {
     initial[index_value + index] = dag_[index] != nullptr ? dag_[index] : builder_.getInt32(0);
   }
   if (stack_written_) {
-    for (unsigned index = 0; index < Registers::pc_stack_capacity; ++index) {
-      initial[pc_stack_value] = builder_.CreateInsertElement(
-          initial[pc_stack_value], load(32, stack_slot + index), builder_.getInt32(index));
-    }
     initial[pc_stack_depth_value] =
         builder_.CreateZExt(load(8, stack_depth_slot), builder_.getInt32Ty());
   }

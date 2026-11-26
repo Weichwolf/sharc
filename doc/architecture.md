@@ -94,8 +94,10 @@ and hardware loops are added to the initial native subset.
 
 The current native ABI passes R0–R5 and their paired raw values, both ASTAT/STKY
 pairs, execution bounds and progress as arguments. Other data registers and the
-architectural stack remain SSA within a connected unit and are materialized at
-unit exits. Indirect transfers use a prepared PC/MODE1 dispatcher. Returns may
+PC-stack depth remain SSA within a connected unit and are materialized at unit
+exits. CALL and RTS access individual cells in the owner’s PC stack. Taken
+returns end the current grant and admit the checked continuation. Indirect
+transfers use a prepared PC/MODE1 dispatcher. Returns may
 also select prepared CALL continuations; ordinary indirect transfers admit only
 declared entries. The selected caller root survives an exact return bound and
 its snapshot. A shared reload and spill handle the pinned set; an explicit
