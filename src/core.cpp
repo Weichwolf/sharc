@@ -386,7 +386,7 @@ struct Core::Impl {
   detail::NativeCall native_call;
   std::vector<detail::HostView> views;
   std::uint32_t pipeline_history{};
-  std::uint32_t delayed_target{}; // Latched PC and the next slot to execute.
+  std::uint64_t delayed_target{}; // Latched PC, next slot and optional loop fetch address.
   LoopPipeline loops;
   std::shared_ptr<const NativeImage::Impl> installed;
   std::uint32_t variant{};
@@ -400,7 +400,7 @@ struct Snapshot::Impl {
   bool yield_requested{};
   std::optional<Resume> resume;
   std::uint32_t pipeline_history{};
-  std::uint32_t delayed_target{};
+  std::uint64_t delayed_target{};
   LoopPipeline loops;
 };
 
@@ -675,9 +675,11 @@ void Core::Impl::observe_pipeline(Progress retired) {
     }
     return;
   }
-  const auto target = delayed_target & detail::maximum_pc;
+  const auto target = static_cast<std::uint32_t>(delayed_target) & detail::maximum_pc;
   const bool first = (delayed_target & detail::before_first_delay_slot) != 0;
-  registers.faddr = (target + (first ? 1U : 2U)) & detail::maximum_pc;
+  registers.faddr = (delayed_target & detail::delayed_fetch_live) != 0
+                        ? static_cast<std::uint32_t>(delayed_target >> detail::delayed_fetch_shift)
+                        : (target + (first ? 1U : 2U)) & detail::maximum_pc;
   registers.daddr = first ? (registers.pc + 2) & detail::maximum_pc : target;
 }
 

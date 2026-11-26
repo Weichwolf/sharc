@@ -3806,30 +3806,234 @@ void refused_do() {
         "exhausted DO stack changed registers or retired the setup");
 }
 
-void skipped_fetch_boundary() {
-  constexpr unsigned length = 7;
-  constexpr unsigned instruction_bits = 48;
-  constexpr auto setup = do_immediate | (std::uint64_t{2} << count_shift) | length;
-  constexpr auto end = base + length;
-  constexpr std::uint64_t jump = 0x063e00000000 | end;
-  std::array<std::uint64_t, 1 + length> words{};
-  words[0] = setup;
-  words[1] = jump;
+constexpr unsigned jump_loop_end = 9;
+constexpr Range jump_loop{.start = base + 1, .end = base + jump_loop_end};
+
+enum class TailJump : std::uint8_t { absolute, relative, dag2 };
+
+struct LoopJump {
+  unsigned distance;
+  bool delayed{};
+  TailJump form{TailJump::absolute};
+
+  [[nodiscard]] unsigned target() const { return jump_loop_end - distance; }
+};
+
+void jump_delay_boundary(Timeline &trace, LoopJump jump, unsigned fetched, bool redirects) {
+  const auto fetch =
+      redirects && jump.distance < fetched ? fetched - jump.distance : jump.target() + fetched;
+  short_boundary(trace,
+                 {.pc = fetched + 1, .fetch = fetch, .decode = fetched == 1 ? 4U : jump.target()});
+}
+
+void counted_jump_tail(Timeline &trace, LoopJump jump, bool repeats) {
+  if (jump.delayed) {
+    if (jump.distance == 0) { parent_count_sample(trace, repeats); }
+    jump_delay_boundary(trace, jump, 1, repeats);
+    nested_tail_add(trace, 0);
+    if (jump.distance == 1) { parent_count_sample(trace, repeats); }
+    jump_delay_boundary(trace, jump, 2, repeats);
+    nested_tail_add(trace, 0);
+  }
+  if (!jump.delayed || jump.distance >= 2) { parent_count_sample(trace, repeats); }
+  nested_counted_boundary(trace, jump_loop, base + jump.target(), repeats, jump.delayed ? 2U : 4U);
+  for (auto pc = jump.target(); pc <= jump_loop_end; ++pc) {
+    if (repeats || pc == jump_loop_end - 3) { nested_tail_add(trace, 2); }
+    nested_counted_boundary(trace, jump_loop, base + pc + 1, repeats);
+  }
+}
+
+void counted_jump_refill(LoopJump jump) {
+  constexpr auto twice = do_immediate | (std::uint64_t{2} << count_shift);
+  constexpr std::uint64_t jump_dag2 = 0x083e00000000;
+  constexpr std::uint64_t jump_relative = 0x093e00000000;
+  constexpr unsigned displacement_shift = 27;
+  std::array<std::uint64_t, jump_loop_end + 2> words{};
+  words[0] = twice | jump_loop_end;
+  words[1] = jump_direct | (base + jump.target());
+  if (jump.form == TailJump::relative) {
+    words[1] = jump_relative | (std::uint64_t{jump.target() - 1} << displacement_shift);
+  }
+  if (jump.form == TailJump::dag2) { words[1] = jump_dag2; }
+  if (jump.delayed) {
+    words[1] |= db;
+    words[2] = words[3] = fixture::add(0, 0, 1);
+  }
+  for (unsigned pc = jump_loop_end - 3; pc <= jump_loop_end; ++pc) {
+    words[pc] = if_not_lce(fixture::add(2, 2, 1));
+  }
   fixture::Program program(words);
-  const auto native = sharc::Core::compile(program.code);
-  sharc::Core core(program.memory());
-  auto registers = starting();
-  fixture::install(core, native, registers);
-  Timeline trace{.registers = registers, .prefixes = {}};
+  auto initial = starting();
+  initial.pe[0].data[0][1] = 1U << raw_shift;
+  if (jump.form == TailJump::dag2) {
+    initial.dag[0][8].index = base + jump.target() - 1;
+    initial.dag[0][8].modifier = 1;
+    program.code.variants[0].entries.push_back(base + jump.target());
+  }
+  Timeline trace{.registers = initial, .prefixes = {}};
   trace.registers.lcntr = 2;
-  entered(trace, {.address = counted_address | end, .count = 2});
-  trace.boundary(end, 4);
-  const auto fault = core.run(3);
-  check(fault.has_fault && fault.fault.reason == sharc::FaultReason::unsupported_feature &&
-            fault.fault.address == end && fault.fault.instruction_bits == instruction_bits &&
-            fault.progress == sharc::Progress{.instructions = 2, .base_cycles = 5} &&
-            core.registers() == trace.registers,
-        "unqualified jump across the fetch decision retired the endpoint");
+  entered(trace, {.address = counted_address | jump_loop.end, .count = 2});
+  for (const bool repeats : {true, false}) { counted_jump_tail(trace, jump, repeats); }
+  verify_timeline(program, initial, trace);
+}
+
+void arithmetic_jump_refill(LoopJump jump, bool ending) {
+  std::array<std::uint64_t, jump_loop_end + 2> words{};
+  words[0] = do_eq | jump_loop_end;
+  words[1] = jump_direct | (base + jump.target()) | (jump.delayed ? db : 0);
+  auto initial = starting();
+  if (ending) { initial.pe[0].astat = az; }
+  if (jump.delayed) {
+    words[2] = fixture::add(0, 1, 1);
+    words[3] = fixture::add(2, 3, 3);
+    // A sample in the second slot sees the first result. A sample in the
+    // refill bubble sees the second result instead.
+    const bool first_zero = ending == (jump.distance == 0);
+    initial.pe[0].data[0][1] = first_zero ? 0 : 1U << raw_shift;
+    initial.pe[0].data[0][3] = first_zero ? 1U << raw_shift : 0;
+  }
+  fixture::Program program(words);
+  Timeline trace{.registers = initial, .prefixes = {}};
+  auto &lane = trace.registers.pe[0];
+  entered(trace, {.address = jump_loop.end, .count = old_lcntr});
+  if (jump.delayed) {
+    jump_delay_boundary(trace, jump, 1, true);
+    lane.data[0][0] = 2 * lane.data[0][1];
+    lane.astat = lane.data[0][0] == 0 ? az : 0;
+    jump_delay_boundary(trace, jump, 2, true);
+    lane.data[0][2] = 2 * lane.data[0][3];
+    lane.astat = lane.data[0][2] == 0 ? az : 0;
+  }
+  auto cycles = jump.delayed ? 2U : 4U;
+  if (ending) { popped(trace.registers); }
+  for (auto pc = jump.target(); pc <= jump_loop_end; ++pc) {
+    const auto distance = jump_loop_end - pc;
+    if (ending) {
+      short_boundary(
+          trace, {.pc = pc, .fetch = jump_loop_end + 2 - distance, .decode = 2 - distance}, cycles);
+    } else {
+      nested_counted_boundary(trace, jump_loop, base + pc, true, cycles);
+    }
+    cycles = 1;
+  }
+  trace.boundary(ending ? jump_loop.end + 1 : jump_loop.start, ending ? 3U : 1U);
+  trace.record();
+  verify_timeline(program, initial, trace);
+}
+
+void delayed_abort_to_parent_tail() {
+  constexpr auto twice = do_immediate | (std::uint64_t{2} << count_shift);
+  constexpr auto once = do_immediate | (std::uint64_t{1} << count_shift);
+  constexpr auto target = jump_loop_end - 1;
+  std::array<std::uint64_t, jump_loop_end + 2> words{};
+  words[0] = twice | jump_loop_end;
+  words[2] = once | 5;
+  words[3] = jump_direct | la | db | (base + target);
+  words[4] = words[5] = fixture::add(0, 0, 1);
+  fixture::Program program(words);
+  auto initial = starting();
+  initial.pe[0].data[0][1] = 1U << raw_shift;
+  Timeline trace{.registers = initial, .prefixes = {}};
+  auto &state = trace.registers;
+  state.lcntr = 2;
+  entered(trace, {.address = counted_address | jump_loop.end, .count = 2});
+  for (const bool repeats : {true, false}) {
+    trace.boundary(base + 2);
+    trace.record();
+    state.lcntr = 1;
+    enter_long_child(trace, counted_address);
+    // LA pops the child before its own counter sample. The new stream
+    // reaches the parent endpoint in the first slot.
+    leave_nested_child(state);
+    short_boundary(trace, {.pc = 4, .fetch = target + 1, .decode = 6});
+    nested_tail_add(trace, 0);
+    parent_count_sample(trace, repeats);
+    short_boundary(trace, {.pc = 5, .fetch = repeats ? 1U : target + 2, .decode = target});
+    nested_tail_add(trace, 0);
+    nested_counted_boundary(trace, jump_loop, base + target, repeats, 2);
+    nested_counted_boundary(trace, jump_loop, jump_loop.end, repeats);
+    nested_counted_boundary(trace, jump_loop, jump_loop.end + 1, repeats);
+  }
+  verify_timeline(program, initial, trace);
+}
+
+void jump_refill_across_arithmetic_child() {
+  constexpr Range parent{.start = base + 1, .end = base + 8};
+  constexpr auto child_end = base + 7;
+  constexpr auto twice = do_immediate | (std::uint64_t{2} << count_shift);
+  std::array<std::uint64_t, 10> words{};
+  words[0] = twice | (parent.end - base);
+  words[2] = do_eq | 5;
+  words[3] = jump_direct | child_end;
+  fixture::Program program(words);
+  auto initial = starting();
+  initial.pe[0].astat = az;
+  Timeline trace{.registers = initial, .prefixes = {}};
+  auto &state = trace.registers;
+  state.lcntr = 2;
+  entered(trace, {.address = counted_address | parent.end, .count = 2});
+  for (const bool repeats : {true, false}) {
+    trace.boundary(base + 2);
+    trace.record();
+    enter_long_child(trace);
+    // The branch fill fetches E, B, B+1, then E+1 after the arithmetic
+    // test cancels the speculative redirect. E+1 is the parent's end.
+    leave_nested_child(state);
+    parent_count_sample(trace, repeats);
+    short_boundary(trace, {.pc = 7, .fetch = repeats ? 1U : 9U, .decode = 4}, 4);
+    nested_counted_boundary(trace, parent, parent.end, repeats, 3);
+    nested_counted_boundary(trace, parent, parent.end + 1, repeats);
+  }
+  verify_timeline(program, initial, trace);
+}
+
+void jump_on_nominal_end_fetch() {
+  constexpr auto once = do_immediate | (std::uint64_t{1} << count_shift);
+  constexpr auto site = jump_loop_end - 4;
+  constexpr std::uint64_t jump_eq = 0x060000000000;
+  std::array<std::uint64_t, jump_loop_end + 2> words{};
+  words[0] = once | jump_loop_end;
+  words[site] = jump_eq | (base + jump_loop_end);
+  fixture::Program program(words);
+  for (const bool taken : {false, true}) {
+    auto initial = starting();
+    initial.pe[0].astat = taken ? az : 0;
+    Timeline trace{.registers = initial, .prefixes = {}};
+    trace.registers.lcntr = 1;
+    entered(trace, {.address = counted_address | jump_loop.end, .count = 1});
+    for (unsigned pc = 2; pc <= site; ++pc) {
+      trace.boundary(base + pc);
+      trace.record();
+    }
+    parent_count_sample(trace, false);
+    auto pc = taken ? jump_loop_end : site + 1;
+    trace.boundary(base + pc, taken ? 4U : 1U);
+    trace.record();
+    for (; pc <= jump_loop_end; ++pc) {
+      trace.boundary(base + pc + 1);
+      trace.record();
+    }
+    verify_timeline(program, initial, trace);
+  }
+}
+
+void jump_loop_refill_cases() {
+  counted_jump_refill({.distance = 0});
+  counted_jump_refill({.distance = 1, .form = TailJump::relative});
+  counted_jump_refill({.distance = 2, .form = TailJump::dag2});
+  counted_jump_refill({.distance = 3});
+  for (const auto distance : {0U, 1U, 2U, 3U}) {
+    counted_jump_refill({.distance = distance,
+                         .delayed = true,
+                         .form = distance % 2 == 0 ? TailJump::dag2 : TailJump::absolute});
+  }
+  arithmetic_jump_refill({.distance = 0}, true);
+  arithmetic_jump_refill({.distance = 0, .delayed = true}, true);
+  arithmetic_jump_refill({.distance = 1, .delayed = true}, true);
+  arithmetic_jump_refill({.distance = 1, .delayed = true}, false);
+  delayed_abort_to_parent_tail();
+  jump_refill_across_arithmetic_child();
+  jump_on_nominal_end_fetch();
 }
 
 void short_loop_call_cases() {
@@ -3962,5 +4166,5 @@ void fixture::hardware_loop_control_flow() {
   computed_loop_abort();
   refused_loop_abort();
   refused_do();
-  skipped_fetch_boundary();
+  jump_loop_refill_cases();
 }

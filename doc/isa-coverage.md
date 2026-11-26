@@ -282,6 +282,20 @@ DAG2 callee entries, SIMD lane disagreement, both return slots and
 snapshot replay. The sample executes at the prepared return address
 before admitting another guest instruction. The combined timing follows
 the documented pipeline and awaits hardware comparison.
+An in-loop JUMP can reach the last four words before the ordinary end fetch.
+The target refill samples a long counted endpoint once or selects the
+speculative arithmetic backedge and tests its condition. Delayed jumps
+advance that fetch stream at each slot boundary, preserving the sampled
+state and fetch address in snapshots. The arithmetic test sees the first
+slot's flags if it coincides with the second slot, and the second slot's
+flags if it occurs in the refill bubble. Installed-image programs cover
+absolute, PC-relative and declared DAG2 targets, both count outcomes, a
+delayed one-level abort into a parent tail and an arithmetic child whose
+branch refill reaches a counted parent's end. In the fourth- and
+fifth-last words of the source loop, plain JUMP needs a static in-loop
+target.
+This timing is derived from the documented pipeline and awaits hardware
+comparison.
 Classic JUMP (LA) handles qualified long-loop exits through absolute,
 PC-relative and DAG2 targets, with either immediate transfer or two delay
 slots. A false predicate leaves the hardware loop's outstanding decision

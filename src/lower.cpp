@@ -204,6 +204,11 @@ bool call_branch_instruction(const Instruction &op) {
          (op.word & call_branch) != 0;
 }
 
+bool jump_instruction(const Instruction &op) {
+  return (op.type == direct_branch_type || op.type == computed_branch_type) &&
+         !call_branch_instruction(op);
+}
+
 bool loop_abort(const Instruction &op) {
   return (op.type == direct_branch_type || op.type == computed_branch_type) &&
          (op.word & abort_branch) != 0;
@@ -352,6 +357,7 @@ struct LoopPlan {
   LoopMap short_nested;
   LoopMap reentry_calls;
   LoopMap aborts;
+  std::map<std::uint32_t, std::vector<std::uint32_t>> jump_ends;
   LoopMap not_lce;
   std::set<std::uint32_t> lce_endpoints;
   std::set<std::uint32_t> short_parent_tails;
@@ -710,6 +716,17 @@ struct OverlappingLoopFetch {
 
 enum class RefillSample : std::uint8_t { instruction, whole_turn, call_return };
 
+struct JumpFetch {
+  unsigned clock;
+  unsigned clocks_retired;
+  llvm::Value *status{};
+};
+
+struct JumpRefill {
+  std::vector<LoopShape> shapes;
+  std::set<std::uint32_t> targets;
+};
+
 bool overlapping_tail(const LoopShape &child, const LoopShape &parent) {
   const auto gap = (parent.end - child.end) & maximum_pc;
   return gap != 0 && gap <= loop_fetch_distance && parent.contains((child.start - 1) & maximum_pc);
@@ -776,6 +793,7 @@ public:
         loop_shapes_(loops.shapes),
         reentry_calls_(loops.reentry_calls),
         aborts_(loops.aborts),
+        jump_ends_(loops.jump_ends),
         short_nested_(loops.short_nested),
         not_lce_(loops.not_lce),
         lce_endpoints_(loops.lce_endpoints),
@@ -932,8 +950,17 @@ private:
                 llvm::Value *lanes,
                 PipelineEffects pipeline,
                 llvm::Value *old_status);
-  void delayed_slot(const Values &values, const Instruction &op, bool partial);
+  void
+  delayed_slot(const Values &values, const Instruction &op, bool partial, llvm::Value *old_status);
   void redirect(Values values, const Instruction &op, llvm::Value *target, bool partial);
+  void plan_jump_refills();
+  [[nodiscard]] bool prepared_jump_target(const Instruction &op, std::uint32_t target) const;
+  llvm::Value *jump_fetch(Values &values,
+                          llvm::Value *target,
+                          const Instruction &op,
+                          llvm::Value *fetch,
+                          JumpFetch position);
+  llvm::Value *pack_delayed_target(llvm::Value *target, std::uint32_t phase, llvm::Value *fetch);
   [[nodiscard]] bool delay_boundary(std::uint32_t pc) const;
   [[nodiscard]] bool sequencer_boundary(std::uint32_t pc) const;
   void plan_hardware_loops(const LoopMap &shapes);
@@ -1123,6 +1150,7 @@ private:
   const LoopMap &loop_shapes_;
   const LoopMap &reentry_calls_;
   const LoopMap &aborts_;
+  const std::map<std::uint32_t, std::vector<std::uint32_t>> &jump_ends_;
   const LoopMap &short_nested_;
   const LoopMap &not_lce_;
   const std::set<std::uint32_t> &lce_endpoints_;
@@ -1137,11 +1165,12 @@ private:
   llvm::Function *function_{};
   std::map<std::uint32_t, std::size_t> addresses_;
   std::set<std::uint32_t> delay_slots_;
-  std::map<std::uint32_t, const Instruction *> delay_ends_;
+  std::map<std::uint32_t, const Instruction *> delay_starts_, delay_ends_;
   std::map<std::uint32_t, LoopShape> loop_fetches_, loop_tests_, hardware_ends_;
   std::map<std::uint32_t, std::vector<OverlappingLoopFetch>> overlapping_fetches_;
   std::map<std::uint32_t, std::vector<LoopShape>> short_parents_;
   std::set<std::uint32_t> shifted_fetches_;
+  std::map<std::uint32_t, JumpRefill> jump_refills_;
   std::map<std::uint32_t, LoopShape> hardware_grants_, short_bodies_;
   std::set<std::uint32_t> short_successors_;
   std::set<std::uint32_t> loop_setups_;
@@ -2434,7 +2463,6 @@ void Lowering::complete(Values values,
   const auto next = next_pc(op);
   if (!branch(op)) {
     retire_short_observation(op.address);
-    delayed_slot(values, op, partial);
     credit(values, count, builder_.CreateAdd(count, values[extra_cycles_value]), partial);
     finish(values, next, partial);
     return;
@@ -2455,10 +2483,13 @@ void Lowering::complete(Values values,
   retire_pipeline(branch_values, pipeline);
   if (delayed(op)) {
     if (target == nullptr) { target = builder_.getInt32(branch_target(op)); }
-    store(builder_.CreateOr(target, builder_.getInt32(before_first_delay_slot)),
-          delayed_target_slot);
     branch_values[hazard_value] = builder_.getInt1(op.compute.kind != ComputeKind::none);
     credit(branch_values, count, cycles, partial);
+    auto *fetch =
+        jump_refills_.contains(op.address)
+            ? jump_fetch(branch_values, target, op, target, {.clock = 0, .clocks_retired = 1})
+            : nullptr;
+    store(pack_delayed_target(target, before_first_delay_slot, fetch), delayed_target_slot);
     finish(branch_values, next, partial);
   } else {
     branch_values[hazard_value] = builder_.getFalse();
@@ -2473,7 +2504,7 @@ void Lowering::complete(Values values,
   retire_short_observation(op.address);
   retire_pipeline(values, pipeline);
   values[hazard_value] = builder_.getInt1(op.compute.kind != ComputeKind::none);
-  if (loop_abort(op) || hardware_ends_.contains(op.address) ||
+  if (loop_abort(op) || loop_fetches_.contains(op.address) || hardware_ends_.contains(op.address) ||
       reentry_calls_.contains(op.address)) {
     loop_retirement(values, op, old_status, partial);
   }
@@ -2482,6 +2513,18 @@ void Lowering::complete(Values values,
 }
 
 void Lowering::redirect(Values values, const Instruction &op, llvm::Value *target, bool partial) {
+  if (!delayed(op) && jump_refills_.contains(op.address)) {
+    auto *entry = target != nullptr ? target : builder_.getInt32(branch_target(op));
+    auto *fetch = entry;
+    for (unsigned clock = 0; clock < loop_fetch_distance; ++clock) {
+      fetch = jump_fetch(
+          values,
+          entry,
+          op,
+          fetch,
+          {.clock = clock, .clocks_retired = loop_fetch_distance, .status = values[status_value]});
+    }
+  }
   if (op.type == return_branch_type) {
     if (!reentry_calls_.empty() && ((op.word & loop_reentry) != 0 || has_plain_loop_returns_)) {
       resume_loop_tail(values, target);
@@ -2494,12 +2537,25 @@ void Lowering::redirect(Values values, const Instruction &op, llvm::Value *targe
   }
 }
 
-void Lowering::delayed_slot(const Values &values, const Instruction &op, bool partial) {
+llvm::Value *
+Lowering::pack_delayed_target(llvm::Value *target, std::uint32_t phase, llvm::Value *fetch) {
+  auto *word = builder_.CreateZExt(builder_.CreateOr(target, builder_.getInt32(phase)),
+                                   builder_.getInt64Ty());
+  if (fetch == nullptr) { return word; }
+  auto *cursor = builder_.CreateShl(builder_.CreateZExt(fetch, builder_.getInt64Ty()),
+                                    builder_.getInt64(delayed_fetch_shift));
+  return builder_.CreateOr(builder_.CreateOr(word, builder_.getInt64(delayed_fetch_live)), cursor);
+}
+
+void Lowering::delayed_slot(const Values &values,
+                            const Instruction &op,
+                            bool partial,
+                            llvm::Value *old_status) {
   if (!delay_slots_.contains(op.address)) { return; }
-  auto *pending = load(32, delayed_target_slot);
+  auto *pending = load(64, delayed_target_slot);
   auto *slot = llvm::BasicBlock::Create(module_.getContext(), "delay.slot", function_);
   auto *ordinary = llvm::BasicBlock::Create(module_.getContext(), "delay.none", function_);
-  builder_.CreateCondBr(builder_.CreateICmpNE(pending, builder_.getInt32(0)), slot, ordinary);
+  builder_.CreateCondBr(builder_.CreateICmpNE(pending, builder_.getInt64(0)), slot, ordinary);
   builder_.SetInsertPoint(slot);
   auto retired = values;
   if (branch(op)) {
@@ -2507,27 +2563,36 @@ void Lowering::delayed_slot(const Values &values, const Instruction &op, bool pa
     retired[hazard_value] = builder_.getFalse();
     retire_pipeline(retired, {.stall = builder_.getInt64(0), .tag = builder_.getInt32(0)});
   }
-  auto *target = builder_.CreateAnd(pending, builder_.getInt32(maximum_pc));
+  auto *address = builder_.CreateTrunc(pending, builder_.getInt32Ty());
+  auto *target = builder_.CreateAnd(address, builder_.getInt32(maximum_pc));
+  auto *fetch = builder_.CreateTrunc(
+      builder_.CreateLShr(pending, builder_.getInt64(delayed_fetch_shift)), builder_.getInt32Ty());
   const auto origin = delay_ends_.find(op.address);
   llvm::BasicBlock *last = nullptr;
   if (origin != delay_ends_.end()) {
     last = llvm::BasicBlock::Create(module_.getContext(), "delay.last", function_);
     auto *first = llvm::BasicBlock::Create(module_.getContext(), "delay.first", function_);
-    auto *phase = builder_.CreateAnd(pending, builder_.getInt32(before_second_delay_slot));
+    auto *phase = builder_.CreateAnd(address, builder_.getInt32(before_second_delay_slot));
     builder_.CreateCondBr(builder_.CreateICmpNE(phase, builder_.getInt32(0)), last, first);
     builder_.SetInsertPoint(first);
   }
   auto first_values = retired;
-  store(builder_.CreateOr(target, builder_.getInt32(before_second_delay_slot)),
-        delayed_target_slot);
   credit(first_values,
          builder_.getInt64(1),
          builder_.CreateAdd(builder_.getInt64(1), retired[extra_cycles_value]),
          partial);
+  const auto first_origin = delay_starts_.find(op.address);
+  llvm::Value *first_fetch = nullptr;
+  if (first_origin != delay_starts_.end() &&
+      jump_refills_.contains(first_origin->second->address)) {
+    first_fetch = jump_fetch(
+        first_values, target, *first_origin->second, fetch, {.clock = 1, .clocks_retired = 2});
+  }
+  store(pack_delayed_target(target, before_second_delay_slot, first_fetch), delayed_target_slot);
   finish(first_values, next_pc(op), partial);
   if (last != nullptr) {
     builder_.SetInsertPoint(last);
-    store(builder_.getInt32(0), delayed_target_slot);
+    store(builder_.getInt64(0), delayed_target_slot);
     retired[hazard_value] = builder_.getFalse();
     // One refill cycle follows the second slot. It also ages the DAG dependency.
     retire_pipeline(retired, {.stall = builder_.getInt64(0), .tag = builder_.getInt32(0)});
@@ -2535,6 +2600,18 @@ void Lowering::delayed_slot(const Values &values, const Instruction &op, bool pa
            builder_.getInt64(1),
            builder_.CreateAdd(builder_.getInt64(2), retired[extra_cycles_value]),
            partial);
+    if (jump_refills_.contains(origin->second->address)) {
+      auto *next_fetch = jump_fetch(retired,
+                                    target,
+                                    *origin->second,
+                                    fetch,
+                                    {.clock = 2, .clocks_retired = 4, .status = old_status});
+      (void)jump_fetch(retired,
+                       target,
+                       *origin->second,
+                       next_fetch,
+                       {.clock = 3, .clocks_retired = 4, .status = retired[status_value]});
+    }
     redirect(retired, *origin->second, target, partial);
   }
   builder_.SetInsertPoint(ordinary);
@@ -2548,7 +2625,7 @@ bool Lowering::sequencer_boundary(std::uint32_t pc) const {
   return delay_boundary(pc) || loop_setups_.contains(pc) || loop_fetches_.contains(pc) ||
          loop_tests_.contains(pc) || hardware_ends_.contains(pc) || hardware_grants_.contains(pc) ||
          short_bodies_.contains(pc) || short_successors_.contains(pc) || aborts_.contains(pc) ||
-         overlapping_fetches_.contains(pc) || not_lce_.contains(pc);
+         overlapping_fetches_.contains(pc) || jump_refills_.contains(pc) || not_lce_.contains(pc);
 }
 
 void Lowering::plan_hardware_loops(const LoopMap &shapes) {
@@ -2571,6 +2648,34 @@ void Lowering::plan_hardware_loops(const LoopMap &shapes) {
     if (shape.arithmetic() && sample_site(test)) { loop_tests_.emplace(test, shape); }
   }
   plan_overlapping_loop_fetches(shapes);
+  plan_jump_refills();
+}
+
+bool Lowering::prepared_jump_target(const Instruction &op, std::uint32_t target) const {
+  if (!indirect_branch(op)) { return target == branch_target(op); }
+  return std::ranges::contains(variant_.entries, target) ||
+         std::ranges::any_of(variant_.interrupt_vectors,
+                             [target](const auto &v) { return v.vector == target; });
+}
+
+void Lowering::plan_jump_refills() {
+  if (jump_ends_.empty()) { return; }
+  for (const auto &op : instructions_) {
+    const auto site = jump_ends_.find(op.address);
+    if (site == jump_ends_.end()) { continue; }
+    JumpRefill refill;
+    for (const auto end : site->second) {
+      bool reaches_end = false;
+      for (unsigned distance = 0; distance < loop_fetch_distance; ++distance) {
+        const auto target = (end - distance) & maximum_pc;
+        if (!prepared_jump_target(op, target)) { continue; }
+        refill.targets.insert(target);
+        reaches_end = true;
+      }
+      if (reaches_end) { refill.shapes.push_back(loop_shapes_.at(end)); }
+    }
+    if (!refill.shapes.empty()) { jump_refills_.emplace(op.address, std::move(refill)); }
+  }
 }
 
 void Lowering::plan_short_body(const LoopShape &shape) {
@@ -3397,6 +3502,48 @@ void Lowering::loop_test(Values &values,
   values = next.values();
 }
 
+llvm::Value *Lowering::jump_fetch(Values &values,
+                                  llvm::Value *target,
+                                  const Instruction &op,
+                                  llvm::Value *fetch,
+                                  JumpFetch position) {
+  const auto &refill = jump_refills_.at(op.address);
+  llvm::Value *declared = builder_.getTrue();
+  if (indirect_branch(op)) {
+    declared = builder_.getFalse();
+    for (const auto entry : refill.targets) {
+      declared =
+          builder_.CreateOr(declared, builder_.CreateICmpEQ(target, builder_.getInt32(entry)));
+    }
+  }
+  auto *mask = builder_.getInt32(maximum_pc);
+  auto *next = builder_.CreateAnd(builder_.CreateAdd(fetch, builder_.getInt32(1)), mask);
+  const auto age = std::min(position.clocks_retired - position.clock, lce_branch_age);
+  for (const auto &shape : refill.shapes) {
+    // All positions use the address present at the start of this clock. A
+    // backedge or a cancelled speculative backedge changes the next fetch.
+    auto *at_end =
+        builder_.CreateAnd(declared, builder_.CreateICmpEQ(fetch, builder_.getInt32(shape.end)));
+    loop_fetch(values, shape, at_end, true, builder_.getInt64(age));
+    const auto frame = active_loop(values, shape);
+    auto *scheduled = builder_.CreateAnd(frame.matches, repeat_scheduled(frame));
+    next = builder_.CreateSelect(
+        builder_.CreateAnd(at_end, scheduled), builder_.getInt32(shape.start), next);
+    if (!shape.arithmetic() || position.clock < loop_decode_distance) { continue; }
+    const auto offset = position.clock - loop_decode_distance;
+    const auto reached_end = (shape.end - offset) & maximum_pc;
+    auto *tests =
+        builder_.CreateAnd(declared, builder_.CreateICmpEQ(target, builder_.getInt32(reached_end)));
+    tests = builder_.CreateAnd(
+        tests, builder_.CreateICmpEQ(fetch, builder_.getInt32((shape.start + 1) & maximum_pc)));
+    tests = builder_.CreateAnd(tests, scheduled);
+    loop_test(values, position.status, shape, tests);
+    auto *exited = builder_.CreateAnd(tests, refill_at(load(64, loop_refill_slot), shape.end));
+    next = builder_.CreateSelect(exited, builder_.getInt32((shape.end + 1) & maximum_pc), next);
+  }
+  return next;
+}
+
 void Lowering::loop_refill(Values &values, const Instruction &op) {
   auto *pending = load(64, loop_refill_slot);
   auto *end =
@@ -4080,13 +4227,14 @@ void Lowering::emit_instruction(std::size_t i,
   auto pipeline =
       PipelineEffects{.stall = pipeline_stall(values, op), .tag = loaded_tag(values, op)};
   auto *old_status = values[status_value];
-  if (branch(op)) { delayed_slot(values, op, false); }
+  if (branch(op)) { delayed_slot(values, op, false, old_status); }
   check_loop_end(values, op, false);
   instruction(values, op, false);
   // Admitted memory accesses have no resumable exit inside this block.
   if (dead_status) { values[status_value] = old_status; }
   if (!branch(op)) {
     retire_pipeline(values, pipeline);
+    delayed_slot(values, op, false, old_status);
     loop_retirement(values, op, old_status, false);
   }
   if (costs_[i].instructions > 1) {
@@ -4107,7 +4255,7 @@ void Lowering::emit_instruction(std::size_t i,
   builder_.SetInsertPoint(bound);
   exit(values, builder_.getInt32(op.address), NativeExit::bound);
   builder_.SetInsertPoint(execute);
-  if (branch(op)) { delayed_slot(values, op, true); }
+  if (branch(op)) { delayed_slot(values, op, true, values[status_value]); }
   check_loop_end(values, op, true);
   lanes = branch_lanes(values, op, true);
   pipeline = {.stall = pipeline_stall(values, op), .tag = loaded_tag(values, op)};
@@ -4115,6 +4263,7 @@ void Lowering::emit_instruction(std::size_t i,
   instruction(values, op, true);
   if (!branch(op)) {
     retire_pipeline(values, pipeline);
+    delayed_slot(values, op, true, old_status);
     loop_retirement(values, op, old_status, true);
   }
   if (costs_[i].instructions > 1) {
@@ -4142,6 +4291,7 @@ void Lowering::emit() {
       reentry_calls_, [](const auto &site) { return site.second.suspends_enclosing_tail; });
   for (const auto &op : instructions_) {
     if (!delayed(op)) { continue; }
+    delay_starts_.emplace(next_pc(op), &op);
     delay_slots_.insert(next_pc(op));
     delay_slots_.insert(next_pc(op, delay_slot_count));
     delay_ends_.emplace(next_pc(op, delay_slot_count), &op);
@@ -4166,7 +4316,7 @@ void Lowering::emit() {
   plan_hardware_loops(loop_shapes_);
   plan_hardware_grants(loop_shapes_);
   stack_written_ = !short_bodies_.empty() || !loop_setups_.empty() || !hardware_ends_.empty() ||
-                   !loop_fetches_.empty() || !loop_tests_.empty() ||
+                   !loop_fetches_.empty() || !loop_tests_.empty() || !jump_refills_.empty() ||
                    std::ranges::any_of(instructions_, [this](const auto &op) {
                      return op.type == return_branch_type || call_branch_instruction(op) ||
                             loop_return_at(op.address, reentry_calls_) != nullptr;
@@ -4412,13 +4562,21 @@ void validate_loop_body(const InstructionMap &code,
     }
     const auto &op = *assigned->second;
     const auto remaining = shape.length - offset;
+    if (!shape.short_body() && jump_instruction(op) &&
+        (indirect_branch(op) ||
+         ((shape.end - branch_target(op)) & maximum_pc) < loop_fetch_distance)) {
+      plan.jump_ends[op.address].push_back(shape.end);
+    }
     if (loop_abort(op)) {
       const auto owner = plan.aborts.find(op.address);
       if (owner == plan.aborts.end() || shape.length < owner->second.length) {
         plan.aborts.insert_or_assign(op.address, shape);
       }
     } else if (branch(op) && remaining <= loop_fetch_distance) {
-      validate_loop_call(plan, shape, op, identity);
+      const bool in_loop_jump = jump_instruction(op) && !indirect_branch(op) &&
+                                shape.contains(branch_target(op)) && !shape.short_body() &&
+                                remaining > loop_decode_distance;
+      if (!in_loop_jump) { validate_loop_call(plan, shape, op, identity); }
     }
     if (loop_setup(op)) { validate_nested_loop(code, plan, shape, op, remaining, identity); }
   }
