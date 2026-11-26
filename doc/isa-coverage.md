@@ -257,6 +257,11 @@ simultaneous pops, all four endpoint gaps for long counted children and
 arithmetic children of one to three words, parent samples preceding child
 setup, and parent outcomes at successive refill clocks. The long counted
 child is also exercised across immediate and delayed `RTS (LR)`.
+Three- and four-word counted outer loops keep their own expiry observation
+while a short child runs or drains. A counted child has an independent
+observation. Tests exercise both outcomes in the overlapping buffers,
+a parent sample on the last clock of a child refill, and preservation of
+the parent's sampled expiry across both return forms after the child drains.
 Observations immediately after DO, explicit loop-resource changes, other
 overlapping configurations and unlooped predicates remain unqualified.
 Combined condition timing awaits hardware comparison.
@@ -306,9 +311,8 @@ popped. Tests cover one- and two-word counted children, a one-word
 arithmetic child, both child positions in a four-word parent, and a
 counted child that admits complete native turns. Fetch and decode
 observations across the handoff are derived from the short-loop timing.
-Three overlapping tails, IF NOT LCE in a short outer overlap and branches
-in an overlapping child refill remain unqualified. The combined timing
-awaits hardware comparison.
+Three overlapping tails and branches in an overlapping child refill remain
+unqualified. The combined timing awaits hardware comparison.
 
 Classic type 5 transfers raw data among R/S and I/M/L/B registers, including
 cross-PE data moves and raw40 register swaps, with supported single-function fixed

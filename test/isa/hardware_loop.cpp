@@ -1201,7 +1201,12 @@ void pop_short_child(Timeline &trace, unsigned retained_count) {
   }
 }
 
-void four_word_short_child(Timeline &trace, ShortChildSetup child, bool repeats) {
+enum class ShortParentProbe : std::uint8_t { none, not_lce };
+
+void four_word_short_child(Timeline &trace,
+                           ShortChildSetup child,
+                           bool repeats,
+                           ShortParentProbe probe = ShortParentProbe::none) {
   auto &result = trace.registers.pe[0].data[0][0];
   const auto next = child.end() + 1;
   const auto fetch = repeats ? next : next + 4;
@@ -1213,20 +1218,39 @@ void four_word_short_child(Timeline &trace, ShortChildSetup child, bool repeats)
     short_boundary(trace, {.pc = next, .fetch = fetch, .decode = decode}, 5);
     return;
   }
-  pop_short_child(trace, 1);
+  auto first_drain_cycles = 2U;
+  if (child.count() == 3) {
+    // The held startup fetch leaves this frame live until the first endpoint.
+    auto &state = trace.registers;
+    state.loop_counter_stack[state.loop_counter_depth - 1] = 2;
+    short_boundary(trace, {.pc = 3, .fetch = 3, .decode = 3}, 2);
+    if (probe == ShortParentProbe::not_lce) { state.pe[0].data[0][6] += 1U << raw_shift; }
+    pop_short_child(trace, 1);
+    short_boundary(trace, {.pc = 2, .fetch = 4, .decode = 2});
+    result += 1U << raw_shift;
+    first_drain_cycles = 1;
+  } else {
+    pop_short_child(trace, 1);
+  }
   // The second parent pass is already in Fetch1 behind the three buffered child words.
-  short_boundary(trace, {.pc = 3, .fetch = repeats ? 1U : 5U, .decode = 3}, 2);
+  short_boundary(trace, {.pc = 3, .fetch = repeats ? 1U : 5U, .decode = 3}, first_drain_cycles);
   short_boundary(trace, {.pc = 2, .fetch = repeats ? 2U : 6U, .decode = 4});
   result += 1U << raw_shift;
   short_boundary(trace, {.pc = 3, .fetch = repeats ? 3U : 7U, .decode = repeats ? 1U : 5U});
   short_boundary(trace, {.pc = next, .fetch = fetch, .decode = decode});
 }
 
-void nested_four_word_parent(ShortChildSetup child, unsigned count) {
+void nested_four_word_parent(ShortChildSetup child,
+                             unsigned count,
+                             ShortParentProbe probe = ShortParentProbe::none) {
   std::array<std::uint64_t, 6> words{};
   words[0] = do_immediate | (std::uint64_t{count} << count_shift) | 4;
   words[child.pc] = do_immediate | (std::uint64_t{child.count()} << count_shift) | child.width;
   words[child.pc + 1] = fixture::add(0, 0, 1);
+  if (probe == ShortParentProbe::not_lce) {
+    words[child.end()] = if_not_lce(fixture::add(6, 6, 1));
+    words[4] = if_not_lce(fixture::add(5, 5, 1));
+  }
   fixture::Program program(words);
   auto initial = starting();
   initial.pe[0].data[0][1] = 1U << raw_shift;
@@ -1245,11 +1269,14 @@ void nested_four_word_parent(ShortChildSetup child, unsigned count) {
       startup = 1;
     }
     push_short_child(trace, child, startup);
-    four_word_short_child(trace, child, repeats);
+    four_word_short_child(trace, child, repeats, probe);
     if (child.end() == 2) {
       short_boundary(trace, {.pc = 4, .fetch = repeats ? 4U : 8U, .decode = repeats ? 1U : 5U});
     }
     if (repeats) {
+      if (probe == ShortParentProbe::not_lce) {
+        trace.registers.pe[0].data[0][5] += 1U << raw_shift;
+      }
       parent_count_sample(trace, false);
       short_boundary(trace, {.pc = 1, .fetch = 5, .decode = 2});
     } else {
@@ -1259,14 +1286,15 @@ void nested_four_word_parent(ShortChildSetup child, unsigned count) {
   verify_timeline(program, initial, trace);
 }
 
-void nested_three_word_parent(bool compact) {
+void nested_three_word_parent(bool compact, ShortParentProbe probe = ShortParentProbe::none) {
   constexpr ShortChildSetup child{.pc = 1, .width = 1};
   const auto count = compact ? 1U : 3U;
   const auto setup = do_immediate | (std::uint64_t{count} << count_shift);
+  const auto endpoint = probe == ShortParentProbe::not_lce ? if_not_lce(fixture::add(5, 5, 1)) : 0;
   const std::array words{setup | 3,
                          do_immediate | (std::uint64_t{1} << count_shift) | 1,
                          fixture::add(0, 0, 1),
-                         std::uint64_t{0},
+                         endpoint,
                          std::uint64_t{0}};
   fixture::Program program(words);
   auto initial = starting();
@@ -1288,12 +1316,52 @@ void nested_three_word_parent(bool compact) {
     auto decode = turn == 2 ? 5U : 2U;
     if (compact) { decode = 3; }
     short_boundary(trace, {.pc = 3, .fetch = fetch, .decode = decode}, 5);
+    // Only the first endpoint is one clock after the parent's sample.
+    if (probe == ShortParentProbe::not_lce && turn == 0) {
+      trace.registers.pe[0].data[0][5] += 1U << raw_shift;
+    }
     if (turn + 1 < count) {
       short_boundary(trace, {.pc = 1, .fetch = turn == 1 ? 5U : 2U, .decode = 3});
     } else {
       short_boundary(trace, {.pc = 4, .fetch = 8, .decode = 6}, compact ? 4U : 1U);
     }
   }
+  verify_timeline(program, initial, trace);
+}
+
+void short_parent_lce_after_arithmetic_drain() {
+  constexpr ShortChildSetup child{.pc = 1, .width = 1};
+  const std::array words{do_immediate | (std::uint64_t{1} << count_shift) | 3,
+                         do_eq | 1,
+                         fixture::add(0, 0, 1),
+                         if_not_lce(fixture::add(5, 5, 1)),
+                         std::uint64_t{0}};
+  fixture::Program program(words);
+  auto initial = starting();
+  initial.pe[0].data[0][1] = 1U << raw_shift;
+  initial.pe[0].astat = az;
+  Timeline trace{.registers = initial, .prefixes = {}};
+  trace.registers.lcntr = 1;
+  const auto address = short_counted_types[2] | (base + 3);
+  entered_arithmetic(trace, {.pc = 1, .fetch = 2, .decode = 3}, address);
+  trace.registers.loop_counter_stack[0] = 1;
+  trace.prefixes.back().registers = trace.registers;
+  push_short_child(trace, child, 1, true);
+  auto &lane = trace.registers.pe[0];
+  lane.astat = 0;
+  lane.data[0][0] = 1U << raw_shift;
+  pop_short_child(trace, 1);
+  short_boundary(trace, {.pc = 2, .fetch = 2, .decode = 2}, 2);
+  for (const unsigned fetch : {3U, 4U}) {
+    lane.data[0][0] += 1U << raw_shift;
+    short_boundary(trace, {.pc = 2, .fetch = fetch, .decode = 2});
+  }
+  lane.data[0][0] += 1U << raw_shift;
+  parent_count_sample(trace, false);
+  short_boundary(trace, {.pc = 3, .fetch = 4, .decode = 3}, 3);
+  // The last refill clock reaches the parent's end sample.
+  lane.data[0][5] = 1U << raw_shift;
+  short_boundary(trace, {.pc = 4, .fetch = 8, .decode = 6}, 4);
   verify_timeline(program, initial, trace);
 }
 
@@ -1996,6 +2064,47 @@ unsigned short_call_round_trip(Timeline &trace,
     short_boundary(trace, {.pc = 12, .fetch = resume + 2, .decode = resume});
   }
   return delayed ? 2U : 4U;
+}
+
+void nested_short_parent_lce_call(bool delayed) {
+  constexpr ShortChildSetup child{.pc = 1, .width = 1};
+  std::array<std::uint64_t, 15> words{};
+  words[0] = do_immediate | (std::uint64_t{2} << count_shift) | 4;
+  words[1] = do_immediate | (std::uint64_t{1} << count_shift) | 1;
+  words[2] = fixture::add(0, 0, 1);
+  words[3] = delayed ? call_dag2 : call_direct | short_call_sub;
+  words[4] = if_not_lce(fixture::add(5, 5, 1));
+  words[5] = jump_direct | (base + 14);
+  words[8] = words[1];
+  words[9] = words[2];
+  words[10] = rts | lr | (delayed ? db : 0);
+  words[11] = fixture::immediate(2, 7);
+  fixture::Program program(words);
+  program.code.variants.front().entries.push_back(short_call_sub);
+  auto initial = starting();
+  initial.dag[0][8].index = short_call_sub;
+  initial.pe[0].data[0][1] = 1U << raw_shift;
+  Timeline trace{.registers = initial, .prefixes = {}};
+  trace.registers.lcntr = 2;
+  entered_arithmetic(trace, {.pc = 1, .fetch = 4, .decode = 2}, counted_address | (base + 4));
+  trace.registers.loop_counter_stack[0] = 2;
+  trace.prefixes.back().registers = trace.registers;
+  parent_count_sample(trace, true);
+  for (const bool repeats : {true, false}) {
+    push_short_child(trace, child, repeats ? 2U : 1U);
+    four_word_short_child(trace, child, repeats);
+    const auto cycles = short_call_round_trip(trace, 4, delayed);
+    short_boundary(
+        trace, {.pc = 4, .fetch = repeats ? 4U : 8U, .decode = repeats ? 1U : 5U}, cycles);
+    if (repeats) {
+      trace.registers.pe[0].data[0][5] += 1U << raw_shift;
+      parent_count_sample(trace, false);
+      short_boundary(trace, {.pc = 1, .fetch = 5, .decode = 2});
+    } else {
+      short_boundary(trace, {.pc = 5, .fetch = 9, .decode = 6});
+    }
+  }
+  verify_timeline(program, initial, trace);
 }
 
 std::array<std::uint64_t, 15> short_condition_callee(bool delayed) {
@@ -3085,6 +3194,13 @@ void fixture::hardware_loop_control_flow() {
   nested_four_word_parent({.pc = 2, .width = 1}, 2);
   nested_three_word_parent(true);
   nested_three_word_parent(false);
+  nested_three_word_parent(true, ShortParentProbe::not_lce);
+  nested_three_word_parent(false, ShortParentProbe::not_lce);
+  short_parent_lce_after_arithmetic_drain();
+  nested_four_word_parent({.pc = 1, .width = 2}, 1, ShortParentProbe::not_lce);
+  nested_four_word_parent({.pc = 1, .width = 2, .iterations = 3}, 2, ShortParentProbe::not_lce);
+  nested_short_parent_lce_call(false);
+  nested_short_parent_lce_call(true);
   nested_forever_child_drain(false);
   nested_forever_child_drain(true);
   refused_three_overlapping_short_tails();

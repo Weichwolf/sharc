@@ -80,6 +80,10 @@ tails. Preparation assigns distinct storage to overlapping long tails. The
 saved CALL payload identifies the storage to restore after a return. A parent
 sample reached during a short drain or long arithmetic refill records the
 clocks from that fetch to the next retirement boundary.
+A short counted parent and child also keep separate observations. When the
+child's final clock reaches the parent's sample, the restored outer suffix
+starts with the fresh observation. Later CALL reentry restores the observation
+to the slot of the short loop that owns the continuation.
 Admitted CALLs in counted two-, three- and four-word loops keep the
 buffered instruction count with the PC-stack entry. The callee can use its
 own loop buffer. The saved buffer is restored at the prepared return

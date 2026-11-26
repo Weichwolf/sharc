@@ -348,6 +348,7 @@ struct LoopPlan {
   LoopMap aborts;
   LoopMap not_lce;
   std::set<std::uint32_t> lce_endpoints;
+  std::set<std::uint32_t> short_parent_tails;
   std::set<std::size_t> lce_slots;
   std::map<std::uint32_t, std::size_t> long_tail_indices;
   std::size_t long_tail_count{};
@@ -764,6 +765,7 @@ public:
         short_nested_(loops.short_nested),
         not_lce_(loops.not_lce),
         lce_endpoints_(loops.lce_endpoints),
+        short_parent_tails_(loops.short_parent_tails),
         lce_slots_(loops.lce_slots),
         long_tail_indices_(loops.long_tail_indices),
         long_tail_count_(loops.long_tail_count),
@@ -994,7 +996,7 @@ private:
                           std::uint32_t pc,
                           const LoopShape &shape,
                           llvm::Value *descriptor,
-                          bool returning = false);
+                          bool after_credit = false);
   llvm::Value *
   short_exit_descriptor(llvm::Value *descriptor, const Values &values, llvm::Value *previous_depth);
   llvm::Value *short_words_after(llvm::Value *remaining, const LoopShape &shape);
@@ -1081,6 +1083,7 @@ private:
   const LoopMap &short_nested_;
   const LoopMap &not_lce_;
   const std::set<std::uint32_t> &lce_endpoints_;
+  const std::set<std::uint32_t> &short_parent_tails_;
   const std::set<std::size_t> &lce_slots_;
   const std::map<std::uint32_t, std::size_t> &long_tail_indices_;
   std::size_t long_tail_count_;
@@ -2058,8 +2061,8 @@ void Lowering::restore_short_call(Values &values,
   if (lce_endpoints_.contains(shape.end)) {
     auto *expired = short_flag(payload, return_short_lce);
     auto *tail = builder_.getInt64(counted_tail_word(shape) | lce_age_mask);
-    store(builder_.CreateSelect(expired, tail, load(64, short_counted_tail_slot)),
-          short_counted_tail_slot);
+    const auto slot = counted_tail_slot_for(shape);
+    store(builder_.CreateSelect(expired, tail, load(64, slot)), slot);
   }
   const auto call_pc = pc == shape.start ? shape.end : ((pc - 1) & maximum_pc);
   llvm::Value *descriptor = builder_.getInt64(shape.end);
@@ -2487,7 +2490,7 @@ void Lowering::resume_short_parent(Values &values,
   builder_.CreateCondBr(builder_.CreateICmpNE(left, builder_.getInt64(0)), resume, next.block);
   builder_.SetInsertPoint(resume);
   auto *descriptor = short_word(short_parent_descriptor);
-  if (parent.counted()) { short_loop_counter(values, child.end, parent, descriptor); }
+  if (parent.counted()) { short_loop_counter(values, child.end, parent, descriptor, true); }
   write_short(short_remaining, left);
   write_short(short_descriptor, descriptor);
   write_short(short_parent_remaining, builder_.getInt64(0));
@@ -2553,7 +2556,7 @@ void Lowering::short_loop_counter(Values &values,
                                   std::uint32_t pc,
                                   const LoopShape &shape,
                                   llvm::Value *descriptor,
-                                  bool returning) {
+                                  bool after_credit) {
   const auto frame = active_loop(values, shape);
   auto *startup = short_flag(descriptor, short_startup);
   auto *compact = short_flag(descriptor, short_compact_count);
@@ -2589,11 +2592,11 @@ void Lowering::short_loop_counter(Values &values,
   loop_pop(values, frame);
   if (lce_endpoints_.contains(shape.end)) {
     llvm::Value *age = builder_.getInt64(1);
-    if (shape.length != 3 && !returning) {
+    if (shape.length != 3 && !after_credit) {
       // The held two- or four-word startup fetch ages through its entry bubble.
       age = builder_.CreateAdd(age, builder_.CreateZExt(startup, builder_.getInt64Ty()));
     }
-    save_counted_tail(shape, age, returning);
+    save_counted_tail(shape, age, after_credit);
   }
   jump(next, values);
   builder_.SetInsertPoint(next.block);
@@ -2950,7 +2953,10 @@ void Lowering::loop_pop(Values &values, const LoopFrame &frame) {
 }
 
 std::size_t Lowering::counted_tail_slot_for(const LoopShape &shape) const {
-  if (shape.short_body()) { return short_counted_tail_slot; }
+  if (shape.short_body()) {
+    return short_parent_tails_.contains(shape.end) ? short_parent_tail_slot
+                                                   : short_counted_tail_slot;
+  }
   const auto index = long_tail_indices_.find(shape.end);
   return counted_tail_slot + (index == long_tail_indices_.end() ? 0 : index->second);
 }
@@ -4164,9 +4170,12 @@ void validate_not_lce(const InstructionMap &code, LoopPlan &plan, std::string_vi
              FaultReason::unsupported_instruction,
              "NOT LCE outside an admitted counted DO tail");
     }
-    const auto unqualified_overlap = [](const LoopShape &parent, const LoopShape &child) {
+    const auto unqualified_overlap = [&plan](const LoopShape &parent, const LoopShape &child) {
+      const auto nested = plan.short_nested.find(child.end);
       return overlapping_tail(child, parent) &&
-             (parent.short_body() || (!child.arithmetic() && !child.counted()));
+             ((!child.arithmetic() && !child.counted()) ||
+              (parent.short_body() &&
+               (nested == plan.short_nested.end() || nested->second.end != parent.end)));
     };
     const bool overlap = std::ranges::any_of(plan.shapes, [&](const auto &entry) {
       return unqualified_overlap(*owner, entry.second) || unqualified_overlap(entry.second, *owner);
@@ -4180,13 +4189,24 @@ void validate_not_lce(const InstructionMap &code, LoopPlan &plan, std::string_vi
   }
 }
 
+void plan_short_counted_tails(LoopPlan &plan) {
+  for (const auto &[end, parent] : plan.short_nested) {
+    if (plan.lce_endpoints.contains(parent.end)) { plan.short_parent_tails.insert(parent.end); }
+  }
+  for (const auto end : plan.lce_endpoints) {
+    if (!plan.shapes.at(end).short_body()) { continue; }
+    const auto slot =
+        plan.short_parent_tails.contains(end) ? short_parent_tail_slot : short_counted_tail_slot;
+    plan.lce_slots.insert(slot);
+  }
+}
+
 void plan_counted_tails(LoopPlan &plan) {
+  plan_short_counted_tails(plan);
   std::vector<const LoopShape *> ordered;
   for (const auto &[end, shape] : plan.shapes) {
-    if (!shape.counted()) { continue; }
-    if (shape.short_body()) {
-      if (plan.lce_endpoints.contains(end)) { plan.lce_slots.insert(short_counted_tail_slot); }
-    } else if (shape.has_reentry || shape.has_tail_abort || plan.lce_endpoints.contains(end)) {
+    if (!shape.counted() || shape.short_body()) { continue; }
+    if (shape.has_reentry || shape.has_tail_abort || plan.lce_endpoints.contains(end)) {
       ordered.push_back(&shape);
     }
   }
