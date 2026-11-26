@@ -5,6 +5,7 @@ This is expectation generation, not an ISA execution test or a fourth CTest laye
 Installed-image ISA tests must eventually consume and check complete expectations.
 """
 
+from itertools import product as cartesian_product
 import argparse
 from dataclasses import asdict
 from fractions import Fraction
@@ -20,6 +21,7 @@ import parallel_expectations
 import shifter_expectations
 import writeback_expectations
 
+from expectation_check import anchor, require, require_raises
 from reference import (
     FloatingResult, IntegerResult, Mode, Unqualified, fixed, fixed_from_float,
     float_from_fixed, float_round, floating, quantize,
@@ -127,25 +129,14 @@ FLOATING = [
 ]
 
 
-def require(actual, expected, name):
-    if actual != expected:
-        raise AssertionError(f"{name}: expected {expected}, got {actual}")
-
-
 def anchored_cases():
     records = []
     for name, operation, left, right, options, expected in FIXED:
-        actual = fixed(operation, left, right, **options)
-        require(actual, expected, name)
-        records.append({"name": name, "kind": "fixed", "operation": operation,
-                        "left": left, "right": right, "options": options,
-                        "expected": asdict(expected)})
+        records.append(anchor(name, "fixed", fixed(operation, left, right, **options), expected,
+                              operation=operation, left=left, right=right, options=options))
     for name, operation, left, right, mode, expected in FLOATING:
-        actual = floating(operation, left, right, mode)
-        require(actual, expected, name)
-        records.append({"name": name, "kind": "floating-value", "operation": operation,
-                        "left": left, "right": right, "mode": asdict(mode),
-                        "expected": asdict(expected)})
+        records.append(anchor(name, "floating-value", floating(operation, left, right, mode),
+                              expected, operation=operation, left=left, right=right, mode=asdict(mode)))
     conversions = [
         ("FLOAT independent of RND32", "float", 0x0100000100, Mode(32), {},
          FloatingResult(0x4B80000080)),
@@ -158,10 +149,8 @@ def anchored_cases():
     ]
     for name, operation, raw, mode, options, expected in conversions:
         function = float_from_fixed if operation == "float" else float_round
-        require(function(raw, mode, **options), expected, name)
-        records.append({"name": name, "kind": "conversion-value", "operation": operation,
-                        "left": raw, "mode": asdict(mode), "options": options,
-                        "expected": asdict(expected)})
+        records.append(anchor(name, "conversion-value", function(raw, mode, **options), expected,
+                              operation=operation, left=raw, mode=asdict(mode), options=options))
     return records
 
 
@@ -210,11 +199,7 @@ def explicit_gaps():
         lambda: fixed_from_float("trunc", 0x7F80000000, Mode(40)),
     ]
     for call in calls:
-        try:
-            call()
-        except Unqualified:
-            continue
-        raise AssertionError("an unqualified expectation was silently generated")
+        require_raises(Unqualified, call, 'an unqualified expectation was silently generated')
 
 
 def branch_header():
@@ -233,12 +218,11 @@ def branch_header():
     rows = []
     for name, opcode in opcodes.items():
         for x, y in inputs:
-            for saturate in (False, True):
-                for simd in (False, True):
-                    expected = condition_expectations.lane_condition(
-                        name, (x, y), saturate=saturate, simd=simd).branch
-                    rows.append(f"BranchCase{{{opcode}, {str(saturate).lower()}, "
-                                f"{str(simd).lower()}, {{0x{x:x}, 0x{y:x}}}, {str(expected).lower()}" + "}")
+            for saturate, simd in cartesian_product((False, True), (False, True)):
+                expected = condition_expectations.lane_condition(
+                    name, (x, y), saturate=saturate, simd=simd).branch
+                rows.append(f"BranchCase{{{opcode}, {str(saturate).lower()}, "
+                            f"{str(simd).lower()}, {{0x{x:x}, 0x{y:x}}}, {str(expected).lower()}" + "}")
     return """
 struct BranchCase {
   unsigned condition;
@@ -258,22 +242,21 @@ def fixed_header(path):
     rows = []
     for name, operation, left, right, options, anchored in FIXED:
         require(fixed(operation, left, right, **options), anchored, name)
-        for saturate in (False, True):
-            for truncate in (False, True):
-                old_astat = (options.get("astat", 0), options.get("astat", 0) ^ 0xA5000408)
-                old_stky = (options.get("stky", 0), options.get("stky", 0) ^ 0x220)
-                results = [fixed(operation, x, y, astat=a, stky=s,
-                                 saturate=saturate, truncate=truncate)
-                           for x, y, a, s in zip((left, right), (right, left), old_astat, old_stky)]
-                def array(values):
-                    return "{" + ", ".join(f"0x{value:x}ULL" for value in values) + "}"
-                rows.append("{" + ", ".join((json.dumps(name), str(opcodes[operation]),
-                            str(saturate).lower(), str(truncate).lower(),
-                            str(results[0].raw is not None).lower(), array((left, right)),
-                            array((right, left)), array(old_astat), array(old_stky),
-                            array(result.raw or 0 for result in results),
-                            array(result.astat for result in results),
-                            array(result.stky for result in results))) + "}")
+        for saturate, truncate in cartesian_product((False, True), (False, True)):
+            old_astat = (options.get("astat", 0), options.get("astat", 0) ^ 0xA5000408)
+            old_stky = (options.get("stky", 0), options.get("stky", 0) ^ 0x220)
+            results = [fixed(operation, x, y, astat=a, stky=s,
+                             saturate=saturate, truncate=truncate)
+                       for x, y, a, s in zip((left, right), (right, left), old_astat, old_stky)]
+            def array(values):
+                return "{" + ", ".join(f"0x{value:x}ULL" for value in values) + "}"
+            rows.append("{" + ", ".join((json.dumps(name), str(opcodes[operation]),
+                        str(saturate).lower(), str(truncate).lower(),
+                        str(results[0].raw is not None).lower(), array((left, right)),
+                        array((right, left)), array(old_astat), array(old_stky),
+                        array(result.raw or 0 for result in results),
+                        array(result.astat for result in results),
+                        array(result.stky for result in results))) + "}")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("""// SPDX-License-Identifier: GPL-3.0-only
 // Generated from the independent integer/rational reference. No production imports.
@@ -302,14 +285,10 @@ def main():
     parser.add_argument("--fixed-header", type=Path, help="write independent installed-image fixed expectations")
     arguments = parser.parse_args()
     records = anchored_cases()
-    records.extend(multiplier_expectations.anchors())
-    records.extend(conversion_expectations.anchors())
-    records.extend(shifter_expectations.anchors())
-    records.extend(floating_expectations.anchors())
-    records.extend(parallel_expectations.anchors())
-    records.extend(packing_expectations.anchors())
-    records.extend(condition_expectations.anchors())
-    records.extend(writeback_expectations.anchors())
+    for module in (multiplier_expectations, conversion_expectations, shifter_expectations,
+                   floating_expectations, parallel_expectations, packing_expectations,
+                   condition_expectations, writeback_expectations):
+        records.extend(module.anchors())
     records.extend(writeback_expectations.swap_anchors())
     swap_count = writeback_expectations.swap_lattice()
     writeback_count, writeback_refusals = writeback_expectations.bank_priority_lattice()
@@ -324,10 +303,8 @@ def main():
     unary_count, unary_refusals = floating_expectations.unary_lattice()
     parts_count, parts_refusals = floating_expectations.parts_lattice()
     floating_expectations.explicit_gaps()
-    shifter_count = shifter_expectations.bit_lattice()
-    shifter_count += shifter_expectations.leading_lattice()
-    fifo_count = shifter_expectations.fifo_lattice()
-    fifo_count += shifter_expectations.pointer_lattice()
+    shifter_count = shifter_expectations.bit_lattice() + shifter_expectations.leading_lattice()
+    fifo_count = shifter_expectations.fifo_lattice() + shifter_expectations.pointer_lattice()
     unpack_count = shifter_expectations.unpack_lattice()
     shifter_expectations.explicit_gaps()
     conversion_count, conversion_refusals = conversion_expectations.quotient_lattice()

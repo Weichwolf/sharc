@@ -8,8 +8,6 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <exception>
-#include <iostream>
 #include <sharc/core.hpp>
 #include <sharc/memory.hpp>
 
@@ -17,7 +15,7 @@ namespace {
 using fixture::check;
 using Clock = bench::Clock;
 constexpr unsigned word_count = 4096, passes = 512;
-constexpr unsigned word_bytes = 4, byte_bits = 8, raw_shift = 8;
+constexpr unsigned word_bytes = 4, raw_shift = 8;
 constexpr std::uint32_t input_address = 0x90000, output_address = 0xa0000, ram_id = 11;
 constexpr std::uint32_t expected_checksum = 0xd9dd7e00, last_input = 0xc54bba88;
 constexpr std::uint32_t positive_rail = 0x7fffffff;
@@ -76,12 +74,7 @@ Words inputs() {
 class Storage : public bench::WordSpace {
 public:
   void initialize(const Words &input) const {
-    auto target = at(input_address, sizeof(input));
-    for (std::size_t i = 0; i < input.size(); ++i) {
-      for (unsigned byte = 0; byte < word_bytes; ++byte) {
-        target[(i * word_bytes) + byte] = static_cast<std::byte>(input[i] >> (byte * byte_bits));
-      }
-    }
+    write_words(input_address, input);
     clear_output();
   }
 
@@ -93,26 +86,16 @@ public:
     const auto source = at(input_address, sizeof(input));
     const auto target = at(output_address, sizeof(input));
     check(std::ranges::equal(source, target), "K5 did not copy the complete output");
-    for (std::size_t i = 0; i < input.size(); ++i) {
-      for (unsigned byte = 0; byte < word_bytes; ++byte) {
-        check(source[(i * word_bytes) + byte] ==
-                  static_cast<std::byte>(input[i] >> (byte * byte_bits)),
-              "K5 changed source storage");
-      }
-    }
-    for (const auto address : {output_address - 1, output_address + word_count}) {
-      check(std::ranges::all_of(at(address, word_bytes),
-                                [](std::byte byte) { return byte == guard; }),
-            "K5 changed an output guard word");
-    }
+    check_words(input_address, input, "K5 changed source storage");
+    check_guards(
+        output_address - 1, output_address + word_count, guard, "K5 changed an output guard word");
   }
 };
 
 void validate(const sharc::Core &core, const sharc::RunResult &result) {
   const auto registers = core.registers();
-  check(!result.has_fault && result.execution == sharc::ExecutionState::stopped &&
-            result.progress ==
-                sharc::Progress{.instructions = guest_instructions, .base_cycles = guest_cycles} &&
+  check(fixture::completed(result, guest_instructions, guest_cycles) &&
+            result.execution == sharc::ExecutionState::stopped &&
             core.state().progress == result.progress &&
             registers.pc == fixture::code_address + 13 && registers.emuclk == guest_cycles &&
             registers.dag[0][0].index == input_address &&
@@ -139,28 +122,17 @@ void run(sharc::ExecutionMode mode, bench::Options options) {
   storage.initialize(input);
   auto program = kernel();
   program.code.variants[0].layout.ordinary_regions = true;
-  program.code.variants[0].layout.regions.push_back({.space = sharc::MemorySpace::data,
-                                                     .view = sharc::MemoryView::normal_word,
-                                                     .first = 0,
-                                                     .count = std::uint64_t{1} << 32,
-                                                     .storage_id = ram_id,
-                                                     .byte_offset = 0,
-                                                     .byte_stride = word_bytes,
-                                                     .readable = true,
-                                                     .writable = true,
-                                                     .initialized = true});
-  auto memory = program.memory();
-  memory.regions.push_back({.storage_id = ram_id, .bytes = storage.all(), .generation = 1});
-  const auto native = sharc::Core::compile(
-      program.code, {.mode = mode, .memory_mode = options.memory_mode, .callbacks = {}});
+  program.code.variants[0].layout.regions.push_back(
+      fixture::normal_region(0, std::uint64_t{1} << 32, ram_id));
+  auto memory = program.memory(ram_id, storage.all());
+  const auto native = fixture::compile(program.code, mode, options.memory_mode);
   sharc::Core core(memory, mode);
   sharc::Registers registers;
   registers.pc = fixture::code_address;
   registers.dag[0][0].index = input_address;
   registers.dag[0][1].index = output_address;
   registers.pe[0].data[0][4] = std::uint64_t{passes} << raw_shift;
-  core.set_registers(registers);
-  (void)core.install(native, fixture::Program::variant_id);
+  fixture::install(core, native, registers);
   const auto initial = core.save();
   bench::sample(
       {.name = "K5",
@@ -183,12 +155,6 @@ void run(sharc::ExecutionMode mode, bench::Options options) {
 }
 } // namespace
 
-int main(int argc, char **argv) try {
-  const auto options = bench::start(argc, argv);
-  run(sharc::ExecutionMode::strict, options);
-  run(sharc::ExecutionMode::fast_fp32, options);
-} catch (const std::exception &error) {
-
-  std::cerr << error.what() << '\n';
-  return 1;
+int main(int argc, char **argv) {
+  return bench::run_modes(argc, argv, run);
 }

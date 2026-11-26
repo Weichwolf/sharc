@@ -8,8 +8,6 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <exception>
-#include <iostream>
 #include <sharc/core.hpp>
 #include <sharc/memory.hpp>
 #include <span>
@@ -18,7 +16,7 @@
 namespace {
 using fixture::check;
 constexpr unsigned transitions = 1U << 20, handler_count = 8, handler_words = 6;
-constexpr unsigned word_bytes = 4, byte_bits = 8, raw_shift = 8;
+constexpr unsigned word_bytes = 4, raw_shift = 8;
 constexpr std::uint32_t table_address = 0x90000, ram_id = 11;
 constexpr std::uint32_t handlers_address = 0x200, common_address = 0x300;
 constexpr std::uint32_t initial_accumulator = 0x2468ace0, final_accumulator = 0x24d0ace0;
@@ -47,31 +45,6 @@ std::uint64_t move(unsigned destination) {
   constexpr std::uint64_t source_r2 = 0x703f00000000;
   constexpr unsigned destination_shift = 23;
   return source_r2 | (std::uint64_t{destination} << destination_shift);
-}
-
-void append_segment(fixture::Program &program,
-                    std::uint32_t address,
-                    std::span<const std::uint64_t> words) {
-  auto &variant = program.code.variants[0];
-  const auto offset = program.bytes.size();
-  auto &segment =
-      variant.spans.emplace_back(address, sharc::InstructionSet::isa, std::vector<std::uint16_t>{});
-  for (const auto word : words) {
-    fixture::append(segment, word);
-    for (unsigned byte = 0; byte < fixture::Program::word_bytes; ++byte) {
-      program.bytes.push_back(static_cast<std::byte>(word >> (byte * byte_bits)));
-    }
-  }
-  variant.layout.regions.push_back({.space = sharc::MemorySpace::program,
-                                    .view = sharc::MemoryView::instruction,
-                                    .first = address,
-                                    .count = words.size(),
-                                    .storage_id = fixture::Program::storage_id,
-                                    .byte_offset = offset,
-                                    .byte_stride = fixture::Program::word_bytes,
-                                    .readable = true,
-                                    .writable = false,
-                                    .initialized = true});
 }
 
 fixture::Program kernel() {
@@ -107,9 +80,9 @@ fixture::Program kernel() {
                           rts};
     handlers.insert(handlers.end(), body.begin(), body.end());
   }
-  append_segment(program, handlers_address, handlers);
+  program.add_span(handlers_address, handlers);
   const std::array common{rotate_r2_r0_r6, fixed(bit_xor, 1, 1, 2), fixture::add(1, 1, 3), rts};
-  append_segment(program, common_address, common);
+  program.add_span(common_address, common);
   return program;
 }
 
@@ -125,29 +98,13 @@ class Storage : public bench::WordSpace {
 public:
   void initialize(const Table &input) const {
     std::ranges::fill(at(table_address - 1, sizeof(input) + (std::size_t{2} * word_bytes)), guard);
-    auto destination = at(table_address, sizeof(input));
-    for (std::size_t word = 0; word < input.size(); ++word) {
-      for (unsigned byte = 0; byte < word_bytes; ++byte) {
-        destination[(word * word_bytes) + byte] =
-            static_cast<std::byte>(input[word] >> (byte * byte_bits));
-      }
-    }
+    write_words(table_address, input);
   }
 
   void validate(const Table &input) const {
-    const auto source = at(table_address, sizeof(input));
-    for (std::size_t word = 0; word < input.size(); ++word) {
-      for (unsigned byte = 0; byte < word_bytes; ++byte) {
-        check(source[(word * word_bytes) + byte] ==
-                  static_cast<std::byte>(input[word] >> (byte * byte_bits)),
-              "K4 modified a table word");
-      }
-    }
-    for (const auto address : {table_address - 1, table_address + handler_count}) {
-      check(std::ranges::all_of(at(address, word_bytes),
-                                [](std::byte byte) { return byte == guard; }),
-            "K4 changed a table guard");
-    }
+    check_words(table_address, input, "K4 modified a table word");
+    check_guards(
+        table_address - 1, table_address + handler_count, guard, "K4 changed a table guard");
   }
 };
 
@@ -177,13 +134,9 @@ void validate(const sharc::Core &core, const sharc::RunResult &result) {
   expected.dag[0][8].index = handlers_address + (answer.last_handler * handler_words);
   expected.pc_stack[0] = (fixture::code_address + 6) | call_tag;
   expected.pc_stack[1] = (handlers_address + (answer.last_handler * handler_words) + 5) | call_tag;
-  expected.pc = fixture::code_address + 9;
-  expected.faddr = expected.pc + 4;
-  expected.daddr = expected.pc + 2;
-  expected.emuclk = cycles;
-  check(!result.has_fault && result.execution == sharc::ExecutionState::stopped &&
-            core.registers() == expected &&
-            result.progress == sharc::Progress{.instructions = guests, .base_cycles = cycles} &&
+  fixture::boundary(expected, {.pc = fixture::code_address + 9, .clock = cycles});
+  check(fixture::completed(result, guests, cycles) &&
+            result.execution == sharc::ExecutionState::stopped && core.registers() == expected &&
             core.state().progress == result.progress,
         "K4 complete registers, output, stack, pointers, flags or exact progress differ");
 }
@@ -202,23 +155,13 @@ void run(sharc::ExecutionMode mode, bench::Options options) {
   storage.initialize(input);
   storage.protect_read_only();
   auto program = kernel();
-  program.code.variants[0].layout.regions.push_back({.space = sharc::MemorySpace::data,
-                                                     .view = sharc::MemoryView::normal_word,
-                                                     .first = 0,
-                                                     .count = std::uint64_t{1} << 32,
-                                                     .storage_id = ram_id,
-                                                     .byte_offset = 0,
-                                                     .byte_stride = word_bytes,
-                                                     .readable = true,
-                                                     .writable = false,
-                                                     .initialized = true});
-  auto memory = program.memory();
-  memory.regions.push_back({.storage_id = ram_id, .bytes = storage.all(), .generation = 1});
-  const auto native = sharc::Core::compile(
-      program.code, {.mode = mode, .memory_mode = options.memory_mode, .callbacks = {}});
+  auto region = fixture::normal_region(0, std::uint64_t{1} << 32, ram_id);
+  region.writable = false;
+  program.code.variants[0].layout.regions.push_back(region);
+  auto memory = program.memory(ram_id, storage.all());
+  const auto native = fixture::compile(program.code, mode, options.memory_mode);
   sharc::Core core(memory, mode);
-  core.set_registers(registers());
-  (void)core.install(native, fixture::Program::variant_id);
+  fixture::install(core, native, registers());
   const auto checkpoint = core.save();
   bench::sample(
       {.name = "K4",
@@ -238,12 +181,6 @@ void run(sharc::ExecutionMode mode, bench::Options options) {
 }
 } // namespace
 
-int main(int argc, char **argv) try {
-  const auto options = bench::start(argc, argv);
-  run(sharc::ExecutionMode::strict, options);
-  run(sharc::ExecutionMode::fast_fp32, options);
-} catch (const std::exception &error) {
-
-  std::cerr << error.what() << '\n';
-  return 1;
+int main(int argc, char **argv) {
+  return bench::run_modes(argc, argv, run);
 }

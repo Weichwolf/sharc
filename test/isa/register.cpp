@@ -19,7 +19,6 @@ constexpr unsigned shadow_first = 0x50, true_condition = 31, i8_code = 0x18;
 constexpr std::uint64_t extension = 0xab;
 constexpr std::uint32_t old_sticky = 0xa5000040;
 constexpr std::uint64_t clock_seed = 123;
-constexpr std::array modes{sharc::ExecutionMode::strict, sharc::ExecutionMode::fast_fp32};
 constexpr std::array bank_bits{4U, 3U, 6U, 5U};
 
 struct Move {
@@ -88,10 +87,7 @@ void apply(const sharc::Registers &before, Move move, sharc::Registers &state) {
 }
 
 void advance(sharc::Registers &state) {
-  ++state.pc;
-  state.faddr = state.pc + 4;
-  state.daddr = state.pc + 2;
-  ++state.emuclk;
+  fixture::boundary(state, {.pc = state.pc + 1, .clock = state.emuclk + 1});
 }
 
 sharc::Registers initial(unsigned configuration) {
@@ -124,8 +120,8 @@ void verify_moves(const std::vector<Move> &moves) {
   words.reserve(moves.size());
   for (const auto &move : moves) { words.push_back(encoding(move)); }
   fixture::Program program(words);
-  for (const auto mode : modes) {
-    const auto native = sharc::Core::compile(program.code, {.mode = mode, .callbacks = {}});
+  for (const auto mode : fixture::numeric_modes) {
+    const auto native = fixture::compile(program.code, mode);
     sharc::Core core(program.memory(), mode);
     (void)core.install(native, fixture::Program::variant_id);
     for (unsigned configuration = 0; configuration < 512; ++configuration) {
@@ -138,8 +134,7 @@ void verify_moves(const std::vector<Move> &moves) {
         advance(expected);
         core.restore(saved);
         const auto result = core.run(count);
-        check(!result.has_fault && core.registers() == expected &&
-                  result.progress == sharc::Progress{.instructions = count, .base_cycles = count},
+        check(fixture::completed(result, count, count) && core.registers() == expected,
               "raw register move/swap lost an old source, lane, physical bank or complete prefix");
       }
     }
@@ -211,8 +206,8 @@ void parallel_priority() {
   for (const auto &move : moves) {
     const std::array words{encoding(move) | add_r0_r2_r3};
     fixture::Program program(words);
-    for (const auto mode : modes) {
-      const auto native = sharc::Core::compile(program.code, {.mode = mode, .callbacks = {}});
+    for (const auto mode : fixture::numeric_modes) {
+      const auto native = fixture::compile(program.code, mode);
       sharc::Core core(program.memory(), mode);
       (void)core.install(native, fixture::Program::variant_id);
       for (unsigned configuration = 0; configuration < 512; ++configuration) {
@@ -234,8 +229,8 @@ void immediate_registers(unsigned quarter) {
   words.reserve(registers.size());
   for (const auto reg : registers) { words.push_back(fixture::immediate(reg, value)); }
   fixture::Program program(words);
-  for (const auto mode : modes) {
-    const auto native = sharc::Core::compile(program.code, {.mode = mode, .callbacks = {}});
+  for (const auto mode : fixture::numeric_modes) {
+    const auto native = fixture::compile(program.code, mode);
     sharc::Core core(program.memory(), mode);
     (void)core.install(native, fixture::Program::variant_id);
     for (unsigned configuration = 0; configuration < 512; ++configuration) {
@@ -251,8 +246,7 @@ void immediate_registers(unsigned quarter) {
         advance(expected);
         core.restore(saved);
         const auto result = core.run(count);
-        check(!result.has_fault && core.registers() == expected &&
-                  result.progress == sharc::Progress{.instructions = count, .base_cycles = count},
+        check(fixture::completed(result, count, count) && core.registers() == expected,
               "DAG/S-register immediate lost its width, bank or prefix");
       }
     }
@@ -303,8 +297,7 @@ std::vector<sharc::Registers> dependency_states(DependencyCase input) {
     expected.pe[0].data[0][1] = std::uint64_t{dependency_word} << 8;
   } else {
     expected.pc = base + 5;
-    expected.faddr = expected.pc + 4;
-    expected.daddr = expected.pc + 2;
+    fixture::fetch_addresses(expected);
   }
   states.push_back(expected);
   advance(expected);
@@ -322,8 +315,7 @@ void exercise_dependency(sharc::Core &core,
     core.restore(saved);
     const auto result = core.run(count);
     const auto cycles = states[count].emuclk - clock_seed;
-    check(!result.has_fault && core.registers() == states[count] &&
-              result.progress == sharc::Progress{.instructions = count, .base_cycles = cycles},
+    check(fixture::completed(result, count, cycles) && core.registers() == states[count],
           "DAG load dependency changed the wrong prefix, value or cycle count");
     resumed.restore(core.save());
     if (count < total) {
@@ -370,23 +362,16 @@ void dependency_case(DependencyCase input) {
     ram[byte] = static_cast<std::byte>(dependency_word >> (byte * 8));
   }
   if (input.memory) {
-    program.code.variants[0].layout.regions.push_back({.space = sharc::MemorySpace::data,
-                                                       .view = sharc::MemoryView::normal_word,
-                                                       .first = dependency_ram,
-                                                       .count = 1,
-                                                       .storage_id = dependency_ram_id,
-                                                       .byte_offset = 0,
-                                                       .byte_stride = 4,
-                                                       .readable = true,
-                                                       .writable = false,
-                                                       .initialized = true});
+    auto region = fixture::normal_region(dependency_ram, 1, dependency_ram_id);
+    region.writable = false;
+    program.code.variants[0].layout.regions.push_back(region);
   }
   auto memory = program.memory();
   if (input.memory) {
     memory.regions.push_back({.storage_id = dependency_ram_id, .bytes = ram, .generation = 1});
   }
-  for (const auto mode : modes) {
-    const auto native = sharc::Core::compile(program.code, {.mode = mode, .callbacks = {}});
+  for (const auto mode : fixture::numeric_modes) {
+    const auto native = fixture::compile(program.code, mode);
     sharc::Core core(memory, mode);
     sharc::Core resumed(memory, mode);
     const auto states = dependency_states(input);
@@ -412,8 +397,8 @@ void two_pending_loads() {
         std::uint64_t{0}};
     fixture::Program program(words);
     program.code.variants[0].entries.push_back(base + 5);
-    for (const auto mode : modes) {
-      const auto native = sharc::Core::compile(program.code, {.mode = mode, .callbacks = {}});
+    for (const auto mode : fixture::numeric_modes) {
+      const auto native = fixture::compile(program.code, mode);
       sharc::Core core(program.memory(), mode);
       sharc::Core resumed(program.memory(), mode);
       (void)core.install(native, fixture::Program::variant_id);
@@ -432,8 +417,7 @@ void two_pending_loads() {
       advance(expected);
       expected.emuclk += matching ? 5 : 4;
       expected.pc = base + 5;
-      expected.faddr = expected.pc + 4;
-      expected.daddr = expected.pc + 2;
+      fixture::fetch_addresses(expected);
       states.push_back(expected);
       advance(expected);
       states.push_back(expected);
@@ -448,13 +432,10 @@ void refused_register_fields() {
   for (const auto bit : reserved) {
     const auto word = encoding({.source = shadow_first, .destination = 0, .swap = true}) |
                       (std::uint64_t{1} << bit);
-    try {
-      (void)sharc::Core::lower(fixture::image(sharc::InstructionSet::isa, word));
-      check(false, "reserved raw40-swap field was accepted");
-    } catch (const sharc::PreparationError &error) {
-      check(error.fault().reason == sharc::FaultReason::invalid_encoding,
-            "reserved raw40-swap field lost its encoding refusal");
-    }
+    const auto fault = fixture::refusal(fixture::image(sharc::InstructionSet::isa, word),
+                                        "reserved raw40-swap field was accepted");
+    check(fault.reason == sharc::FaultReason::invalid_encoding,
+          "reserved raw40-swap field lost its encoding refusal");
   }
   fixture::throws<sharc::PreparationError>(
       [&] {

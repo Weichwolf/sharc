@@ -6,7 +6,6 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
-#include <exception>
 #include <iostream>
 #include <limits>
 #include <llvm/Support/TargetSelect.h>
@@ -116,24 +115,20 @@ void qualify(sharc::ExecutionMode mode) {
     sharc::Core core(program.memory(), mode);
     sharc::Registers registers;
     registers.pc = variant == fixture::Program::variant_id ? 0 : last_pc;
-    core.set_registers(registers);
-    (void)core.install(native, variant);
+    fixture::install(core, native, registers, variant);
     const auto run = core.run(1);
-    check(!run.has_fault && run.progress == sharc::Progress{.instructions = 1, .base_cycles = 1} &&
+    check(fixture::completed(run, 1, 1) &&
               core.registers().pe[0].data[0][0] == std::uint64_t{result} << 8,
           "bound image lost code lifetime after releasing fault-map input buffers");
   }
 }
 } // namespace
 
-int main() try {
-  check(!llvm::InitializeNativeTarget() && !llvm::InitializeNativeTargetAsmPrinter(),
-        "LLVM unavailable");
-  qualify(sharc::ExecutionMode::strict);
-  qualify(sharc::ExecutionMode::fast_fp32);
-  std::cout << "native fault-map binding passed\n";
-} catch (const std::exception &error) {
-
-  std::cerr << error.what() << '\n';
-  return 1;
+int main() {
+  return fixture::run_test([] {
+    check(!llvm::InitializeNativeTarget() && !llvm::InitializeNativeTargetAsmPrinter(),
+          "LLVM unavailable");
+    for (const auto mode : fixture::numeric_modes) { qualify(mode); }
+    std::cout << "native fault-map binding passed\n";
+  });
 }

@@ -55,16 +55,7 @@ prepare(unsigned seed, const sharc::CompileOptions &options, std::barrier<> *gat
   const std::array other_words{
       fixture::immediate(0, first + seed + variant_delta), words[1], words[2], words[3]};
   fixture::Program other_program(other_words);
-  program.code.variants[0].layout.regions.push_back({.space = sharc::MemorySpace::data,
-                                                     .view = sharc::MemoryView::normal_word,
-                                                     .first = ram_address,
-                                                     .count = 1,
-                                                     .storage_id = ram_id,
-                                                     .byte_offset = 0,
-                                                     .byte_stride = 4,
-                                                     .readable = true,
-                                                     .writable = true,
-                                                     .initialized = true});
+  program.code.variants[0].layout.regions.push_back(fixture::normal_region(ram_address, 1, ram_id));
   auto variant = other_program.code.variants[0];
   variant.id = other_variant;
   variant.layout.regions[0].storage_id = other_storage;
@@ -92,11 +83,10 @@ prepare(unsigned seed, const sharc::CompileOptions &options, std::barrier<> *gat
   sharc::Registers registers;
   registers.pc = fixture::code_address;
   registers.dag[0][0].index = ram_address;
-  core.set_registers(registers);
-  (void)core.install(native, use_other ? other_variant : fixture::Program::variant_id);
+  fixture::install(
+      core, native, registers, use_other ? other_variant : fixture::Program::variant_id);
   const auto run = core.run(words.size());
-  check(!run.has_fault &&
-            run.progress == sharc::Progress{.instructions = words.size(), .base_cycles = 4} &&
+  check(fixture::completed(run, words.size(), 4) &&
             core.registers().pe[0].data[0][2] == (std::uint64_t{expected} << byte_bits),
         "parallel installed image lost independently expected arithmetic or progress");
   for (unsigned byte = 0; byte < ram.size(); ++byte) {
@@ -154,11 +144,9 @@ void qualify() {
 }
 } // namespace
 
-int main() try {
-  qualify();
-  std::cout << "concurrent preparation passed\n";
-} catch (const std::exception &error) {
-
-  std::cerr << error.what() << '\n';
-  return 1;
+int main() {
+  return fixture::run_test([] {
+    qualify();
+    std::cout << "concurrent preparation passed\n";
+  });
 }

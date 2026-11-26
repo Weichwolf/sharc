@@ -44,6 +44,7 @@ namespace fixture {
 struct ConsumerEffects {
   void (*probe)() noexcept {};
   std::uintptr_t fault_address{};
+  bool wrap_exports{};
 };
 
 struct Provider {
@@ -122,9 +123,22 @@ inline void inject_effects(llvm::Module &module,
   }
   for (const auto &name : image.exports()) {
     auto *function = module.getFunction(name);
+    check(function != nullptr, "consumer did not find semantic export");
+    if (effects.wrap_exports) {
+      function->setName(name + "_guest");
+      auto *wrapper = llvm::Function::Create(
+          function->getFunctionType(), llvm::GlobalValue::ExternalLinkage, name, module);
+      llvm::IRBuilder<> body(llvm::BasicBlock::Create(module.getContext(), "entry", wrapper));
+      std::vector<llvm::Value *> arguments;
+      for (auto &argument : wrapper->args()) { arguments.push_back(&argument); }
+      body.CreateCall(function, arguments);
+      body.CreateRetVoid();
+      function = wrapper;
+    }
     llvm::IRBuilder<> builder(&*function->getEntryBlock().getFirstInsertionPt());
-    builder.SetCurrentDebugLocation(
-        llvm::DILocation::get(module.getContext(), 0, 0, function->getSubprogram()));
+    if (auto *scope = function->getSubprogram()) {
+      builder.SetCurrentDebugLocation(llvm::DILocation::get(module.getContext(), 0, 0, scope));
+    }
     if (probe != nullptr) { builder.CreateCall(probe); }
     if (effects.fault_address != 0) {
       auto *pointer =
@@ -185,7 +199,7 @@ inline sharc::NativeSymbols link(const sharc::SemanticImage &image,
   auto module = std::move(*parsed);
   module->setDataLayout(engine->getDataLayout());
   module->setTargetTriple(engine->getTargetTriple().str());
-  if (effects.probe != nullptr || effects.fault_address != 0) {
+  if (effects.probe != nullptr || effects.fault_address != 0 || effects.wrap_exports) {
     inject_effects(*module, *engine, image, effects);
   }
   if (strip) { llvm::StripDebugInfo(*module); }

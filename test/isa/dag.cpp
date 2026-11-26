@@ -66,10 +66,7 @@ void apply(sharc::Registers &registers, const Modify &op) {
     registers.pe[0].stky |= 1U << (sticky_bit + (op.source / 8));
     registers.irptl |= 1U << (interrupt_bit + (op.source / 8));
   }
-  ++registers.pc;
-  registers.faddr = registers.pc + 4;
-  registers.daddr = registers.pc + 2;
-  ++registers.emuclk;
+  fixture::boundary(registers, {.pc = registers.pc + 1, .clock = registers.emuclk + 1});
 }
 
 struct Input {
@@ -120,8 +117,7 @@ void verify(fixture::Program &program,
             sharc::Registers expected,
             const std::vector<Modify> &operations) {
   sharc::Core core(program.memory(), mode);
-  core.set_registers(expected);
-  (void)core.install(native, fixture::Program::variant_id);
+  fixture::install(core, native, expected);
   const auto saved = core.save();
   std::uint64_t count{};
   for (const auto &op : operations) {
@@ -130,9 +126,7 @@ void verify(fixture::Program &program,
     for (const bool cycles : {false, true}) {
       core.restore(saved);
       const auto result = cycles ? core.run_until(count) : core.run(count);
-      check(!result.has_fault &&
-                result.progress == sharc::Progress{.instructions = count, .base_cycles = count} &&
-                core.registers() == expected,
+      check(fixture::completed(result, count, count) && core.registers() == expected,
             "DAG modify/reverse source, destination, banks, flags or exact prefix differs");
     }
   }
@@ -152,7 +146,7 @@ void index_matrix(sharc::ExecutionMode mode) {
         words.push_back(encoding(op));
       }
       fixture::Program program(words);
-      const auto native = sharc::Core::compile(program.code, {.mode = mode, .callbacks = {}});
+      const auto native = fixture::compile(program.code, mode);
       for (unsigned flags = 0; flags < 64; ++flags) {
         for (unsigned configuration = 0; configuration < 3; ++configuration) {
           verify(program,
@@ -193,7 +187,7 @@ void special_buffers(sharc::ExecutionMode mode) {
                         .reverse = reverse};
         const std::array words{encoding(op)};
         fixture::Program program(words);
-        const auto native = sharc::Core::compile(program.code, {.mode = mode, .callbacks = {}});
+        const auto native = fixture::compile(program.code, mode);
         verify_special(program, native, mode, op);
       }
     }
@@ -202,7 +196,7 @@ void special_buffers(sharc::ExecutionMode mode) {
 } // namespace
 
 void fixture::dag_addressing() {
-  for (const auto mode : {sharc::ExecutionMode::strict, sharc::ExecutionMode::fast_fp32}) {
+  for (const auto mode : fixture::numeric_modes) {
     index_matrix(mode);
     special_buffers(mode);
   }

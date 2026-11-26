@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: GPL-3.0-only
 """Authored condition truth tables and conditional numeric lane expectations."""
 
+from itertools import product as cartesian_product
 from dataclasses import asdict
 
+from expectation_check import require, require_raises
 from reference import (
     IntegerResult, LaneCondition, Mode, Unqualified, condition, lane_condition, predicated_alu,
 )
@@ -43,11 +45,6 @@ CASES = [
 ]
 
 
-def require(actual, expected, context):
-    if actual != expected:
-        raise AssertionError((context, expected, actual))
-
-
 def anchors():
     records = []
     for name, kind, operation, options, expected in CASES:
@@ -73,12 +70,11 @@ def predicate_lattice():
                         (name, index, noise))
                 count += 1
     for name, bit in FLAG_BITS.items():
-        for value in (False, True):
-            for noise in (0, 0xFFFFFFFF, 0xA5C30000, 0x5A3CFFFF):
-                status = (noise & ~bit) | (bit if value else 0)
-                require(condition(name, status), value, (name, status))
-                require(condition("not_" + name, status), not value, (name, status))
-                count += 2
+        for value, noise in cartesian_product((False, True), (0, 0xFFFFFFFF, 0xA5C30000, 0x5A3CFFFF)):
+            status = (noise & ~bit) | (bit if value else 0)
+            require(condition(name, status), value, (name, status))
+            require(condition("not_" + name, status), not value, (name, status))
+            count += 2
     return count
 
 
@@ -98,20 +94,15 @@ def lane_lattice():
         LaneCondition((True, False), True, True), LaneCondition((True, False), True, True),
     )
     for mnemonic, status in inputs.items():
-        for index in range(4):
-            for saturate in (False, True):
-                for simd, table in ((False, sisd_table), (True, simd_table)):
-                    require(lane_condition(mnemonic, (status[index // 2], status[index % 2]),
-                                           simd=simd, saturate=saturate), table[index],
-                            (mnemonic, index, simd, saturate))
-                    count += 1
+        for index, saturate in cartesian_product(range(4), (False, True)):
+            for simd, table in ((False, sisd_table), (True, simd_table)):
+                require(lane_condition(mnemonic, (status[index // 2], status[index % 2]),
+                                       simd=simd, saturate=saturate), table[index],
+                        (mnemonic, index, simd, saturate))
+                count += 1
     return count
 
 
 def explicit_gaps():
     for name in ("flag0_in", "not_lce", "bm", "ai"):
-        try:
-            condition(name, 0)
-        except Unqualified:
-            continue
-        raise AssertionError("unmodeled external/system condition accepted")
+        require_raises(Unqualified, condition, 'unmodeled external/system condition accepted', name, 0)

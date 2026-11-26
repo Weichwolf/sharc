@@ -145,10 +145,8 @@ void expected(sharc::Registers &registers,
       put(ram, base + 11, static_cast<std::uint32_t>(registers.pe[1].data[low][1] >> byte_bits));
     }
   }
-  registers.pc += completed;
-  registers.faddr = registers.pc + 4;
-  registers.daddr = registers.pc + 2;
-  registers.emuclk += completed;
+  fixture::boundary(registers,
+                    {.pc = registers.pc + completed, .clock = registers.emuclk + completed});
 }
 
 void memory_index(unsigned index, sharc::ExecutionMode numeric_mode) {
@@ -159,24 +157,17 @@ void memory_index(unsigned index, sharc::ExecutionMode numeric_mode) {
                         encoding({.reg = 1, .index = index, .write = true, .displacement = 10})};
   fixture::Program program(code);
   auto &variant = program.code.variants[0];
-  variant.layout.regions.push_back(
-      {.space = index < 8 ? sharc::MemorySpace::data : sharc::MemorySpace::program,
-       .view = sharc::MemoryView::normal_word,
-       .first = ram_address,
-       .count = words.size(),
-       .storage_id = ram_id,
-       .byte_offset = offset,
-       .byte_stride = stride,
-       .readable = true,
-       .writable = true,
-       .initialized = true});
+  auto region = fixture::normal_region(ram_address, words.size(), ram_id);
+  region.space = index < 8 ? sharc::MemorySpace::data : sharc::MemorySpace::program;
+  region.byte_offset = offset;
+  region.byte_stride = stride;
+  variant.layout.regions.push_back(region);
   constexpr unsigned ram_size = 128;
   std::vector<std::byte> ram(ram_size, padding);
   for (unsigned i = 0; i < words.size(); ++i) { put(ram, i, words[i]); }
   const auto original_ram = ram;
-  auto memory = program.memory();
-  memory.regions.push_back({.storage_id = ram_id, .bytes = ram, .generation = 1});
-  const auto native = sharc::Core::compile(program.code, {.mode = numeric_mode, .callbacks = {}});
+  auto memory = program.memory(ram_id, ram);
+  const auto native = fixture::compile(program.code, numeric_mode);
   for (unsigned flags = 0; flags < 32; ++flags) {
     const auto mode = ((flags & 1) << low_data_bit) | (((flags >> 1) & 1) << high_data_bit) |
                       (((flags >> 2) & 1) << dag_bank_bits[index]) |
@@ -184,8 +175,7 @@ void memory_index(unsigned index, sharc::ExecutionMode numeric_mode) {
                       (((flags >> 4) & 1) << (index == 9 ? broadcast9_bit : broadcast1_bit));
     sharc::Core core(memory, numeric_mode);
     const auto registers = initial({.index = index, .mode = mode});
-    core.set_registers(registers);
-    (void)core.install(native, fixture::Program::variant_id);
+    fixture::install(core, native, registers);
     const auto saved = core.save();
     for (unsigned count = 1; count <= code.size(); ++count) {
       auto final_registers = registers;
@@ -195,9 +185,8 @@ void memory_index(unsigned index, sharc::ExecutionMode numeric_mode) {
         core.restore(saved);
         std::ranges::copy(original_ram, ram.begin());
         const auto result = cycle_bound ? core.run_until(count) : core.run(count);
-        check(!result.has_fault &&
-                  result.progress == sharc::Progress{.instructions = count, .base_cycles = count} &&
-                  core.registers() == final_registers && ram == final_ram,
+        check(fixture::completed(result, count, count) && core.registers() == final_registers &&
+                  ram == final_ram,
               "pre-indexed memory changed data, extension, banks, flags, I or padding");
       }
     }
@@ -208,9 +197,7 @@ void memory_index(unsigned index, sharc::ExecutionMode numeric_mode) {
 namespace fixture {
 void memory_access() {
   for (unsigned index = 0; index < 16; ++index) {
-    for (const auto mode : {sharc::ExecutionMode::strict, sharc::ExecutionMode::fast_fp32}) {
-      memory_index(index, mode);
-    }
+    for (const auto mode : fixture::numeric_modes) { memory_index(index, mode); }
   }
 }
 } // namespace fixture
