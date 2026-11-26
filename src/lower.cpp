@@ -970,7 +970,7 @@ private:
   void check_loop_end(const Values &values, const Instruction &op, bool partial);
 
   struct ShortLookahead {
-    llvm::Value *fetch{}, *decode{};
+    llvm::Value *fetch{}, *decode{}, *decode_lag{};
   };
 
   struct ShortRetirement {
@@ -978,12 +978,14 @@ private:
   };
 
   struct ShortFetchWindow {
-    llvm::Value *before{}, *after{}, *old_status{};
+    llvm::Value *before{}, *after{}, *old_status{}, *decode_lag{};
   };
 
   void write_short_addresses(ShortLookahead addresses, llvm::Value *live);
-  ShortLookahead
-  project_short_parent(ShortLookahead stages, const LoopShape &child, const LoopShape &parent);
+  ShortLookahead project_short_parent(ShortLookahead stages,
+                                      const LoopShape &child,
+                                      const LoopShape &parent,
+                                      llvm::Value *resumes);
   llvm::Value *short_flag(llvm::Value *descriptor, std::uint64_t mask);
   llvm::Value *short_active(const LoopShape &shape, llvm::Value *left);
   void setup_short_loop(const LoopShape &shape, llvm::Value *count);
@@ -1004,7 +1006,10 @@ private:
   llvm::Value *short_loop_refill(const LoopShape &shape, llvm::Value *done);
   llvm::Value *
   short_stage(const LoopShape &shape, std::uint32_t pc, llvm::Value *left, unsigned lag);
-  ShortLookahead short_lookahead(std::uint32_t pc, const LoopShape &shape, llvm::Value *left);
+  ShortLookahead short_lookahead(std::uint32_t pc,
+                                 const LoopShape &shape,
+                                 llvm::Value *left,
+                                 bool saved_parent = false);
   void short_loop_observation(Values &values,
                               const Instruction &op,
                               const LoopShape &shape,
@@ -2378,7 +2383,7 @@ void Lowering::plan_overlapping_loop_fetches(const LoopMap &shapes) {
     for (unsigned gap = 1; gap <= loop_fetch_distance; ++gap) {
       const auto parent = shapes.find((end + gap) & maximum_pc);
       if (parent == shapes.end()) { continue; }
-      if (overlapping_short_tail(child, parent->second)) {
+      if (!parent->second.short_body() && overlapping_short_tail(child, parent->second)) {
         short_parents_[end].push_back(parent->second);
       }
       if (!overlapping_refill(child, parent->second)) { continue; }
@@ -2494,8 +2499,13 @@ void Lowering::resume_short_parent(Values &values,
   write_short(short_remaining, left);
   write_short(short_descriptor, descriptor);
   write_short(short_parent_remaining, builder_.getInt64(0));
-  write_short(short_fetch_progress, builder_.getInt64(0));
-  write_short_addresses(short_lookahead(child.end, parent, left), builder_.getTrue());
+  llvm::Value *progress = builder_.getInt64(0);
+  if (short_parents_.contains(child.end)) {
+    const auto gap = (parent.end - child.end) & maximum_pc;
+    progress = builder_.CreateBinaryIntrinsic(
+        llvm::Intrinsic::usub_sat, short_word(short_fetch_progress), builder_.getInt64(gap));
+  }
+  write_short(short_fetch_progress, progress);
   jump(next, values);
   builder_.SetInsertPoint(next.block);
   values = next.values();
@@ -2659,8 +2669,10 @@ Lowering::short_stage(const LoopShape &shape, std::uint32_t pc, llvm::Value *lef
       builder_.CreateICmpUGT(left, builder_.getInt64(lag)), builder_.getInt64(body_pc), following);
 }
 
-Lowering::ShortLookahead
-Lowering::short_lookahead(std::uint32_t pc, const LoopShape &shape, llvm::Value *left) {
+Lowering::ShortLookahead Lowering::short_lookahead(std::uint32_t pc,
+                                                   const LoopShape &shape,
+                                                   llvm::Value *left,
+                                                   bool saved_parent) {
   if (!shape.counted()) {
     auto *repeat = builder_.getInt64(short_unbounded);
     auto *fetch = short_stage(shape, pc, repeat, loop_fetch_distance);
@@ -2670,7 +2682,7 @@ Lowering::short_lookahead(std::uint32_t pc, const LoopShape &shape, llvm::Value 
         builder_.CreateSelect(redirect, short_stage(shape, pc, left, loop_decode_distance), fetch);
     return {.fetch = fetch, .decode = decode};
   }
-  auto *descriptor = short_word(short_descriptor);
+  auto *descriptor = short_word(saved_parent ? short_parent_descriptor : short_descriptor);
   auto *fetch = short_stage(shape, pc, left, loop_fetch_distance);
   auto *decode =
       short_stage(shape, pc, left, shape.length == loop_fetch_distance ? 1U : loop_decode_distance);
@@ -2703,21 +2715,27 @@ void Lowering::short_loop_observation(Values &values,
   const auto [left, old_status] = retirement;
   auto stages = short_lookahead(op.address, shape, left);
   auto *live = builder_.CreateICmpNE(left, builder_.getInt64(0));
-  const auto parent = short_nested_.find(shape.end);
-  if (parent != short_nested_.end()) {
-    stages = project_short_parent(stages, shape, parent->second);
-  } else if (short_parents_.contains(shape.end)) {
+  const bool has_ancestors = short_parents_.contains(shape.end);
+  if (has_ancestors) {
     stages.fetch = builder_.CreateSelect(
         live, stages.fetch, builder_.getInt64(shape.end + 1 + loop_fetch_distance));
-    stages = overlapping_short_fetches(values, shape, stages, old_status);
   }
+  const auto parent = short_nested_.find(shape.end);
+  if (parent != short_nested_.end()) {
+    auto *saved = builder_.CreateICmpNE(short_word(short_parent_remaining), builder_.getInt64(0));
+    auto *resumes = builder_.CreateAnd(builder_.CreateNot(live), saved);
+    stages = project_short_parent(stages, shape, parent->second, resumes);
+    live = builder_.CreateOr(live, resumes);
+  }
+  if (has_ancestors) { stages = overlapping_short_fetches(values, shape, stages, old_status); }
   if (shape.length == loop_fetch_distance) { live = builder_.getTrue(); }
   write_short_addresses(stages, live);
 }
 
 Lowering::ShortLookahead Lowering::project_short_parent(ShortLookahead stages,
                                                         const LoopShape &child,
-                                                        const LoopShape &parent) {
+                                                        const LoopShape &parent,
+                                                        llvm::Value *resumes) {
   const auto gap = (parent.end - child.end) & maximum_pc;
   auto *left = short_word(short_parent_remaining);
   auto *distance =
@@ -2738,11 +2756,18 @@ Lowering::ShortLookahead Lowering::project_short_parent(ShortLookahead stages,
   auto *index = builder_.CreateSub(distance, builder_.getInt64(1));
   auto *decode = builder_.CreateAnd(
       wrap, builder_.CreateICmpUGT(distance, builder_.getInt64(gap + loop_decode_distance)));
-  return {.fetch = builder_.CreateSelect(wrap, address_at(index), stages.fetch),
-          .decode = builder_.CreateSelect(
-              decode,
-              address_at(builder_.CreateSub(index, builder_.getInt64(loop_decode_distance))),
-              stages.decode)};
+  auto *fetch = builder_.CreateSelect(wrap, address_at(index), stages.fetch);
+  auto *decoded = builder_.CreateSelect(
+      decode,
+      address_at(builder_.CreateSub(index, builder_.getInt64(loop_decode_distance))),
+      stages.decode);
+  // At the handoff the restored buffer owns both visible addresses.
+  const auto restored = short_lookahead(child.end, parent, left, true);
+  const auto lag = parent.length == loop_fetch_distance ? 3U : loop_decode_distance;
+  return {.fetch = builder_.CreateSelect(resumes, restored.fetch, fetch),
+          .decode = builder_.CreateSelect(resumes, restored.decode, decoded),
+          .decode_lag = builder_.CreateSelect(
+              resumes, builder_.getInt64(lag), builder_.getInt64(loop_decode_distance))};
 }
 
 llvm::Value *Lowering::short_fetch_crossed(ShortFetchWindow window, unsigned offset) {
@@ -2765,12 +2790,10 @@ Lowering::ShortLookahead Lowering::redirect_short_parent(ShortLookahead stages,
         builder_.CreateAdd(builder_.getInt64(parent.end - loop_decode_distance), delta);
     fetch = builder_.CreateSelect(terminating, following, fetch);
   }
-  constexpr unsigned normal_decode_lag = loop_decode_distance;
-  const unsigned decode_lag = child.length == loop_fetch_distance ? 3U : normal_decode_lag;
   auto *decoder_redirected =
-      builder_.CreateAnd(selected, builder_.CreateICmpUGT(delta, builder_.getInt64(decode_lag)));
-  auto *decode = builder_.CreateSub(builder_.CreateAdd(builder_.getInt64(parent.start), delta),
-                                    builder_.getInt64(decode_lag + 1));
+      builder_.CreateAnd(selected, builder_.CreateICmpUGT(delta, window.decode_lag));
+  auto *decode = builder_.CreateSub(builder_.CreateAdd(builder_.getInt64(parent.start - 1), delta),
+                                    window.decode_lag);
   return {.fetch = builder_.CreateSelect(selected, fetch, stages.fetch),
           .decode = builder_.CreateSelect(decoder_redirected, decode, stages.decode)};
 }
@@ -2783,10 +2806,15 @@ Lowering::ShortLookahead Lowering::overlapping_short_fetches(Values &values,
       builder_.CreateAnd(builder_.CreateSub(stages.fetch, builder_.getInt64(shape.end)),
                          builder_.getInt64(maximum_pc));
   auto *linear = builder_.CreateICmpULE(distance, builder_.getInt64(loop_fetch_distance + 1));
+  auto *lag = stages.decode_lag;
+  if (lag == nullptr) {
+    lag = builder_.getInt64(shape.length == loop_fetch_distance ? 3U : loop_decode_distance);
+  }
   const ShortFetchWindow window{.before = short_word(short_fetch_progress),
                                 .after =
                                     builder_.CreateSelect(linear, distance, builder_.getInt64(0)),
-                                .old_status = old_status};
+                                .old_status = old_status,
+                                .decode_lag = lag};
   write_short(short_fetch_progress, window.after);
   llvm::Value *redirected = builder_.getFalse();
   for (const auto &parent : short_parents_.at(shape.end)) {
@@ -4237,19 +4265,6 @@ LoopPlan validate_loop_bodies(const InstructionMap &code, std::string_view ident
     const auto &op = *entry.second;
     if (!loop_setup(op)) { continue; }
     validate_loop_body(code, op, plan, identity);
-  }
-  for (const auto &[end, parent] : plan.short_nested) {
-    for (unsigned gap = 1; gap <= loop_fetch_distance; ++gap) {
-      const auto ancestor = plan.shapes.find((parent.end + gap) & maximum_pc);
-      if (ancestor == plan.shapes.end() || !overlapping_tail(parent, ancestor->second)) {
-        continue;
-      }
-      const auto setup = (plan.shapes.at(end).start - 1) & maximum_pc;
-      reject(*code.at(setup),
-             identity,
-             FaultReason::unsupported_instruction,
-             "three overlapping DO tails are unqualified");
-    }
   }
   validate_loop_aborts(code, plan, identity);
   validate_not_lce(code, plan, identity);

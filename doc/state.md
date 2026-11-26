@@ -66,6 +66,10 @@ inner DO owns the short fetch buffer. The child's drain can see addresses
 from the next outer pass. The child endpoint restores the outer suffix
 after the inner frame has popped, even when the outer stack frame popped
 earlier. Exact bounds and snapshots retain both buffers during the handoff.
+If a long DO also encloses both short loops, it sees the fetch stream
+after applying the middle loop's redirects. The handoff carries fetch
+progress forward relative to the middle endpoint and preserves any outer
+decision already reached during the inner drain.
 A counted DO loads LCNTR once. The current count then evolves on the loop
 counter stack while LCNTR continues to hold the setup value.
 A qualified CALL saves a suspended terminating tail with its PC-stack entry.

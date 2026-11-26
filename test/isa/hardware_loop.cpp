@@ -1197,7 +1197,9 @@ void pop_short_child(Timeline &trace, unsigned retained_count) {
   if (state.loop_address_depth == 1) {
     popped(state);
   } else {
-    leave_nested_child(state);
+    --state.loop_address_depth;
+    --state.loop_counter_depth;
+    --state.pc_stack_pointer;
   }
 }
 
@@ -1415,17 +1417,181 @@ void nested_forever_child_drain(bool arithmetic) {
   verify_timeline(program, initial, trace);
 }
 
-void refused_three_overlapping_short_tails() {
-  constexpr auto count_two = do_immediate | (std::uint64_t{2} << count_shift);
+constexpr unsigned middle_setup = 3;
+constexpr unsigned middle_end = 7;
+constexpr ShortChildSetup innermost{.pc = 4, .width = 2};
+
+void enter_middle_short(Timeline &trace, ShortChildSetup middle) {
+  short_boundary(trace, {.pc = 2, .fetch = 6, .decode = 4});
+  short_boundary(trace, {.pc = 3, .fetch = 7, .decode = 5});
+  push_short_child(trace, middle, 1);
+  trace.registers.faddr = base + (middle.width == 3 ? 5U : 7U);
+  trace.registers.daddr = base + (middle.width == 3 ? 6U : 5U);
+  trace.prefixes.back().registers = trace.registers;
+}
+
+void repeat_middle_pass(Timeline &trace) {
+  auto &data = trace.registers.pe[0].data[0];
+  push_short_child(trace, innermost, 2);
+  data[0] += 1U << raw_shift;
+  pop_short_child(trace, 1);
+  short_boundary(trace, {.pc = 6, .fetch = 4, .decode = 6}, 2);
+  short_boundary(trace, {.pc = 5, .fetch = 5, .decode = 7});
+  data[0] += 1U << raw_shift;
+  short_boundary(trace, {.pc = 6, .fetch = 6, .decode = 4});
+  short_boundary(trace, {.pc = 7, .fetch = 7, .decode = 4});
+  pop_short_child(trace, 0);
+  short_boundary(trace, {.pc = 4, .fetch = 8, .decode = 5});
+}
+
+void finish_middle_pass(Timeline &trace, unsigned gap, bool outer_repeats) {
+  auto &data = trace.registers.pe[0].data[0];
+  const auto end = middle_end + gap;
+  data[0] += 1U << raw_shift;
+  pop_short_child(trace, 1);
+  short_boundary(trace, {.pc = 6, .fetch = 8, .decode = 6}, 2);
+  // The four boundaries after the hold expose successive outer Fetch1 clocks.
+  constexpr std::array drain{ShortAddress{.pc = 5, .fetch = 9, .decode = 7},
+                             ShortAddress{.pc = 6, .fetch = 10, .decode = 8},
+                             ShortAddress{.pc = 7, .fetch = 11, .decode = 8},
+                             ShortAddress{.pc = 8, .fetch = 12, .decode = 9}};
+  for (auto boundary : drain) {
+    if (boundary.pc == innermost.end()) { data[0] += 1U << raw_shift; }
+    if (boundary.fetch == end + 1) { parent_count_sample(trace, outer_repeats); }
+    if (outer_repeats && boundary.fetch > end) {
+      boundary.fetch -= end;
+      if (boundary.decode > end) { boundary.decode -= end; }
+    }
+    short_boundary(trace, boundary);
+  }
+}
+
+void finish_outer_three_tail(Timeline &trace, unsigned gap, bool repeats) {
+  const auto end = middle_end + gap;
+  for (auto pc = middle_end + 1; pc <= end; ++pc) {
+    if (repeats || (gap == 4 && pc == middle_end + 1)) {
+      trace.registers.pe[0].data[0][pc - 3] += 1U << raw_shift;
+    }
+    if (repeats && pc < end) {
+      const auto distance = end - (pc + 1);
+      const auto decode = distance < 2 ? 2 - distance : pc + 3;
+      short_boundary(trace, {.pc = pc + 1, .fetch = 4 - distance, .decode = decode});
+    } else {
+      trace.boundary(base + (repeats ? 1U : pc + 1));
+      trace.record();
+    }
+  }
+}
+
+void three_overlapping_counted_tails(unsigned gap, bool middle_repeats = false) {
+  constexpr auto twice = do_immediate | (std::uint64_t{2} << count_shift);
+  constexpr auto once = do_immediate | (std::uint64_t{1} << count_shift);
+  const auto end = middle_end + gap;
+  std::vector<std::uint64_t> words(end + 2);
+  words[0] = twice | end;
+  words[middle_setup] = (middle_repeats ? twice : once) | 4;
+  words[innermost.pc] = twice | innermost.width;
+  words[innermost.pc + 1] = fixture::add(0, 0, 1);
+  for (auto pc = middle_end + 1; pc <= end; ++pc) {
+    words[pc] = if_not_lce(fixture::add(pc - 3, pc - 3, 1));
+  }
+  fixture::Program program(words);
+  auto initial = starting();
+  initial.pe[0].data[0][1] = 1U << raw_shift;
+  Timeline trace{.registers = initial, .prefixes = {}};
+  trace.registers.lcntr = 2;
+  entered(trace, {.address = counted_address | (base + end), .count = 2});
+  for (const bool outer_repeats : {true, false}) {
+    const auto middle_count = middle_repeats ? 2U : 1U;
+    enter_middle_short(trace, {.pc = middle_setup, .width = 4, .iterations = middle_count});
+    if (middle_repeats) {
+      trace.registers.loop_counter_stack[1] = 1;
+      repeat_middle_pass(trace);
+    } else {
+      pop_short_child(trace, 0);
+    }
+    push_short_child(trace, innermost, middle_repeats ? 1U : 2U);
+    finish_middle_pass(trace, gap, outer_repeats);
+    finish_outer_three_tail(trace, gap, outer_repeats);
+  }
+  verify_timeline(program, initial, trace);
+}
+
+void three_overlapping_compact_middle() {
+  constexpr auto once = do_immediate | (std::uint64_t{1} << count_shift);
+  constexpr auto twice = do_immediate | (std::uint64_t{2} << count_shift);
   std::array<std::uint64_t, 9> words{};
-  words[0] = count_two | 8;
-  words[1] = count_two | 3;
-  words[2] = count_two | 1;
-  const fixture::Program program(words);
-  const auto fault = fixture::refusal(program.code, "three overlapping DO tails were prepared");
-  check(fault.reason == sharc::FaultReason::unsupported_instruction && fault.address == base + 2 &&
-            fault.instruction == words[2],
-        "overlapping short parent fault lost the inner DO");
+  words[0] = twice | 7;
+  words[3] = once | 3;
+  words[4] = once | 1;
+  words[5] = fixture::add(0, 0, 1);
+  words[6] = if_not_lce(fixture::add(4, 4, 1));
+  words[7] = if_not_lce(fixture::add(5, 5, 1));
+  fixture::Program program(words);
+  auto initial = starting();
+  initial.pe[0].data[0][1] = 1U << raw_shift;
+  Timeline trace{.registers = initial, .prefixes = {}};
+  auto &data = trace.registers.pe[0].data[0];
+  trace.registers.lcntr = 2;
+  entered(trace, {.address = counted_address | (base + 7), .count = 2});
+  for (const bool repeats : {true, false}) {
+    enter_middle_short(trace, {.pc = middle_setup, .width = 3, .iterations = 1});
+    push_short_child(trace, {.pc = 4, .width = 1}, 1);
+    data[0] += 1U << raw_shift;
+    pop_short_child(trace, 0);
+    pop_short_child(trace, 0);
+    short_boundary(trace, {.pc = 6, .fetch = 7, .decode = 6}, 5);
+    // The compact middle samples at the handoff. Its exit refill reaches the outer end.
+    data[4] += 1U << raw_shift;
+    parent_count_sample(trace, repeats);
+    short_boundary(trace, {.pc = 7, .fetch = repeats ? 4U : 11U, .decode = repeats ? 2U : 9U}, 4);
+    if (repeats) { data[5] += 1U << raw_shift; }
+    trace.boundary(base + (repeats ? 1U : 8U));
+    trace.record();
+  }
+  verify_timeline(program, initial, trace);
+}
+
+void three_overlapping_arithmetic_outer(bool ending) {
+  constexpr auto once = do_immediate | (std::uint64_t{1} << count_shift);
+  constexpr auto twice = do_immediate | (std::uint64_t{2} << count_shift);
+  std::array<std::uint64_t, 11> words{};
+  words[0] = do_eq | 9;
+  words[3] = once | 4;
+  words[4] = twice | 2;
+  words[5] = fixture::add(0, 0, 1);
+  words[6] = fixture::add(7, 3, 3);
+  words[7] = fixture::add(2, 1, 1);
+  fixture::Program program(words);
+  auto initial = starting();
+  initial.pe[0].data[0][1] = 1U << raw_shift;
+  initial.pe[0].data[0][3] = ending ? 0 : 1U << raw_shift;
+  Timeline trace{.registers = initial, .prefixes = {}};
+  auto &lane = trace.registers.pe[0];
+  entered(trace, {.address = base + 9, .count = old_lcntr});
+  enter_middle_short(trace, {.pc = middle_setup, .width = 4, .iterations = 1});
+  pop_short_child(trace, 0);
+  push_short_child(trace, innermost, 2);
+  lane.data[0][0] = 1U << raw_shift;
+  pop_short_child(trace, 1);
+  short_boundary(trace, {.pc = 6, .fetch = 8, .decode = 6}, 2);
+  lane.data[0][7] = ending ? 0 : 2U << raw_shift;
+  lane.astat = ending ? az : 0;
+  short_boundary(trace, {.pc = 5, .fetch = 9, .decode = 7});
+  lane.data[0][0] += 1U << raw_shift;
+  lane.astat = 0;
+  short_boundary(trace, {.pc = 6, .fetch = 1, .decode = 8});
+  lane.astat = ending ? az : 0;
+  short_boundary(trace, {.pc = 7, .fetch = 2, .decode = 8});
+  // The outer sample sees the last leaf word's flags before the middle endpoint clears them.
+  lane.data[0][2] = 2U << raw_shift;
+  lane.astat = 0;
+  if (ending) { popped(trace.registers); }
+  short_boundary(trace, {.pc = 8, .fetch = ending ? 10U : 3U, .decode = 9});
+  short_boundary(trace, {.pc = 9, .fetch = ending ? 11U : 4U, .decode = 2});
+  trace.boundary(base + (ending ? 10U : 1U), ending ? 3U : 1U);
+  trace.record();
+  verify_timeline(program, initial, trace);
 }
 
 void short_arithmetic_child_overlap() {
@@ -3203,7 +3369,11 @@ void fixture::hardware_loop_control_flow() {
   nested_short_parent_lce_call(true);
   nested_forever_child_drain(false);
   nested_forever_child_drain(true);
-  refused_three_overlapping_short_tails();
+  for (const auto gap : {1U, 2U, 3U, 4U}) { three_overlapping_counted_tails(gap); }
+  three_overlapping_counted_tails(1, true);
+  three_overlapping_compact_middle();
+  three_overlapping_arithmetic_outer(false);
+  three_overlapping_arithmetic_outer(true);
   counted_call_reentry();
   counted_sample_call(CountedSampleCall::plain);
   counted_sample_call(CountedSampleCall::direct);

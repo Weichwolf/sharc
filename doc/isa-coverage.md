@@ -311,8 +311,13 @@ popped. Tests cover one- and two-word counted children, a one-word
 arithmetic child, both child positions in a four-word parent, and a
 counted child that admits complete native turns. Fetch and decode
 observations across the handoff are derived from the short-loop timing.
-Three overlapping tails and branches in an overlapping child refill remain
-unqualified. The combined timing awaits hardware comparison.
+When both short buffers are nested in a long DO, their fetch stream still
+reaches the long endpoint at the correct point in the drain. Tests exercise
+all four counted outer endpoint gaps, another middle pass, a compact
+middle loop, and a long arithmetic condition sampled across the handoff.
+The authored expectations use the documented fetch and decode timing.
+Branches in an overlapping child refill remain unqualified. The combined
+timing awaits hardware comparison.
 
 Classic type 5 transfers raw data among R/S and I/M/L/B registers, including
 cross-PE data moves and raw40 register swaps, with supported single-function fixed
