@@ -1180,13 +1180,14 @@ void push_short_child(Timeline &trace,
                       bool arithmetic = false) {
   auto &state = trace.registers;
   const auto depth = state.loop_address_depth;
-  state.pc_stack[depth] = base + child.pc + 1;
+  state.pc_stack[state.pc_stack_pointer++] = base + child.pc + 1;
   constexpr auto one_word_arithmetic = 1U << 29;
   const auto type = arithmetic ? one_word_arithmetic : short_counted_types[child.width - 1];
   state.loop_address_stack[depth] = type | (base + child.end());
   if (!arithmetic) { state.lcntr = child.count(); }
   state.loop_counter_stack[depth] = state.lcntr;
-  state.loop_address_depth = state.loop_counter_depth = state.pc_stack_pointer = depth + 1;
+  ++state.loop_address_depth;
+  ++state.loop_counter_depth;
   state.pe[0].stky &= ~empty;
   short_boundary(trace, {.pc = child.pc + 1, .fetch = child.end(), .decode = child.end()}, cycles);
 }
@@ -1194,13 +1195,10 @@ void push_short_child(Timeline &trace,
 void pop_short_child(Timeline &trace, unsigned retained_count) {
   auto &state = trace.registers;
   state.loop_counter_stack[state.loop_counter_depth - 1] = retained_count;
-  if (state.loop_address_depth == 1) {
-    popped(state);
-  } else {
-    --state.loop_address_depth;
-    --state.loop_counter_depth;
-    --state.pc_stack_pointer;
-  }
+  --state.loop_address_depth;
+  --state.loop_counter_depth;
+  popped_call(state);
+  if (state.loop_address_depth == 0) { state.pe[0].stky |= loop_empty; }
 }
 
 enum class ShortParentProbe : std::uint8_t { none, not_lce };
@@ -2232,6 +2230,126 @@ unsigned short_call_round_trip(Timeline &trace,
   return delayed ? 2U : 4U;
 }
 
+struct OverlappingShortCall {
+  unsigned pc;
+  bool delayed_return{};
+};
+
+void short_call_counted_ancestor_tail(Timeline &trace, OverlappingShortCall call, bool repeats) {
+  constexpr std::array linear{ShortAddress{.pc = 3, .fetch = 7, .decode = 4},
+                              ShortAddress{.pc = 4, .fetch = 8, .decode = 5},
+                              ShortAddress{.pc = 5, .fetch = 9, .decode = 6},
+                              ShortAddress{.pc = 6, .fetch = 10, .decode = 7}};
+  // The one-pass four-word child pops on its held startup fetch.
+  pop_short_child(trace, 0);
+  short_boundary(trace, linear[0], 2);
+  for (unsigned pc = 3; pc <= 5; ++pc) {
+    auto boundary = linear[pc - 2];
+    const bool taken = pc == call.pc;
+    const bool tagged = !repeats && pc == 4;
+    const auto tags = call_tag | (tagged ? termination_tag : 0);
+    const auto cycles =
+        taken ? short_call_round_trip(trace, pc + 1, call.delayed_return, tags) : 1U;
+    // This clock either retires normally or is replayed by the return fill.
+    if (pc == 3) { parent_count_sample(trace, repeats); }
+    if (repeats) { boundary.fetch -= 7; }
+    if (taken && pc == 5) { boundary.decode = repeats ? 1U : 8U; }
+    short_boundary(trace, boundary, cycles);
+  }
+}
+
+void short_call_counted_ancestor(OverlappingShortCall call) {
+  constexpr auto once = do_immediate | (std::uint64_t{1} << count_shift);
+  constexpr auto twice = do_immediate | (std::uint64_t{2} << count_shift);
+  std::array<std::uint64_t, 13> words{};
+  words[0] = twice | 7;
+  words[1] = once | 4;
+  words[call.pc] = call.delayed_return ? call_dag2 : call_direct | short_call_sub;
+  words[6] = if_not_lce(fixture::add(6, 6, 1));
+  words[7] = if_not_lce(fixture::add(5, 5, 1));
+  words[8] = once | 1;
+  words[9] = fixture::add(0, 0, 1);
+  words[10] = rts | lr | (call.delayed_return ? db : 0);
+  words[11] = fixture::immediate(2, 7);
+  fixture::Program program(words);
+  program.code.variants.front().entries.push_back(short_call_sub);
+  auto initial = starting();
+  initial.dag[0][8].index = short_call_sub;
+  initial.pe[0].data[0][1] = 1U << raw_shift;
+  Timeline trace{.registers = initial, .prefixes = {}};
+  auto &data = trace.registers.pe[0].data[0];
+  trace.registers.lcntr = 2;
+  entered(trace, {.address = counted_address | (base + 7), .count = 2});
+  for (const bool repeats : {true, false}) {
+    push_short_child(trace, {.pc = 1, .width = 4, .iterations = 1}, 1);
+    trace.registers.daddr = base + 3;
+    trace.prefixes.back().registers = trace.registers;
+    short_call_counted_ancestor_tail(trace, call, repeats);
+    if (repeats) { data[6] += 1U << raw_shift; }
+    short_boundary(trace, {.pc = 7, .fetch = repeats ? 4U : 11U, .decode = repeats ? 2U : 9U});
+    if (repeats) { data[5] += 1U << raw_shift; }
+    trace.boundary(base + (repeats ? 1U : 8U));
+    trace.record();
+  }
+  verify_timeline(program, initial, trace);
+}
+
+void callee_nested_short_loop(Timeline &trace, unsigned resume) {
+  constexpr ShortChildSetup parent{.pc = 8, .width = 3, .iterations = 1};
+  entered_call(trace, {.target = short_call_sub, .raw_return = call_tag | (base + resume)});
+  push_short_child(trace, parent, 1);
+  trace.registers.faddr = base + 10;
+  trace.prefixes.back().registers = trace.registers;
+  push_short_child(trace, {.pc = 9, .width = 1}, 1);
+  auto &data = trace.registers.pe[0].data[0];
+  data[7] += 1U << raw_shift;
+  pop_short_child(trace, 0);
+  pop_short_child(trace, 0);
+  short_boundary(trace, {.pc = 11, .fetch = 12, .decode = 11}, 5);
+  data[6] += 1U << raw_shift;
+  trace.boundary(base + 12, 4);
+  trace.record();
+  popped_call(trace.registers);
+}
+
+void short_call_suspended_short_parent() {
+  constexpr auto once = do_immediate | (std::uint64_t{1} << count_shift);
+  constexpr auto twice = do_immediate | (std::uint64_t{2} << count_shift);
+  std::array<std::uint64_t, 13> words{};
+  words[0] = once | 4;
+  words[1] = twice | 2;
+  words[2] = fixture::add(0, 0, 1);
+  words[3] = call_direct | short_call_sub;
+  words[4] = if_not_lce(fixture::add(5, 5, 1));
+  words[8] = once | 3;
+  words[9] = once | 1;
+  words[10] = fixture::add(7, 7, 1);
+  words[11] = if_not_lce(fixture::add(6, 6, 1));
+  words[12] = rts | lr;
+  fixture::Program program(words);
+  auto initial = starting();
+  initial.pe[0].data[0][1] = 1U << raw_shift;
+  Timeline trace{.registers = initial, .prefixes = {}};
+  auto &data = trace.registers.pe[0].data[0];
+  trace.registers.lcntr = 1;
+  entered_arithmetic(trace, {.pc = 1, .fetch = 4, .decode = 2}, counted_address | (base + 4));
+  trace.registers.loop_counter_stack[0] = 1;
+  trace.prefixes.back().registers = trace.registers;
+  parent_count_sample(trace, false);
+  push_short_child(trace, {.pc = 1, .width = 2}, 2);
+  data[0] += 1U << raw_shift;
+  pop_short_child(trace, 1);
+  short_boundary(trace, {.pc = 3, .fetch = 5, .decode = 3}, 2);
+  callee_nested_short_loop(trace, 2);
+  short_boundary(trace, {.pc = 2, .fetch = 6, .decode = 4}, 4);
+  data[0] += 1U << raw_shift;
+  short_boundary(trace, {.pc = 3, .fetch = 7, .decode = 5});
+  callee_nested_short_loop(trace, 4);
+  short_boundary(trace, {.pc = 4, .fetch = 8, .decode = 5}, 4);
+  short_boundary(trace, {.pc = 5, .fetch = 9, .decode = 6});
+  verify_timeline(program, initial, trace);
+}
+
 void nested_short_parent_lce_call(bool delayed) {
   constexpr ShortChildSetup child{.pc = 1, .width = 1};
   std::array<std::uint64_t, 15> words{};
@@ -2290,6 +2408,36 @@ void short_condition_return_slots(Timeline &trace, unsigned resume, std::uint32_
   short_boundary(trace, {.pc = 12, .fetch = resume + 2, .decode = resume});
   // Only the last delay slot sets EQ.
   trace.registers.pe[0].astat = az;
+}
+
+void short_call_arithmetic_ancestor() {
+  constexpr auto once = do_immediate | (std::uint64_t{1} << count_shift);
+  auto words = short_condition_callee(true);
+  words[0] = do_eq | 7;
+  words[1] = once | 4;
+  words[5] = call_dag2;
+  fixture::Program program(words);
+  program.code.variants.front().entries.push_back(short_call_sub);
+  auto initial = starting();
+  initial.dag[0][8].index = short_call_sub;
+  initial.pe[0].data[0][1] = 1U << raw_shift;
+  Timeline trace{.registers = initial, .prefixes = {}};
+  entered(trace, {.address = base + 7, .count = old_lcntr});
+  push_short_child(trace, {.pc = 1, .width = 4, .iterations = 1}, 1);
+  trace.registers.daddr = base + 3;
+  trace.prefixes.back().registers = trace.registers;
+  pop_short_child(trace, 0);
+  short_boundary(trace, {.pc = 3, .fetch = 7, .decode = 4}, 2);
+  short_boundary(trace, {.pc = 4, .fetch = 1, .decode = 5});
+  short_boundary(trace, {.pc = 5, .fetch = 2, .decode = 6});
+  short_condition_return_slots(trace, 6);
+  // The child's terminal CALL replaced the outer test clock. The last RTS slot supplies EQ.
+  popped(trace.registers);
+  short_boundary(trace, {.pc = 6, .fetch = 8, .decode = 1}, 2);
+  short_boundary(trace, {.pc = 7, .fetch = 9, .decode = 2});
+  trace.boundary(base + 8, 3);
+  trace.record();
+  verify_timeline(program, initial, trace);
 }
 
 void two_word_condition_call() {
@@ -2858,16 +3006,16 @@ void refused_plain_short_loop_return(unsigned site) {
         "ordinary RTS consumed a buffered short loop");
 }
 
-void refused_overlapping_short_call(unsigned site) {
+void refused_overlapping_delayed_short_call(unsigned site) {
   constexpr auto count_two = do_immediate | (std::uint64_t{2} << count_shift);
-  constexpr auto call = call_direct | (base + 10);
+  constexpr auto call = call_direct | db | (base + 10);
   std::array<std::uint64_t, 11> words{};
   words[0] = count_two | 9;
   words[1] = count_two | 4;
   words[site] = call;
   words[10] = rts | lr;
   const fixture::Program program(words);
-  const auto fault = fixture::refusal(program.code, "overlapping short CALL was prepared");
+  const auto fault = fixture::refusal(program.code, "overlapping delayed CALL was prepared");
   check(fault.reason == sharc::FaultReason::unsupported_instruction &&
             fault.address == base + site && fault.instruction == call,
         "overlapping short CALL fault lost instruction attribution");
@@ -3328,6 +3476,59 @@ void skipped_fetch_boundary() {
             core.registers() == trace.registers,
         "unqualified jump across the fetch decision retired the endpoint");
 }
+
+void short_loop_call_cases() {
+  two_word_condition_call();
+  two_word_call_after_condition_sample();
+  three_word_condition_call(false);
+  three_word_condition_call(true);
+  three_word_call_in_condition_drain();
+  short_forever_call();
+  four_word_loop_call(FourWordCall::direct);
+  four_word_loop_call(FourWordCall::delayed);
+  four_word_loop_call(FourWordCall::predicated);
+  four_word_loop_call(FourWordCall::full_count);
+  four_word_loop_call(FourWordCall::delayed, 2);
+  four_word_loop_call(FourWordCall::direct, 1);
+  four_word_loop_call(FourWordCall::delayed, 1);
+  four_word_loop_call(FourWordCall::predicated, 1);
+  four_word_loop_call(FourWordCall::full_count, 1);
+  four_word_loop_call(FourWordCall::single_turn, 1);
+  four_word_endpoint_call(FourWordCall::direct);
+  four_word_endpoint_call(FourWordCall::delayed);
+  four_word_endpoint_call(FourWordCall::predicated);
+  counted_short_endpoint_call(2, false);
+  counted_short_endpoint_call(2, true);
+  counted_short_endpoint_call(3, false);
+  counted_short_endpoint_call(3, true);
+  counted_short_endpoint_call(2, true, ShortEndpointPredicate::not_lce);
+  counted_short_endpoint_call(3, false, ShortEndpointPredicate::not_lce);
+  counted_short_header_call({.width = 2, .form = ShortHeaderForm::direct});
+  counted_short_header_call({.width = 2, .form = ShortHeaderForm::delayed_return, .count = 2});
+  counted_short_header_call({.width = 3, .form = ShortHeaderForm::first_only});
+  counted_short_header_call({.width = 3, .form = ShortHeaderForm::delayed_return});
+  counted_short_header_call({.width = 3, .form = ShortHeaderForm::direct, .count = 1});
+  three_word_penultimate_call(ThreeWordCall::direct);
+  three_word_penultimate_call(ThreeWordCall::delayed);
+  three_word_penultimate_call(ThreeWordCall::predicated);
+  three_word_penultimate_call(ThreeWordCall::delayed, true);
+  compact_three_word_penultimate_call(false);
+  compact_three_word_penultimate_call(true);
+  single_iteration_two_word_call(1);
+  single_iteration_two_word_call(2);
+  single_iteration_three_word_call(false);
+  single_iteration_three_word_call(true);
+  refused_plain_short_loop_return(1);
+  refused_plain_short_loop_return(3);
+  refused_overlapping_delayed_short_call(2);
+  refused_overlapping_delayed_short_call(3);
+  short_call_counted_ancestor({.pc = 3});
+  short_call_counted_ancestor({.pc = 3, .delayed_return = true});
+  short_call_counted_ancestor({.pc = 4, .delayed_return = true});
+  short_call_counted_ancestor({.pc = 5});
+  short_call_suspended_short_parent();
+  short_call_arithmetic_ancestor();
+}
 } // namespace
 
 void fixture::hardware_loop_control_flow() {
@@ -3389,51 +3590,8 @@ void fixture::hardware_loop_control_flow() {
   counted_not_lce_call(4);
   counted_not_lce_call(3, true);
   refused_not_lce_without_loop();
-  two_word_condition_call();
-  two_word_call_after_condition_sample();
-  three_word_condition_call(false);
-  three_word_condition_call(true);
-  three_word_call_in_condition_drain();
-  short_forever_call();
-  four_word_loop_call(FourWordCall::direct);
-  four_word_loop_call(FourWordCall::delayed);
-  four_word_loop_call(FourWordCall::predicated);
-  four_word_loop_call(FourWordCall::full_count);
-  four_word_loop_call(FourWordCall::delayed, 2);
-  four_word_loop_call(FourWordCall::direct, 1);
-  four_word_loop_call(FourWordCall::delayed, 1);
-  four_word_loop_call(FourWordCall::predicated, 1);
-  four_word_loop_call(FourWordCall::full_count, 1);
-  four_word_loop_call(FourWordCall::single_turn, 1);
-  four_word_endpoint_call(FourWordCall::direct);
-  four_word_endpoint_call(FourWordCall::delayed);
-  four_word_endpoint_call(FourWordCall::predicated);
-  counted_short_endpoint_call(2, false);
-  counted_short_endpoint_call(2, true);
-  counted_short_endpoint_call(3, false);
-  counted_short_endpoint_call(3, true);
-  counted_short_endpoint_call(2, true, ShortEndpointPredicate::not_lce);
-  counted_short_endpoint_call(3, false, ShortEndpointPredicate::not_lce);
-  counted_short_header_call({.width = 2, .form = ShortHeaderForm::direct});
-  counted_short_header_call({.width = 2, .form = ShortHeaderForm::delayed_return, .count = 2});
-  counted_short_header_call({.width = 3, .form = ShortHeaderForm::first_only});
-  counted_short_header_call({.width = 3, .form = ShortHeaderForm::delayed_return});
-  counted_short_header_call({.width = 3, .form = ShortHeaderForm::direct, .count = 1});
-  three_word_penultimate_call(ThreeWordCall::direct);
-  three_word_penultimate_call(ThreeWordCall::delayed);
-  three_word_penultimate_call(ThreeWordCall::predicated);
-  three_word_penultimate_call(ThreeWordCall::delayed, true);
-  compact_three_word_penultimate_call(false);
-  compact_three_word_penultimate_call(true);
-  single_iteration_two_word_call(1);
-  single_iteration_two_word_call(2);
-  single_iteration_three_word_call(false);
-  single_iteration_three_word_call(true);
+  short_loop_call_cases();
   late_address_long_loop_call();
-  refused_plain_short_loop_return(1);
-  refused_plain_short_loop_return(3);
-  refused_overlapping_short_call(2);
-  refused_overlapping_short_call(3);
   arithmetic_sample_call(ArithmeticSampleCall::immediate);
   arithmetic_sample_call(ArithmeticSampleCall::delayed);
   arithmetic_sample_call(ArithmeticSampleCall::repeated);

@@ -74,6 +74,10 @@ A counted DO loads LCNTR once. The current count then evolves on the loop
 counter stack while LCNTR continues to hold the setup value.
 A qualified CALL saves a suspended terminating tail with its PC-stack entry.
 For a delayed `RTS (LR)`, the tail becomes active after the two return slots.
+An overlapping short CALL also saves the ancestor fetch position and any
+suspended short parent with that PC-stack entry. The callee uses its own
+buffers and observations. The prepared return restores the caller's state
+and processes the surviving fetches, including after a terminal child CALL.
 When a prepared DO tail uses IF NOT LCE, the counted tail also carries
 the clocks elapsed after its terminal fetch. This observation survives a
 stack pop, a return refill and a cross-Core snapshot. A short CALL saves

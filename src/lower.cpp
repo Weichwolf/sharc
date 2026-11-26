@@ -288,6 +288,7 @@ constexpr std::uint64_t return_short_left_mask = (unsigned_limit * loop_fetch_di
 constexpr std::uint64_t return_short_loop = 1ULL << 58;
 constexpr std::uint64_t return_short_compact = 1ULL << 59;
 constexpr std::uint64_t return_short_lce = 1ULL << 60;
+constexpr std::uint64_t return_short_done = 1ULL << 61;
 constexpr std::uint64_t return_loop_ready = 1ULL << 62;
 // The counted tail shares its word with two bits of termination history.
 constexpr unsigned lce_age_shift = 56;
@@ -937,7 +938,10 @@ private:
                             const LoopShape &parent,
                             unsigned words,
                             llvm::Value *active);
-  void resume_short_parent(Values &values, const LoopShape &child, const LoopShape &parent);
+  void resume_short_parent(Values &values,
+                           const LoopShape &child,
+                           const LoopShape &parent,
+                           llvm::Value *done = nullptr);
   void loop_pop(Values &values, const LoopFrame &frame);
   void
   guard_loop_abort(const Values &values, const Instruction &op, llvm::Value *lanes, bool partial);
@@ -1014,10 +1018,16 @@ private:
                               const Instruction &op,
                               const LoopShape &shape,
                               ShortRetirement retirement);
+  void observe_short_fetches(Values &values,
+                             const LoopShape &shape,
+                             ShortLookahead stages,
+                             ShortRetirement retirement,
+                             bool after_credit);
   ShortLookahead overlapping_short_fetches(Values &values,
                                            const LoopShape &shape,
                                            ShortLookahead stages,
-                                           llvm::Value *old_status);
+                                           llvm::Value *old_status,
+                                           bool after_credit);
   llvm::Value *short_fetch_crossed(ShortFetchWindow window, unsigned offset);
   ShortLookahead redirect_short_parent(ShortLookahead stages,
                                        const LoopShape &child,
@@ -1042,6 +1052,8 @@ private:
   llvm::Value *
   call_termination_tag(const Values &values, const Instruction &op, llvm::Value *terminated);
   llvm::Value *suspend_short_call(Values &values, const Instruction &op, const LoopShape &shape);
+  [[nodiscard]] bool overlapping_short_call(const LoopShape &shape) const;
+  void transfer_short_call_state(llvm::Value *depth, bool saving);
   void restore_short_call(Values &values,
                           const LoopShape &shape,
                           std::uint32_t pc,
@@ -1900,21 +1912,68 @@ Lowering::suspend_short_call(Values &values, const Instruction &op, const LoopSh
         buffer, builder_.CreateSelect(expired, builder_.getInt64(return_short_lce), zero));
     clear_counted_tail(shape, active);
   }
-  auto *saved = builder_.CreateSelect(
-      builder_.CreateICmpEQ(left, zero),
-      builder_.getInt64(loop_call_live),
-      builder_.CreateOr(buffer, builder_.getInt64(loop_call_live | return_short_loop)));
+  auto *done = builder_.CreateICmpEQ(left, zero);
+  auto *payload = builder_.CreateOr(buffer, builder_.getInt64(loop_call_live | return_short_loop));
+  llvm::Value *terminal = builder_.getInt64(loop_call_live);
+  if (overlapping_short_call(shape)) {
+    // Even a final endpoint CALL has to finish the enclosing fetch stream on return.
+    terminal = builder_.CreateOr(payload, builder_.getInt64(return_short_done));
+    auto *save = llvm::BasicBlock::Create(module_.getContext(), "short.call.save", function_);
+    auto *next = llvm::BasicBlock::Create(module_.getContext(), "short.call.ready", function_);
+    builder_.CreateCondBr(active, save, next);
+    builder_.SetInsertPoint(save);
+    transfer_short_call_state(values[pc_stack_depth_value], true);
+    builder_.CreateBr(next);
+    builder_.SetInsertPoint(next);
+  }
+  auto *saved = builder_.CreateSelect(done, terminal, payload);
   auto *slot = loop_cell(loop_call_slot, values[pc_stack_depth_value], 64);
   builder_.CreateStore(builder_.CreateSelect(active, saved, zero), slot);
   write_short(short_remaining, builder_.CreateSelect(active, zero, remaining));
   write_short(short_addresses, builder_.CreateSelect(active, zero, short_word(short_addresses)));
   llvm::Value *tags = builder_.getInt32(pc_call_tag);
-  if (shape.arithmetic() || (shape.counted() && shape.length == 3)) {
+  if (shape.arithmetic() || (shape.counted() && shape.length == 3) ||
+      overlapping_short_call(shape)) {
     auto *exit = short_flag(descriptor, short_call_exit);
     tags =
         builder_.CreateOr(tags, call_termination_tag(values, op, builder_.CreateAnd(active, exit)));
   }
   return builder_.CreateOr(target, tags);
+}
+
+bool Lowering::overlapping_short_call(const LoopShape &shape) const {
+  return short_nested_.contains(shape.end) || short_parents_.contains(shape.end);
+}
+
+void Lowering::transfer_short_call_state(llvm::Value *depth, bool saving) {
+  auto *first = builder_.CreateMul(depth, builder_.getInt32(short_call_state_words));
+  unsigned word = 0;
+  const auto transfer = [&](llvm::Value *cell, bool has_age = false) {
+    auto *index = builder_.CreateAdd(first, builder_.getInt32(word++));
+    auto *saved = loop_cell(short_call_state_slot, index, 64);
+    auto *source = saving ? cell : saved;
+    auto *target = saving ? saved : cell;
+    llvm::Value *value = builder_.CreateLoad(builder_.getInt64Ty(), source);
+    if (!saving && has_age) {
+      auto *mature =
+          builder_.CreateOr(builder_.CreateAnd(value, builder_.getInt64(~lce_clock_mask)),
+                            builder_.getInt64(lce_age_mask));
+      value = builder_.CreateSelect(short_flag(value, lce_clock_mask), mature, value);
+    }
+    builder_.CreateStore(value, target);
+    builder_.CreateStore(builder_.getInt64(0), source);
+  };
+  transfer(short_cell(short_fetch_progress));
+  transfer(short_cell(short_parent_remaining));
+  transfer(short_cell(short_parent_descriptor));
+  transfer(pointer(loop_refill_slot));
+  for (std::size_t i = 0; i < long_tail_count_; ++i) {
+    const auto slot = counted_tail_slot + i;
+    transfer(pointer(slot), lce_slots_.contains(slot));
+  }
+  for (const auto slot : {short_counted_tail_slot, short_parent_tail_slot}) {
+    if (lce_slots_.contains(slot)) { transfer(pointer(slot), true); }
+  }
 }
 
 llvm::Value *Lowering::pop(Values &values, const Instruction &op, bool partial) {
@@ -2062,7 +2121,13 @@ void Lowering::restore_short_call(Values &values,
   auto *left =
       builder_.CreateAnd(builder_.CreateLShr(payload, builder_.getInt64(return_short_left_shift)),
                          builder_.getInt64(return_short_left_mask));
-  write_short(short_fetch_progress, builder_.getInt64(0));
+  const bool overlap = overlapping_short_call(shape);
+  if (overlap) {
+    transfer_short_call_state(values[pc_stack_depth_value], false);
+  } else {
+    write_short(short_fetch_progress, builder_.getInt64(0));
+  }
+  auto *done = short_flag(payload, return_short_done);
   if (lce_endpoints_.contains(shape.end)) {
     auto *expired = short_flag(payload, return_short_lce);
     auto *tail = builder_.getInt64(counted_tail_word(shape) | lce_age_mask);
@@ -2074,9 +2139,9 @@ void Lowering::restore_short_call(Values &values,
   if (shape.counted()) {
     descriptor = resume_short_count(values, shape, pc, payload);
   } else {
-    left = builder_.CreateSelect(builder_.CreateICmpEQ(left, builder_.getInt64(0)),
-                                 builder_.getInt64(short_unbounded),
-                                 left);
+    auto *unbounded = builder_.CreateAnd(builder_.CreateNot(done),
+                                         builder_.CreateICmpEQ(left, builder_.getInt64(0)));
+    left = builder_.CreateSelect(unbounded, builder_.getInt64(short_unbounded), left);
     if (shape.arithmetic() && call_pc == shape.condition_pc()) {
       // The fourth return fetch reaches the condition word after the freeze.
       auto *depth = values[pc_stack_depth_value];
@@ -2094,7 +2159,25 @@ void Lowering::restore_short_call(Values &values,
     auto *compact = short_flag(descriptor, short_compact_count);
     stages.fetch = builder_.CreateSelect(compact, builder_.getInt64(shape.end), stages.fetch);
   }
-  write_short_addresses(stages, builder_.getTrue());
+  if (overlap) {
+    auto *depth = values[pc_stack_depth_value];
+    stages.decode = builder_.CreateSelect(
+        done, builder_.getInt64((pc + loop_decode_distance) & maximum_pc), stages.decode);
+    const auto lag = shape.length == loop_fetch_distance ? 3U : loop_decode_distance;
+    stages.decode_lag = builder_.CreateSelect(
+        done, builder_.getInt64(loop_decode_distance), builder_.getInt64(lag));
+    observe_short_fetches(
+        values, shape, stages, {.left = left, .old_status = values[status_value]}, true);
+    if (const auto parent = short_nested_.find(shape.end); parent != short_nested_.end()) {
+      resume_short_parent(values, shape, parent->second, done);
+    }
+    if (reentry_calls_.contains(pc)) {
+      write_short(short_descriptor,
+                  short_exit_descriptor(short_word(short_descriptor), values, depth));
+    }
+  } else {
+    write_short_addresses(stages, builder_.getTrue());
+  }
   store(builder_.getInt64(0), return_loop_tail_slot);
   jump(next, values);
   builder_.SetInsertPoint(next.block);
@@ -2487,12 +2570,15 @@ void Lowering::suspend_short_parent(Values &values,
 
 void Lowering::resume_short_parent(Values &values,
                                    const LoopShape &child,
-                                   const LoopShape &parent) {
+                                   const LoopShape &parent,
+                                   llvm::Value *done) {
   auto *left = short_word(short_parent_remaining);
   auto *resume = llvm::BasicBlock::Create(module_.getContext(), "short.parent.resume", function_);
   auto next = node("short.child.leave");
   next.incoming(values, builder_.GetInsertBlock());
-  builder_.CreateCondBr(builder_.CreateICmpNE(left, builder_.getInt64(0)), resume, next.block);
+  auto *ready = builder_.CreateICmpNE(left, builder_.getInt64(0));
+  if (done != nullptr) { ready = builder_.CreateAnd(ready, done); }
+  builder_.CreateCondBr(ready, resume, next.block);
   builder_.SetInsertPoint(resume);
   auto *descriptor = short_word(short_parent_descriptor);
   if (parent.counted()) { short_loop_counter(values, child.end, parent, descriptor, true); }
@@ -2712,8 +2798,16 @@ void Lowering::short_loop_observation(Values &values,
                                       const Instruction &op,
                                       const LoopShape &shape,
                                       ShortRetirement retirement) {
+  observe_short_fetches(
+      values, shape, short_lookahead(op.address, shape, retirement.left), retirement, false);
+}
+
+void Lowering::observe_short_fetches(Values &values,
+                                     const LoopShape &shape,
+                                     ShortLookahead stages,
+                                     ShortRetirement retirement,
+                                     bool after_credit) {
   const auto [left, old_status] = retirement;
-  auto stages = short_lookahead(op.address, shape, left);
   auto *live = builder_.CreateICmpNE(left, builder_.getInt64(0));
   const bool has_ancestors = short_parents_.contains(shape.end);
   if (has_ancestors) {
@@ -2727,7 +2821,9 @@ void Lowering::short_loop_observation(Values &values,
     stages = project_short_parent(stages, shape, parent->second, resumes);
     live = builder_.CreateOr(live, resumes);
   }
-  if (has_ancestors) { stages = overlapping_short_fetches(values, shape, stages, old_status); }
+  if (has_ancestors) {
+    stages = overlapping_short_fetches(values, shape, stages, old_status, after_credit);
+  }
   if (shape.length == loop_fetch_distance) { live = builder_.getTrue(); }
   write_short_addresses(stages, live);
 }
@@ -2801,7 +2897,8 @@ Lowering::ShortLookahead Lowering::redirect_short_parent(ShortLookahead stages,
 Lowering::ShortLookahead Lowering::overlapping_short_fetches(Values &values,
                                                              const LoopShape &shape,
                                                              ShortLookahead stages,
-                                                             llvm::Value *old_status) {
+                                                             llvm::Value *old_status,
+                                                             bool after_credit) {
   auto *distance =
       builder_.CreateAnd(builder_.CreateSub(stages.fetch, builder_.getInt64(shape.end)),
                          builder_.getInt64(maximum_pc));
@@ -2831,7 +2928,7 @@ Lowering::ShortLookahead Lowering::overlapping_short_fetches(Values &values,
     loop_fetch(values,
                parent,
                builder_.CreateAnd(reachable, short_fetch_crossed(window, gap)),
-               false,
+               after_credit,
                age);
     const auto frame = active_loop(values, parent);
     auto *repeat = builder_.CreateAnd(frame.matches, repeat_scheduled(frame));
@@ -2912,7 +3009,12 @@ void Lowering::short_loop_retirement(Values values,
       values[dag_history_value]);
   auto *cycles = builder_.CreateAdd(builder_.CreateAdd(builder_.getInt64(1), refill),
                                     values[extra_cycles_value]);
+  auto *before_fetch = values[pc_stack_depth_value];
   short_loop_observation(values, op, shape, {.left = left, .old_status = old_status});
+  const bool overlapping = short_parents_.contains(shape.end);
+  if (overlapping && reentry_calls_.contains(following)) {
+    next_descriptor = short_exit_descriptor(next_descriptor, values, before_fetch);
+  }
   credit(values, builder_.getInt64(1), cycles, partial);
   write_short(short_remaining, left);
   write_short(short_descriptor, next_descriptor);
@@ -2926,6 +3028,10 @@ void Lowering::short_loop_retirement(Values values,
     builder_.SetInsertPoint(finished);
     if (const auto parent = short_nested_.find(shape.end); parent != short_nested_.end()) {
       resume_short_parent(values, shape, parent->second);
+      if (reentry_calls_.contains(next_pc(op))) {
+        write_short(short_descriptor,
+                    short_exit_descriptor(short_word(short_descriptor), values, before_fetch));
+      }
     }
   }
   finish(values, next_pc(op), partial);
@@ -4094,9 +4200,13 @@ void validate_loop_call(LoopPlan &plan,
     reject(op, identity, FaultReason::unsupported_instruction, "branch near the DO endpoint");
   }
   shape.has_reentry = true;
-  if (!plan.reentry_calls.emplace(op.address, shape).second) {
+  const auto [site, inserted] = plan.reentry_calls.try_emplace(op.address, shape);
+  if (inserted) { return; }
+  const bool inner = shape.length < site->second.length;
+  if (!(inner ? shape : site->second).short_body()) {
     reject(op, identity, FaultReason::unsupported_instruction, "overlapping loop CALL");
   }
+  if (inner) { site->second = shape; }
 }
 
 void validate_nested_loop(const InstructionMap &code,
@@ -4119,6 +4229,10 @@ void validate_nested_loop(const InstructionMap &code,
     for (unsigned distance = 0; distance < overlap_words; ++distance) {
       const auto word = code.find((child.end - distance) & maximum_pc);
       if (word != code.end() && branch(*word->second)) {
+        if (child.short_body() && call_branch_instruction(*word->second) &&
+            !delayed(*word->second)) {
+          continue;
+        }
         reject(*word->second,
                identity,
                FaultReason::unsupported_instruction,

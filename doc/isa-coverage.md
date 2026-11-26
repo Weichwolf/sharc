@@ -316,8 +316,15 @@ reaches the long endpoint at the correct point in the drain. Tests exercise
 all four counted outer endpoint gaps, another middle pass, a compact
 middle loop, and a long arithmetic condition sampled across the handoff.
 The authored expectations use the documented fetch and decode timing.
-Branches in an overlapping child refill remain unqualified. The combined
-timing awaits hardware comparison.
+An immediate CALL in an overlapping short child saves the outside fetch
+position, sampled conditions and any suspended short parent. `RTS (LR)`
+and `RTS (DB, LR)` restore that context. The return can finish a displaced
+ancestor sample or resume a short parent after a terminal child CALL.
+Fixtures exercise an already sampled ancestor, an unsampled ancestor,
+callee-owned nested short loops and the last return slot's arithmetic
+flags. Overlapping CALLs in long children and other branches in an
+overlapping refill remain unqualified. The combined timing awaits
+hardware comparison.
 
 Classic type 5 transfers raw data among R/S and I/M/L/B registers, including
 cross-PE data moves and raw40 register swaps, with supported single-function fixed
