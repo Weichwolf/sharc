@@ -66,10 +66,9 @@ bound while the core sleeps. A snapshot preserves the sleeping boundary.
 Table B-2. Its bit in IRPTL/IMASK/IMASKP or LIRPTL follows Tables A-12 and A-13.
 The consumer chooses a pending source and supplies its declared vector PC.
 `interrupt_ready` checks the installed route, the global and individual masks,
-the active service priority, the first ISR instruction, the startup and counter
-expiry shadows of short counted loops, and a pending delayed transfer. A
-successful `interrupt` clears the source latch, marks the source
-active and pushes the tagged return PC. It charges the four nominal vector
+the active service priority, the first ISR instruction, loop interrupt shadows,
+and a pending delayed transfer. On entry, `interrupt` clears the source latch,
+marks the source active and pushes the tagged return PC. It charges the four nominal vector
 refill cycles without retiring a guest instruction. Latches for sources in
 service are kept clear at execution boundaries. A sleeping core wakes
 through the vector and resumes after IDLE on RTI.
@@ -80,9 +79,18 @@ that frame and clears the source's latch and active bit. RTI (DB) is admitted
 for sources without automatic status stacking. The PC stack pops and service
 ends when RTI retires. The two slots complete before the redirect. A snapshot
 captures the nested service frames, the interrupted native continuation and
-suspended loop fetch state, including during a delayed return. Unsupported emulation
-events, internal timer evolution, extra loop interrupt shadows and software
-interrupt control instructions still require qualification.
+suspended loop fetch state, including during a delayed return. Emulation events,
+internal timer evolution, external stalls, software interrupt control and
+simultaneous branch Address and loop-end Fetch1 admission remain profile
+coverage items.
+
+Short counted DO setup inhibits service on the next clock for one-, two-, and
+four-word bodies. For expiry in counted bodies shorter than four words and for
+arithmetic termination, the loop sample and the three following clocks inhibit
+service. The hidden deadline uses nominal base cycles and survives a snapshot.
+Native code records it at a terminating sample, including samples reached during
+a whole-turn grant or a branch or child-loop refill. Variants without declared
+interrupt vectors omit this tracking.
 
 ## Continuations
 

@@ -117,7 +117,8 @@ numerical modes, frozen progression, reset and snapshot replay. IDLE in either
 slot of a taken delayed branch keeps the delayed transfer pending. An eligible
 declared interrupt wakes ordinary IDLE. Public installed-image tests cover
 vector entry, masks, nesting, RTI and RTI (DB), absolute deadlines, a suspended
-long DO fetch, and replay into another Core. See [state.md](state.md) for the
+long DO fetch, short counted and arithmetic termination shadows, nested refills,
+and replay into another Core. See [state.md](state.md) for the
 admitted event model and open cases.
 
 Non-delayed direct CALL and plain conditional RTS keep static call targets and
@@ -128,10 +129,10 @@ return address with its CALL tag, updates PEx full/empty status and latches the
 almost-full interrupt at depth 29. A return address altered by the owner takes a
 cold path to another declared entry; owner dispatch uses a loop, not host recursion.
 A completed return respects the current bound before requiring a new entry.
-Empty/overflowed stacks and returns with a loop/interrupt continuation tag fail before
-retiring that instruction, retaining any preceding completed prefix. These are
-qualification gaps, not architectural stack-exception implementations.
-Loop-reentry, interrupt and parallel-compute returns remain unsupported.
+Empty/overflowed stacks and plain RTS on a loop or interrupt continuation fail
+at the instruction boundary, retaining the preceding completed prefix. Admitted
+reentry uses RTS (LR), and admitted interrupt return uses RTI. Architectural
+stack exceptions and parallel-compute returns remain open.
 
 Classic type 9 adds non-delayed DAG2-indirect and signed six-bit PC-relative
 jumps and calls, optionally with supported single-function fixed ALU computation.
@@ -166,7 +167,8 @@ path. Preparation admits adjacent complementary delayed jumps without
 parallel computation and rejects other branches in slots. The ISA tests in
 `test/isa/delay.cpp` cover instruction and cycle prefixes, cross-Core replay,
 absolute, relative and DAG2 calls, 24-bit PC wrap, stack refusal and a slot
-memory fault. RTI remains open.
+memory fault. `test/core/interrupt.cpp` qualifies RTI (DB) for sources without
+automatic status stacking.
 
 Long classic DO bodies of at least five words support immediate and admitted
 register counts, LCNTR, arithmetic termination and FOREVER. Counted loops

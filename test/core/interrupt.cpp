@@ -275,6 +275,33 @@ void irq_stack_limits() {
         "RTI near the stack limits failed to restore the prior depths");
 }
 
+void irq_conditional_return() {
+  constexpr std::uint64_t rti_eq = 0x0b0000000000;
+  constexpr std::uint64_t entry_clock = 4;
+  const std::array main{std::uint64_t{0}};
+  const std::array handler{rti_eq, fixture::add(0, 0, 0), rti_eq};
+  fixture::Program program(main);
+  program.add_span(irq2.vector, handler);
+  program.code.variants.front().interrupt_vectors = {irq2};
+  const auto native = sharc::Core::compile(program.code);
+  sharc::Core core(program.memory());
+  (void)core.install(native, fixture::Program::variant_id);
+  core.reset(base);
+  auto registers = core.registers();
+  registers.mode1 = interrupt_enable;
+  registers.imask |= irq2_mask;
+  core.set_registers(registers);
+  core.interrupt(irq2);
+  check(fixture::completed(core.run_until(entry_clock + 1), 1, 1) &&
+            core.registers().pc == irq2.vector + 1 && core.registers().status_depth == 1 &&
+            core.registers().pc_stack_pointer == 1 && core.registers().imaskp == irq2_mask,
+        "false RTI consumed the interrupt frame");
+  check(fixture::completed(core.run_until(entry_clock + 3), 2, 6) && core.registers().pc == base &&
+            core.registers().status_depth == 0 && core.registers().pc_stack_pointer == 0 &&
+            core.registers().imaskp == 0,
+        "taken RTI failed to restore the frame after the compute interlock");
+}
+
 void irq_shadow_after_do() {
   constexpr std::uint64_t counted_seven_times = 0x0c0007000000;
   const std::array handler{rti};
@@ -347,6 +374,169 @@ void irq_shadow_after_short_count_expires() {
           "snapshot or different run grants changed the counter expiry shadow");
   }
 }
+
+void irq_shadow_after_arithmetic_abort(sharc::ExecutionMode mode) {
+  struct Loop {
+    unsigned length;
+    std::uint64_t before_sample, sampled, last_deferred, next_boundary;
+    bool starts_zero;
+  };
+
+  // Short-loop sampling (4-58) and the six-word loop in Table 4-15.
+  // A deadline inside the final refill returns at the next retirement boundary.
+  constexpr std::array rows{Loop{.length = 1,
+                                 .before_sample = 1,
+                                 .sampled = 3,
+                                 .last_deferred = 4,
+                                 .next_boundary = 5,
+                                 .starts_zero = true},
+                            Loop{.length = 1,
+                                 .before_sample = 1,
+                                 .sampled = 3,
+                                 .last_deferred = 5,
+                                 .next_boundary = 8,
+                                 .starts_zero = false},
+                            Loop{.length = 2,
+                                 .before_sample = 3,
+                                 .sampled = 4,
+                                 .last_deferred = 5,
+                                 .next_boundary = 8,
+                                 .starts_zero = true},
+                            Loop{.length = 3,
+                                 .before_sample = 4,
+                                 .sampled = 5,
+                                 .last_deferred = 7,
+                                 .next_boundary = 8,
+                                 .starts_zero = false},
+                            Loop{.length = 6,
+                                 .before_sample = 4,
+                                 .sampled = 5,
+                                 .last_deferred = 6,
+                                 .next_boundary = 9,
+                                 .starts_zero = true}};
+  constexpr std::uint64_t do_eq = 0x0e0000000000;
+  const std::array handler{rti};
+  for (const auto &row : rows) {
+    std::array<std::uint64_t, 9> main{};
+    main[0] = do_eq | row.length;
+    if (!row.starts_zero) { main[row.length] = fixture::add(0, 2, 2); }
+    fixture::Program program(main);
+    program.add_span(irq2.vector, handler);
+    program.code.variants.front().interrupt_vectors = {irq2};
+    const auto native = fixture::compile(program.code, mode);
+    sharc::Core core(program.memory(), mode);
+    (void)core.install(native, fixture::Program::variant_id);
+    core.reset(base);
+    auto registers = core.registers();
+    registers.mode1 = interrupt_enable;
+    registers.imask |= irq2_mask;
+    if (row.starts_zero) { registers.pe[0].astat = 1; }
+    core.set_registers(registers);
+    check(!core.run_until(row.before_sample).has_fault && core.interrupt_ready(irq2),
+          "arithmetic loop deferred an IRQ before its termination sample");
+    const auto before = core.save();
+    check(!core.run_until(row.sampled).has_fault &&
+              core.state().progress.base_cycles == row.sampled && !core.interrupt_ready(irq2),
+          "arithmetic abort failed to inhibit interrupt service");
+    const auto abort = core.save();
+    check(!core.run_until(row.last_deferred).has_fault && !core.interrupt_ready(irq2),
+          "arithmetic abort released interrupt service early");
+    const auto deferred = core.state();
+    core.restore(before);
+    check(!core.run_until(row.last_deferred).has_fault && !core.interrupt_ready(irq2) &&
+              core.state() == deferred,
+          "whole-turn admission moved the arithmetic interrupt boundary");
+    core.restore(abort);
+    check(!core.run_until(row.next_boundary).has_fault &&
+              core.state().progress.base_cycles == row.next_boundary && core.interrupt_ready(irq2),
+          "arithmetic abort kept interrupts masked past the retirement boundary");
+  }
+}
+
+void irq_shadow_after_nested_refill() {
+  constexpr std::uint64_t do_eq = 0x0e0000000000;
+  constexpr std::uint64_t child_entered = 3;
+  constexpr std::uint64_t child_sampled = 6;
+  constexpr std::uint64_t shared_refill = 10;
+  constexpr std::uint64_t parent_refilled = 14;
+  std::array<std::uint64_t, 11> main{};
+  main[0] = do_eq | 9;
+  main[2] = do_eq | 5;
+  main[3] = fixture::add(0, 0, 0);
+  main[6] = fixture::add(2, 1, 1);
+  main[7] = fixture::add(3, 4, 4);
+  const std::array handler{rti};
+  fixture::Program program(main);
+  program.add_span(irq2.vector, handler);
+  program.code.variants.front().interrupt_vectors = {irq2};
+  const auto native = sharc::Core::compile(program.code);
+  sharc::Core core(program.memory());
+  (void)core.install(native, fixture::Program::variant_id);
+  core.reset(base);
+  auto registers = core.registers();
+  registers.mode1 = interrupt_enable;
+  registers.imask |= irq2_mask;
+  registers.pe[0].data[0][1] = 1U << 8;
+  core.set_registers(registers);
+  check(fixture::completed(core.run_until(child_entered), 3, 3) && core.interrupt_ready(irq2),
+        "nested arithmetic loops blocked an IRQ before the first sample");
+  const auto before = core.save();
+  check(fixture::completed(core.run_until(child_sampled), 3, 3) && !core.interrupt_ready(irq2) &&
+            fixture::completed(core.run_until(shared_refill), 2, 4) &&
+            !core.interrupt_ready(irq2) && core.registers().loop_address_depth == 0,
+        "parent sample did not renew the child's shadow on the final refill clock");
+  const auto both_popped = core.state();
+  core.restore(before);
+  check(fixture::completed(core.run_until(shared_refill), 5, 7) && core.state() == both_popped &&
+            !core.interrupt_ready(irq2),
+        "whole-turn refill lost the parent's interrupt shadow");
+  check(fixture::completed(core.run_until(shared_refill + 1), 1, 1) &&
+            !core.interrupt_ready(irq2) &&
+            fixture::completed(core.run_until(parent_refilled), 1, 3) && core.interrupt_ready(irq2),
+        "parent's interrupt shadow did not expire after its tail");
+}
+
+void irq_shadow_after_call_refill() {
+  constexpr std::uint64_t do_eq = 0x0e0000000000;
+  constexpr std::uint64_t call = 0x06be00000000;
+  constexpr std::uint64_t rts_lr = 0x0a3e01000000;
+  constexpr auto subroutine = base + 0x20;
+  constexpr std::uint64_t before_return = 9;
+  constexpr std::uint64_t returned = 13;
+  constexpr std::uint64_t refilled = 17;
+  std::array<std::uint64_t, 8> main{};
+  main[0] = do_eq | 6;
+  main[4] = call | subroutine;
+  const std::array helper{fixture::add(0, 0, 0), rts_lr};
+  const std::array handler{rti};
+  fixture::Program program(main);
+  program.add_span(subroutine, helper);
+  program.add_span(irq2.vector, handler);
+  program.code.variants.front().interrupt_vectors = {irq2};
+  const auto native = sharc::Core::compile(program.code);
+  sharc::Core core(program.memory());
+  (void)core.install(native, fixture::Program::variant_id);
+  core.reset(base);
+  auto registers = core.registers();
+  registers.mode1 = interrupt_enable;
+  registers.imask |= irq2_mask;
+  core.set_registers(registers);
+  check(fixture::completed(core.run_until(before_return), 6, 9) &&
+            core.registers().pc == subroutine + 1 && core.interrupt_ready(irq2),
+        "condition-word CALL sampled before returning to the loop");
+  const auto in_callee = core.save();
+  check(fixture::completed(core.run_until(returned), 1, 4) && core.registers().pc == base + 5 &&
+            core.registers().loop_address_depth == 0 && !core.interrupt_ready(irq2),
+        "CALL return fill did not start the arithmetic interrupt shadow");
+  check(fixture::completed(core.run_until(returned + 1), 1, 1) && !core.interrupt_ready(irq2) &&
+            fixture::completed(core.run_until(refilled), 1, 3) && core.interrupt_ready(irq2),
+        "CALL return shadow released outside the final refill boundary");
+  const auto end = core.state();
+  core.restore(in_callee);
+  check(fixture::completed(core.run_until(refilled), 3, 8) && core.state() == end &&
+            core.interrupt_ready(irq2),
+        "CALL return interrupt shadow differed after snapshot replay");
+}
 } // namespace
 
 int main() {
@@ -354,9 +544,13 @@ int main() {
     for (const auto mode : fixture::numeric_modes) {
       irq_deadlines(mode);
       irq_in_counted_loop(mode);
+      irq_shadow_after_arithmetic_abort(mode);
     }
     irq_stack_limits();
+    irq_conditional_return();
     irq_shadow_after_do();
     irq_shadow_after_short_count_expires();
+    irq_shadow_after_nested_refill();
+    irq_shadow_after_call_refill();
   });
 }

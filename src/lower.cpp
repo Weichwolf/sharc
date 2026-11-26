@@ -98,6 +98,8 @@ constexpr unsigned loop_opcode_shift = 40;
 constexpr unsigned immediate_count_shift = 24;
 constexpr unsigned loop_count_register_opcode = 0x0d;
 constexpr unsigned loop_counter_expired = 15;
+// Programming Reference 4-39: the sample and three subsequent clocks.
+constexpr unsigned loop_interrupt_shadow_clocks = 4;
 constexpr unsigned loop_type_shift = 29;
 constexpr unsigned long_counted_loop_kind = 7;
 constexpr std::int64_t fixed_minimum = std::numeric_limits<std::int32_t>::min();
@@ -726,6 +728,10 @@ struct OverlappingLoopFetch {
   LoopShape parent;
 };
 
+struct LoopConditionSample {
+  llvm::Value *status{}, *enabled{}, *interrupt_clocks{};
+};
+
 enum class RefillSample : std::uint8_t { instruction, whole_turn, call_return };
 
 struct JumpFetch {
@@ -955,9 +961,8 @@ private:
   void finish_instruction(Values values, const Instruction &op, std::uint32_t next, bool partial);
   void readmit(const Values &values, std::uint32_t next);
   void credit(Values &values, llvm::Value *count, llvm::Value *cycles, bool partial);
-  void block_interrupt_after_short_sample(const Values &values,
-                                          llvm::Value *late_sample,
-                                          bool after_credit);
+  void block_interrupt_after_loop_sample(const Values &values, llvm::Value *clocks = nullptr);
+  llvm::Value *short_sample_shadow(const Values &values, llvm::Value *late_sample, bool credited);
   void advance_lce(llvm::Value *cycles, std::size_t slot);
   llvm::Value *lce_age(llvm::Value *tail);
   void complete(Values values,
@@ -1019,13 +1024,13 @@ private:
                   llvm::Value *enabled,
                   bool returning = false,
                   llvm::Value *age = nullptr);
-  void
-  loop_test(Values &values, llvm::Value *old_status, const LoopShape &shape, llvm::Value *enabled);
+  void loop_test(Values &values, const LoopShape &shape, LoopConditionSample sample);
   [[nodiscard]] llvm::Value *refill_at(llvm::Value *refill, std::uint32_t child_end);
   void overlapping_loop_fetches(Values &values,
                                 std::uint32_t pc,
                                 llvm::Value *refill,
-                                RefillSample sample = RefillSample::instruction);
+                                RefillSample sample = RefillSample::instruction,
+                                llvm::Value *refill_clocks = nullptr);
   void loop_samples(Values &values,
                     llvm::Value *old_status,
                     std::uint32_t pc,
@@ -1040,6 +1045,8 @@ private:
 
   struct ShortRetirement {
     llvm::Value *left{}, *old_status{};
+    // Clocks still to credit at the retirement boundary, null after a return fill.
+    llvm::Value *clocks{};
   };
 
   struct ShortFetchWindow {
@@ -1067,7 +1074,10 @@ private:
   llvm::Value *
   short_exit_descriptor(llvm::Value *descriptor, const Values &values, llvm::Value *previous_depth);
   llvm::Value *short_words_after(llvm::Value *remaining, const LoopShape &shape);
-  llvm::Value *short_loop_test(Values &values, const LoopShape &shape, ShortRetirement retirement);
+  llvm::Value *short_loop_test(Values &values,
+                               const LoopShape &shape,
+                               ShortRetirement retirement,
+                               bool after_credit = false);
   llvm::Value *short_loop_refill(const LoopShape &shape, llvm::Value *done);
   llvm::Value *
   short_stage(const LoopShape &shape, std::uint32_t pc, llvm::Value *left, unsigned lag);
@@ -1087,7 +1097,7 @@ private:
   ShortLookahead overlapping_short_fetches(Values &values,
                                            const LoopShape &shape,
                                            ShortLookahead stages,
-                                           llvm::Value *old_status,
+                                           ShortRetirement retirement,
                                            bool after_credit);
   llvm::Value *short_fetch_crossed(ShortFetchWindow window, unsigned offset);
   ShortLookahead redirect_short_parent(ShortLookahead stages,
@@ -2300,7 +2310,11 @@ void Lowering::finish_loop_return(Values &values, const Instruction &op) {
   if ((sample & return_loop_fetch) != 0) {
     loop_fetch(values, *shape, ready, true);
   } else {
-    loop_test(values, values[status_value], *shape, ready);
+    loop_test(values,
+              *shape,
+              {.status = values[status_value],
+               .enabled = ready,
+               .interrupt_clocks = builder_.getInt64(loop_interrupt_shadow_clocks - 1)});
   }
 }
 
@@ -2370,7 +2384,8 @@ void Lowering::restore_short_call(Values &values,
     if (shape.arithmetic() && call_pc == shape.condition_pc()) {
       // The fourth return fetch reaches the condition word after the freeze.
       auto *depth = values[pc_stack_depth_value];
-      left = short_loop_test(values, shape, {.left = left, .old_status = values[status_value]});
+      left =
+          short_loop_test(values, shape, {.left = left, .old_status = values[status_value]}, true);
       if (reentry_calls_.contains(pc)) {
         descriptor = short_exit_descriptor(descriptor, values, depth);
       }
@@ -2464,27 +2479,30 @@ void Lowering::credit(Values &values, llvm::Value *count, llvm::Value *cycles, b
   values[extra_cycles_value] = builder_.getInt64(0);
 }
 
-void Lowering::block_interrupt_after_short_sample(const Values &values,
-                                                  llvm::Value *late_sample,
-                                                  bool after_credit) {
+void Lowering::block_interrupt_after_loop_sample(const Values &values, llvm::Value *clocks) {
+  if (variant_.interrupt_vectors.empty()) { return; }
   auto *budget = builder_.CreateGEP(
       builder_.getInt64Ty(), function_->getArg(unit_controls), builder_.getInt64(cycle_budget));
   auto *spent = builder_.CreateSub(builder_.CreateLoad(builder_.getInt64Ty(), budget),
                                    values[cycle_remaining_value]);
   auto *now = builder_.CreateAdd(load(64, progress_cycle_slot),
                                  builder_.CreateAdd(spent, values[cycle_overrun_value]));
-  // The sample itself and its three following clocks inhibit service (4-39).
-  auto *clocks = builder_.getInt64(loop_fetch_distance);
-  if (after_credit) {
-    clocks = builder_.getInt64(loop_fetch_distance - 1);
-  } else {
-    now = builder_.CreateAdd(now, values[extra_cycles_value]);
-    now = builder_.CreateAdd(now, builder_.CreateZExt(late_sample, builder_.getInt64Ty()));
+  if (clocks == nullptr) {
+    clocks = builder_.CreateAdd(values[extra_cycles_value],
+                                builder_.getInt64(loop_interrupt_shadow_clocks));
   }
   auto *deadline = builder_.CreateAdd(now, clocks);
   store(builder_.CreateBinaryIntrinsic(
             llvm::Intrinsic::umax, load(64, interrupt_deadline_slot), deadline),
         interrupt_deadline_slot);
+}
+
+llvm::Value *
+Lowering::short_sample_shadow(const Values &values, llvm::Value *late_sample, bool credited) {
+  if (credited) { return builder_.getInt64(loop_interrupt_shadow_clocks - 1); }
+  auto *sample = builder_.CreateAdd(values[extra_cycles_value],
+                                    builder_.CreateZExt(late_sample, builder_.getInt64Ty()));
+  return builder_.CreateAdd(sample, builder_.getInt64(loop_interrupt_shadow_clocks));
 }
 
 llvm::Value *Lowering::lce_age(llvm::Value *tail) {
@@ -3041,7 +3059,8 @@ void Lowering::short_loop_counter(Values &values,
         steady_fetch && !after_credit
             ? builder_.CreateAnd(startup, builder_.CreateICmpUGT(current, threshold))
             : builder_.getFalse();
-    block_interrupt_after_short_sample(values, late_sample, after_credit);
+    block_interrupt_after_loop_sample(values,
+                                      short_sample_shadow(values, late_sample, after_credit));
   }
   if (lce_endpoints_.contains(shape.end)) {
     llvm::Value *age = builder_.getInt64(1);
@@ -3073,18 +3092,24 @@ llvm::Value *Lowering::short_words_after(llvm::Value *remaining, const LoopShape
   return builder_.CreateSelect(unbounded, remaining, left);
 }
 
-llvm::Value *
-Lowering::short_loop_test(Values &values, const LoopShape &shape, ShortRetirement retirement) {
-  const auto [left, old_status] = retirement;
+llvm::Value *Lowering::short_loop_test(Values &values,
+                                       const LoopShape &shape,
+                                       ShortRetirement retirement,
+                                       bool after_credit) {
+  auto *left = retirement.left;
   auto *unbounded = builder_.CreateICmpEQ(left, builder_.getInt64(short_unbounded));
   auto before = values;
-  before[status_value] = old_status;
+  before[status_value] = retirement.old_status;
   auto *satisfied = branch_taken(condition(before, shape.term));
+  llvm::Value *late_sample = builder_.getFalse();
   if (shape.length == 1) {
     // The single-word loop samples on the startup bubble as well.
     auto *startup = short_flag(short_word(short_descriptor), short_startup);
-    satisfied = builder_.CreateOr(
-        satisfied, builder_.CreateAnd(startup, branch_taken(condition(values, shape.term))));
+    auto *bubble = builder_.CreateAnd(startup, branch_taken(condition(values, shape.term)));
+    if (!variant_.interrupt_vectors.empty()) {
+      late_sample = builder_.CreateAnd(bubble, builder_.CreateNot(satisfied));
+    }
+    satisfied = builder_.CreateOr(satisfied, bubble);
   }
   const auto frame = active_loop(values, shape);
   auto *done = builder_.CreateAnd(builder_.CreateAnd(frame.matches, unbounded), satisfied);
@@ -3094,6 +3119,10 @@ Lowering::short_loop_test(Values &values, const LoopShape &shape, ShortRetiremen
   builder_.CreateCondBr(done, pop, next.block);
   builder_.SetInsertPoint(pop);
   loop_pop(values, frame);
+  if (!variant_.interrupt_vectors.empty()) {
+    block_interrupt_after_loop_sample(values,
+                                      short_sample_shadow(values, late_sample, after_credit));
+  }
   jump(next, values);
   builder_.SetInsertPoint(next.block);
   values = next.values();
@@ -3164,8 +3193,7 @@ void Lowering::observe_short_fetches(Values &values,
                                      ShortLookahead stages,
                                      ShortRetirement retirement,
                                      bool after_credit) {
-  const auto [left, old_status] = retirement;
-  auto *live = builder_.CreateICmpNE(left, builder_.getInt64(0));
+  auto *live = builder_.CreateICmpNE(retirement.left, builder_.getInt64(0));
   const bool has_ancestors = short_parents_.contains(shape.end);
   if (has_ancestors) {
     stages.fetch = builder_.CreateSelect(
@@ -3179,7 +3207,7 @@ void Lowering::observe_short_fetches(Values &values,
     live = builder_.CreateOr(live, resumes);
   }
   if (has_ancestors) {
-    stages = overlapping_short_fetches(values, shape, stages, old_status, after_credit);
+    stages = overlapping_short_fetches(values, shape, stages, retirement, after_credit);
   }
   if (shape.length == loop_fetch_distance) { live = builder_.getTrue(); }
   write_short_addresses(stages, live);
@@ -3254,7 +3282,7 @@ Lowering::ShortLookahead Lowering::redirect_short_parent(ShortLookahead stages,
 Lowering::ShortLookahead Lowering::overlapping_short_fetches(Values &values,
                                                              const LoopShape &shape,
                                                              ShortLookahead stages,
-                                                             llvm::Value *old_status,
+                                                             ShortRetirement retirement,
                                                              bool after_credit) {
   auto *distance =
       builder_.CreateAnd(builder_.CreateSub(stages.fetch, builder_.getInt64(shape.end)),
@@ -3267,7 +3295,7 @@ Lowering::ShortLookahead Lowering::overlapping_short_fetches(Values &values,
   const ShortFetchWindow window{.before = short_word(short_fetch_progress),
                                 .after =
                                     builder_.CreateSelect(linear, distance, builder_.getInt64(0)),
-                                .old_status = old_status,
+                                .old_status = retirement.old_status,
                                 .decode_lag = lag};
   write_short(short_fetch_progress, window.after);
   llvm::Value *redirected = builder_.getFalse();
@@ -3296,7 +3324,17 @@ Lowering::ShortLookahead Lowering::overlapping_short_fetches(Values &values,
       auto *status = builder_.CreateSelect(at_execute, window.old_status, values[status_value]);
       auto *sampled = builder_.CreateAnd(builder_.CreateAnd(reachable, repeat),
                                          short_fetch_crossed(window, sample));
-      loop_test(values, status, parent, sampled);
+      llvm::Value *interrupt_clocks = nullptr;
+      if (!variant_.interrupt_vectors.empty()) {
+        auto *clocks = builder_.getInt64(loop_interrupt_shadow_clocks);
+        llvm::Value *limit = clocks;
+        if (retirement.clocks != nullptr) { limit = builder_.CreateAdd(retirement.clocks, clocks); }
+        auto *age = builder_.CreateSub(window.after, builder_.getInt64(sample));
+        interrupt_clocks = builder_.CreateBinaryIntrinsic(llvm::Intrinsic::usub_sat, limit, age);
+      }
+      loop_test(values,
+                parent,
+                {.status = status, .enabled = sampled, .interrupt_clocks = interrupt_clocks});
       selection = builder_.CreateOr(repeat, refill_at(load(64, loop_refill_slot), parent.end));
     }
     auto *selected =
@@ -3367,7 +3405,8 @@ void Lowering::short_loop_retirement(Values values,
   auto *cycles = builder_.CreateAdd(builder_.CreateAdd(builder_.getInt64(1), refill),
                                     values[extra_cycles_value]);
   auto *before_fetch = values[pc_stack_depth_value];
-  short_loop_observation(values, op, shape, {.left = left, .old_status = old_status});
+  short_loop_observation(
+      values, op, shape, {.left = left, .old_status = old_status, .clocks = cycles});
   const bool overlapping = short_parents_.contains(shape.end);
   if (overlapping && reentry_calls_.contains(following)) {
     next_descriptor = short_exit_descriptor(next_descriptor, values, before_fetch);
@@ -3603,22 +3642,21 @@ void Lowering::loop_fetch(Values &values,
   values = continuation.values();
 }
 
-void Lowering::loop_test(Values &values,
-                         llvm::Value *old_status,
-                         const LoopShape &shape,
-                         llvm::Value *enabled) {
+void Lowering::loop_test(Values &values, const LoopShape &shape, LoopConditionSample sample) {
   const auto frame = active_loop(values, shape);
   auto before = values;
-  before[status_value] = old_status;
+  before[status_value] = sample.status;
   auto *done = branch_taken(condition(before, shape.term));
   auto *leave = llvm::BasicBlock::Create(module_.getContext(), "loop.condition.exit", function_);
   auto next = node("loop.condition.continue");
   next.incoming(values, builder_.GetInsertBlock());
-  builder_.CreateCondBr(
-      builder_.CreateAnd(enabled, builder_.CreateAnd(frame.matches, done)), leave, next.block);
+  builder_.CreateCondBr(builder_.CreateAnd(sample.enabled, builder_.CreateAnd(frame.matches, done)),
+                        leave,
+                        next.block);
   builder_.SetInsertPoint(leave);
   auto popped = values;
   loop_pop(popped, frame);
+  block_interrupt_after_loop_sample(popped, sample.interrupt_clocks);
   const auto refill =
       loop_refill_live | (std::uint64_t{shape.end} << loop_refill_end_shift) | shape.start;
   store(builder_.getInt64(refill), loop_refill_slot);
@@ -3662,7 +3700,12 @@ llvm::Value *Lowering::jump_fetch(Values &values,
     tests = builder_.CreateAnd(
         tests, builder_.CreateICmpEQ(fetch, builder_.getInt32((shape.start + 1) & maximum_pc)));
     tests = builder_.CreateAnd(tests, scheduled);
-    loop_test(values, position.status, shape, tests);
+    const auto sample_age = position.clocks_retired - position.clock;
+    loop_test(values,
+              shape,
+              {.status = position.status,
+               .enabled = tests,
+               .interrupt_clocks = builder_.getInt64(loop_interrupt_shadow_clocks - sample_age)});
     auto *exited = builder_.CreateAnd(tests, refill_at(load(64, loop_refill_slot), shape.end));
     next = builder_.CreateSelect(exited, builder_.getInt32((shape.end + 1) & maximum_pc), next);
   }
@@ -3741,7 +3784,8 @@ llvm::Value *Lowering::refill_at(llvm::Value *refill, std::uint32_t child_end) {
 void Lowering::overlapping_loop_fetches(Values &values,
                                         std::uint32_t pc,
                                         llvm::Value *refill,
-                                        RefillSample sample) {
+                                        RefillSample sample,
+                                        llvm::Value *refill_clocks) {
   const auto overlaps = overlapping_fetches_.find(pc);
   if (overlaps == overlapping_fetches_.end()) { return; }
   llvm::Value *redirected = builder_.getFalse();
@@ -3762,7 +3806,18 @@ void Lowering::overlapping_loop_fetches(Values &values,
     if (parent.arithmetic() && gap == loop_decode_distance) {
       // Fetch1 reaches the parent's second word on the last child refill
       // clock. Decode sees this decision before any more guest work retires.
-      loop_test(values, values[status_value], parent, repeat);
+      llvm::Value *interrupt_clocks = nullptr;
+      if (refill_clocks != nullptr && !variant_.interrupt_vectors.empty()) {
+        interrupt_clocks =
+            builder_.CreateAdd(refill_clocks, builder_.getInt64(loop_interrupt_shadow_clocks - 1));
+      } else if (sample == RefillSample::call_return) {
+        interrupt_clocks = builder_.getInt64(loop_interrupt_shadow_clocks - 1);
+      }
+      loop_test(values,
+                parent,
+                {.status = values[status_value],
+                 .enabled = repeat,
+                 .interrupt_clocks = interrupt_clocks});
     }
   }
 }
@@ -3808,7 +3863,12 @@ void Lowering::loop_samples(Values &values,
   const auto test = loop_tests_.find(pc);
   if (test != loop_tests_.end()) {
     auto *enabled = builder_.CreateNot(refill_at(refill, pc));
-    loop_test(values, old_status, test->second, enabled);
+    auto *interrupt_clocks = sample == RefillSample::call_return
+                                 ? builder_.getInt64(loop_interrupt_shadow_clocks - 1)
+                                 : nullptr;
+    loop_test(values,
+              test->second,
+              {.status = old_status, .enabled = enabled, .interrupt_clocks = interrupt_clocks});
   }
   overlapping_loop_fetches(values, pc, refill, sample);
 }
@@ -3948,8 +4008,17 @@ void Lowering::emit_hardware_turns(const Node &body,
   if (shape.short_body()) {
     auto *buffered = builder_.getInt64(shape.short_condition_tail());
     write_short(short_remaining, buffered);
+    if (!variant_.interrupt_vectors.empty()) {
+      const auto age = shape.end - shape.condition_pc() + 1;
+      block_interrupt_after_loop_sample(
+          values,
+          builder_.CreateAdd(retired, builder_.getInt64(loop_interrupt_shadow_clocks - age)));
+    }
     short_loop_observation(
-        values, words.back(), shape, {.left = buffered, .old_status = values[status_value]});
+        values,
+        words.back(),
+        shape,
+        {.left = buffered, .old_status = values[status_value], .clocks = retired});
     credit(values, retired, retired, false);
     jump(partial_[start], values);
     return;
@@ -3958,9 +4027,9 @@ void Lowering::emit_hardware_turns(const Node &body,
   auto *refill = builder_.getInt64(
       loop_refill_live | (std::uint64_t{shape.end} << loop_refill_end_shift) | shape.start);
   overlapping_loop_fetches(values, (shape.end - 1) & maximum_pc, refill, RefillSample::whole_turn);
-  overlapping_loop_fetches(values, shape.end, refill);
-  credit(
-      values, retired, builder_.CreateAdd(retired, builder_.getInt64(loop_decode_distance)), false);
+  auto *refill_clocks = builder_.CreateAdd(retired, builder_.getInt64(loop_decode_distance));
+  overlapping_loop_fetches(values, shape.end, refill, RefillSample::instruction, refill_clocks);
+  credit(values, retired, refill_clocks, false);
   readmit(values, (shape.end + 1) & maximum_pc);
 }
 
