@@ -35,6 +35,12 @@ constexpr unsigned raw_shift = 8;
 constexpr unsigned count_shift = 24;
 constexpr std::uint32_t az = 1, an = 4, ac = 8;
 
+constexpr std::uint64_t if_not_lce(std::uint64_t op) {
+  constexpr auto field = 31ULL << 33;
+  constexpr auto not_lce = 15ULL << 33;
+  return (op & ~field) | not_lce;
+}
+
 struct Timeline {
   sharc::Registers registers;
   std::vector<Prefix> prefixes;
@@ -187,7 +193,8 @@ struct ShortBoundary {
 void short_counted_case(unsigned length,
                         std::uint32_t count,
                         std::span<const ShortBoundary> boundaries,
-                        std::uint64_t successor = 0) {
+                        std::uint64_t successor = 0,
+                        std::span<const bool> enabled = {}) {
   constexpr std::array address_types{
       single_word_counted_address, 0x8f000000U, 0xcf000000U, counted_address};
   constexpr std::array setup_fetch{1U, 2U, 2U, 4U};
@@ -195,6 +202,9 @@ void short_counted_case(unsigned length,
   std::vector<std::uint64_t> words(length + 2, fixture::add(0, 0, 1));
   words.front() = do_immediate | (std::uint64_t{count} << count_shift) | length;
   words.back() = successor;
+  if (!enabled.empty()) {
+    for (unsigned pc = 2; pc <= length; ++pc) { words[pc] = if_not_lce(words[pc]); }
+  }
   fixture::Program program(words);
   auto initial = starting();
   initial.pe[0].data[0][1] = 1U << raw_shift;
@@ -204,8 +214,9 @@ void short_counted_case(unsigned length,
   trace.registers.faddr = base + setup_fetch[length - 1];
   trace.registers.daddr = base + setup_decode[length - 1];
   trace.prefixes.back().registers = trace.registers;
-  for (const auto &expected : boundaries) {
-    if (trace.registers.pc != base + length + 1) {
+  for (std::size_t i = 0; i < boundaries.size(); ++i) {
+    const auto &expected = boundaries[i];
+    if (trace.registers.pc != base + length + 1 && (enabled.empty() || enabled[i])) {
       trace.registers.pe[0].data[0][0] += 1U << raw_shift;
     }
     trace.boundary(base + expected.pc, expected.cycles);
@@ -291,6 +302,13 @@ void multiword_short_loops() {
   short_counted_case(2, 3, two_three);
   short_counted_case(2, 2, two_two);
   short_counted_case(2, 1, two_one);
+  // A held startup sample is already one clock older at the second instruction.
+  constexpr std::array two_three_enabled{true, true, true, false, true, false};
+  constexpr std::array two_two_enabled{true, false, true, false};
+  constexpr std::array two_one_enabled{true, false};
+  short_counted_case(2, 3, two_three, 0, two_three_enabled);
+  short_counted_case(2, 2, two_two, 0, two_two_enabled);
+  short_counted_case(2, 1, two_one, 0, two_one_enabled);
 
   // Tables 4-25 and 4-26: a three-word body does not stall on entry.
   constexpr std::array three_two{ShortBoundary{.pc = 2, .fetch = 3, .decode = 1, .count = 1},
@@ -305,6 +323,10 @@ void multiword_short_loops() {
       ShortBoundary{.pc = 4, .fetch = 8, .decode = 6, .cycles = 4, .count = 0}};
   short_counted_case(3, 2, three_two);
   short_counted_case(3, 1, three_one);
+  constexpr std::array three_two_enabled{true, true, false, true, false, false};
+  constexpr std::array three_one_enabled{true, true, true};
+  short_counted_case(3, 2, three_two, 0, three_two_enabled);
+  short_counted_case(3, 1, three_one, 0, three_one_enabled);
 
   // Table 4-27 carries the held decode address through the last body word.
   constexpr std::array four_one{
@@ -324,6 +346,10 @@ void multiword_short_loops() {
       four_one[2],
       four_one[3]};
   short_counted_case(4, 2, four_two);
+  constexpr std::array four_one_enabled{true, false, false, false, false};
+  constexpr std::array four_two_enabled{true, true, true, true, true, false, false, false};
+  short_counted_case(4, 1, four_one, 0, four_one_enabled);
+  short_counted_case(4, 2, four_two, 0, four_two_enabled);
   auto after_jump = four_one;
   after_jump.back() = ShortBoundary{.pc = 5, .fetch = 9, .decode = 7, .cycles = 4, .count = 0};
   constexpr auto jump_to_successor = std::uint64_t{0x063e00000000} | (base + 5);
@@ -1333,12 +1359,6 @@ void counted_sample_before_second_call() {
 
 constexpr auto short_call_sub = base + 8;
 
-constexpr std::uint64_t if_not_lce(std::uint64_t op) {
-  constexpr auto field = 31ULL << 33;
-  constexpr auto not_lce = 15ULL << 33;
-  return (op & ~field) | not_lce;
-}
-
 void counted_not_lce_compute() {
   std::array<std::uint64_t, 7> words{};
   words[0] = do_immediate | (std::uint64_t{2} << count_shift) | 5;
@@ -1580,7 +1600,12 @@ constexpr std::array three_word_turns{
                       .second = {.pc = 3, .fetch = 7, .decode = 5},
                       .returned = {.pc = 4, .fetch = 8, .decode = 6}}};
 
-void counted_short_endpoint_call(unsigned width, bool delayed) {
+enum class ShortEndpointPredicate : std::uint8_t { unconditional, not_lce };
+
+void counted_short_endpoint_call(
+    unsigned width,
+    bool delayed,
+    ShortEndpointPredicate predicate = ShortEndpointPredicate::unconditional) {
   constexpr std::array two_word{ShortEndpointTurn{.first = {.pc = 2, .fetch = 2, .decode = 2},
                                                   .returned = {.pc = 1, .fetch = 1, .decode = 1}},
                                 ShortEndpointTurn{.first = {.pc = 2, .fetch = 2, .decode = 2},
@@ -1593,6 +1618,8 @@ void counted_short_endpoint_call(unsigned width, bool delayed) {
   std::array<std::uint64_t, 15> words{};
   words[0] = do_immediate | (std::uint64_t{4} << count_shift) | width;
   words[width] = delayed ? call_dag2 : call_direct | short_call_sub;
+  const bool predicated = predicate == ShortEndpointPredicate::not_lce;
+  if (predicated) { words[width] = if_not_lce(words[width]); }
   words[width + 1] = jump_direct | (base + 14);
   words[8] = do_immediate | (std::uint64_t{1} << count_shift) | 1;
   words[9] = fixture::add(0, 0, 1);
@@ -1621,7 +1648,10 @@ void counted_short_endpoint_call(unsigned width, bool delayed) {
       short_boundary(trace, turn.second);
     }
     const auto tags = call_tag | (width == 3 && i == 1 ? termination_tag : 0);
-    const auto cycles = short_call_round_trip(trace, turn.returned.pc, delayed, tags);
+    const auto taken_through = width == 2 ? 2U : 1U;
+    const auto cycles = !predicated || i <= taken_through
+                            ? short_call_round_trip(trace, turn.returned.pc, delayed, tags)
+                            : 1U;
     // In a two-word body the fourth return fetch reaches E after the freeze.
     if (width == 2 && i < 2) { parent_count_sample(trace, i == 0); }
     short_boundary(trace, turn.returned, cycles);
@@ -1631,13 +1661,14 @@ void counted_short_endpoint_call(unsigned width, bool delayed) {
 
 enum class ThreeWordCall : std::uint8_t { direct, delayed, predicated };
 
-void three_word_penultimate_call(ThreeWordCall form) {
+void three_word_penultimate_call(ThreeWordCall form, bool observe_after_return = false) {
   constexpr std::uint64_t call_eq = 0x068000000000;
   const bool delayed = form == ThreeWordCall::delayed;
   const bool predicated = form == ThreeWordCall::predicated;
   std::array<std::uint64_t, 15> words{};
   words[0] = do_immediate | (std::uint64_t{4} << count_shift) | 3;
   words[2] = delayed ? call_dag2 : (predicated ? call_eq : call_direct) | short_call_sub;
+  if (observe_after_return) { words[3] = if_not_lce(fixture::add(6, 6, 1)); }
   words[4] = jump_direct | (base + 14);
   words[8] = do_immediate | (std::uint64_t{1} << count_shift) | 1;
   words[9] = fixture::add(0, 0, 1);
@@ -1664,6 +1695,7 @@ void three_word_penultimate_call(ThreeWordCall form) {
     // E reaches Fetch1 after the return's frozen clocks, or in place on a false CALL.
     if (i < 2) { parent_count_sample(trace, i == 0); }
     short_boundary(trace, turn.second, cycles);
+    if (observe_after_return && i < 2) { state.pe[0].data[0][6] += 1U << raw_shift; }
     short_boundary(trace, turn.returned);
   }
   verify_timeline(program, initial, trace);
@@ -2335,9 +2367,12 @@ void fixture::hardware_loop_control_flow() {
   counted_short_endpoint_call(2, true);
   counted_short_endpoint_call(3, false);
   counted_short_endpoint_call(3, true);
+  counted_short_endpoint_call(2, true, ShortEndpointPredicate::not_lce);
+  counted_short_endpoint_call(3, false, ShortEndpointPredicate::not_lce);
   three_word_penultimate_call(ThreeWordCall::direct);
   three_word_penultimate_call(ThreeWordCall::delayed);
   three_word_penultimate_call(ThreeWordCall::predicated);
+  three_word_penultimate_call(ThreeWordCall::delayed, true);
   compact_three_word_penultimate_call(false);
   compact_three_word_penultimate_call(true);
   single_iteration_two_word_call();
