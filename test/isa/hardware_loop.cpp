@@ -28,6 +28,7 @@ constexpr std::uint32_t call_tag = 1U << 24, termination_tag = 1U << 25;
 constexpr std::uint32_t pc_empty = 1U << 22, loop_empty = 1U << 26;
 constexpr std::uint32_t counted_address = 0xef000000;
 constexpr std::uint32_t single_word_counted_address = 0x4f000000;
+constexpr std::uint32_t two_word_counted_address = 0x8f000000;
 constexpr std::uint32_t empty = pc_empty | loop_empty;
 constexpr std::uint32_t loop_overflow = 1U << 25;
 constexpr std::uint32_t old_lcntr = 0x13579bdf;
@@ -194,16 +195,17 @@ void short_counted_case(unsigned length,
                         std::uint32_t count,
                         std::span<const ShortBoundary> boundaries,
                         std::uint64_t successor = 0,
-                        std::span<const bool> enabled = {}) {
+                        std::span<const bool> enabled = {},
+                        unsigned first_predicate = 2) {
   constexpr std::array address_types{
-      single_word_counted_address, 0x8f000000U, 0xcf000000U, counted_address};
+      single_word_counted_address, two_word_counted_address, 0xcf000000U, counted_address};
   constexpr std::array setup_fetch{1U, 2U, 2U, 4U};
   constexpr std::array setup_decode{1U, 2U, 3U, 2U};
   std::vector<std::uint64_t> words(length + 2, fixture::add(0, 0, 1));
   words.front() = do_immediate | (std::uint64_t{count} << count_shift) | length;
   words.back() = successor;
   if (!enabled.empty()) {
-    for (unsigned pc = 2; pc <= length; ++pc) { words[pc] = if_not_lce(words[pc]); }
+    for (unsigned pc = first_predicate; pc <= length; ++pc) { words[pc] = if_not_lce(words[pc]); }
   }
   fixture::Program program(words);
   auto initial = starting();
@@ -236,6 +238,16 @@ void short_counted_case(unsigned length,
   }
 }
 
+void short_not_lce_header(unsigned length,
+                          std::uint32_t count,
+                          std::span<const ShortBoundary> boundaries,
+                          std::span<const bool> enabled) {
+  std::vector<ShortBoundary> held(boundaries.begin(), boundaries.end());
+  // The count-load dependency precedes issue. The buffered refill still follows it.
+  ++held.front().cycles;
+  short_counted_case(length, count, held, 0, enabled, 1);
+}
+
 void single_word_loops() {
   // Table 4-17: Fetch1 can leave the body four retirements before Execute.
   constexpr std::array five{
@@ -245,6 +257,8 @@ void single_word_loops() {
       ShortBoundary{.pc = 1, .fetch = 5, .decode = 3, .count = 3},
       ShortBoundary{.pc = 2, .fetch = 6, .decode = 4, .count = 3}};
   short_counted_case(1, 5, five);
+  constexpr std::array five_enabled{true, false, false, false, false};
+  short_not_lce_header(1, 5, five, five_enabled);
   constexpr std::array four{
       ShortBoundary{.pc = 1, .fetch = 3, .decode = 1, .cycles = 2, .count = 3},
       five[2],
@@ -279,7 +293,11 @@ void single_word_loops() {
   short_counted_case(1, 3, three);
   short_counted_case(1, 2, two);
   short_counted_case(1, 1, one);
+  constexpr std::array one_enabled{false};
+  short_not_lce_header(1, 1, one, one_enabled);
   short_counted_case(1, 0, zero);
+  constexpr std::array zero_enabled{true, true};
+  short_not_lce_header(1, 0, zero, zero_enabled);
 }
 
 void multiword_short_loops() {
@@ -309,6 +327,10 @@ void multiword_short_loops() {
   short_counted_case(2, 3, two_three, 0, two_three_enabled);
   short_counted_case(2, 2, two_two, 0, two_two_enabled);
   short_counted_case(2, 1, two_one, 0, two_one_enabled);
+  constexpr std::array two_one_header_enabled{false, false};
+  short_not_lce_header(2, 1, two_one, two_one_header_enabled);
+  constexpr std::array two_three_header_enabled{true, true, true, false, false, false};
+  short_not_lce_header(2, 3, two_three, two_three_header_enabled);
 
   // Tables 4-25 and 4-26: a three-word body does not stall on entry.
   constexpr std::array three_two{ShortBoundary{.pc = 2, .fetch = 3, .decode = 1, .count = 1},
@@ -327,6 +349,10 @@ void multiword_short_loops() {
   constexpr std::array three_one_enabled{true, true, true};
   short_counted_case(3, 2, three_two, 0, three_two_enabled);
   short_counted_case(3, 1, three_one, 0, three_one_enabled);
+  constexpr std::array three_one_header_enabled{false, true, true};
+  short_not_lce_header(3, 1, three_one, three_one_header_enabled);
+  constexpr std::array three_two_header_enabled{true, true, false, false, false, false};
+  short_not_lce_header(3, 2, three_two, three_two_header_enabled);
 
   // Table 4-27 carries the held decode address through the last body word.
   constexpr std::array four_one{
@@ -350,6 +376,7 @@ void multiword_short_loops() {
   constexpr std::array four_two_enabled{true, true, true, true, true, false, false, false};
   short_counted_case(4, 1, four_one, 0, four_one_enabled);
   short_counted_case(4, 2, four_two, 0, four_two_enabled);
+  short_not_lce_header(4, 2, four_two, four_two_enabled);
   auto after_jump = four_one;
   after_jump.back() = ShortBoundary{.pc = 5, .fetch = 9, .decode = 7, .cycles = 4, .count = 0};
   constexpr auto jump_to_successor = std::uint64_t{0x063e00000000} | (base + 5);
@@ -904,7 +931,7 @@ void arithmetic_refill_overlap(bool ending) {
 
 constexpr unsigned short_setup_pc = 4;
 constexpr std::array short_counted_types{
-    single_word_counted_address, 0x8f000000U, 0xcf000000U, counted_address};
+    single_word_counted_address, two_word_counted_address, 0xcf000000U, counted_address};
 
 void enter_nested_short(Timeline &trace, const ShortBoundary &entry, std::uint32_t address) {
   auto &state = trace.registers;
@@ -2167,6 +2194,101 @@ void nested_counted_call_cases() {
   // These pre-sample branch predicates still see the old observation.
   nested_counted_not_lce(4, {.form = NestedTailReturn::immediate, .predicated = true});
   nested_counted_not_lce(4, {.form = NestedTailReturn::delayed, .predicated = true});
+}
+
+void long_not_lce_header(std::uint32_t count, bool register_setup) {
+  constexpr unsigned length = 8;
+  constexpr Range loop{.start = base + 1, .end = base + length};
+  std::array<std::uint64_t, length + 2> words{};
+  words[0] =
+      (register_setup ? do_r9 : do_immediate | (std::uint64_t{count} << count_shift)) | length;
+  words[1] = if_not_lce(fixture::add(0, 0, 1));
+  fixture::Program program(words);
+  auto initial = starting();
+  initial.pe[0].data[0][1] = 1U << raw_shift;
+  initial.pe[0].data[0][9] = std::uint64_t{count} << raw_shift;
+  if (register_setup) {
+    constexpr auto simd = 1U << 21;
+    initial.mode1 = simd;
+    initial.pe[1].data[0][1] = 2U << raw_shift;
+    initial.pe[1].data[0][9] = std::uint64_t{3 - count} << raw_shift;
+  }
+  Timeline trace{.registers = initial, .prefixes = {}};
+  trace.registers.lcntr = count;
+  entered(trace, {.address = counted_address | loop.end, .count = count});
+  for (unsigned turn = 0; turn < count; ++turn) {
+    const bool repeats = turn + 1 < count;
+    if (turn != 0 || count != 1) {
+      nested_tail_add(trace, 0);
+      if (register_setup) { trace.registers.pe[1].data[0][0] += 2U << raw_shift; }
+    }
+    trace.boundary(loop.start + 1, turn == 0 ? 2U : 1U);
+    trace.record();
+    for (auto pc = loop.start + 1; pc <= loop.end; ++pc) {
+      if (pc == loop.end - 4) { parent_count_sample(trace, repeats); }
+      nested_counted_boundary(trace, loop, pc + 1, repeats);
+    }
+  }
+  verify_timeline(program, initial, trace);
+}
+
+void not_lce_header_call(std::uint32_t count) {
+  constexpr Range loop{.start = base + 1, .end = base + 5};
+  constexpr auto callee = base + nested_tail_sub;
+  std::array<std::uint64_t, nested_tail_sub + 1> words{};
+  words[0] = do_lce | 5;
+  words[1] = if_not_lce(call_direct | callee);
+  words[nested_tail_sub] = rts | lr;
+  fixture::Program program(words);
+  auto initial = starting();
+  initial.lcntr = count;
+  Timeline trace{.registers = initial, .prefixes = {}};
+  entered(trace, {.address = counted_address | loop.end, .count = count});
+  for (unsigned turn = 0; turn < count; ++turn) {
+    const bool repeats = turn + 1 < count;
+    unsigned cycles = 3;
+    if (count != 1) {
+      entered_call(trace,
+                   {.target = callee, .raw_return = call_tag | (loop.start + 1)},
+                   turn == 0 ? 6U : 4U);
+      popped_call(trace.registers);
+      cycles = 4;
+    }
+    parent_count_sample(trace, repeats);
+    nested_counted_boundary(trace, loop, loop.start + 1, repeats, cycles);
+    for (auto pc = loop.start + 1; pc <= loop.end; ++pc) {
+      nested_counted_boundary(trace, loop, pc + 1, repeats);
+    }
+  }
+  verify_timeline(program, initial, trace);
+}
+
+void not_lce_header_skips_short_call() {
+  constexpr auto once = do_immediate | (std::uint64_t{1} << count_shift);
+  constexpr auto sub = base + 4;
+  constexpr std::array words{
+      once | 2, if_not_lce(call_direct | sub), std::uint64_t{0}, std::uint64_t{0}, rts | lr};
+  fixture::Program program(words);
+  const auto initial = starting();
+  Timeline trace{.registers = initial, .prefixes = {}};
+  trace.registers.lcntr = 1;
+  entered(trace, {.address = two_word_counted_address | (base + 2), .count = 1});
+  trace.registers.faddr = trace.registers.daddr = base + 2;
+  trace.prefixes.back().registers = trace.registers;
+  parent_count_sample(trace, false);
+  short_boundary(trace, {.pc = 2, .fetch = 4, .decode = 2}, 4);
+  trace.boundary(base + 3, 3);
+  trace.record();
+  verify_timeline(program, initial, trace);
+}
+
+void not_lce_header_cases() {
+  long_not_lce_header(1, false);
+  long_not_lce_header(1, true);
+  long_not_lce_header(3, true);
+  not_lce_header_call(1);
+  not_lce_header_call(2);
+  not_lce_header_skips_short_call();
 }
 
 void counted_parent_call_without_child_setup() {
@@ -4141,6 +4263,7 @@ void fixture::hardware_loop_control_flow() {
   counted_sample_call(CountedSampleCall::predicated);
   counted_sample_before_second_call();
   counted_not_lce_compute();
+  not_lce_header_cases();
   nested_counted_call_cases();
   counted_parent_call_without_child_setup();
   counted_not_lce_call(2);

@@ -61,6 +61,7 @@ constexpr unsigned shadow_register_first = 0x50;
 constexpr unsigned system_register_first = 0x60;
 constexpr unsigned ureg_mask = 127, byte_mask = 255;
 constexpr unsigned history_older_mask = 0xff00;
+constexpr unsigned history_loop_setup = 1U << 16;
 constexpr unsigned rotate_opcode = 0x08;
 constexpr unsigned conditional_compute_type = 2;
 constexpr unsigned immediate_shift_type = 6;
@@ -1131,6 +1132,7 @@ private:
   void write_register(Values &values, unsigned reg, llvm::Value *raw, llvm::Value *selected);
   void register_instruction(Values &values, const Instruction &op, const Values &before);
   llvm::Value *pipeline_stall(const Values &values, const Instruction &op);
+  llvm::Value *loop_count_loaded(const Values &values);
   llvm::Value *loaded_tag(const Values &values, const Instruction &op);
   void retire_pipeline(Values &values, PipelineEffects effects);
   void plan_memory();
@@ -1232,8 +1234,14 @@ llvm::Value *Lowering::condition(const Values &values, const Instruction &op) {
   auto *age = lce_age(load(64, counted_tail_slot_for(site->second)));
   age = builder_.CreateAdd(age, pipeline_stall(values, op));
   const auto limit = branch(op) ? lce_branch_age : lce_compute_age;
-  auto *expired = builder_.CreateAnd(counted_tail_matches(site->second),
-                                     builder_.CreateICmpUGE(age, builder_.getInt64(limit)));
+  llvm::Value *expired = builder_.CreateAnd(counted_tail_matches(site->second),
+                                            builder_.CreateICmpUGE(age, builder_.getInt64(limit)));
+  if (op.address == site->second.start) {
+    // The DO just copied LCNTR to CURLCNTR. Its interlock makes the loaded
+    // count visible before the first predicate. A backedge uses fetch history.
+    auto *single = builder_.CreateICmpEQ(load(32, lcntr_slot), builder_.getInt32(1));
+    expired = builder_.CreateSelect(loop_count_loaded(values), single, expired);
+  }
   auto *enabled = builder_.CreateNot(expired);
   return pair(enabled, (context_ & simd_mode) != 0 ? enabled : builder_.getFalse(), 1);
 }
@@ -1459,6 +1467,9 @@ void Lowering::register_instruction(Values &values, const Instruction &op, const
 }
 
 llvm::Value *Lowering::loaded_tag(const Values &values, const Instruction &op) {
+  if (loop_setup(op) && not_lce_.contains(next_pc(op))) {
+    return builder_.getInt32(history_loop_setup);
+  }
   const auto reg = loaded_register(op);
   if (!dag_register(reg)) { return builder_.getInt32(0); }
   const auto index = reg & 15;
@@ -1471,6 +1482,12 @@ llvm::Value *Lowering::loaded_tag(const Values &values, const Instruction &op) {
                                builder_.getInt32(0));
 }
 
+llvm::Value *Lowering::loop_count_loaded(const Values &values) {
+  auto *setup =
+      builder_.CreateAnd(values[dag_history_value], builder_.getInt32(history_loop_setup));
+  return builder_.CreateICmpNE(setup, builder_.getInt32(0));
+}
+
 llvm::Value *Lowering::pipeline_stall(const Values &values, const Instruction &op) {
   llvm::Value *stall = builder_.getInt64(0);
   std::vector<unsigned> dependencies;
@@ -1481,7 +1498,11 @@ llvm::Value *Lowering::pipeline_stall(const Values &values, const Instruction &o
     dependencies.push_back(16 + branch_modifier(op));
   }
   auto *previous = builder_.CreateAnd(values[dag_history_value], builder_.getInt32(byte_mask));
-  auto *earlier = builder_.CreateLShr(values[dag_history_value], builder_.getInt32(8));
+  auto *older = values[dag_history_value];
+  if (!not_lce_.empty()) {
+    older = builder_.CreateAnd(older, builder_.getInt32(history_older_mask));
+  }
+  auto *earlier = builder_.CreateLShr(older, builder_.getInt32(8));
   llvm::Value *recent_match = builder_.getFalse();
   llvm::Value *earlier_match = builder_.getFalse();
   for (const auto dependency : dependencies) {
@@ -1498,6 +1519,12 @@ llvm::Value *Lowering::pipeline_stall(const Values &values, const Instruction &o
     // Concurrent Decode/Address hazards overlap, rather than adding sequential stalls.
     auto *compute = builder_.CreateZExt(values[hazard_value], builder_.getInt64Ty());
     stall = builder_.CreateSelect(builder_.CreateICmpUGT(compute, stall), compute, stall);
+  }
+  const auto lce = not_lce_.find(op.address);
+  if (lce != not_lce_.end() && op.address == lce->second.start) {
+    auto *interlock = builder_.CreateSelect(
+        loop_count_loaded(values), builder_.getInt64(branch(op) ? 2 : 1), builder_.getInt64(0));
+    stall = builder_.CreateBinaryIntrinsic(llvm::Intrinsic::umax, stall, interlock);
   }
   return stall;
 }
@@ -2921,7 +2948,7 @@ void Lowering::short_loop_counter(Values &values,
   if (lce_endpoints_.contains(shape.end)) {
     llvm::Value *age = builder_.getInt64(1);
     if (shape.length != 3 && !after_credit) {
-      // The held two- or four-word startup fetch ages through its entry bubble.
+      // A held startup fetch ages through its entry bubble.
       age = builder_.CreateAdd(age, builder_.CreateZExt(startup, builder_.getInt64Ty()));
     }
     save_counted_tail(shape, age, after_credit);
@@ -4619,14 +4646,12 @@ void validate_not_lce(const InstructionMap &code, LoopPlan &plan, std::string_vi
         owner = &shape;
       }
     }
-    const auto previous = code.find((pc - 1) & maximum_pc);
     if (owner == nullptr || !owner->counted() ||
-        ((owner->end - pc) & maximum_pc) > loop_fetch_distance ||
-        (previous != code.end() && loop_setup(*previous->second))) {
+        (pc != owner->start && ((owner->end - pc) & maximum_pc) > loop_fetch_distance)) {
       reject(*op,
              identity,
              FaultReason::unsupported_instruction,
-             "NOT LCE outside an admitted counted DO tail");
+             "NOT LCE outside an admitted counted DO header or tail");
     }
     const auto unqualified_overlap = [&plan](const LoopShape &parent, const LoopShape &child) {
       const auto nested = plan.short_nested.find(child.end);

@@ -243,13 +243,18 @@ An interlock that holds the CALL in Decode delays its address stage past
 the counter sample. The saved PC has no termination tag in that case.
 Installed-image fixtures exercise this timing in short and long bodies.
 Qualified classic IF NOT LCE uses the end-fetch decision in long counted
-DO tails and in counted two-, three- and four-word bodies after the
-first word. The condition changes at different clocks for a branch and
-an Execute-stage consumer. Buffered passes retain the decision after
-the loop stacks pop and across CALL and RTS (LR). A held two- or
-four-word startup fetch also ages through the entry bubble. The tests
-exercise both condition latencies, a DAG2 interlock, replay at exact
-bounds, and complete-turn grants for nonterminating counted passes.
+DO tails and in buffered one- through four-word bodies. At a counted
+header reached from its DO, the predicate observes the newly loaded
+count with a one-cycle compute or two-cycle branch interlock.
+A backedge to the same header follows the normal sample history.
+The tests exercise immediate, register and LCNTR setup, SIMD compute,
+both header CALL predicate outcomes, and snapshot replay.
+The startup timing is derived from the programming reference's
+conditional-branch stalls and loop timing tables.
+Buffered passes retain sampled decisions after the loop stacks pop and
+across CALL and RTS (LR). A held startup fetch ages through its entry
+bubble. The tests exercise the separate branch and Execute latencies,
+a DAG2 interlock and complete-turn grants for nonterminating counted passes.
 An admitted long counted parent tracks the sample clock during a short
 child's drain or a long arithmetic child's refill. A counted child preserves
 its own observation while the parent samples. Installed-image fixtures cover
@@ -262,8 +267,8 @@ while a short child runs or drains. A counted child has an independent
 observation. Tests exercise both outcomes in the overlapping buffers,
 a parent sample on the last clock of a child refill, and preservation of
 the parent's sampled expiry across both return forms after the child drains.
-Observations immediately after DO, explicit loop-resource changes, other
-overlapping configurations and unlooped predicates remain unqualified.
+Explicit loop-resource changes, other overlapping configurations, predicates
+in the middle of long bodies and unlooped predicates remain unqualified.
 Combined condition timing awaits hardware comparison.
 An immediate CALL at the endpoint stores the next loop header or the word
 after the loop as its return address. On a terminating arithmetic turn the
