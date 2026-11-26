@@ -109,8 +109,17 @@ a compute adds one interlock cycle, including when not taken (Programming
 Reference 2.4, 4-19–4-21 and 4-115–4-116). The preceding-compute history is SSA
 state, stored at exits and included in snapshots. Cycle bounds may cross the
 deadline to finish the current instruction; cycle credit cannot wrap under zero.
-External conditions refuse preparation. VISA, floating computation, multiplier,
+External conditions refuse preparation. VISA, floating computation,
 timer evolution and remaining shifter and memory forms remain unimplemented.
+
+Single fixed multiplier computations include register and MR destinations,
+integer and fractional signedness combinations, MAC, MSUB, convergent rounding,
+saturation, clear, and MR0/MR1/MR2 transfers. Native code carries both logical
+80-bit accumulators in SSA and applies SRCU to the physical banks at its boundary.
+`test/core/compute.cpp` checks generated independent expectations in Strict and
+FastFP32, with SISD, SIMD, and both bank selections. A multiply-accumulate sequence
+also checks conditional write suppression and snapshot replay across owner bounds.
+Multifunction multiplier/ALU and parallel PM/DM transfer forms remain open.
 
 Classic `IDLE` stops at retirement under either run bound. Tests cover both
 numerical modes, frozen progression, reset and snapshot replay. IDLE in either

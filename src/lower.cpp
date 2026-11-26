@@ -105,6 +105,26 @@ constexpr unsigned long_counted_loop_kind = 7;
 constexpr std::int64_t fixed_minimum = std::numeric_limits<std::int32_t>::min();
 constexpr std::int64_t fixed_maximum = std::numeric_limits<std::int32_t>::max();
 constexpr auto unsigned_limit = std::uint64_t{1} << 32;
+constexpr unsigned accumulator_bits = 80;
+constexpr unsigned mr_limb_bits = 32;
+constexpr unsigned mr_guard_bits = 16;
+constexpr unsigned mr_guard_shift = 2 * mr_limb_bits;
+constexpr unsigned float_multiply_opcode = 0x30;
+constexpr unsigned clear_mrf_opcode = 0x14;
+constexpr unsigned round_mr_opcode = 0x18;
+constexpr unsigned product_opcode = 0x40;
+constexpr unsigned mac_opcode = 0x80;
+constexpr unsigned msub_opcode = 0xc0;
+constexpr unsigned fractional_product = 0x08;
+constexpr unsigned destination_mr = 0x04;
+constexpr unsigned background_mr = 0x02;
+constexpr unsigned product_signed_x = 0x10;
+constexpr unsigned product_signed_y = 0x20;
+constexpr std::uint32_t multiplier_negative = 1U << 6;
+constexpr std::uint32_t multiplier_overflow = 1U << 7;
+constexpr std::uint32_t multiplier_underflow = 1U << 8;
+constexpr std::uint32_t multiplier_flags = 0x3c0;
+constexpr std::uint32_t multiplier_sticky_overflow = 1U << 6;
 constexpr std::array fixed_operations{
     alu::add,       alu::subtract,       alu::add_carry,        alu::subtract_carry,
     alu::average,   alu::compare,        alu::compare_unsigned, alu::pass,
@@ -129,8 +149,13 @@ constexpr std::array fixed_operations{
          instruction.bits);
 }
 
+bool fixed_multiplier(const Compute &compute) {
+  return compute.kind == ComputeKind::multiplier && compute.opcode != float_multiply_opcode;
+}
+
 bool supported_compute(const Compute &compute) {
-  return compute.kind == ComputeKind::none ||
+  return compute.kind == ComputeKind::none || fixed_multiplier(compute) ||
+         compute.kind == ComputeKind::mr_transfer ||
          (compute.kind == ComputeKind::alu &&
           std::ranges::find(fixed_operations, compute.opcode) != fixed_operations.end()) ||
          ((compute.kind == ComputeKind::shifter || compute.kind == ComputeKind::shift_immediate) &&
@@ -682,7 +707,8 @@ constexpr std::size_t index_value = dag_history_value + 1;
 constexpr std::size_t modifier_value = index_value + 16;
 constexpr std::size_t length_value = modifier_value + 16;
 constexpr std::size_t base_value = length_value + 16;
-constexpr std::size_t state_value_count = base_value + 16;
+constexpr std::size_t accumulator_value = base_value + 16;
+constexpr std::size_t state_value_count = accumulator_value + accumulator_banks;
 using Values = std::array<llvm::Value *, state_value_count>;
 
 struct Node {
@@ -704,6 +730,10 @@ struct Node {
 
 struct Arithmetic {
   llvm::Value *raw{}, *status{}, *sticky{};
+};
+
+struct MultiplierFormat {
+  bool fractional{}, signed_result{}, saturated{};
 };
 
 struct FixedResult {
@@ -910,12 +940,16 @@ private:
     result.block = llvm::BasicBlock::Create(module_.getContext(), name, function_);
     llvm::IRBuilder<> start(result.block);
     for (std::size_t i = 0; i < state_value_count; ++i) {
-      if (i >= index_value && dag_[i - index_value] == nullptr) { continue; }
+      if (i >= accumulator_value && !uses_multiplier_) { continue; }
+      if (i >= index_value && i < accumulator_value && dag_[i - index_value] == nullptr) {
+        continue;
+      }
       llvm::Type *type = builder_.getInt64Ty();
       if (i < instruction_remaining_value) { type = vector_type(32); }
       if (i < status_value) { type = vector_type(64); }
       if (i == hazard_value || i == tail_value) { type = builder_.getInt1Ty(); }
       if (i >= dag_history_value) { type = builder_.getInt32Ty(); }
+      if (i >= accumulator_value) { type = vector_type(accumulator_bits); }
       if (i == pc_stack_depth_value || i == interrupt_latch_value) { type = builder_.getInt32Ty(); }
       result.phi[i] = start.CreatePHI(type, 2);
     }
@@ -938,6 +972,15 @@ private:
   llvm::Value *condition(const Values &values, unsigned code);
   llvm::Value *condition(const Values &values, const Instruction &op);
   Arithmetic arithmetic(const Values &values, const Compute &compute, unsigned opcode);
+  Arithmetic multiplier(Values &values, const Compute &compute, llvm::Value *selected);
+  Arithmetic move_accumulator(Values &values, const Compute &compute, llvm::Value *selected);
+  Arithmetic multiplier_result(const Values &values, llvm::Value *value, MultiplierFormat format);
+  llvm::Value *product(const Values &values, const Compute &compute);
+  llvm::Value *round_accumulator(llvm::Value *value);
+  llvm::Value *saturate_accumulator(llvm::Value *value, MultiplierFormat format);
+  void load_accumulators(Values &values);
+  void spill_accumulator(unsigned bank, llvm::Value *value);
+  void write_accumulator(Values &values, unsigned bank, llvm::Value *value, llvm::Value *selected);
   FixedResult word_step(llvm::Value *input, bool decrement);
   Arithmetic rotation(const Values &values, const Compute &compute);
   Arithmetic status_result(const Values &values,
@@ -1207,6 +1250,8 @@ private:
   llvm::Value *memory_admitted_{};
   std::set<unsigned> written_;
   std::set<unsigned> y_written_;
+  std::array<bool, accumulator_banks> accumulator_written_{};
+  bool uses_multiplier_{};
   std::array<llvm::Value *, 64> dag_{};
   std::set<unsigned> dag_written_;
   bool dag_status_written_{};
@@ -1589,6 +1634,195 @@ Arithmetic Lowering::rotation(const Values &values, const Compute &compute) {
   return {.raw = raw, .status = status, .sticky = values[sticky_value]};
 }
 
+void Lowering::load_accumulators(Values &values) {
+  if (!uses_multiplier_) { return; }
+  const auto swap = (context_ & multiplier_swap_mode) != 0 ? 1U : 0U;
+  auto *type = llvm::IntegerType::get(module_.getContext(), accumulator_bits);
+  for (unsigned bank = 0; bank < accumulator_banks; ++bank) {
+    const auto physical = bank ^ swap;
+    const auto load_lane = [&](unsigned lane) {
+      auto *low = builder_.CreateZExt(load(mr_limb_bits, mr_slot(lane, physical, 0)), type);
+      auto *middle = builder_.CreateZExt(load(mr_limb_bits, mr_slot(lane, physical, 1)), type);
+      auto *high = builder_.CreateZExt(load(mr_guard_bits, mr_slot(lane, physical, 2)), type);
+      return builder_.CreateOr(builder_.CreateOr(low, builder_.CreateShl(middle, mr_limb_bits)),
+                               builder_.CreateShl(high, mr_guard_shift));
+    };
+    auto *x = load_lane(0);
+    auto *y = (context_ & simd_mode) != 0 ? load_lane(1) : llvm::ConstantInt::get(type, 0);
+    values[accumulator_value + bank] = pair(x, y, accumulator_bits);
+  }
+}
+
+void Lowering::spill_accumulator(unsigned bank, llvm::Value *value) {
+  const auto physical = bank ^ ((context_ & multiplier_swap_mode) != 0 ? 1U : 0U);
+  const unsigned lanes = (context_ & simd_mode) != 0 ? 2U : 1U;
+  for (unsigned lane = 0; lane < lanes; ++lane) {
+    auto *raw = builder_.CreateExtractElement(value, builder_.getInt32(lane));
+    store(builder_.CreateTrunc(raw, builder_.getInt32Ty()), mr_slot(lane, physical, 0));
+    store(builder_.CreateTrunc(builder_.CreateLShr(raw, mr_limb_bits), builder_.getInt32Ty()),
+          mr_slot(lane, physical, 1));
+    store(builder_.CreateTrunc(builder_.CreateLShr(raw, mr_guard_shift), builder_.getInt16Ty()),
+          mr_slot(lane, physical, 2));
+  }
+}
+
+void Lowering::write_accumulator(Values &values,
+                                 unsigned bank,
+                                 llvm::Value *value,
+                                 llvm::Value *selected) {
+  const auto slot = accumulator_value + bank;
+  values[slot] = builder_.CreateSelect(selected, value, values[slot]);
+  accumulator_written_[bank] = true;
+}
+
+llvm::Value *Lowering::product(const Values &values, const Compute &compute) {
+  const bool signed_x = (compute.opcode & product_signed_x) != 0;
+  const bool signed_y = (compute.opcode & product_signed_y) != 0;
+  const auto operand = [&](unsigned reg, bool is_signed) {
+    auto *word = builder_.CreateTrunc(
+        builder_.CreateLShr(values[reg], vector(64, raw_extension_bits)), vector_type(32));
+    return builder_.CreateIntCast(word, vector_type(64), is_signed);
+  };
+  auto *narrow = builder_.CreateMul(operand(compute.inputs[0], signed_x),
+                                    operand(compute.inputs[1], signed_y));
+  auto *wide = builder_.CreateIntCast(narrow, vector_type(accumulator_bits), signed_x || signed_y);
+  if (signed_x && signed_y && (compute.opcode & fractional_product) != 0) {
+    wide = builder_.CreateShl(wide, vector(accumulator_bits, 1));
+  }
+  return wide;
+}
+
+llvm::Value *Lowering::round_accumulator(llvm::Value *value) {
+  auto *discarded = builder_.CreateTrunc(value, vector_type(32));
+  auto *middle = builder_.CreateLShr(value, mr_limb_bits);
+  auto *odd = builder_.CreateTrunc(middle, vector_type(1));
+  auto *half = vector(32, 1ULL << (mr_limb_bits - 1));
+  auto *up = builder_.CreateOr(builder_.CreateICmpUGT(discarded, half),
+                               builder_.CreateAnd(builder_.CreateICmpEQ(discarded, half), odd));
+  auto *rounded =
+      builder_.CreateAdd(middle, builder_.CreateZExt(up, vector_type(accumulator_bits)));
+  return builder_.CreateShl(rounded, mr_limb_bits);
+}
+
+llvm::Value *Lowering::saturate_accumulator(llvm::Value *value, MultiplierFormat format) {
+  const unsigned width = format.fractional ? 64U : 32U;
+  const auto sign = std::uint64_t{1} << (width - 1);
+  const auto maximum = format.signed_result ? sign - 1 : (sign | (sign - 1));
+  auto *upper = vector(accumulator_bits, maximum);
+  if (!format.signed_result) {
+    return builder_.CreateBinaryIntrinsic(llvm::Intrinsic::umin, value, upper);
+  }
+  auto *lower = builder_.CreateSExt(vector(width, sign), vector_type(accumulator_bits));
+  auto *bounded = builder_.CreateBinaryIntrinsic(llvm::Intrinsic::smax, value, lower);
+  return builder_.CreateBinaryIntrinsic(llvm::Intrinsic::smin, bounded, upper);
+}
+
+Arithmetic
+Lowering::multiplier_result(const Values &values, llvm::Value *value, MultiplierFormat format) {
+  auto *zero = vector(accumulator_bits, 0);
+  auto *negative = builder_.CreateICmpSLT(value, zero);
+  auto *status =
+      builder_.CreateOr(builder_.CreateAnd(values[status_value], vector(32, ~multiplier_flags)),
+                        flag(negative, multiplier_negative));
+  auto *sticky = values[sticky_value];
+  if (!format.saturated) {
+    const unsigned width = format.fractional ? 64U : 32U;
+    auto *narrow = builder_.CreateTrunc(value, vector_type(width));
+    auto *extended =
+        builder_.CreateIntCast(narrow, vector_type(accumulator_bits), format.signed_result);
+    auto *overflow = builder_.CreateICmpNE(value, extended);
+    status = builder_.CreateOr(status, flag(overflow, multiplier_overflow));
+    sticky = builder_.CreateOr(sticky, flag(overflow, multiplier_sticky_overflow));
+  }
+  auto *word = value;
+  if (format.fractional) {
+    word = builder_.CreateLShr(value, mr_limb_bits);
+    auto *upper_zero = builder_.CreateICmpEQ(word, zero);
+    if (format.signed_result) {
+      auto *sign_fill = builder_.CreateLShr(builder_.CreateNot(zero), mr_limb_bits);
+      upper_zero = builder_.CreateOr(upper_zero, builder_.CreateICmpEQ(word, sign_fill));
+    }
+    auto *low = builder_.CreateTrunc(value, vector_type(32));
+    auto *underflow = builder_.CreateAnd(upper_zero, builder_.CreateICmpNE(low, vector(32, 0)));
+    status = builder_.CreateOr(status, flag(underflow, multiplier_underflow));
+  }
+  auto *raw = builder_.CreateShl(
+      builder_.CreateZExt(builder_.CreateTrunc(word, vector_type(32)), vector_type(64)),
+      vector(64, raw_extension_bits));
+  return {.raw = raw, .status = status, .sticky = sticky};
+}
+
+Arithmetic Lowering::multiplier(Values &values, const Compute &compute, llvm::Value *selected) {
+  const auto opcode = compute.opcode;
+  const auto bank = (opcode & background_mr) != 0 ? 1U : 0U;
+  const bool binary = opcode >= product_opcode;
+  const bool fractional = (opcode & fractional_product) != 0;
+  const bool signed_result =
+      binary ? (opcode & (product_signed_x | product_signed_y)) != 0 : (opcode & 1U) != 0;
+  const bool saturated = opcode < clear_mrf_opcode;
+  const MultiplierFormat format{
+      .fractional = fractional, .signed_result = signed_result, .saturated = saturated};
+  llvm::Value *value = values[accumulator_value + bank];
+  if (binary) {
+    auto *term = product(values, compute);
+    if (opcode >= msub_opcode) {
+      value = builder_.CreateSub(value, term);
+    } else if (opcode >= mac_opcode) {
+      value = builder_.CreateAdd(value, term);
+    } else {
+      value = term;
+    }
+    if ((opcode & 1U) != 0) { value = round_accumulator(value); }
+  } else if (saturated) {
+    value = saturate_accumulator(value, format);
+  } else if (opcode >= round_mr_opcode) {
+    value = round_accumulator(value);
+  } else {
+    value = vector(accumulator_bits, 0);
+  }
+  auto result = multiplier_result(values, value, format);
+  if ((opcode & destination_mr) != 0) {
+    write_accumulator(values, bank, value, selected);
+    result.raw = nullptr;
+  }
+  return result;
+}
+
+Arithmetic
+Lowering::move_accumulator(Values &values, const Compute &compute, llvm::Value *selected) {
+  constexpr unsigned transfer_bank = 4;
+  constexpr unsigned transfer_write = 1U << 16;
+  const auto bank = (compute.opcode & transfer_bank) != 0 ? 1U : 0U;
+  const auto part = compute.opcode & (transfer_bank - 1);
+  const auto shift = part * mr_limb_bits;
+  auto *old = values[accumulator_value + bank];
+  llvm::Value *raw = nullptr;
+  if ((compute.raw & transfer_write) != 0) {
+    auto *word = builder_.CreateTrunc(
+        builder_.CreateLShr(values[compute.inputs[0]], vector(64, raw_extension_bits)),
+        vector_type(32));
+    if (part == 2) { word = builder_.CreateTrunc(word, vector_type(mr_guard_bits)); }
+    auto *input = builder_.CreateIntCast(word, vector_type(accumulator_bits), part == 1);
+    const auto preserved =
+        part == 2 ? std::numeric_limits<std::uint64_t>::max() : unsigned_limit - 1;
+    auto *keep = vector(accumulator_bits, preserved);
+    llvm::Value *mask = part == 0 ? builder_.CreateNot(keep) : keep;
+    auto *next = builder_.CreateOr(builder_.CreateAnd(old, mask),
+                                   builder_.CreateShl(input, vector(accumulator_bits, shift)));
+    write_accumulator(values, bank, next, selected);
+  } else {
+    const unsigned width = part == 2 ? mr_guard_bits : mr_limb_bits;
+    auto *word = builder_.CreateTrunc(builder_.CreateLShr(old, vector(accumulator_bits, shift)),
+                                      vector_type(width));
+    auto *normal = builder_.CreateIntCast(word, vector_type(32), part == 2);
+    raw = builder_.CreateShl(builder_.CreateZExt(normal, vector_type(64)),
+                             vector(64, raw_extension_bits));
+  }
+  return {.raw = raw,
+          .status = builder_.CreateAnd(values[status_value], vector(32, ~multiplier_flags)),
+          .sticky = values[sticky_value]};
+}
+
 void Lowering::instruction(Values &values, const Instruction &op, bool partial) {
   if (loop_setup(op)) {
     loop_push(values, op, partial);
@@ -1640,6 +1874,10 @@ void Lowering::instruction(Values &values, const Instruction &op, bool partial) 
     written_.insert(reg);
   } else if (compute.kind == ComputeKind::shifter || compute.kind == ComputeKind::shift_immediate) {
     result = rotation(values, compute);
+  } else if (fixed_multiplier(compute)) {
+    result = multiplier(values, compute, selected);
+  } else if (compute.kind == ComputeKind::mr_transfer) {
+    result = move_accumulator(values, compute, selected);
   } else {
     result = arithmetic(values, compute, compute.opcode);
   }
@@ -4096,6 +4334,10 @@ void Lowering::emit_exit() {
     const auto bank = (context_ & dag_bank_mode(index & 15)) != 0 ? 1U : 0U;
     store(values[index_value + index], dag_slot(bank, index & 15, index / 16));
   }
+  for (unsigned bank = 0; bank < accumulator_banks; ++bank) {
+    if (!accumulator_written_[bank]) { continue; }
+    spill_accumulator(bank, values[accumulator_value + bank]);
+  }
   if (stack_written_) {
     store(builder_.CreateTrunc(values[pc_stack_depth_value], builder_.getInt8Ty()),
           stack_depth_slot);
@@ -4508,6 +4750,9 @@ void Lowering::emit() {
   dag_status_written_ = std::ranges::any_of(instructions_, [](const auto &op) {
     return op.type == index_modify_type && (index_modify(op).source & 7) == 7;
   });
+  uses_multiplier_ = std::ranges::any_of(instructions_, [](const auto &op) {
+    return fixed_multiplier(op.compute) || op.compute.kind == ComputeKind::mr_transfer;
+  });
   auto *entry = llvm::BasicBlock::Create(module_.getContext(), "entry", function_);
   builder_.SetInsertPoint(entry);
   load_indices();
@@ -4543,6 +4788,7 @@ void Lowering::emit() {
   }
   initial[status_value] = function_->getArg(unit_status);
   initial[sticky_value] = function_->getArg(unit_sticky);
+  load_accumulators(initial);
   initial[instruction_remaining_value] = function_->getArg(unit_instructions);
   initial[cycle_remaining_value] = function_->getArg(unit_cycles);
   initial[cycle_overrun_value] = function_->getArg(unit_cycle_overrun);
@@ -4625,13 +4871,21 @@ std::uint32_t instruction_context(const Instruction &instruction) {
     mask |= dag_bank_mode(branch_index(instruction)) | dag_bank_mode(branch_modifier(instruction));
   }
   if (instruction.compute.kind == ComputeKind::none) { return mask; }
-  mask |= simd_mode | saturation_mode;
+  mask |= simd_mode;
+  if (fixed_multiplier(instruction.compute) ||
+      instruction.compute.kind == ComputeKind::mr_transfer) {
+    mask |= multiplier_swap_mode;
+  } else {
+    mask |= saturation_mode;
+  }
   const auto high_register = [](std::uint8_t reg) { return reg >= 8; };
   if (std::ranges::any_of(instruction.compute.inputs, high_register) ||
       std::ranges::any_of(instruction.compute.outputs, high_register)) {
     mask |= high_bank_mode;
   }
-  if (instruction.compute.opcode == alu::average) { mask |= truncation_mode; }
+  if (instruction.compute.kind == ComputeKind::alu && instruction.compute.opcode == alu::average) {
+    mask |= truncation_mode;
+  }
   return mask;
 }
 

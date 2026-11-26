@@ -3,6 +3,7 @@
 
 from itertools import product as cartesian_product
 from dataclasses import asdict
+import json
 
 from expectation_check import anchor, require, require_raises
 from reference import (
@@ -123,6 +124,83 @@ def anchors():
                               accumulator_move(direction, part, value, **options), expected,
                               direction=direction, part=part, accumulator=value, options=options))
     return [_record(record) for record in records]
+
+
+def installed_header():
+    """Export authored cases with independent Table 12-5 and 12-10 encodings."""
+    rows = []
+
+    def row(name, field, bank, operands, result):
+        lanes = []
+        for lane, (left, right) in enumerate(operands):
+            old, register, astat, stky, final = result(left, right, lane)
+            def limbs(value):
+                return "{" + ", ".join(f"0x{(value >> shift) & 0xffffffff:x}" for shift in (0, 32, 64)) + "}"
+            lanes.append("MultiplierLane{" + ", ".join((
+                f"0x{left:x}ULL", f"0x{right:x}ULL", f"0x{register:x}ULL",
+                f"0x{(register if final.raw is None else final.raw):x}ULL",
+                limbs(old), limbs(final.accumulator), f"0x{astat:x}", f"0x{stky:x}",
+                f"0x{final.astat:x}", f"0x{final.stky:x}")) + "}")
+        rows.append(f"MultiplierCase{{{json.dumps(name)}, 0x{field:x}, {bank}, "
+                    + "{" + ", ".join(lanes) + "}}")
+
+    for name, operation, left, right, options, _ in MULTIPLIES:
+        destination = options.get("destination", "mr")
+        modifier = options.get("modifier", "SSF")
+        opcode = {"mul": 0x40, "mac": 0x80, "msub": 0xc0}[operation]
+        opcode |= ((modifier[0] == "S") << 4) | ((modifier[1] == "S") << 5)
+        opcode |= ((modifier[2] == "F") << 3) | modifier.endswith("R")
+        opcode |= (destination == "mr") << 2
+        for bank in range(1 if operation == "mul" and destination == "register" else 2):
+            def evaluate(x, y, lane):
+                old = options.get("accumulator", 0)
+                astat = options.get("astat", 0) ^ (0xA5000208 if lane else 0)
+                stky = options.get("stky", 0) ^ (0x220 if lane else 0)
+                return old, 0xAABBCCDD11, astat, stky, multiply(
+                    operation, x, y, **(options | {"astat": astat, "stky": stky}))
+            field = 0x100012 | ((opcode | (bank << 1)) << 12)
+            row(name, field, bank, ((left, right), (right, left)), evaluate)
+
+    for name, operation, old, options, _ in UNARY:
+        fmt = options.get("format", "SF")
+        destination = options.get("destination", "mr")
+        opcode = {"sat": 0, "round": 0x10, "clear": 0x14}[operation]
+        if operation != "clear":
+            opcode |= ((fmt[1] == "F") << 3) | ((destination == "mr") << 2) | (fmt[0] == "S")
+        for bank in range(2):
+            def evaluate(unused_left, unused_right, lane):
+                astat = options.get("astat", 0) ^ (0xA5000208 if lane else 0)
+                stky = options.get("stky", 0) ^ (0x220 if lane else 0)
+                return old, 0xAABBCCDD11, astat, stky, accumulator_unary(
+                    operation, old, **(options | {"astat": astat, "stky": stky}))
+            row(name, 0x100000 | ((opcode | (bank << 1)) << 12), bank,
+                ((0, 0), (0, 0)), evaluate)
+
+    for name, direction, part, old, options, _ in MOVES:
+        for bank in range(2):
+            def evaluate(unused_left, unused_right, lane):
+                register = options.get("register", 0xAABBCCDD11)
+                astat = options.get("astat", 0) ^ (0xA5000208 if lane else 0)
+                stky = options.get("stky", 0) ^ (0x220 if lane else 0)
+                return old, register, astat, stky, accumulator_move(
+                    direction, part, old, register=register, astat=astat, stky=stky)
+            field = 0x400000 | ((direction == "write") << 16) | ((part | (bank << 2)) << 12)
+            row(name, field, bank, ((0, 0), (0, 0)), evaluate)
+
+    return """
+struct MultiplierLane {
+  std::uint64_t left, right, old_register, result_register;
+  std::array<std::uint32_t, 3> old_mr, result_mr;
+  std::uint32_t old_astat, old_stky, astat, stky;
+};
+struct MultiplierCase {
+  std::string_view name;
+  std::uint32_t field;
+  unsigned bank;
+  std::array<MultiplierLane, 2> lanes;
+};
+inline constexpr std::array multiplier_cases{
+""" + ",\n".join(rows) + "\n};\n"
 
 
 def _limb_product(x, y, modifier):

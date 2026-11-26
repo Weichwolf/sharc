@@ -314,6 +314,12 @@ struct Core::Impl {
           pointers[(lane * 32) + (bank * 16) + reg] = &state.registers.pe[lane].data[bank][reg];
         }
       }
+      for (unsigned bank = 0; bank < detail::accumulator_banks; ++bank) {
+        auto &mr = state.registers.pe[lane].multiplier[bank];
+        pointers[detail::mr_slot(lane, bank, 0)] = &mr.low;
+        pointers[detail::mr_slot(lane, bank, 1)] = &mr.middle;
+        pointers[detail::mr_slot(lane, bank, 2)] = &mr.high;
+      }
       pointers[detail::astat_slot + lane] = &state.registers.pe[lane].astat;
       pointers[detail::stky_slot + lane] = &state.registers.pe[lane].stky;
     }
