@@ -71,6 +71,9 @@ own loop buffer. The saved buffer is restored at the prepared return
 address. On a repeating endpoint CALL in two- and four-word bodies the
 return refill samples the loop count before the header executes. In a
 three-word body the penultimate word already sampled the count.
+If a three-word CALL occupies that penultimate word, its continuation
+instead samples during the return refill. The continuation also preserves
+the compact drain state of a one-pass loop.
 A CALL occupying an admitted long-loop endpoint consumes the loop decision
 and pushes the selected successor, including the loop header on a repeat.
 When a CALL redirects before a pending long-loop sample reaches Fetch1,

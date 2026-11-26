@@ -206,6 +206,14 @@ Address, the saved PC carries the loop-termination tag. Fixtures cover
 direct and indirect calls, both return forms, buffered passes after a
 stack pop and snapshot replay. These combined pipeline observations await
 hardware comparison.
+An immediate CALL on the penultimate word of a counted three-word DO
+suspends the pending end sample. The return refill samples before the
+endpoint executes, after both slots of a delayed RTS. The compact
+single-iteration buffer keeps its drain clocks. When the replayed sample
+terminates the loop with a following CALL in Address, that CALL carries
+the termination tag. A false predicate takes the ordinary sample in
+place. Fixtures cover both return forms, the compact drain, consecutive
+calls and snapshot replay. This combined timing awaits hardware comparison.
 Admitted immediate CALLs in the tail of a long DO preserve the sampled loop
 decision across `RTS (LR)` and `RTS (DB, LR)`. The PC stack records a separate
 tag when the loop terminates during the call's address stage. Tests cover

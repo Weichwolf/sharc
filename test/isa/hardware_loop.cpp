@@ -1479,6 +1479,19 @@ struct ShortEndpointTurn {
   ShortAddress first, second{}, returned;
 };
 
+constexpr ShortEndpointTurn early_three_word_turn{.first = {.pc = 2, .fetch = 3, .decode = 1},
+                                                  .second = {.pc = 3, .fetch = 1, .decode = 2},
+                                                  .returned = {.pc = 1, .fetch = 2, .decode = 3}};
+constexpr std::array three_word_turns{
+    early_three_word_turn,
+    early_three_word_turn,
+    ShortEndpointTurn{.first = {.pc = 2, .fetch = 3, .decode = 1},
+                      .second = {.pc = 3, .fetch = 4, .decode = 2},
+                      .returned = {.pc = 1, .fetch = 5, .decode = 3}},
+    ShortEndpointTurn{.first = {.pc = 2, .fetch = 6, .decode = 4},
+                      .second = {.pc = 3, .fetch = 7, .decode = 5},
+                      .returned = {.pc = 4, .fetch = 8, .decode = 6}}};
+
 void counted_short_endpoint_call(unsigned width, bool delayed) {
   constexpr std::array two_word{ShortEndpointTurn{.first = {.pc = 2, .fetch = 2, .decode = 2},
                                                   .returned = {.pc = 1, .fetch = 1, .decode = 1}},
@@ -1488,19 +1501,7 @@ void counted_short_endpoint_call(unsigned width, bool delayed) {
                                                   .returned = {.pc = 1, .fetch = 5, .decode = 3}},
                                 ShortEndpointTurn{.first = {.pc = 2, .fetch = 6, .decode = 4},
                                                   .returned = {.pc = 3, .fetch = 7, .decode = 5}}};
-  constexpr ShortEndpointTurn early_three{.first = {.pc = 2, .fetch = 3, .decode = 1},
-                                          .second = {.pc = 3, .fetch = 1, .decode = 2},
-                                          .returned = {.pc = 1, .fetch = 2, .decode = 3}};
-  constexpr std::array three_word{
-      early_three,
-      early_three,
-      ShortEndpointTurn{.first = {.pc = 2, .fetch = 3, .decode = 1},
-                        .second = {.pc = 3, .fetch = 4, .decode = 2},
-                        .returned = {.pc = 1, .fetch = 5, .decode = 3}},
-      ShortEndpointTurn{.first = {.pc = 2, .fetch = 6, .decode = 4},
-                        .second = {.pc = 3, .fetch = 7, .decode = 5},
-                        .returned = {.pc = 4, .fetch = 8, .decode = 6}}};
-  const auto &turns = width == 2 ? two_word : three_word;
+  const auto &turns = width == 2 ? two_word : three_word_turns;
   std::array<std::uint64_t, 15> words{};
   words[0] = do_immediate | (std::uint64_t{4} << count_shift) | width;
   words[width] = delayed ? call_dag2 : call_direct | short_call_sub;
@@ -1536,6 +1537,77 @@ void counted_short_endpoint_call(unsigned width, bool delayed) {
     // In a two-word body the fourth return fetch reaches E after the freeze.
     if (width == 2 && i < 2) { parent_count_sample(trace, i == 0); }
     short_boundary(trace, turn.returned, cycles);
+  }
+  verify_timeline(program, initial, trace);
+}
+
+enum class ThreeWordCall : std::uint8_t { direct, delayed, predicated };
+
+void three_word_penultimate_call(ThreeWordCall form) {
+  constexpr std::uint64_t call_eq = 0x068000000000;
+  const bool delayed = form == ThreeWordCall::delayed;
+  const bool predicated = form == ThreeWordCall::predicated;
+  std::array<std::uint64_t, 15> words{};
+  words[0] = do_immediate | (std::uint64_t{4} << count_shift) | 3;
+  words[2] = delayed ? call_dag2 : (predicated ? call_eq : call_direct) | short_call_sub;
+  words[4] = jump_direct | (base + 14);
+  words[8] = do_immediate | (std::uint64_t{1} << count_shift) | 1;
+  words[9] = fixture::add(0, 0, 1);
+  words[10] = rts | lr | (delayed ? db : 0);
+  words[11] = fixture::immediate(2, 7);
+  fixture::Program program(words);
+  program.code.variants.front().entries.push_back(short_call_sub);
+  auto initial = starting();
+  initial.dag[0][8].index = short_call_sub;
+  initial.pe[0].data[0][1] = 1U << raw_shift;
+  initial.pe[0].astat = predicated ? az : 0;
+  Timeline trace{.registers = initial, .prefixes = {}};
+  auto &state = trace.registers;
+  state.lcntr = 4;
+  entered(trace, {.address = short_counted_types[2] | (base + 3), .count = 4});
+  state.faddr = base + 2;
+  state.daddr = base + 3;
+  trace.prefixes.back().registers = state;
+  --state.loop_counter_stack[0];
+  for (std::size_t i = 0; i < three_word_turns.size(); ++i) {
+    const auto &turn = three_word_turns[i];
+    short_boundary(trace, turn.first);
+    const auto cycles = !predicated || i == 0 ? short_call_round_trip(trace, 3, delayed) : 1U;
+    // E reaches Fetch1 after the return's frozen clocks, or in place on a false CALL.
+    if (i < 2) { parent_count_sample(trace, i == 0); }
+    short_boundary(trace, turn.second, cycles);
+    short_boundary(trace, turn.returned);
+  }
+  verify_timeline(program, initial, trace);
+}
+
+void compact_three_word_penultimate_call(bool chain) {
+  std::array<std::uint64_t, 11> words{};
+  words[0] = do_immediate | (std::uint64_t{1} << count_shift) | 3;
+  words[2] = call_direct | short_call_sub;
+  if (chain) { words[3] = words[2]; }
+  words[8] = do_immediate | (std::uint64_t{1} << count_shift) | 1;
+  words[9] = fixture::add(0, 0, 1);
+  words[10] = rts | lr;
+  fixture::Program program(words);
+  auto initial = starting();
+  initial.pe[0].data[0][1] = 1U << raw_shift;
+  Timeline trace{.registers = initial, .prefixes = {}};
+  trace.registers.lcntr = 1;
+  entered(trace, {.address = short_counted_types[2] | (base + 3), .count = 1});
+  trace.registers.faddr = base + 2;
+  trace.registers.daddr = base + 3;
+  trace.prefixes.back().registers = trace.registers;
+  short_boundary(trace, {.pc = 2, .fetch = 3, .decode = 3});
+  const auto cycles = short_call_round_trip(trace, 3, false);
+  parent_count_sample(trace, false);
+  short_boundary(trace, {.pc = 3, .fetch = 4, .decode = 3}, cycles);
+  if (chain) {
+    const auto exit_cycles = short_call_round_trip(trace, 4, false, call_tag | termination_tag);
+    short_boundary(trace, {.pc = 4, .fetch = 8, .decode = 6}, exit_cycles);
+  } else {
+    trace.boundary(base + 4, 4);
+    trace.record();
   }
   verify_timeline(program, initial, trace);
 }
@@ -2169,6 +2241,11 @@ void fixture::hardware_loop_control_flow() {
   counted_short_endpoint_call(2, true);
   counted_short_endpoint_call(3, false);
   counted_short_endpoint_call(3, true);
+  three_word_penultimate_call(ThreeWordCall::direct);
+  three_word_penultimate_call(ThreeWordCall::delayed);
+  three_word_penultimate_call(ThreeWordCall::predicated);
+  compact_three_word_penultimate_call(false);
+  compact_three_word_penultimate_call(true);
   single_iteration_two_word_call();
   single_iteration_three_word_call(false);
   single_iteration_three_word_call(true);
