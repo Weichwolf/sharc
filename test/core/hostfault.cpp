@@ -131,6 +131,8 @@ void nonresumable(sharc::Core &core,
             core.run_until(std::numeric_limits<std::uint64_t>::max()).progress == sharc::Progress{},
         "terminal instance resumed execution");
   fixture::throws<std::logic_error>([&] { core.restore(snapshot); }, "terminal instance restored");
+  fixture::throws<std::logic_error>([&] { core.reset(before.registers.pc); },
+                                    "terminal instance reset");
   fixture::throws<std::logic_error>([&] { core.set_registers(before.registers); },
                                     "terminal registers replaced");
   fixture::throws<std::logic_error>([&] { core.set_memory(memory); }, "terminal memory rebound");

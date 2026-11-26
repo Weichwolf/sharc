@@ -1,11 +1,9 @@
 # ADSP-21489 architectural storage
 
 The public `Registers` definition stores physical architectural bits, independently
-of the selected computation precision. It is the S1 programmer-visible storage model, not an
-execution or reset implementation. Default initialization supplies zeroed inspection
-storage; it does not claim the hardware reset state. The reference is the SHARC
-Processor Programming Reference 2.4, chapters 2–6 and appendix A, identified in
-`reference-manifest.json`.
+of the selected computation precision. Default initialization supplies zeroed inspection
+storage. The reference is the SHARC Processor Programming Reference 2.4,
+chapters 2–6 and appendix A, identified in `reference-manifest.json`.
 
 | Public member | Architectural representation |
 |---|---|
@@ -37,6 +35,25 @@ condition. The storage boundary must not truncate those raw bits to a valid FIFO
 occupancy. Instruction effects and undefined FIFO overflow/underflow behavior
 still require separate execution qualification.
 No host C++ object layout is a file or generated-code ABI.
+
+## Reset
+
+`Core::reset(address, instruction_set)` resets the defined core controls and
+empty stack depths according to Table A-18. An empty stack's architectural
+top value is a register view. Its inactive cells retain their raw backing.
+Data banks, DAG fields and the other registers with unspecified reset values
+retain their contents. FLAGS uses the pin-level bit positions in Table A-5.
+Timer count and period retain their contents in accordance with Chapter 5's
+timer initialization rule. MODE2 disables the timer.
+
+The consumer supplies the restart PC and instruction set. The core initializes
+both empty pipeline addresses to that PC, clears pending transfers, faults and
+yield requests, and retains the installed image and elapsed progress. Execution
+resumes through a declared entry. A VISA restart records its address and mode
+in state. VISA execution remains open. A previously claimed terminal host
+fault prevents reset under the owner contract.
+
+## Continuations
 
 `State` adds cumulative instruction/base-cycle progress, instruction set, execution
 state and a latched fault. `Snapshot` is an immutable owning copy of the current
@@ -121,6 +138,6 @@ original endpoint retires. With DB, the two slots execute after the stack effect
 Peripheral interrupt routing (PICR), SRU, DMA and peripheral timers remain consumer
 state. TAP emulation controls and physical instruction-cache contents are not
 implemented. Instruction pipeline observations beyond the admitted classic
-transfers and loop reentry, interrupt eligibility/shadows, timer evolution and
-reset values remain open. Straight-line ISA and admitted direct and indirect
+transfers and loop reentry, interrupt eligibility/shadows and timer evolution
+remain open. Straight-line ISA and admitted direct and indirect
 transfers update PC, FADDR, DADDR and EMUCLK at owner boundaries.

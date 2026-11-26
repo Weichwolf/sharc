@@ -267,6 +267,7 @@ public:
   void request_yield() noexcept;
   [[nodiscard]] bool interrupt_ready(const InterruptRequest &request) const noexcept;
   void interrupt(const InterruptRequest &request);
+  // Reset at the consumer's restart address, keeping the installed image and elapsed progress.
   void reset(std::uint32_t address = 0, InstructionSet instruction_set = InstructionSet::isa);
   void resume_from_stop();
   void set_memory(Memory memory);

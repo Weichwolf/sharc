@@ -274,6 +274,13 @@ struct Core::Impl {
     }
   }
 
+  void clear_continuation() noexcept {
+    resume.reset();
+    pipeline_history = 0;
+    delayed_target = 0;
+    loops = {};
+  }
+
   RunResult fail(FaultReason reason, std::string detail) {
     state.has_fault = true;
     state.execution = ExecutionState::faulted;
@@ -567,8 +574,44 @@ void Core::interrupt(const InterruptRequest & /*request*/) {
   unavailable("interrupt entry is not implemented", impl_->state.registers.pc);
 }
 
-void Core::reset(std::uint32_t /*address*/, InstructionSet /*instruction_set*/) {
-  unavailable("architectural reset is not implemented", impl_->state.registers.pc);
+void Core::reset(std::uint32_t address, InstructionSet instruction_set) {
+  impl_->stopped_owner();
+  if (address > detail::maximum_pc) {
+    throw std::invalid_argument("reset address exceeds 24 bits");
+  }
+  if (instruction_set != InstructionSet::isa && instruction_set != InstructionSet::visa) {
+    throw std::invalid_argument("unknown reset instruction set");
+  }
+
+  constexpr std::uint32_t mode2_reset = 0x42000000;
+  constexpr std::uint32_t sticky_reset = 0x05400000;
+  constexpr std::uint32_t interrupt_mask_reset = 0x00000003;
+  constexpr std::uint32_t interrupt_mode_mask_reset = 0x00200000;
+  constexpr std::uint32_t flag_level_mask = 0x55555555; // FLAGS pin levels are even bits.
+  auto &state = impl_->state;
+  auto &registers = state.registers;
+  // The consumer supplies the restart address. Fetch and Decode start empty.
+  registers.pc = registers.faddr = registers.daddr = address;
+  registers.pc_stack_pointer = registers.loop_address_depth = registers.loop_counter_depth = 0;
+  registers.status_depth = 0;
+  for (auto &pe : registers.pe) {
+    pe.astat = 0;
+    pe.stky = sticky_reset;
+  }
+  registers.mode1 = 0;
+  registers.mode2 = mode2_reset;
+  registers.mmask = interrupt_mode_mask_reset;
+  registers.flags &= flag_level_mask;
+  registers.irptl = registers.imaskp = registers.lirptl = 0;
+  registers.imask = interrupt_mask_reset;
+  registers.ustat = {};
+
+  state.instruction_set = instruction_set;
+  state.execution = ExecutionState::stopped;
+  state.has_fault = false;
+  state.fault = {};
+  impl_->yield_requested = false;
+  impl_->clear_continuation();
 }
 
 void Core::resume_from_stop() {
@@ -615,12 +658,7 @@ void Core::set_registers(const Registers &registers) {
       throw std::invalid_argument("PC stack entry exceeds 26 bits");
     }
   }
-  if (registers.pc != impl_->state.registers.pc) {
-    impl_->resume.reset();
-    impl_->pipeline_history = 0;
-    impl_->delayed_target = 0;
-    impl_->loops = {};
-  }
+  if (registers.pc != impl_->state.registers.pc) { impl_->clear_continuation(); }
   impl_->state.registers = registers;
 }
 
