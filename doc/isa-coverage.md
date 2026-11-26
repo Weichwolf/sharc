@@ -15,7 +15,7 @@ is claimed.
 | FastFP32 numerical mode (opt-in) | Independent approximation expectations, rounding/flags, unchanged raw moves/integer behavior, separate translations | Unimplemented |
 | Parallel operations | Old operands, memory aliases, register exchanges and ordered partial effects | Partial: raw register moves/swaps with supported fixed ALU writeback |
 | Address generation and memory | Both DAGs, modulo/reverse addressing, PM/DM and physical view aliases | Partial: normal-word pre-indexing, immediate modify/reverse and DAG register-load dependencies |
-| Sequencer and control | Delayed flow, DO/loop endpoints, LR, stacks, reset and interrupts | Partial: classic direct/indirect transfers, two delay slots, classic hardware DO, counted nesting and admitted loop reentry |
+| Sequencer and control | Delayed flow, DO/loop endpoints, LR, stacks, reset and interrupts | Partial: classic direct/indirect transfers, hardware DO and admitted reentry, reset, declared maskable vectors, admitted RTI and IDLE |
 | Chip-profile boundaries | ADSP-21489 memory/vector parameters and explicit I/O ownership | Unimplemented |
 | JIT coherence and hosts | Self-modifying aliases, natural loops, precise exits, x86-64 and ARM64 | Unimplemented |
 
@@ -40,8 +40,8 @@ reason.
 
 `test/core/state.cpp` checks raw banks, DAGs, stacks, state replacement, snapshot
 mode compatibility and clearing a later unprepared-execution fault. These are
-storage/interface checks; hardware reset, interrupted continuation and execution
-semantics are not qualified. See [state.md](state.md).
+storage/interface checks. Core reset and IDLE have additional execution tests in
+`test/core/control.cpp`. See [state.md](state.md).
 
 S1 provides the original contract declarations, an installable `sharc::core` package,
 top-level ISA/VISA and compute decoding, independent preparation fixtures, and
@@ -109,9 +109,17 @@ a compute adds one interlock cycle, including when not taken (Programming
 Reference 2.4, 4-19–4-21 and 4-115–4-116). The preceding-compute history is SSA
 state, stored at exits and included in snapshots. Cycle bounds may cross the
 deadline to finish the current instruction; cycle credit cannot wrap under zero.
-External-flag and loop conditions refuse preparation. VISA, floating computation,
-multiplier, remaining shifter and memory forms, timer, reset and
-interrupt entry remain unimplemented. `interrupt_ready` reports false.
+External conditions refuse preparation. VISA, floating computation, multiplier,
+timer evolution and remaining shifter and memory forms remain unimplemented.
+
+Classic `IDLE` stops at retirement under either run bound. Tests cover both
+numerical modes, frozen progression, reset and snapshot replay. IDLE in either
+slot of a taken delayed branch keeps the delayed transfer pending. An eligible
+declared interrupt wakes ordinary IDLE. Public installed-image tests cover
+vector entry, masks, nesting, RTI and RTI (DB), absolute deadlines, a suspended
+long DO fetch, short counted and arithmetic termination shadows, nested refills,
+and replay into another Core. See [state.md](state.md) for the
+admitted event model and open cases.
 
 Non-delayed direct CALL and plain conditional RTS keep static call targets and
 known return addresses inside the same LLVM function. CALL and RTS access one
@@ -121,10 +129,10 @@ return address with its CALL tag, updates PEx full/empty status and latches the
 almost-full interrupt at depth 29. A return address altered by the owner takes a
 cold path to another declared entry; owner dispatch uses a loop, not host recursion.
 A completed return respects the current bound before requiring a new entry.
-Empty/overflowed stacks and returns with a loop/interrupt continuation tag fail before
-retiring that instruction, retaining any preceding completed prefix. These are
-qualification gaps, not architectural stack-exception implementations.
-Loop-reentry, interrupt and parallel-compute returns remain unsupported.
+Empty/overflowed stacks and plain RTS on a loop or interrupt continuation fail
+at the instruction boundary, retaining the preceding completed prefix. Admitted
+reentry uses RTS (LR), and admitted interrupt return uses RTI. Architectural
+stack exceptions and parallel-compute returns remain open.
 
 Classic type 9 adds non-delayed DAG2-indirect and signed six-bit PC-relative
 jumps and calls, optionally with supported single-function fixed ALU computation.
@@ -159,7 +167,8 @@ path. Preparation admits adjacent complementary delayed jumps without
 parallel computation and rejects other branches in slots. The ISA tests in
 `test/isa/delay.cpp` cover instruction and cycle prefixes, cross-Core replay,
 absolute, relative and DAG2 calls, 24-bit PC wrap, stack refusal and a slot
-memory fault. RTI remains open.
+memory fault. `test/core/interrupt.cpp` qualifies RTI (DB) for sources without
+automatic status stacking.
 
 Long classic DO bodies of at least five words support immediate and admitted
 register counts, LCNTR, arithmetic termination and FOREVER. Counted loops

@@ -1,11 +1,9 @@
 # ADSP-21489 architectural storage
 
 The public `Registers` definition stores physical architectural bits, independently
-of the selected computation precision. It is the S1 programmer-visible storage model, not an
-execution or reset implementation. Default initialization supplies zeroed inspection
-storage; it does not claim the hardware reset state. The reference is the SHARC
-Processor Programming Reference 2.4, chapters 2–6 and appendix A, identified in
-`reference-manifest.json`.
+of the selected computation precision. Default initialization supplies zeroed inspection
+storage. The reference is the SHARC Processor Programming Reference 2.4,
+chapters 2–6 and appendix A, identified in `reference-manifest.json`.
 
 | Public member | Architectural representation |
 |---|---|
@@ -38,6 +36,64 @@ occupancy. Instruction effects and undefined FIFO overflow/underflow behavior
 still require separate execution qualification.
 No host C++ object layout is a file or generated-code ABI.
 
+## Reset
+
+`Core::reset(address, instruction_set)` resets the defined core controls and
+empty stack depths according to Table A-18. An empty stack's architectural
+top value is a register view. Its inactive cells retain their raw backing.
+Data banks, DAG fields and the other registers with unspecified reset values
+retain their contents. FLAGS uses the pin-level bit positions in Table A-5.
+Timer count and period retain their contents in accordance with Chapter 5's
+timer initialization rule. MODE2 disables the timer.
+
+The consumer supplies the restart PC and instruction set. The core initializes
+both empty pipeline addresses to that PC, clears pending transfers, faults and
+yield requests, and retains the installed image and elapsed progress. Execution
+resumes through a declared entry. A VISA restart records its address and mode
+in state. VISA execution remains open. A previously claimed terminal host
+fault prevents reset under the owner contract.
+
+Classic `IDLE` retires once and stops execution before its successor. In
+straight-line code Decode holds the successor and Fetch1 stops two words
+ahead, as shown in Table 4-12. Later runs return `sleeping` with zero progress.
+A taken delayed branch held by `IDLE` in a slot remains pending and blocks
+interrupt release. The consumer accounts for elapsed time outside the run
+bound while the core sleeps. A snapshot preserves the sleeping boundary.
+
+## Interrupts
+
+`InterruptRequest::source` is the IVT priority slot in Programming Reference
+Table B-2. Its bit in IRPTL/IMASK/IMASKP or LIRPTL follows Tables A-12 and A-13.
+The consumer chooses a pending source and supplies its declared vector PC.
+`interrupt_ready` checks the installed route, the global and individual masks,
+the active service priority, the first ISR instruction, loop interrupt shadows,
+and a pending delayed transfer. On entry, `interrupt` clears the source latch,
+marks the source active and pushes the tagged return PC. It charges the four nominal vector
+refill cycles without retiring a guest instruction. Latches for sources in
+service are kept clear at execution boundaries. A sleeping core wakes
+through the vector and resumes after IDLE on RTI.
+
+IRQ2 through IRQ0 and the two timer priorities also push both ASTAT registers
+and MODE1, then clear the MODE1 bits selected by MMASK. Classic RTI restores
+that frame and clears the source's latch and active bit. RTI (DB) is admitted
+for sources without automatic status stacking. The PC stack pops and service
+ends when RTI retires. The two slots complete before the redirect. A snapshot
+captures the nested service frames, the interrupted native continuation and
+suspended loop fetch state, including during a delayed return. Emulation events,
+internal timer evolution, external stalls, software interrupt control and
+simultaneous branch Address and loop-end Fetch1 admission remain profile
+coverage items.
+
+Short counted DO setup inhibits service on the next clock for one-, two-, and
+four-word bodies. For expiry in counted bodies shorter than four words and for
+arithmetic termination, the loop sample and the three following clocks inhibit
+service. The hidden deadline uses nominal base cycles and survives a snapshot.
+Native code records it at a terminating sample, including samples reached during
+a whole-turn grant or a branch or child-loop refill. Variants without declared
+interrupt vectors omit this tracking.
+
+## Continuations
+
 `State` adds cumulative instruction/base-cycle progress, instruction set, execution
 state and a latched fault. `Snapshot` is an immutable owning copy of the current
 state, yield request, prepared continuation identity/entry/address and preceding-compute
@@ -51,8 +107,8 @@ replacing PC starts a fresh declared entry and clears its pipeline history.
 Snapshots retain the preceding-compute interlock, two recent physical DAG
 register-load tags and a taken classic delayed transfer's destination and slot
 phase. Cross-Core replay preserves the destination even when a slot changes a
-contributing DAG register. Pending interrupts, mode-register writes and
-declared code transfers still need execution and snapshot qualification.
+contributing DAG register. Mode-register writes and declared code transfers
+still need execution and snapshot qualification.
 
 For admitted DO forms, snapshots retain the PC-stack ownership of each
 hardware loop frame and its fetch decision. They also retain the pending
@@ -120,7 +176,5 @@ original endpoint retires. With DB, the two slots execute after the stack effect
 
 Peripheral interrupt routing (PICR), SRU, DMA and peripheral timers remain consumer
 state. TAP emulation controls and physical instruction-cache contents are not
-implemented. Instruction pipeline observations beyond the admitted classic
-transfers and loop reentry, interrupt eligibility/shadows, timer evolution and
-reset values remain open. Straight-line ISA and admitted direct and indirect
-transfers update PC, FADDR, DADDR and EMUCLK at owner boundaries.
+implemented. Straight-line ISA and admitted classic transfers, loop reentry and
+interrupts update PC, FADDR, DADDR and EMUCLK at owner boundaries.

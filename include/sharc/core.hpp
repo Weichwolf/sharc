@@ -138,6 +138,7 @@ struct VariantLayout {
 };
 
 struct InterruptRequest {
+  // Priority slot in the IVT (0 through 41); the consumer supplies the vector PC.
   std::uint8_t source{};
   std::uint32_t vector{};
 };
@@ -267,6 +268,7 @@ public:
   void request_yield() noexcept;
   [[nodiscard]] bool interrupt_ready(const InterruptRequest &request) const noexcept;
   void interrupt(const InterruptRequest &request);
+  // Reset at the consumer's restart address, keeping the installed image and elapsed progress.
   void reset(std::uint32_t address = 0, InstructionSet instruction_set = InstructionSet::isa);
   void resume_from_stop();
   void set_memory(Memory memory);

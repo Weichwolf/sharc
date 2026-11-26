@@ -16,6 +16,7 @@ constexpr std::uint64_t loop_cycles = 23;
 constexpr std::uint64_t raw_seed = 0x81234567ef;
 constexpr std::uint64_t rts_eq = 0x0a0000000000;
 constexpr std::uint64_t direct_call_eq = 0x068000000000;
+constexpr std::uint64_t idle = 0x008000000000;
 constexpr std::uint32_t stack_empty = 1U << 22;
 constexpr std::uint32_t stack_full = 1U << 21;
 
@@ -433,6 +434,126 @@ void unretired_branch_stalls() {
   }
 }
 
+void reset_during_delay_slots() {
+  constexpr auto base = fixture::code_address;
+  constexpr unsigned length = 9;
+  constexpr auto first_slot = base + 2;
+  constexpr auto target = base + 6;
+  constexpr std::uint64_t counted_twice = 0x0c0002000000;
+  constexpr std::uint64_t delayed_jump = 0x063e04000000;
+  std::array<std::uint64_t, length + 2> words{};
+  words[0] = counted_twice | length;
+  words[1] = delayed_jump | target;
+  words[2] = fixture::immediate(0, 7);
+  words[3] = fixture::immediate(1, 9);
+  fixture::Program program(words);
+  program.code.variants[0].entries.push_back(first_slot);
+  for (const auto mode : fixture::numeric_modes) {
+    const auto native = fixture::compile(program.code, mode);
+    sharc::Core core(program.memory(), mode);
+    (void)core.install(native, fixture::Program::variant_id);
+    core.reset(base);
+    check(fixture::completed(core.run_until(2), 2, 2) && core.registers().pc == first_slot &&
+              core.registers().loop_address_depth == 1,
+          "reset fixture did not reach a delayed jump in a live loop");
+    const auto pending = core.save();
+    core.request_yield();
+    core.reset(first_slot);
+    check(core.state().progress == sharc::Progress{.instructions = 2, .base_cycles = 2} &&
+              core.registers().emuclk == 2 && core.registers().pc_stack_pointer == 0 &&
+              core.registers().loop_counter_depth == 0 && core.registers().loop_address_depth == 0,
+          "reset changed elapsed time or retained the loop frame");
+    check(fixture::completed(core.run_until(4), 2, 2) && core.registers().pc == base + 4 &&
+              core.registers().pe[0].data[0][0] == 7U << 8 &&
+              core.registers().pe[0].data[0][1] == 9U << 8,
+          "reset retained the pending jump or revoked the prepared restart entry");
+    core.restore(pending);
+    check(fixture::completed(core.run_until(5), 2, 3) && core.registers().pc == target &&
+              core.registers().loop_address_depth == 1 &&
+              core.registers().loop_counter_stack[0] == 1,
+          "snapshot lost the pre-reset loop and delayed target");
+
+    // A saved continuation can reach this address, but it is not a restart entry.
+    core.reset(target);
+    const auto undeclared = core.run(1);
+    check(undeclared.has_fault && undeclared.fault.reason == sharc::FaultReason::undeclared_entry &&
+              undeclared.fault.address == target && undeclared.progress == sharc::Progress{},
+          "reset entered code through the discarded continuation");
+  }
+}
+
+void idle_boundaries() {
+  constexpr auto base = fixture::code_address;
+  constexpr auto after_idle = base + 2;
+  constexpr std::uint64_t later_deadline = 100;
+  const std::array words{fixture::immediate(0, 7), idle, fixture::immediate(1, 9)};
+  fixture::Program program(words);
+  for (const auto mode : fixture::numeric_modes) {
+    const auto native = fixture::compile(program.code, mode);
+    sharc::Core core(program.memory(), mode);
+    (void)core.install(native, fixture::Program::variant_id);
+    core.reset(base);
+    const auto initial = core.save();
+    const auto check_idle = [&](const sharc::RunResult &result, std::uint64_t retired) {
+      check(fixture::completed(result, retired, retired) &&
+                result.execution == sharc::ExecutionState::sleeping &&
+                core.state().progress == sharc::Progress{.instructions = 2, .base_cycles = 2} &&
+                core.registers().pc == after_idle && core.registers().daddr == after_idle &&
+                core.registers().faddr == after_idle + 2 && core.registers().emuclk == 2 &&
+                core.registers().pe[0].data[0][0] == 7U << 8 &&
+                core.registers().pe[0].data[0][1] == 0,
+            "IDLE did not stop exactly at its retirement boundary");
+    };
+    check_idle(core.run(10), 2);
+    const auto sleeping = core.save();
+    const auto state = core.state();
+    check_idle(core.run_until(later_deadline), 0);
+    check(core.state() == state, "a later bound advanced an idled core");
+    try {
+      core.resume_from_stop();
+      check(false, "IDLE resumed without an interrupt");
+    } catch (const sharc::PreparationError &) {
+      check(core.state() == state, "invalid IDLE wake changed core state");
+    }
+    core.restore(initial);
+    check(fixture::completed(core.run_until(1), 1, 1), "IDLE bounded prefix failed");
+    check_idle(core.run_until(2), 1);
+    core.reset(base);
+    check(fixture::completed(core.run(1), 1, 1) && core.registers().pc == base + 1,
+          "reset did not leave IDLE");
+    core.restore(sleeping);
+    check_idle(core.run(10), 0);
+    check(core.state() == state, "snapshot failed to restore the frozen IDLE boundary");
+  }
+}
+
+void idle_in_taken_delay_slots() {
+  constexpr auto base = fixture::code_address;
+  constexpr auto target = base + 4;
+  constexpr std::uint64_t delayed_jump = 0x063e04000000;
+  for (const unsigned slot : {1U, 2U}) {
+    std::array words{delayed_jump | target,
+                     std::uint64_t{0},
+                     std::uint64_t{0},
+                     std::uint64_t{0},
+                     fixture::immediate(1, 9)};
+    words[slot] = idle;
+    fixture::Program program(words);
+    const auto native = sharc::Core::compile(program.code);
+    sharc::Core core(program.memory());
+    (void)core.install(native, fixture::Program::variant_id);
+    core.reset(base);
+    const auto result = core.run(10);
+    check(fixture::completed(result, slot + 1, slot + 1) &&
+              result.execution == sharc::ExecutionState::sleeping &&
+              core.registers().pc == base + slot && core.registers().pe[0].data[0][1] == 0,
+          "IDLE in a taken delay slot allowed the redirect to complete");
+    const auto sleeping = core.state();
+    check(fixture::completed(core.run(1), 0, 0) && core.state() == sleeping,
+          "taken delayed branch progressed while the core slept");
+  }
+}
+
 } // namespace
 
 int main() {
@@ -447,5 +568,8 @@ int main() {
     stack_interlock();
     stalled_stack_refusal();
     unretired_branch_stalls();
+    reset_during_delay_slots();
+    idle_boundaries();
+    idle_in_taken_delay_slots();
   });
 }

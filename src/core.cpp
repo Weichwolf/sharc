@@ -63,7 +63,6 @@ struct NativeImage::Impl {
   std::vector<NativeSymbols::TextRange> text_ranges;
   std::vector<NativeSymbols::Site> sites;
   std::vector<FaultAccess> accesses;
-  bool interrupts_supported{};
 };
 
 std::span<const std::byte> SemanticImage::bitcode() const noexcept {
@@ -144,6 +143,7 @@ struct LoopPipeline {
   std::array<std::uint64_t, Registers::pc_stack_capacity * detail::suspended_call_state_words>
       suspended_calls{};
   std::uint64_t return_tail{};
+  std::uint64_t interrupt_deadline{};
 
   [[nodiscard]] bool active() const {
     return short_loop[detail::short_remaining] != 0 ||
@@ -152,6 +152,22 @@ struct LoopPipeline {
            std::ranges::any_of(counted_tails, [](auto tail) { return tail != 0; }) ||
            std::ranges::any_of(frames, [](auto frame) { return frame != 0; }) ||
            std::ranges::any_of(calls, [](auto call) { return call != 0; });
+  }
+
+  [[nodiscard]] bool blocks_interrupt_at_setup(const Registers &registers) const noexcept {
+    const auto descriptor = short_loop[detail::short_descriptor];
+    const auto depth = registers.loop_address_depth;
+    if ((descriptor & detail::short_startup) == 0 || depth == 0) { return false; }
+    const auto address = registers.loop_address_stack[depth - 1];
+    constexpr unsigned termination_shift = 24;
+    constexpr unsigned termination_mask = 31;
+    constexpr unsigned counter_expired = 15;
+    constexpr unsigned type_shift = 29;
+    constexpr unsigned three_word_counted_type = 6;
+    // A counted DO with one, two or four body words blocks the following cycle.
+    return (address & detail::maximum_pc) == (descriptor & detail::maximum_pc) &&
+           ((address >> termination_shift) & termination_mask) == counter_expired &&
+           (address >> type_shift) != three_word_counted_type;
   }
 
   void observe(Registers &registers) const {
@@ -212,6 +228,81 @@ private:
     return true;
   }
 };
+
+constexpr std::uint32_t nesting_enable = 1U << 11;
+constexpr std::uint32_t interrupt_enable = 1U << 12;
+constexpr std::uint32_t stack_overflow_interrupt = 1U << 3;
+constexpr std::uint32_t pc_stack_full = 1U << 21;
+constexpr std::uint32_t pc_stack_empty = 1U << 22;
+constexpr std::uint32_t status_stack_empty = 1U << 24;
+constexpr std::uint32_t timer_enable = 1U << 5;
+constexpr unsigned vector_refill_cycles = 4;
+constexpr unsigned lirptl_enable_shift = 10;
+constexpr unsigned lirptl_pointer_shift = 20;
+
+struct InterruptLine {
+  std::uint32_t latch, enable, active;
+  bool extended{};
+
+  [[nodiscard]] bool enabled(const Registers &registers) const noexcept {
+    return ((extended ? registers.lirptl : registers.imask) & enable) != 0;
+  }
+
+  [[nodiscard]] bool in_service(const Registers &registers) const noexcept {
+    return ((extended ? registers.lirptl : registers.imaskp) & active) != 0;
+  }
+
+  void set_service(Registers &registers, bool begin) const noexcept {
+    auto &latches = extended ? registers.lirptl : registers.irptl;
+    auto &pointers = extended ? registers.lirptl : registers.imaskp;
+    latches &= ~latch;
+    if (begin) {
+      pointers |= active;
+    } else {
+      pointers &= ~active;
+    }
+  }
+};
+
+// Table B-2 gives vector priorities; Tables A-12 and A-13 map them to registers.
+InterruptLine interrupt_line(unsigned source) noexcept {
+  constexpr unsigned p6 = 17;
+  constexpr unsigned p14 = 25;
+  constexpr unsigned p17 = 28;
+  constexpr unsigned cb7 = 30;
+  if ((source >= p6 && source < p14) || (source >= p17 && source < cb7)) {
+    const auto index = source < p14 ? source - p6 : (p14 - p6) + (source - p17);
+    const auto bit = 1U << index;
+    return {.latch = bit,
+            .enable = bit << lirptl_enable_shift,
+            .active = bit << lirptl_pointer_shift,
+            .extended = true};
+  }
+  const auto skipped = (source >= p14 ? p14 - p6 : 0U) + (source >= cb7 ? cb7 - p17 : 0U);
+  const auto bit = 1U << (source - skipped);
+  return {.latch = bit, .enable = bit, .active = bit};
+}
+
+void clear_in_service_latches(Registers &registers) noexcept {
+  constexpr std::uint32_t extended_latch_mask = (1U << lirptl_enable_shift) - 1;
+  registers.irptl &= ~registers.imaskp;
+  registers.lirptl &= ~((registers.lirptl >> lirptl_pointer_shift) & extended_latch_mask);
+}
+
+bool saves_interrupt_status(unsigned source) noexcept {
+  constexpr unsigned timer_high = 4;
+  constexpr unsigned timer_low = 32;
+  constexpr unsigned irq2 = 8;
+  constexpr unsigned irq0 = 10;
+  return (source >= irq2 && source <= irq0) || source == timer_high || source == timer_low;
+}
+
+struct InterruptFrame {
+  std::optional<Resume> resume;
+  LoopPipeline loops;
+  std::uint64_t entry_instruction{};
+  std::uint8_t source{}, pc_depth{};
+};
 } // namespace
 
 struct Core::Impl {
@@ -252,6 +343,10 @@ struct Core::Impl {
     pointers[detail::short_parent_tail_slot] = &loops.short_parent_tail;
     pointers[detail::suspended_call_state_slot] = loops.suspended_calls.data();
     pointers[detail::interrupt_latch_slot] = &state.registers.irptl;
+    pointers[detail::interrupt_frame_slot] = &interrupt_frame_guard;
+    pointers[detail::status_depth_slot] = &state.registers.status_depth;
+    pointers[detail::progress_cycle_slot] = &state.progress.base_cycles;
+    pointers[detail::interrupt_deadline_slot] = &loops.interrupt_deadline;
     for (unsigned bank = 0; bank < 2; ++bank) {
       for (unsigned index = 0; index < 16; ++index) {
         auto &dag = state.registers.dag[bank][index];
@@ -272,6 +367,13 @@ struct Core::Impl {
     if (terminal_fault) {
       throw std::logic_error("a Core terminated by a host fault cannot be resumed");
     }
+  }
+
+  void clear_continuation() noexcept {
+    resume.reset();
+    pipeline_history = 0;
+    delayed_target = 0;
+    loops = {};
   }
 
   RunResult fail(FaultReason reason, std::string detail) {
@@ -335,6 +437,13 @@ struct Core::Impl {
         result.fault.instruction_bits = detail::full_instruction_bits;
         state.fault = result.fault;
         break;
+      case detail::NativeExit::invalid_interrupt_return:
+        result = fail(FaultReason::unsupported_feature,
+                      "RTI has no matching stack frame or uses DB with automatic status restore");
+        result.fault.instruction = control[detail::fault_instruction];
+        result.fault.instruction_bits = detail::full_instruction_bits;
+        state.fault = result.fault;
+        break;
       case detail::NativeExit::undeclared:
         result = fail(FaultReason::undeclared_entry, "execution reached an undeclared instruction");
         break;
@@ -349,12 +458,24 @@ struct Core::Impl {
            resume->address == state.registers.pc;
   }
 
+  [[nodiscard]] const CodeVariant *installed_variant() const noexcept {
+    const auto &variants = installed->image->code.variants;
+    const auto code = std::ranges::find(variants, variant, &CodeVariant::id);
+    return code != variants.end() ? &*code : nullptr;
+  }
+
+  [[nodiscard]] bool declared_interrupt(const InterruptRequest &request) const noexcept {
+    const auto *code = installed_variant();
+    return code != nullptr && std::ranges::any_of(code->interrupt_vectors, [&](const auto &entry) {
+             return entry.source == request.source && entry.vector == request.vector;
+           });
+  }
+
   [[nodiscard]] bool entry_allowed() const {
     if (continuing()) { return true; }
     if (delayed_target != 0 || loops.active()) { return false; }
-    const auto &variants = installed->image->code.variants;
-    const auto code = std::ranges::find(variants, variant, &CodeVariant::id);
-    return code != variants.end() &&
+    const auto *code = installed_variant();
+    return code != nullptr &&
            (std::ranges::find(code->entries, state.registers.pc) != code->entries.end() ||
             std::ranges::any_of(code->interrupt_vectors, [&](const auto &request) {
               return request.vector == state.registers.pc;
@@ -373,6 +494,10 @@ struct Core::Impl {
   }
 
   RunResult execute(std::uint64_t instructions, std::uint64_t cycles);
+  [[nodiscard]] bool continue_after(detail::NativeExit reason);
+  void enter_idle();
+  void refresh_interrupt_frame() noexcept;
+  void return_from_interrupt();
   void observe_pipeline(Progress retired);
   RunResult host_failure(Progress progress);
   bool enter(std::size_t index, detail::ControlWords &control);
@@ -391,6 +516,8 @@ struct Core::Impl {
   std::shared_ptr<const NativeImage::Impl> installed;
   std::uint32_t variant{};
   std::optional<Resume> resume;
+  std::vector<InterruptFrame> interrupt_frames;
+  std::uint32_t interrupt_frame_guard{};
   detail::RegisterPointers pointers;
 };
 
@@ -402,6 +529,7 @@ struct Snapshot::Impl {
   std::uint32_t pipeline_history{};
   std::uint64_t delayed_target{};
   LoopPipeline loops;
+  std::vector<InterruptFrame> interrupt_frames;
 };
 
 Core::Core(Memory memory, ExecutionMode mode)
@@ -559,20 +687,131 @@ void Core::request_yield() noexcept {
   impl_->yield_requested = true;
 }
 
-bool Core::interrupt_ready(const InterruptRequest & /*request*/) const noexcept {
-  return impl_->installed && impl_->installed->interrupts_supported;
+bool Core::interrupt_ready(const InterruptRequest &request) const noexcept {
+  constexpr unsigned first_maskable = 2;
+  constexpr unsigned reserved = 7;
+  const auto &state = impl_->state;
+  const auto &registers = state.registers;
+  if (impl_->executing || !impl_->installed || state.has_fault ||
+      state.instruction_set != InstructionSet::isa || (registers.mode2 & timer_enable) != 0 ||
+      impl_->delayed_target != 0 || impl_->loops.blocks_interrupt_at_setup(registers) ||
+      state.progress.base_cycles < impl_->loops.interrupt_deadline ||
+      request.source < first_maskable || request.source == reserved ||
+      request.source >= detail::interrupt_source_count ||
+      (registers.mode1 & interrupt_enable) == 0 ||
+      registers.pc_stack_pointer >= Registers::pc_stack_capacity ||
+      (saves_interrupt_status(request.source) &&
+       registers.status_depth >= registers.status_stack.size()) ||
+      !interrupt_line(request.source).enabled(registers) || !impl_->declared_interrupt(request) ||
+      !impl_->entry_allowed()) {
+    return false;
+  }
+  if (!impl_->interrupt_frames.empty() &&
+      impl_->interrupt_frames.back().entry_instruction == state.progress.instructions) {
+    return false; // The first instruction of the current vector must retire.
+  }
+  const auto limit = (registers.mode1 & nesting_enable) != 0
+                         ? static_cast<unsigned>(request.source) + 1
+                         : detail::interrupt_source_count;
+  for (unsigned source = 0; source < limit; ++source) {
+    if (interrupt_line(source).in_service(registers)) { return false; }
+  }
+  return true;
 }
 
-void Core::interrupt(const InterruptRequest & /*request*/) {
-  unavailable("interrupt entry is not implemented", impl_->state.registers.pc);
+void Core::interrupt(const InterruptRequest &request) {
+  impl_->stopped_owner();
+  if (!impl_->installed) { unavailable("interrupt requires an installed image", request.vector); }
+  if (!impl_->declared_interrupt(request)) {
+    detail::refuse(FaultReason::undeclared_entry,
+                   impl_->installed->image->identity,
+                   impl_->variant,
+                   request.vector,
+                   "interrupt source and vector are not declared together");
+  }
+  if (!interrupt_ready(request)) {
+    throw std::invalid_argument("SHARC interrupt is not eligible at this boundary");
+  }
+  auto &state = impl_->state;
+  auto &registers = state.registers;
+  const auto next_depth = static_cast<std::uint8_t>(registers.pc_stack_pointer + 1);
+  impl_->interrupt_frames.push_back({.resume = impl_->resume,
+                                     .loops = impl_->loops,
+                                     .entry_instruction = state.progress.instructions,
+                                     .source = request.source,
+                                     .pc_depth = next_depth});
+  impl_->clear_continuation();
+  impl_->refresh_interrupt_frame();
+
+  registers.pc_stack[registers.pc_stack_pointer] = registers.pc | detail::pc_sequencer_tag;
+  registers.pc_stack_pointer = next_depth;
+  registers.pe[0].stky &= ~(pc_stack_full | pc_stack_empty);
+  if (next_depth == Registers::pc_stack_capacity) { registers.pe[0].stky |= pc_stack_full; }
+  if (next_depth == Registers::pc_stack_capacity - 1) {
+    registers.irptl |= stack_overflow_interrupt;
+  }
+  if (saves_interrupt_status(request.source)) {
+    registers.status_stack[registers.status_depth++] = {.mode1 = registers.mode1,
+                                                        .astat_x = registers.pe[0].astat,
+                                                        .astat_y = registers.pe[1].astat};
+    registers.mode1 &= ~registers.mmask;
+    registers.pe[0].stky &= ~status_stack_empty;
+  }
+  interrupt_line(request.source).set_service(registers, true);
+  clear_in_service_latches(registers);
+  registers.pc = request.vector;
+  registers.daddr = (request.vector + detail::loop_decode_distance) & detail::maximum_pc;
+  registers.faddr = (request.vector + detail::loop_fetch_distance) & detail::maximum_pc;
+  registers.emuclk += vector_refill_cycles;
+  state.progress.base_cycles += vector_refill_cycles;
+  state.execution = ExecutionState::stopped;
 }
 
-void Core::reset(std::uint32_t /*address*/, InstructionSet /*instruction_set*/) {
-  unavailable("architectural reset is not implemented", impl_->state.registers.pc);
+void Core::reset(std::uint32_t address, InstructionSet instruction_set) {
+  impl_->stopped_owner();
+  if (address > detail::maximum_pc) {
+    throw std::invalid_argument("reset address exceeds 24 bits");
+  }
+  if (instruction_set != InstructionSet::isa && instruction_set != InstructionSet::visa) {
+    throw std::invalid_argument("unknown reset instruction set");
+  }
+
+  constexpr std::uint32_t mode2_reset = 0x42000000;
+  constexpr std::uint32_t sticky_reset = 0x05400000;
+  constexpr std::uint32_t interrupt_mask_reset = 0x00000003;
+  constexpr std::uint32_t interrupt_mode_mask_reset = 0x00200000;
+  constexpr std::uint32_t flag_level_mask = 0x55555555; // FLAGS pin levels are even bits.
+  auto &state = impl_->state;
+  auto &registers = state.registers;
+  // The consumer supplies the restart address. Fetch and Decode start empty.
+  registers.pc = registers.faddr = registers.daddr = address;
+  registers.pc_stack_pointer = registers.loop_address_depth = registers.loop_counter_depth = 0;
+  registers.status_depth = 0;
+  for (auto &pe : registers.pe) {
+    pe.astat = 0;
+    pe.stky = sticky_reset;
+  }
+  registers.mode1 = 0;
+  registers.mode2 = mode2_reset;
+  registers.mmask = interrupt_mode_mask_reset;
+  registers.flags &= flag_level_mask;
+  registers.irptl = registers.imaskp = registers.lirptl = 0;
+  registers.imask = interrupt_mask_reset;
+  registers.ustat = {};
+
+  state.instruction_set = instruction_set;
+  state.execution = ExecutionState::stopped;
+  state.has_fault = false;
+  state.fault = {};
+  impl_->yield_requested = false;
+  impl_->clear_continuation();
+  impl_->interrupt_frames.clear();
+  impl_->refresh_interrupt_frame();
 }
 
 void Core::resume_from_stop() {
-  unavailable("sleep wake-up is not implemented", impl_->state.registers.pc);
+  impl_->stopped_owner();
+  unavailable("SHARC IDLE requires interrupt vector entry", impl_->state.registers.pc);
 }
 
 void Core::set_memory(Memory memory) {
@@ -615,12 +854,7 @@ void Core::set_registers(const Registers &registers) {
       throw std::invalid_argument("PC stack entry exceeds 26 bits");
     }
   }
-  if (registers.pc != impl_->state.registers.pc) {
-    impl_->resume.reset();
-    impl_->pipeline_history = 0;
-    impl_->delayed_target = 0;
-    impl_->loops = {};
-  }
+  if (registers.pc != impl_->state.registers.pc) { impl_->clear_continuation(); }
   impl_->state.registers = registers;
 }
 
@@ -638,7 +872,8 @@ Snapshot Core::save() const {
                      .resume = impl_->resume,
                      .pipeline_history = impl_->pipeline_history,
                      .delayed_target = impl_->delayed_target,
-                     .loops = impl_->loops});
+                     .loops = impl_->loops,
+                     .interrupt_frames = impl_->interrupt_frames});
   return snapshot;
 }
 
@@ -647,12 +882,44 @@ void Core::restore(const Snapshot &snapshot) {
   if (!snapshot.impl_ || snapshot.impl_->mode != impl_->mode) {
     throw std::invalid_argument("empty snapshot or incompatible numerical mode");
   }
-  impl_->state = snapshot.impl_->state;
-  impl_->yield_requested = snapshot.impl_->yield_requested;
-  impl_->resume = snapshot.impl_->resume;
-  impl_->pipeline_history = snapshot.impl_->pipeline_history;
-  impl_->delayed_target = snapshot.impl_->delayed_target;
-  impl_->loops = snapshot.impl_->loops;
+  auto restored = *snapshot.impl_;
+  impl_->state = std::move(restored.state);
+  impl_->yield_requested = restored.yield_requested;
+  impl_->resume = std::move(restored.resume);
+  impl_->pipeline_history = restored.pipeline_history;
+  impl_->delayed_target = restored.delayed_target;
+  impl_->loops = restored.loops;
+  impl_->interrupt_frames = std::move(restored.interrupt_frames);
+  impl_->refresh_interrupt_frame();
+}
+
+void Core::Impl::refresh_interrupt_frame() noexcept {
+  interrupt_frame_guard = 0;
+  if (!interrupt_frames.empty()) {
+    const auto &frame = interrupt_frames.back();
+    interrupt_frame_guard =
+        frame.pc_depth |
+        (saves_interrupt_status(frame.source) ? detail::interrupt_status_frame : 0);
+  }
+}
+
+void Core::Impl::return_from_interrupt() {
+  auto &registers = state.registers;
+  auto &frame = interrupt_frames.back();
+  if (saves_interrupt_status(frame.source)) {
+    const auto &status = registers.status_stack[--registers.status_depth];
+    registers.mode1 = status.mode1;
+    registers.pe[0].astat = status.astat_x;
+    registers.pe[1].astat = status.astat_y;
+    if (registers.status_depth == 0) { registers.pe[0].stky |= status_stack_empty; }
+  }
+  resume = std::move(frame.resume);
+  frame.loops.interrupt_deadline =
+      std::max(frame.loops.interrupt_deadline, loops.interrupt_deadline);
+  loops = frame.loops;
+  loops.observe(registers);
+  interrupt_frames.pop_back();
+  refresh_interrupt_frame();
 }
 
 bool Core::Impl::enter(std::size_t index, detail::ControlWords &control) {
@@ -668,6 +935,7 @@ bool Core::Impl::enter(std::size_t index, detail::ControlWords &control) {
 void Core::Impl::observe_pipeline(Progress retired) {
   if (retired.instructions == 0) { return; }
   auto &registers = state.registers;
+  if (!interrupt_frames.empty()) { clear_in_service_latches(registers); }
   if (delayed_target == 0) {
     if (registers.loop_address_depth != 0 || loops.refill != 0 ||
         loops.short_loop[detail::short_addresses] != 0) {
@@ -683,10 +951,39 @@ void Core::Impl::observe_pipeline(Progress retired) {
   registers.daddr = first ? (registers.pc + 2) & detail::maximum_pc : target;
 }
 
+void Core::Impl::enter_idle() {
+  auto &registers = state.registers;
+  if (delayed_target == 0 && registers.loop_address_depth == 0 && !loops.active()) {
+    // IDLE leaves its successor in Decode and stops Fetch1 two words later.
+    registers.daddr = registers.pc;
+    registers.faddr = (registers.pc + detail::loop_decode_distance) & detail::maximum_pc;
+  }
+  state.execution = ExecutionState::sleeping;
+}
+
+bool Core::Impl::continue_after(detail::NativeExit reason) {
+  switch (reason) {
+    case detail::NativeExit::interrupt_return:
+      interrupt_line(interrupt_frames.back().source).set_service(state.registers, false);
+      [[fallthrough]];
+    case detail::NativeExit::interrupt_return_redirect: return_from_interrupt(); return true;
+    case detail::NativeExit::interrupt_return_slots:
+      interrupt_line(interrupt_frames.back().source).set_service(state.registers, false);
+      return true;
+    case detail::NativeExit::indirect:
+    case detail::NativeExit::returned: resume.reset(); return true;
+    case detail::NativeExit::sleeping: enter_idle(); return false;
+    default: return false;
+  }
+}
+
 RunResult Core::Impl::execute(std::uint64_t instructions, std::uint64_t cycles) {
   idle_owner();
   if (state.has_fault) {
     return {.progress = {}, .execution = state.execution, .has_fault = true, .fault = state.fault};
+  }
+  if (state.execution == ExecutionState::sleeping) {
+    return {.progress = {}, .execution = state.execution, .has_fault = false, .fault = {}};
   }
   if (!installed) {
     return fail(FaultReason::unprepared, "execution requires an installed native image");
@@ -704,7 +1001,6 @@ RunResult Core::Impl::execute(std::uint64_t instructions, std::uint64_t cycles) 
       return failure(FaultReason::undeclared_entry,
                      "execution PC is not a declared entry or saved continuation");
     }
-    constexpr unsigned timer_enable = 1U << 5;
     if (state.instruction_set != InstructionSet::isa || (registers.mode2 & timer_enable) != 0) {
       return failure(FaultReason::unsupported_feature,
                      "VISA execution or an enabled core timer is not implemented");
@@ -734,13 +1030,14 @@ RunResult Core::Impl::execute(std::uint64_t instructions, std::uint64_t cycles) 
                     .variant = variant,
                     .address = state.registers.pc,
                     .entry = static_cast<std::uint32_t>(control[detail::resume_entry])};
-    const auto reason = static_cast<detail::NativeExit>(control[detail::exit_reason]);
     if (const auto result = native_failure(control, progress)) { return *result; }
-    if (reason != detail::NativeExit::indirect && reason != detail::NativeExit::returned) { break; }
-    resume.reset();
-    if (progress.instructions == instructions || progress.base_cycles >= cycles) { break; }
+    const auto reason = static_cast<detail::NativeExit>(control[detail::exit_reason]);
+    if (!continue_after(reason) || progress.instructions == instructions ||
+        progress.base_cycles >= cycles) {
+      break;
+    }
   }
-  state.execution = ExecutionState::stopped;
+  if (state.execution != ExecutionState::sleeping) { state.execution = ExecutionState::stopped; }
   return {.progress = progress, .execution = state.execution, .has_fault = false, .fault = {}};
 }
 

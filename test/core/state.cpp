@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #include "../support/check.hpp"
 
+#include <bit>
 #include <cstdint>
 #include <sharc/core.hpp>
 #include <stdexcept>
@@ -23,6 +24,50 @@ constexpr unsigned flag_bits = 0x5678;
 constexpr unsigned timer_period = 0xffffffff;
 constexpr unsigned timer_count = 123;
 constexpr std::uint64_t clock_bits = 0x123456789abcdef0;
+
+void reset_registers_and_fault(sharc::Core &core) {
+  constexpr std::uint32_t out_of_range = 0x1000000;
+  constexpr auto invalid_instruction_set = std::bit_cast<sharc::InstructionSet>(std::uint8_t{0xff});
+  const auto faulted = core.state();
+  fixture::throws<std::invalid_argument>([&] { core.reset(out_of_range); },
+                                         "reset accepted an address beyond 24 bits");
+  fixture::throws<std::invalid_argument>([&] { core.reset(execute_pc, invalid_instruction_set); },
+                                         "reset accepted an unknown instruction set");
+  fixture::check(core.state() == faulted, "invalid reset changed state");
+
+  auto expected = faulted;
+  auto &registers = expected.registers;
+  registers.pc = registers.faddr = registers.daddr = execute_pc;
+  registers.pc_stack_pointer = registers.loop_address_depth = registers.loop_counter_depth = 0;
+  registers.status_depth = 0;
+  constexpr std::uint32_t reset_stky = 0x05400000;
+  for (auto &pe : registers.pe) {
+    pe.astat = 0;
+    pe.stky = reset_stky;
+  }
+  constexpr std::uint32_t reset_mode2 = 0x42000000;
+  constexpr std::uint32_t reset_mmask = 0x00200000;
+  constexpr std::uint32_t retained_pin_levels = 0x5450;
+  registers.mode1 = 0;
+  registers.mode2 = reset_mode2;
+  registers.mmask = reset_mmask;
+  registers.flags = retained_pin_levels;
+  registers.irptl = registers.imaskp = registers.lirptl = 0;
+  registers.imask = 3;
+  registers.ustat = {};
+  expected.execution = sharc::ExecutionState::stopped;
+  expected.instruction_set = sharc::InstructionSet::visa;
+  expected.has_fault = false;
+  expected.fault = {};
+  core.reset(execute_pc, sharc::InstructionSet::visa);
+  fixture::check(core.state() == expected, "reset did not restore the documented control state");
+
+  registers.pc = registers.faddr = registers.daddr = 0;
+  expected.instruction_set = sharc::InstructionSet::isa;
+  core.reset();
+  fixture::check(core.state() == expected,
+                 "default ISA reset lost the selected entry or raw state");
+}
 }
 
 int main() {
@@ -131,8 +176,7 @@ int main() {
                                              "empty semantic image serialized");
     fixture::throws<sharc::PreparationError>([] { (void)sharc::NativeImage{}.report(); },
                                              "empty native image reports success");
-    fixture::throws<sharc::PreparationError>([&] { core.reset(); },
-                                             "unimplemented reset reports success");
-    check(core.state() == faulted, "failed installation or reset changed guest state");
+    check(core.state() == faulted, "failed installation changed guest state");
+    reset_registers_and_fault(core);
   });
 }

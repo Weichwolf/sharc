@@ -10,7 +10,7 @@
 
 namespace {
 constexpr unsigned full_width = 48, wide_width = 32;
-constexpr unsigned immediate_move_type = 17, index_modify_type = 19, nop_type = 21;
+constexpr unsigned immediate_move_type = 17, index_modify_type = 19, nop_type = 21, idle_type = 22;
 constexpr std::uint64_t classic_branch = 0xc00000001123;
 constexpr std::uint16_t compact_immediate_head = 0x0f81;
 constexpr std::uint16_t immediate_high = 0x1234, immediate_low = 0xabcd;
@@ -18,6 +18,7 @@ constexpr std::uint16_t conditional_compute_head = 0x013e, add_operands = 0x1123
 constexpr std::uint16_t immediate_shift_head = 0x023e, reserved_prefix_head = 0x0300;
 constexpr std::uint32_t next_classic_pc = 0x101, next_visa_pc = 0x103;
 constexpr std::uint32_t last_pc = 0xffffff, immediate_value = 0xdeadbeef;
+constexpr std::uint8_t first_invalid_interrupt_source = 42;
 using fixture::check;
 using sharc::Core;
 using sharc::FaultReason;
@@ -98,7 +99,7 @@ void formats() {
       const auto image = fixture::image(InstructionSet::isa, item.word);
       if (item.type == 2 || item.type == 5 || item.type == 8 || item.type == 9 || item.type == 15 ||
           item.type == immediate_move_type || item.type == index_modify_type ||
-          item.type == nop_type) {
+          item.type == nop_type || item.type == idle_type) {
         const auto semantic = Core::lower(image);
         check(!semantic.bitcode().empty() && !semantic.exports().empty(),
               "supported classic form has no semantic image");
@@ -179,7 +180,7 @@ void declarations() {
   variant.spans.pop_back();
   variant.interrupt_vectors = {{.source = 8, .vector = next_classic_pc}};
   check(refusal(image).reason == FaultReason::undeclared_entry, "undeclared vector accepted");
-  variant.interrupt_vectors = {{.source = 32, .vector = 0x100}};
+  variant.interrupt_vectors = {{.source = first_invalid_interrupt_source, .vector = 0x100}};
   check(refusal(image).reason == FaultReason::invalid_image, "invalid interrupt source accepted");
   variant.interrupt_vectors.clear();
   image.transitions = {{.from_variant = 7, .address = 0x100, .to_variants = {9}}};

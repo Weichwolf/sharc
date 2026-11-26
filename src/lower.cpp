@@ -68,9 +68,13 @@ constexpr unsigned immediate_shift_type = 6;
 constexpr unsigned register_move_type = 5;
 constexpr unsigned immediate_move_type = 17;
 constexpr unsigned nop_type = 21;
+constexpr unsigned idle_type = 22;
+constexpr std::uint64_t idle_word = std::uint64_t{1} << 39;
 constexpr unsigned direct_branch_type = 8;
 constexpr unsigned computed_branch_type = 9;
 constexpr unsigned return_branch_type = 11;
+constexpr unsigned flow_opcode_shift = 40;
+constexpr unsigned rti_opcode = 0x0b;
 constexpr unsigned counted_loop_type = 12;
 constexpr unsigned conditional_loop_type = 13;
 constexpr unsigned memory_move_type = 15;
@@ -94,6 +98,8 @@ constexpr unsigned loop_opcode_shift = 40;
 constexpr unsigned immediate_count_shift = 24;
 constexpr unsigned loop_count_register_opcode = 0x0d;
 constexpr unsigned loop_counter_expired = 15;
+// Programming Reference 4-39: the sample and three subsequent clocks.
+constexpr unsigned loop_interrupt_shadow_clocks = 4;
 constexpr unsigned loop_type_shift = 29;
 constexpr unsigned long_counted_loop_kind = 7;
 constexpr std::int64_t fixed_minimum = std::numeric_limits<std::int32_t>::min();
@@ -198,6 +204,14 @@ unsigned loaded_register(const Instruction &op) {
 bool branch(const Instruction &op) {
   return op.type == direct_branch_type || op.type == computed_branch_type ||
          op.type == return_branch_type;
+}
+
+bool idle(const Instruction &op) {
+  return op.type == idle_type && op.word == idle_word;
+}
+
+bool interrupt_return(const Instruction &op) {
+  return op.type == return_branch_type && (op.word >> flow_opcode_shift) == rti_opcode;
 }
 
 bool call_branch_instruction(const Instruction &op) {
@@ -509,21 +523,20 @@ void validate_register_move(const Instruction &instruction, std::string_view ide
 }
 
 void validate_return(const Instruction &instruction, std::string_view identity) {
-  constexpr unsigned opcode_shift = 40;
-  constexpr auto prefix = std::uint64_t{0x0b} << opcode_shift;
+  constexpr auto prefix = std::uint64_t{rti_opcode} << flow_opcode_shift;
   constexpr auto modifiers = std::uint64_t{7} << 24;
   constexpr auto allowed =
       prefix | (std::uint64_t{true_condition} << condition_shift) | modifiers | 0x7fffff;
   if ((instruction.word & ~allowed) != 0) {
     reject(instruction, identity, FaultReason::invalid_encoding, "reserved return bits");
   }
-  if ((instruction.word >> opcode_shift) != 0x0a ||
-      (instruction.word & (modifiers & ~(delayed_branch | loop_reentry))) != 0 ||
+  const auto supported = delayed_branch | (interrupt_return(instruction) ? 0 : loop_reentry);
+  if ((instruction.word & (modifiers & ~supported)) != 0 ||
       instruction.compute.kind != ComputeKind::none) {
     reject(instruction,
            identity,
            FaultReason::unsupported_instruction,
-           "RTI, modified return or parallel return compute is not lowered");
+           "modified return or parallel return compute is not lowered");
   }
   validate_condition(instruction, identity);
 }
@@ -589,7 +602,7 @@ void validate(const Instruction &instruction, std::string_view identity) {
            FaultReason::unsupported_instruction,
            "VISA native pipeline lowering is not implemented");
   }
-  if (instruction.type == nop_type && instruction.word == 0) { return; }
+  if ((instruction.type == nop_type && instruction.word == 0) || idle(instruction)) { return; }
   if (instruction.type == index_modify_type) { return; }
   if (instruction.type == register_move_type) {
     validate_register_move(instruction, identity);
@@ -713,6 +726,10 @@ struct LoopFrame {
 struct OverlappingLoopFetch {
   std::uint32_t child_end;
   LoopShape parent;
+};
+
+struct LoopConditionSample {
+  llvm::Value *status{}, *enabled{}, *interrupt_clocks{};
 };
 
 enum class RefillSample : std::uint8_t { instruction, whole_turn, call_return };
@@ -941,8 +958,11 @@ private:
                       NativeExit reason,
                       bool partial);
   void finish(Values values, std::uint32_t next, bool partial);
+  void finish_instruction(Values values, const Instruction &op, std::uint32_t next, bool partial);
   void readmit(const Values &values, std::uint32_t next);
   void credit(Values &values, llvm::Value *count, llvm::Value *cycles, bool partial);
+  void block_interrupt_after_loop_sample(const Values &values, llvm::Value *clocks = nullptr);
+  llvm::Value *short_sample_shadow(const Values &values, llvm::Value *late_sample, bool credited);
   void advance_lce(llvm::Value *cycles, std::size_t slot);
   llvm::Value *lce_age(llvm::Value *tail);
   void complete(Values values,
@@ -1004,13 +1024,13 @@ private:
                   llvm::Value *enabled,
                   bool returning = false,
                   llvm::Value *age = nullptr);
-  void
-  loop_test(Values &values, llvm::Value *old_status, const LoopShape &shape, llvm::Value *enabled);
+  void loop_test(Values &values, const LoopShape &shape, LoopConditionSample sample);
   [[nodiscard]] llvm::Value *refill_at(llvm::Value *refill, std::uint32_t child_end);
   void overlapping_loop_fetches(Values &values,
                                 std::uint32_t pc,
                                 llvm::Value *refill,
-                                RefillSample sample = RefillSample::instruction);
+                                RefillSample sample = RefillSample::instruction,
+                                llvm::Value *refill_clocks = nullptr);
   void loop_samples(Values &values,
                     llvm::Value *old_status,
                     std::uint32_t pc,
@@ -1025,6 +1045,8 @@ private:
 
   struct ShortRetirement {
     llvm::Value *left{}, *old_status{};
+    // Clocks still to credit at the retirement boundary, null after a return fill.
+    llvm::Value *clocks{};
   };
 
   struct ShortFetchWindow {
@@ -1052,7 +1074,10 @@ private:
   llvm::Value *
   short_exit_descriptor(llvm::Value *descriptor, const Values &values, llvm::Value *previous_depth);
   llvm::Value *short_words_after(llvm::Value *remaining, const LoopShape &shape);
-  llvm::Value *short_loop_test(Values &values, const LoopShape &shape, ShortRetirement retirement);
+  llvm::Value *short_loop_test(Values &values,
+                               const LoopShape &shape,
+                               ShortRetirement retirement,
+                               bool after_credit = false);
   llvm::Value *short_loop_refill(const LoopShape &shape, llvm::Value *done);
   llvm::Value *
   short_stage(const LoopShape &shape, std::uint32_t pc, llvm::Value *left, unsigned lag);
@@ -1072,7 +1097,7 @@ private:
   ShortLookahead overlapping_short_fetches(Values &values,
                                            const LoopShape &shape,
                                            ShortLookahead stages,
-                                           llvm::Value *old_status,
+                                           ShortRetirement retirement,
                                            bool after_credit);
   llvm::Value *short_fetch_crossed(ShortFetchWindow window, unsigned offset);
   ShortLookahead redirect_short_parent(ShortLookahead stages,
@@ -1081,7 +1106,8 @@ private:
                                        ShortFetchWindow window,
                                        llvm::Value *selected);
   void retire_short_observation(std::uint32_t pc);
-  void loop_backedge(const Values &values, const LoopShape &shape, bool partial);
+  void
+  loop_backedge(const Values &values, const Instruction &op, const LoopShape &shape, bool partial);
   void
   loop_retirement(Values &values, const Instruction &op, llvm::Value *old_status, bool partial);
   llvm::Value *branch_lanes(const Values &values, const Instruction &op, bool partial);
@@ -1839,7 +1865,8 @@ void Lowering::stack_guard(const Values &values,
   }
   if (reason == NativeExit::unsupported_loop_stack ||
       reason == NativeExit::unsupported_loop_reentry || reason == NativeExit::invalid_loop_abort ||
-      reason == NativeExit::invalid_short_loop_call) {
+      reason == NativeExit::invalid_short_loop_call ||
+      reason == NativeExit::invalid_interrupt_return) {
     auto *word = builder_.CreateGEP(builder_.getInt64Ty(),
                                     function_->getArg(unit_controls),
                                     builder_.getInt64(fault_instruction));
@@ -2113,6 +2140,35 @@ void Lowering::transfer_call_state(llvm::Value *depth, bool saving) {
 
 llvm::Value *Lowering::pop(Values &values, const Instruction &op, bool partial) {
   auto *depth = values[pc_stack_depth_value];
+  if (interrupt_return(op)) {
+    auto *guard = load(32, interrupt_frame_slot);
+    auto *pc_depth = builder_.CreateAnd(guard, builder_.getInt32(loop_pc_index_mask));
+    auto *has_frame = builder_.CreateAnd(builder_.CreateICmpEQ(depth, pc_depth),
+                                         builder_.CreateICmpNE(depth, builder_.getInt32(0)));
+    auto *status_bit = builder_.CreateAnd(guard, builder_.getInt32(interrupt_status_frame));
+    auto *pops_status = builder_.CreateICmpNE(status_bit, builder_.getInt32(0));
+    auto *status_ready = delayed(op)
+                             ? builder_.CreateNot(pops_status)
+                             : builder_.CreateOr(builder_.CreateNot(pops_status),
+                                                 builder_.CreateICmpNE(load(8, status_depth_slot),
+                                                                       builder_.getInt8(0)));
+    stack_guard(values,
+                op,
+                builder_.CreateAnd(has_frame, status_ready),
+                partial,
+                NativeExit::invalid_interrupt_return);
+    auto *popped_depth = builder_.CreateSub(depth, builder_.getInt32(1));
+    auto *top = builder_.CreateLoad(builder_.getInt32Ty(), stack_cell(popped_depth));
+    auto *tag = builder_.CreateAnd(top, builder_.getInt32(pc_call_tag | pc_sequencer_tag));
+    stack_guard(values,
+                op,
+                builder_.CreateICmpEQ(tag, builder_.getInt32(pc_sequencer_tag)),
+                partial,
+                NativeExit::invalid_interrupt_return);
+    values[pc_stack_depth_value] = popped_depth;
+    stack_status(values);
+    return builder_.CreateAnd(top, builder_.getInt32(maximum_pc));
+  }
   stack_guard(values,
               op,
               builder_.CreateAnd(
@@ -2254,7 +2310,11 @@ void Lowering::finish_loop_return(Values &values, const Instruction &op) {
   if ((sample & return_loop_fetch) != 0) {
     loop_fetch(values, *shape, ready, true);
   } else {
-    loop_test(values, values[status_value], *shape, ready);
+    loop_test(values,
+              *shape,
+              {.status = values[status_value],
+               .enabled = ready,
+               .interrupt_clocks = builder_.getInt64(loop_interrupt_shadow_clocks - 1)});
   }
 }
 
@@ -2324,7 +2384,8 @@ void Lowering::restore_short_call(Values &values,
     if (shape.arithmetic() && call_pc == shape.condition_pc()) {
       // The fourth return fetch reaches the condition word after the freeze.
       auto *depth = values[pc_stack_depth_value];
-      left = short_loop_test(values, shape, {.left = left, .old_status = values[status_value]});
+      left =
+          short_loop_test(values, shape, {.left = left, .old_status = values[status_value]}, true);
       if (reentry_calls_.contains(pc)) {
         descriptor = short_exit_descriptor(descriptor, values, depth);
       }
@@ -2418,6 +2479,32 @@ void Lowering::credit(Values &values, llvm::Value *count, llvm::Value *cycles, b
   values[extra_cycles_value] = builder_.getInt64(0);
 }
 
+void Lowering::block_interrupt_after_loop_sample(const Values &values, llvm::Value *clocks) {
+  if (variant_.interrupt_vectors.empty()) { return; }
+  auto *budget = builder_.CreateGEP(
+      builder_.getInt64Ty(), function_->getArg(unit_controls), builder_.getInt64(cycle_budget));
+  auto *spent = builder_.CreateSub(builder_.CreateLoad(builder_.getInt64Ty(), budget),
+                                   values[cycle_remaining_value]);
+  auto *now = builder_.CreateAdd(load(64, progress_cycle_slot),
+                                 builder_.CreateAdd(spent, values[cycle_overrun_value]));
+  if (clocks == nullptr) {
+    clocks = builder_.CreateAdd(values[extra_cycles_value],
+                                builder_.getInt64(loop_interrupt_shadow_clocks));
+  }
+  auto *deadline = builder_.CreateAdd(now, clocks);
+  store(builder_.CreateBinaryIntrinsic(
+            llvm::Intrinsic::umax, load(64, interrupt_deadline_slot), deadline),
+        interrupt_deadline_slot);
+}
+
+llvm::Value *
+Lowering::short_sample_shadow(const Values &values, llvm::Value *late_sample, bool credited) {
+  if (credited) { return builder_.getInt64(loop_interrupt_shadow_clocks - 1); }
+  auto *sample = builder_.CreateAdd(values[extra_cycles_value],
+                                    builder_.CreateZExt(late_sample, builder_.getInt64Ty()));
+  return builder_.CreateAdd(sample, builder_.getInt64(loop_interrupt_shadow_clocks));
+}
+
 llvm::Value *Lowering::lce_age(llvm::Value *tail) {
   auto *masked = builder_.CreateAnd(tail, builder_.getInt64(lce_age_mask));
   return builder_.CreateLShr(masked, builder_.getInt64(lce_age_shift));
@@ -2491,7 +2578,7 @@ void Lowering::complete(Values values,
   if (!branch(op)) {
     retire_short_observation(op.address);
     credit(values, count, builder_.CreateAdd(count, values[extra_cycles_value]), partial);
-    finish(values, next, partial);
+    finish_instruction(values, op, next, partial);
     return;
   }
   auto *cycles =
@@ -2517,7 +2604,11 @@ void Lowering::complete(Values values,
             ? jump_fetch(branch_values, target, op, target, {.clock = 0, .clocks_retired = 1})
             : nullptr;
     store(pack_delayed_target(target, before_first_delay_slot, fetch), delayed_target_slot);
-    finish(branch_values, next, partial);
+    if (interrupt_return(op)) {
+      exit(branch_values, builder_.getInt32(next), NativeExit::interrupt_return_slots);
+    } else {
+      finish(branch_values, next, partial);
+    }
   } else {
     branch_values[hazard_value] = builder_.getFalse();
     branch_values[dag_history_value] = builder_.getInt32(0);
@@ -2540,6 +2631,12 @@ void Lowering::complete(Values values,
 }
 
 void Lowering::redirect(Values values, const Instruction &op, llvm::Value *target, bool partial) {
+  if (interrupt_return(op)) {
+    const auto reason =
+        delayed(op) ? NativeExit::interrupt_return_redirect : NativeExit::interrupt_return;
+    exit(values, target, reason);
+    return;
+  }
   if (!delayed(op) && jump_refills_.contains(op.address)) {
     auto *entry = target != nullptr ? target : builder_.getInt32(branch_target(op));
     auto *fetch = entry;
@@ -2585,6 +2682,16 @@ void Lowering::delayed_slot(const Values &values,
   builder_.CreateCondBr(builder_.CreateICmpNE(pending, builder_.getInt64(0)), slot, ordinary);
   builder_.SetInsertPoint(slot);
   auto retired = values;
+  if (idle(op)) {
+    // The pending branch blocks interrupt service even though this slot idles.
+    credit(retired,
+           builder_.getInt64(1),
+           builder_.CreateAdd(builder_.getInt64(1), retired[extra_cycles_value]),
+           partial);
+    exit(retired, builder_.getInt32(op.address), NativeExit::sleeping);
+    builder_.SetInsertPoint(ordinary);
+    return;
+  }
   if (branch(op)) {
     // An adjacent complementary delayed JUMP is suppressed on the taken path.
     retired[hazard_value] = builder_.getFalse();
@@ -2945,6 +3052,16 @@ void Lowering::short_loop_counter(Values &values,
   builder_.CreateCondBr(terminate, pop, next.block);
   builder_.SetInsertPoint(pop);
   loop_pop(values, frame);
+  if (!variant_.interrupt_vectors.empty() && shape.length < loop_fetch_distance) {
+    // In the startup of a one-word DO the held fetch can sample twice.
+    // If the first decrement reaches the threshold, expiry is on the bubble.
+    auto *late_sample =
+        steady_fetch && !after_credit
+            ? builder_.CreateAnd(startup, builder_.CreateICmpUGT(current, threshold))
+            : builder_.getFalse();
+    block_interrupt_after_loop_sample(values,
+                                      short_sample_shadow(values, late_sample, after_credit));
+  }
   if (lce_endpoints_.contains(shape.end)) {
     llvm::Value *age = builder_.getInt64(1);
     if (shape.length != 3 && !after_credit) {
@@ -2975,18 +3092,24 @@ llvm::Value *Lowering::short_words_after(llvm::Value *remaining, const LoopShape
   return builder_.CreateSelect(unbounded, remaining, left);
 }
 
-llvm::Value *
-Lowering::short_loop_test(Values &values, const LoopShape &shape, ShortRetirement retirement) {
-  const auto [left, old_status] = retirement;
+llvm::Value *Lowering::short_loop_test(Values &values,
+                                       const LoopShape &shape,
+                                       ShortRetirement retirement,
+                                       bool after_credit) {
+  auto *left = retirement.left;
   auto *unbounded = builder_.CreateICmpEQ(left, builder_.getInt64(short_unbounded));
   auto before = values;
-  before[status_value] = old_status;
+  before[status_value] = retirement.old_status;
   auto *satisfied = branch_taken(condition(before, shape.term));
+  llvm::Value *late_sample = builder_.getFalse();
   if (shape.length == 1) {
     // The single-word loop samples on the startup bubble as well.
     auto *startup = short_flag(short_word(short_descriptor), short_startup);
-    satisfied = builder_.CreateOr(
-        satisfied, builder_.CreateAnd(startup, branch_taken(condition(values, shape.term))));
+    auto *bubble = builder_.CreateAnd(startup, branch_taken(condition(values, shape.term)));
+    if (!variant_.interrupt_vectors.empty()) {
+      late_sample = builder_.CreateAnd(bubble, builder_.CreateNot(satisfied));
+    }
+    satisfied = builder_.CreateOr(satisfied, bubble);
   }
   const auto frame = active_loop(values, shape);
   auto *done = builder_.CreateAnd(builder_.CreateAnd(frame.matches, unbounded), satisfied);
@@ -2996,6 +3119,10 @@ Lowering::short_loop_test(Values &values, const LoopShape &shape, ShortRetiremen
   builder_.CreateCondBr(done, pop, next.block);
   builder_.SetInsertPoint(pop);
   loop_pop(values, frame);
+  if (!variant_.interrupt_vectors.empty()) {
+    block_interrupt_after_loop_sample(values,
+                                      short_sample_shadow(values, late_sample, after_credit));
+  }
   jump(next, values);
   builder_.SetInsertPoint(next.block);
   values = next.values();
@@ -3066,8 +3193,7 @@ void Lowering::observe_short_fetches(Values &values,
                                      ShortLookahead stages,
                                      ShortRetirement retirement,
                                      bool after_credit) {
-  const auto [left, old_status] = retirement;
-  auto *live = builder_.CreateICmpNE(left, builder_.getInt64(0));
+  auto *live = builder_.CreateICmpNE(retirement.left, builder_.getInt64(0));
   const bool has_ancestors = short_parents_.contains(shape.end);
   if (has_ancestors) {
     stages.fetch = builder_.CreateSelect(
@@ -3081,7 +3207,7 @@ void Lowering::observe_short_fetches(Values &values,
     live = builder_.CreateOr(live, resumes);
   }
   if (has_ancestors) {
-    stages = overlapping_short_fetches(values, shape, stages, old_status, after_credit);
+    stages = overlapping_short_fetches(values, shape, stages, retirement, after_credit);
   }
   if (shape.length == loop_fetch_distance) { live = builder_.getTrue(); }
   write_short_addresses(stages, live);
@@ -3156,7 +3282,7 @@ Lowering::ShortLookahead Lowering::redirect_short_parent(ShortLookahead stages,
 Lowering::ShortLookahead Lowering::overlapping_short_fetches(Values &values,
                                                              const LoopShape &shape,
                                                              ShortLookahead stages,
-                                                             llvm::Value *old_status,
+                                                             ShortRetirement retirement,
                                                              bool after_credit) {
   auto *distance =
       builder_.CreateAnd(builder_.CreateSub(stages.fetch, builder_.getInt64(shape.end)),
@@ -3169,7 +3295,7 @@ Lowering::ShortLookahead Lowering::overlapping_short_fetches(Values &values,
   const ShortFetchWindow window{.before = short_word(short_fetch_progress),
                                 .after =
                                     builder_.CreateSelect(linear, distance, builder_.getInt64(0)),
-                                .old_status = old_status,
+                                .old_status = retirement.old_status,
                                 .decode_lag = lag};
   write_short(short_fetch_progress, window.after);
   llvm::Value *redirected = builder_.getFalse();
@@ -3198,7 +3324,17 @@ Lowering::ShortLookahead Lowering::overlapping_short_fetches(Values &values,
       auto *status = builder_.CreateSelect(at_execute, window.old_status, values[status_value]);
       auto *sampled = builder_.CreateAnd(builder_.CreateAnd(reachable, repeat),
                                          short_fetch_crossed(window, sample));
-      loop_test(values, status, parent, sampled);
+      llvm::Value *interrupt_clocks = nullptr;
+      if (!variant_.interrupt_vectors.empty()) {
+        auto *clocks = builder_.getInt64(loop_interrupt_shadow_clocks);
+        llvm::Value *limit = clocks;
+        if (retirement.clocks != nullptr) { limit = builder_.CreateAdd(retirement.clocks, clocks); }
+        auto *age = builder_.CreateSub(window.after, builder_.getInt64(sample));
+        interrupt_clocks = builder_.CreateBinaryIntrinsic(llvm::Intrinsic::usub_sat, limit, age);
+      }
+      loop_test(values,
+                parent,
+                {.status = status, .enabled = sampled, .interrupt_clocks = interrupt_clocks});
       selection = builder_.CreateOr(repeat, refill_at(load(64, loop_refill_slot), parent.end));
     }
     auto *selected =
@@ -3269,7 +3405,8 @@ void Lowering::short_loop_retirement(Values values,
   auto *cycles = builder_.CreateAdd(builder_.CreateAdd(builder_.getInt64(1), refill),
                                     values[extra_cycles_value]);
   auto *before_fetch = values[pc_stack_depth_value];
-  short_loop_observation(values, op, shape, {.left = left, .old_status = old_status});
+  short_loop_observation(
+      values, op, shape, {.left = left, .old_status = old_status, .clocks = cycles});
   const bool overlapping = short_parents_.contains(shape.end);
   if (overlapping && reentry_calls_.contains(following)) {
     next_descriptor = short_exit_descriptor(next_descriptor, values, before_fetch);
@@ -3283,7 +3420,7 @@ void Lowering::short_loop_retirement(Values values,
     auto *finished = llvm::BasicBlock::Create(module_.getContext(), "short.finished", function_);
     builder_.CreateCondBr(done, finished, repeat);
     builder_.SetInsertPoint(repeat);
-    finish(values, shape.start, partial);
+    finish_instruction(values, op, shape.start, partial);
     builder_.SetInsertPoint(finished);
     if (const auto parent = short_nested_.find(shape.end); parent != short_nested_.end()) {
       resume_short_parent(values, shape, parent->second);
@@ -3293,7 +3430,7 @@ void Lowering::short_loop_retirement(Values values,
       }
     }
   }
-  finish(values, next_pc(op), partial);
+  finish_instruction(values, op, next_pc(op), partial);
   builder_.SetInsertPoint(ordinary);
 }
 
@@ -3505,22 +3642,21 @@ void Lowering::loop_fetch(Values &values,
   values = continuation.values();
 }
 
-void Lowering::loop_test(Values &values,
-                         llvm::Value *old_status,
-                         const LoopShape &shape,
-                         llvm::Value *enabled) {
+void Lowering::loop_test(Values &values, const LoopShape &shape, LoopConditionSample sample) {
   const auto frame = active_loop(values, shape);
   auto before = values;
-  before[status_value] = old_status;
+  before[status_value] = sample.status;
   auto *done = branch_taken(condition(before, shape.term));
   auto *leave = llvm::BasicBlock::Create(module_.getContext(), "loop.condition.exit", function_);
   auto next = node("loop.condition.continue");
   next.incoming(values, builder_.GetInsertBlock());
-  builder_.CreateCondBr(
-      builder_.CreateAnd(enabled, builder_.CreateAnd(frame.matches, done)), leave, next.block);
+  builder_.CreateCondBr(builder_.CreateAnd(sample.enabled, builder_.CreateAnd(frame.matches, done)),
+                        leave,
+                        next.block);
   builder_.SetInsertPoint(leave);
   auto popped = values;
   loop_pop(popped, frame);
+  block_interrupt_after_loop_sample(popped, sample.interrupt_clocks);
   const auto refill =
       loop_refill_live | (std::uint64_t{shape.end} << loop_refill_end_shift) | shape.start;
   store(builder_.getInt64(refill), loop_refill_slot);
@@ -3564,7 +3700,12 @@ llvm::Value *Lowering::jump_fetch(Values &values,
     tests = builder_.CreateAnd(
         tests, builder_.CreateICmpEQ(fetch, builder_.getInt32((shape.start + 1) & maximum_pc)));
     tests = builder_.CreateAnd(tests, scheduled);
-    loop_test(values, position.status, shape, tests);
+    const auto sample_age = position.clocks_retired - position.clock;
+    loop_test(values,
+              shape,
+              {.status = position.status,
+               .enabled = tests,
+               .interrupt_clocks = builder_.getInt64(loop_interrupt_shadow_clocks - sample_age)});
     auto *exited = builder_.CreateAnd(tests, refill_at(load(64, loop_refill_slot), shape.end));
     next = builder_.CreateSelect(exited, builder_.getInt32((shape.end + 1) & maximum_pc), next);
   }
@@ -3607,7 +3748,10 @@ void Lowering::clear_loop_repeat(const LoopFrame &frame) {
   builder_.CreateStore(metadata, loop_cell(loop_frames_slot, frame.index));
 }
 
-void Lowering::loop_backedge(const Values &values, const LoopShape &shape, bool partial) {
+void Lowering::loop_backedge(const Values &values,
+                             const Instruction &op,
+                             const LoopShape &shape,
+                             bool partial) {
   const auto frame = active_loop(values, shape);
   auto *repeat = llvm::BasicBlock::Create(module_.getContext(), "loop.repeat", function_);
   auto *next = llvm::BasicBlock::Create(module_.getContext(), "loop.next", function_);
@@ -3619,7 +3763,7 @@ void Lowering::loop_backedge(const Values &values, const LoopShape &shape, bool 
          builder_.getInt64(1),
          builder_.CreateAdd(builder_.getInt64(1), values[extra_cycles_value]),
          partial);
-  finish(turn, shape.start, partial);
+  finish_instruction(turn, op, shape.start, partial);
   builder_.SetInsertPoint(next);
 }
 
@@ -3640,7 +3784,8 @@ llvm::Value *Lowering::refill_at(llvm::Value *refill, std::uint32_t child_end) {
 void Lowering::overlapping_loop_fetches(Values &values,
                                         std::uint32_t pc,
                                         llvm::Value *refill,
-                                        RefillSample sample) {
+                                        RefillSample sample,
+                                        llvm::Value *refill_clocks) {
   const auto overlaps = overlapping_fetches_.find(pc);
   if (overlaps == overlapping_fetches_.end()) { return; }
   llvm::Value *redirected = builder_.getFalse();
@@ -3661,7 +3806,18 @@ void Lowering::overlapping_loop_fetches(Values &values,
     if (parent.arithmetic() && gap == loop_decode_distance) {
       // Fetch1 reaches the parent's second word on the last child refill
       // clock. Decode sees this decision before any more guest work retires.
-      loop_test(values, values[status_value], parent, repeat);
+      llvm::Value *interrupt_clocks = nullptr;
+      if (refill_clocks != nullptr && !variant_.interrupt_vectors.empty()) {
+        interrupt_clocks =
+            builder_.CreateAdd(refill_clocks, builder_.getInt64(loop_interrupt_shadow_clocks - 1));
+      } else if (sample == RefillSample::call_return) {
+        interrupt_clocks = builder_.getInt64(loop_interrupt_shadow_clocks - 1);
+      }
+      loop_test(values,
+                parent,
+                {.status = values[status_value],
+                 .enabled = repeat,
+                 .interrupt_clocks = interrupt_clocks});
     }
   }
 }
@@ -3687,7 +3843,7 @@ void Lowering::loop_retirement(Values &values,
     }
   }
   loop_samples(values, old_status, op.address, refill);
-  if (end != hardware_ends_.end()) { loop_backedge(values, end->second, partial); }
+  if (end != hardware_ends_.end()) { loop_backedge(values, op, end->second, partial); }
 }
 
 void Lowering::loop_samples(Values &values,
@@ -3707,7 +3863,12 @@ void Lowering::loop_samples(Values &values,
   const auto test = loop_tests_.find(pc);
   if (test != loop_tests_.end()) {
     auto *enabled = builder_.CreateNot(refill_at(refill, pc));
-    loop_test(values, old_status, test->second, enabled);
+    auto *interrupt_clocks = sample == RefillSample::call_return
+                                 ? builder_.getInt64(loop_interrupt_shadow_clocks - 1)
+                                 : nullptr;
+    loop_test(values,
+              test->second,
+              {.status = old_status, .enabled = enabled, .interrupt_clocks = interrupt_clocks});
   }
   overlapping_loop_fetches(values, pc, refill, sample);
 }
@@ -3724,7 +3885,7 @@ void Lowering::plan_hardware_grants(const LoopMap &shapes) {
     if (!std::ranges::all_of(body, [this, &shape](const Instruction &op) {
           const auto fetch = loop_fetches_.find(op.address);
           const auto test = loop_tests_.find(op.address);
-          return !branch(op) && !loop_setup(op) && !delay_boundary(op.address) &&
+          return !branch(op) && !idle(op) && !loop_setup(op) && !delay_boundary(op.address) &&
                  (test == loop_tests_.end() || test->second.end == shape.end ||
                   overlapping_refill(shape, test->second) ||
                   overlapping_short_tail(shape, test->second)) &&
@@ -3847,8 +4008,17 @@ void Lowering::emit_hardware_turns(const Node &body,
   if (shape.short_body()) {
     auto *buffered = builder_.getInt64(shape.short_condition_tail());
     write_short(short_remaining, buffered);
+    if (!variant_.interrupt_vectors.empty()) {
+      const auto age = shape.end - shape.condition_pc() + 1;
+      block_interrupt_after_loop_sample(
+          values,
+          builder_.CreateAdd(retired, builder_.getInt64(loop_interrupt_shadow_clocks - age)));
+    }
     short_loop_observation(
-        values, words.back(), shape, {.left = buffered, .old_status = values[status_value]});
+        values,
+        words.back(),
+        shape,
+        {.left = buffered, .old_status = values[status_value], .clocks = retired});
     credit(values, retired, retired, false);
     jump(partial_[start], values);
     return;
@@ -3857,10 +4027,21 @@ void Lowering::emit_hardware_turns(const Node &body,
   auto *refill = builder_.getInt64(
       loop_refill_live | (std::uint64_t{shape.end} << loop_refill_end_shift) | shape.start);
   overlapping_loop_fetches(values, (shape.end - 1) & maximum_pc, refill, RefillSample::whole_turn);
-  overlapping_loop_fetches(values, shape.end, refill);
-  credit(
-      values, retired, builder_.CreateAdd(retired, builder_.getInt64(loop_decode_distance)), false);
+  auto *refill_clocks = builder_.CreateAdd(retired, builder_.getInt64(loop_decode_distance));
+  overlapping_loop_fetches(values, shape.end, refill, RefillSample::instruction, refill_clocks);
+  credit(values, retired, refill_clocks, false);
   readmit(values, (shape.end + 1) & maximum_pc);
+}
+
+void Lowering::finish_instruction(Values values,
+                                  const Instruction &op,
+                                  std::uint32_t next,
+                                  bool partial) {
+  if (idle(op)) {
+    exit(values, builder_.getInt32(next), NativeExit::sleeping);
+  } else {
+    finish(values, next, partial);
+  }
 }
 
 void Lowering::finish(Values values, std::uint32_t next, bool partial) {
@@ -3958,6 +4139,7 @@ std::vector<BlockCost> Lowering::block_costs() const {
       leaders.insert(op.address);
       continue;
     }
+    if (idle(op)) { continue; }
     if (branch(op)) {
       result[index].cycles += branch_penalty;
       if (((op.word >> condition_shift) & true_condition) != true_condition) {
@@ -4125,7 +4307,7 @@ std::set<std::uint32_t> grant_successors(const Instruction &op) {
     next.insert(branch_target(op));
   }
   // A taken return ends this grant. Its checked continuation admits a new one.
-  if (!is_branch || ((op.word >> condition_shift) & true_condition) != true_condition) {
+  if ((!is_branch && !idle(op)) || (is_branch && branch_condition(op) != true_condition)) {
     next.insert((op.address + 1) & maximum_pc);
   }
   return next;
