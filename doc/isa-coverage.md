@@ -186,6 +186,12 @@ tests cover old ASTAT sampling, a flag changing on either word of a two-word
 loop, SIMD lane agreement, FOREVER, exact bounds and cross-Core replay.
 Short arithmetic fetch and decode observations derive from the documented
 sample points and five-stage pipeline. They have no hardware trace comparison.
+An immediate CALL on the penultimate word of a counted four-word DO
+suspends the remaining buffered words. The callee can run its own DO.
+`RTS (LR)` restores the suspended buffer, after both slots for a delayed
+return. The installed-image tests cover a popped loop frame, a live
+frame, the zero-encoded full count, a false CALL predicate and snapshot
+replay. The combined CALL and refill timing awaits hardware comparison.
 Admitted immediate CALLs in the tail of a long DO preserve the sampled loop
 decision across `RTS (LR)` and `RTS (DB, LR)`. The PC stack records a separate
 tag when the loop terminates during the call's address stage. Tests cover
@@ -231,8 +237,8 @@ short child fill. Tests exercise counted bodies of one through four words,
 a short arithmetic child, a late arithmetic parent sample and snapshot
 replay with both active and already-popped frames. The overlap timing is
 derived from the documented pipeline observations.
-Short-loop calls, short outer loops and branches in the overlapping child
-refill remain open.
+Other short-loop CALL positions, short outer loops and branches in the
+overlapping child refill remain open.
 
 Classic type 5 transfers raw data among R/S and I/M/L/B registers, including
 cross-PE data moves and raw40 register swaps, with supported single-function fixed

@@ -1330,6 +1330,125 @@ void counted_sample_before_second_call() {
   verify_timeline(program, initial, trace);
 }
 
+constexpr auto short_call_sub = base + 8;
+
+void callee_short_loop(Timeline &trace) {
+  auto &state = trace.registers;
+  const auto depth = state.loop_address_depth;
+  const auto pc_slot = state.pc_stack_pointer++;
+  state.pc_stack[pc_slot] = short_call_sub + 1;
+  state.loop_address_stack[depth] = single_word_counted_address | (short_call_sub + 1);
+  state.loop_counter_stack[depth] = 1;
+  ++state.loop_address_depth;
+  ++state.loop_counter_depth;
+  state.lcntr = 1;
+  state.pe[0].stky &= ~empty;
+  short_boundary(trace, {.pc = 9, .fetch = 9, .decode = 9});
+  state.pe[0].data[0][0] += 1U << raw_shift;
+  state.pe[0].astat = 0;
+  state.loop_counter_stack[depth] = 0;
+  --state.loop_address_depth;
+  --state.loop_counter_depth;
+  if (depth == 0) { state.pe[0].stky |= loop_empty; }
+  popped_call(state);
+  trace.boundary(short_call_sub + 2, 5);
+  trace.record();
+}
+
+unsigned short_call_round_trip(Timeline &trace, bool delayed) {
+  entered_call(trace, {.target = short_call_sub, .raw_return = call_tag | (base + 4)});
+  callee_short_loop(trace);
+  popped_call(trace.registers);
+  if (delayed) {
+    short_boundary(trace, {.pc = 11, .fetch = 5, .decode = 13});
+    trace.registers.pe[0].data[0][2] = 7U << raw_shift;
+    short_boundary(trace, {.pc = 12, .fetch = 6, .decode = 4});
+  }
+  return delayed ? 2U : 4U;
+}
+
+enum class FourWordCall : std::uint8_t { direct, delayed, predicated, full_count };
+
+void four_word_loop_call(FourWordCall form) {
+  constexpr std::uint64_t call_eq = 0x068000000000;
+  const bool delayed = form == FourWordCall::delayed;
+  const bool predicated = form == FourWordCall::predicated;
+  const bool full_count = form == FourWordCall::full_count;
+  const std::uint32_t count = full_count ? 0 : 2;
+  std::array<std::uint64_t, 15> words{};
+  words[0] = do_immediate | (std::uint64_t{count} << count_shift) | 4;
+  words[3] = delayed ? call_dag2 : (predicated ? call_eq : call_direct) | short_call_sub;
+  words[5] = jump_direct | (base + 14);
+  words[8] = do_immediate | (std::uint64_t{1} << count_shift) | 1;
+  words[9] = fixture::add(0, 0, 1);
+  words[10] = rts | lr | (delayed ? db : 0);
+  words[11] = fixture::immediate(2, 7);
+  fixture::Program program(words);
+  program.code.variants.front().entries.push_back(short_call_sub);
+  auto initial = starting();
+  initial.dag[0][8].index = short_call_sub;
+  initial.pe[0].data[0][1] = 1U << raw_shift;
+  initial.pe[0].astat = predicated ? az : 0;
+  Timeline trace{.registers = initial, .prefixes = {}};
+  auto &state = trace.registers;
+  state.lcntr = count;
+  entered(trace, {.address = counted_address | (base + 4), .count = count});
+  state.faddr = base + 4;
+  state.daddr = base + 2;
+  trace.prefixes.back().registers = state;
+  --state.loop_counter_stack[0];
+  short_boundary(trace, {.pc = 2, .fetch = 2, .decode = 3}, 2);
+  for (const bool repeats : {true, false}) {
+    short_boundary(trace, {.pc = 3, .fetch = repeats ? 3U : 7U, .decode = 4});
+    const auto cycles = !predicated || repeats ? short_call_round_trip(trace, delayed) : 1U;
+    short_boundary(
+        trace, {.pc = 4, .fetch = repeats ? 4U : 8U, .decode = repeats ? 1U : 5U}, cycles);
+    if (full_count) {
+      parent_count_sample(trace, true);
+      short_boundary(trace, {.pc = 1, .fetch = 1, .decode = 2});
+      break;
+    }
+    if (repeats) {
+      // The last word is still buffered after the final counter check.
+      parent_count_sample(trace, false);
+      short_boundary(trace, {.pc = 1, .fetch = 5, .decode = 2});
+      short_boundary(trace, {.pc = 2, .fetch = 6, .decode = 3});
+    } else {
+      short_boundary(trace, {.pc = 5, .fetch = 9, .decode = 6});
+    }
+  }
+  verify_timeline(program, initial, trace);
+}
+
+void refused_plain_short_loop_return() {
+  std::array<std::uint64_t, 9> words{};
+  words[0] = do_immediate | 4; // Zero encodes the full 32-bit count.
+  words[3] = call_direct | short_call_sub;
+  words[8] = rts;
+  fixture::Program program(words);
+  // An unrelated long-loop CALL makes plain RTS valid for its deferred fetch.
+  // Its packed kind must remain distinct from the high bits of the short count.
+  constexpr auto separate = base + 32;
+  std::array<std::uint64_t, 7> long_loop{};
+  long_loop[0] = do_immediate | (std::uint64_t{1} << count_shift) | 5;
+  long_loop[1] = call_direct | short_call_sub;
+  program.add_span(separate, long_loop);
+  program.code.variants.front().entries.push_back(separate);
+
+  const auto native = sharc::Core::compile(program.code);
+  sharc::Core core(program.memory());
+  fixture::install(core, native, starting());
+  check(fixture::completed(core.run(4), 4, 8) && core.registers().pc == short_call_sub,
+        "full-count short loop failed to reach an ordinary RTS");
+  const auto before = core.registers();
+  const auto fault = core.run(1);
+  check(fault.has_fault && fault.fault.reason == sharc::FaultReason::unsupported_feature &&
+            fault.fault.address == short_call_sub && fault.fault.instruction == rts &&
+            fault.fault.detail.contains("RTS (LR)") && fault.progress == sharc::Progress{} &&
+            core.registers() == before,
+        "ordinary RTS consumed a buffered short loop");
+}
+
 enum class ArithmeticSampleCall : std::uint8_t {
   immediate,
   delayed,
@@ -1816,6 +1935,11 @@ void fixture::hardware_loop_control_flow() {
   counted_sample_call(CountedSampleCall::delayed);
   counted_sample_call(CountedSampleCall::predicated);
   counted_sample_before_second_call();
+  four_word_loop_call(FourWordCall::direct);
+  four_word_loop_call(FourWordCall::delayed);
+  four_word_loop_call(FourWordCall::predicated);
+  four_word_loop_call(FourWordCall::full_count);
+  refused_plain_short_loop_return();
   arithmetic_sample_call(ArithmeticSampleCall::immediate);
   arithmetic_sample_call(ArithmeticSampleCall::delayed);
   arithmetic_sample_call(ArithmeticSampleCall::repeated);
