@@ -217,6 +217,12 @@ unsigned branch_condition(const Instruction &op) {
   return static_cast<unsigned>((op.word >> condition_shift) & true_condition);
 }
 
+bool observes_not_lce(const Instruction &op) {
+  return branch_condition(op) == loop_counter_expired &&
+         (branch(op) || op.type == conditional_compute_type || op.type == immediate_shift_type ||
+          op.type == register_move_type);
+}
+
 bool delayed(const Instruction &op) {
   return branch(op) && (op.word & delayed_branch) != 0;
 }
@@ -280,6 +286,11 @@ constexpr std::uint64_t return_short_left_mask = (unsigned_limit * loop_fetch_di
 constexpr std::uint64_t return_short_loop = 1ULL << 58;
 constexpr std::uint64_t return_short_compact = 1ULL << 59;
 constexpr std::uint64_t return_loop_ready = 1ULL << 62;
+// The counted tail shares its word with two bits of termination history.
+constexpr unsigned lce_age_shift = 56;
+constexpr unsigned lce_compute_age = 2;
+constexpr unsigned lce_branch_age = 3;
+constexpr auto lce_age_mask = std::uint64_t{lce_branch_age} << lce_age_shift;
 
 std::uint64_t loop_return_payload(std::uint32_t call_pc, const LoopShape &shape) {
   if (shape.short_body()) { return return_short_loop | ((call_pc + 1) & maximum_pc); }
@@ -329,6 +340,8 @@ struct LoopPlan {
   LoopMap shapes;
   LoopMap reentry_calls;
   LoopMap aborts;
+  LoopMap not_lce;
+  std::set<std::uint32_t> lce_endpoints;
 };
 
 LoopShape loop_shape(const Instruction &op) {
@@ -360,11 +373,11 @@ unsigned branch_modifier(const Instruction &op) {
 void validate_condition(const Instruction &instruction, std::string_view identity) {
   const auto cond = (instruction.word >> condition_shift) & true_condition;
   const auto base = cond & 15;
-  if (cond != true_condition && (base == 15 || (base >= 9 && base <= 12))) {
+  if (base >= 9 && base <= 12) {
     reject(instruction,
            identity,
            FaultReason::unsupported_instruction,
-           "external or loop condition is not lowered");
+           "external condition is not lowered");
   }
 }
 
@@ -738,6 +751,8 @@ public:
         variant_(variant),
         reentry_calls_(loops.reentry_calls),
         aborts_(loops.aborts),
+        not_lce_(loops.not_lce),
+        lce_endpoints_(loops.lce_endpoints),
         instructions_(std::move(instructions)),
         entry_address_(unit.entry),
         context_(unit.context),
@@ -855,6 +870,7 @@ private:
   }
 
   llvm::Value *condition(const Values &values, unsigned code);
+  llvm::Value *condition(const Values &values, const Instruction &op);
   Arithmetic arithmetic(const Values &values, const Compute &compute, unsigned opcode);
   FixedResult word_step(llvm::Value *input, bool decrement);
   Arithmetic rotation(const Values &values, const Compute &compute);
@@ -878,6 +894,8 @@ private:
   void finish(Values values, std::uint32_t next, bool partial);
   void readmit(const Values &values, std::uint32_t next);
   void credit(Values &values, llvm::Value *count, llvm::Value *cycles, bool partial);
+  void advance_lce(llvm::Value *cycles);
+  llvm::Value *lce_age(llvm::Value *tail);
   void complete(Values values,
                 const Instruction &op,
                 bool partial,
@@ -910,7 +928,8 @@ private:
   [[nodiscard]] LoopFrame active_loop(const Values &values, const LoopShape &shape);
   llvm::Value *repeat_scheduled(const LoopFrame &frame);
   void clear_loop_repeat(const LoopFrame &frame);
-  void loop_fetch(Values &values, const LoopShape &shape, llvm::Value *enabled);
+  void
+  loop_fetch(Values &values, const LoopShape &shape, llvm::Value *enabled, bool returning = false);
   void
   loop_test(Values &values, llvm::Value *old_status, const LoopShape &shape, llvm::Value *enabled);
   [[nodiscard]] llvm::Value *refill_at(llvm::Value *refill, std::uint32_t child_end);
@@ -1026,6 +1045,8 @@ private:
   const CodeVariant &variant_;
   const LoopMap &reentry_calls_;
   const LoopMap &aborts_;
+  const LoopMap &not_lce_;
+  const std::set<std::uint32_t> &lce_endpoints_;
   std::vector<Instruction> instructions_;
   std::uint32_t entry_address_;
   std::uint32_t context_;
@@ -1090,6 +1111,18 @@ llvm::Value *Lowering::condition(const Values &values, unsigned code) {
     result = builder_.CreateInsertElement(result, builder_.getFalse(), builder_.getInt32(1));
   }
   return result;
+}
+
+llvm::Value *Lowering::condition(const Values &values, const Instruction &op) {
+  const auto site = not_lce_.find(op.address);
+  if (site == not_lce_.end()) { return condition(values, branch_condition(op)); }
+  auto *age = lce_age(load(64, counted_tail_slot));
+  age = builder_.CreateAdd(age, pipeline_stall(values, op));
+  const auto limit = branch(op) ? lce_branch_age : lce_compute_age;
+  auto *expired = builder_.CreateAnd(counted_tail_matches(site->second),
+                                     builder_.CreateICmpUGE(age, builder_.getInt64(limit)));
+  auto *enabled = builder_.CreateNot(expired);
+  return pair(enabled, (context_ & simd_mode) != 0 ? enabled : builder_.getFalse(), 1);
 }
 
 Arithmetic Lowering::arithmetic(const Values &values, const Compute &compute, unsigned opcode) {
@@ -1293,8 +1326,7 @@ void Lowering::write_register(Values &values,
 
 void Lowering::register_instruction(Values &values, const Instruction &op, const Values &before) {
   const auto move = register_move(op);
-  auto *selected =
-      condition(before, static_cast<unsigned>((op.word >> condition_shift) & true_condition));
+  auto *selected = condition(before, op);
   if (!move.swap) {
     write_register(values, move.destination, read_register(before, move.source), selected);
     return;
@@ -1320,10 +1352,7 @@ llvm::Value *Lowering::loaded_tag(const Values &values, const Instruction &op) {
   const auto bank = (context_ & dag_bank_mode(index)) != 0 ? 1U : 0U;
   const auto tag = 1 + index + (bank * 16) + (reg >= 0x20 && reg < 0x30 ? 32U : 0U);
   auto *selected =
-      condition(values,
-                op.type == immediate_move_type
-                    ? true_condition
-                    : static_cast<unsigned>((op.word >> condition_shift) & true_condition));
+      op.type == immediate_move_type ? condition(values, true_condition) : condition(values, op);
   return builder_.CreateSelect(builder_.CreateExtractElement(selected, builder_.getInt32(0)),
                                builder_.getInt32(tag),
                                builder_.getInt32(0));
@@ -1352,7 +1381,7 @@ llvm::Value *Lowering::pipeline_stall(const Values &values, const Instruction &o
   stall = builder_.CreateSelect(recent_match,
                                 builder_.getInt64(2),
                                 builder_.CreateSelect(earlier_match, builder_.getInt64(1), stall));
-  if (branch(op) && ((op.word >> condition_shift) & true_condition) != true_condition) {
+  if (branch(op) && branch_condition(op) != true_condition && !observes_not_lce(op)) {
     // Concurrent Decode/Address hazards overlap, rather than adding sequential stalls.
     auto *compute = builder_.CreateZExt(values[hazard_value], builder_.getInt64Ty());
     stall = builder_.CreateSelect(builder_.CreateICmpUGT(compute, stall), compute, stall);
@@ -1425,8 +1454,7 @@ void Lowering::instruction(Values &values, const Instruction &op, bool partial) 
     if (op.type == register_move_type) { register_instruction(values, op, before); }
     return;
   }
-  auto *selected =
-      condition(values, static_cast<unsigned>((op.word >> condition_shift) & true_condition));
+  auto *selected = condition(values, op);
   if (op.type == computed_branch_type) {
     if ((op.word & else_compute) != 0) {
       selected =
@@ -1738,7 +1766,9 @@ Lowering::loop_call_address(const Values &values, const Instruction &op, const L
   auto *pending = load(64, tail_slot);
   const auto signature = (std::uint64_t{shape.end} << loop_refill_end_shift) | shape.start |
                          (shape.counted() ? counted_loop_tail : loop_refill_live);
-  auto *terminating = builder_.CreateICmpEQ(pending, builder_.getInt64(signature));
+  auto *terminating = shape.counted()
+                          ? counted_tail_matches(shape)
+                          : builder_.CreateICmpEQ(pending, builder_.getInt64(signature));
   const auto frame = active_loop(values, shape);
   auto *in_loop = builder_.CreateOr(terminating, frame.matches);
   const bool endpoint = op.address == shape.end;
@@ -1881,7 +1911,10 @@ void Lowering::restore_loop_tail(llvm::Value *tail) {
                                   std::pair{counted_loop_tail, counted_tail_slot}}) {
     auto *present = builder_.CreateICmpNE(builder_.CreateAnd(tail, builder_.getInt64(flag)),
                                           builder_.getInt64(0));
-    store(builder_.CreateSelect(present, tail, load(64, slot)), slot);
+    auto *restored = slot == counted_tail_slot && !not_lce_.empty()
+                         ? builder_.CreateOr(tail, builder_.getInt64(lce_age_mask))
+                         : tail;
+    store(builder_.CreateSelect(present, restored, load(64, slot)), slot);
   }
 }
 
@@ -1933,7 +1966,7 @@ void Lowering::finish_loop_return(Values &values, const Instruction &op) {
   auto *ready = builder_.CreateICmpEQ(payload, builder_.getInt64(sample | return_loop_ready));
   store(builder_.CreateSelect(ready, builder_.getInt64(0), payload), return_loop_tail_slot);
   if ((sample & return_loop_fetch) != 0) {
-    loop_fetch(values, *shape, ready);
+    loop_fetch(values, *shape, ready, true);
   } else {
     loop_test(values, values[status_value], *shape, ready);
   }
@@ -1998,6 +2031,7 @@ void Lowering::return_to_caller(Values values, llvm::Value *target, bool partial
 }
 
 void Lowering::credit(Values &values, llvm::Value *count, llvm::Value *cycles, bool partial) {
+  if (!not_lce_.empty()) { advance_lce(cycles); }
   values[instruction_remaining_value] =
       builder_.CreateSub(values[instruction_remaining_value], count);
   auto *available = values[cycle_remaining_value];
@@ -2011,6 +2045,28 @@ void Lowering::credit(Values &values, llvm::Value *count, llvm::Value *cycles, b
   values[extra_cycles_value] = builder_.getInt64(0);
 }
 
+llvm::Value *Lowering::lce_age(llvm::Value *tail) {
+  auto *masked = builder_.CreateAnd(tail, builder_.getInt64(lce_age_mask));
+  return builder_.CreateLShr(masked, builder_.getInt64(lce_age_shift));
+}
+
+void Lowering::advance_lce(llvm::Value *cycles) {
+  auto *tail = load(64, counted_tail_slot);
+  auto *age = lce_age(tail);
+  auto *limit = builder_.getInt64(lce_branch_age);
+  auto *elapsed = builder_.CreateBinaryIntrinsic(llvm::Intrinsic::umin, cycles, limit);
+  auto *advanced = builder_.CreateBinaryIntrinsic(
+      llvm::Intrinsic::umin, builder_.CreateAdd(age, elapsed), limit);
+  // Age zero marks a termination sampled by this instruction after its stalls.
+  auto *next = builder_.CreateSelect(
+      builder_.CreateICmpEQ(age, builder_.getInt64(0)), builder_.getInt64(1), advanced);
+  auto *clocked = builder_.CreateOr(builder_.CreateAnd(tail, builder_.getInt64(~lce_age_mask)),
+                                    builder_.CreateShl(next, builder_.getInt64(lce_age_shift)));
+  auto *live = builder_.CreateAnd(builder_.CreateICmpNE(tail, builder_.getInt64(0)),
+                                  builder_.CreateICmpNE(cycles, builder_.getInt64(0)));
+  store(builder_.CreateSelect(live, clocked, tail), counted_tail_slot);
+}
+
 llvm::Value *Lowering::branch_taken(llvm::Value *lanes) {
   auto *taken = builder_.CreateExtractElement(lanes, builder_.getInt32(0));
   if ((context_ & simd_mode) != 0) {
@@ -2021,8 +2077,7 @@ llvm::Value *Lowering::branch_taken(llvm::Value *lanes) {
 
 llvm::Value *Lowering::branch_lanes(const Values &values, const Instruction &op, bool partial) {
   if (!branch(op)) { return nullptr; }
-  auto *lanes =
-      condition(values, static_cast<unsigned>((op.word >> condition_shift) & true_condition));
+  auto *lanes = condition(values, op);
   if (call_branch_instruction(op) && op.compute.kind != ComputeKind::none) {
     auto *room = builder_.CreateICmpULT(values[pc_stack_depth_value],
                                         builder_.getInt32(Registers::pc_stack_capacity));
@@ -2176,7 +2231,7 @@ bool Lowering::sequencer_boundary(std::uint32_t pc) const {
   return delay_boundary(pc) || loop_setups_.contains(pc) || loop_fetches_.contains(pc) ||
          loop_tests_.contains(pc) || hardware_ends_.contains(pc) || hardware_grants_.contains(pc) ||
          short_bodies_.contains(pc) || short_successors_.contains(pc) || aborts_.contains(pc) ||
-         overlapping_fetches_.contains(pc);
+         overlapping_fetches_.contains(pc) || not_lce_.contains(pc);
 }
 
 void Lowering::plan_hardware_loops(const LoopMap &shapes) {
@@ -2658,7 +2713,9 @@ llvm::Value *Lowering::counted_tail_matches(const LoopShape &shape) {
   if (!shape.counted()) { return builder_.getFalse(); }
   const auto tail =
       counted_loop_tail | (std::uint64_t{shape.end} << loop_refill_end_shift) | shape.start;
-  return builder_.CreateICmpEQ(load(64, counted_tail_slot), builder_.getInt64(tail));
+  auto *saved = load(64, counted_tail_slot);
+  if (!not_lce_.empty()) { saved = builder_.CreateAnd(saved, builder_.getInt64(~lce_age_mask)); }
+  return builder_.CreateICmpEQ(saved, builder_.getInt64(tail));
 }
 
 void Lowering::clear_counted_tail(const LoopShape &shape) {
@@ -2744,7 +2801,10 @@ void Lowering::retire_loop_abort(Values &values, const LoopShape &shape) {
   }
 }
 
-void Lowering::loop_fetch(Values &values, const LoopShape &shape, llvm::Value *enabled) {
+void Lowering::loop_fetch(Values &values,
+                          const LoopShape &shape,
+                          llvm::Value *enabled,
+                          bool returning) {
   const auto frame = active_loop(values, shape);
   auto *pending = builder_.CreateAnd(frame.metadata, builder_.getInt32(loop_repeat_scheduled));
   auto *consider = llvm::BasicBlock::Create(module_.getContext(), "loop.fetch.end", function_);
@@ -2769,9 +2829,10 @@ void Lowering::loop_fetch(Values &values, const LoopShape &shape, llvm::Value *e
     builder_.SetInsertPoint(terminate);
     auto popped = values;
     loop_pop(popped, frame);
-    if (shape.has_reentry || shape.has_tail_abort) {
-      const auto tail =
-          counted_loop_tail | (std::uint64_t{shape.end} << loop_refill_end_shift) | shape.start;
+    if (shape.has_reentry || shape.has_tail_abort || lce_endpoints_.contains(shape.end)) {
+      const auto age = returning && !not_lce_.empty() ? (1ULL << lce_age_shift) : 0;
+      const auto tail = counted_loop_tail | (std::uint64_t{shape.end} << loop_refill_end_shift) |
+                        shape.start | age;
       store(builder_.getInt64(tail), counted_tail_slot);
     }
     jump(continuation, popped);
@@ -2909,7 +2970,8 @@ void Lowering::loop_retirement(Values &values,
   auto *refill = shifted || overlapping ? load(64, loop_refill_slot) : builder_.getInt64(0);
   if (end != hardware_ends_.end()) {
     if (end->second.arithmetic()) { loop_refill(values, op); }
-    if (end->second.counted() && (end->second.has_reentry || end->second.has_tail_abort)) {
+    if (end->second.counted() && (end->second.has_reentry || end->second.has_tail_abort ||
+                                  lce_endpoints_.contains(op.address))) {
       clear_counted_tail(end->second);
     }
   }
@@ -3251,8 +3313,7 @@ void Lowering::complete_loop(Values values, const Instruction &op) {
   const auto end = addresses_.at(op.address);
   const auto start = addresses_.at(branch_target(op));
   const auto cost = loop_ends_.at(end);
-  auto *lanes =
-      condition(values, static_cast<unsigned>((op.word >> condition_shift) & true_condition));
+  auto *lanes = condition(values, op);
   auto *taken = builder_.CreateExtractElement(lanes, builder_.getInt32(0));
   if ((context_ & simd_mode) != 0) {
     taken = builder_.CreateAnd(taken, builder_.CreateExtractElement(lanes, builder_.getInt32(1)));
@@ -3819,6 +3880,39 @@ void validate_loop_aborts(const InstructionMap &code, LoopPlan &plan, std::strin
   }
 }
 
+void validate_not_lce(const InstructionMap &code, LoopPlan &plan, std::string_view identity) {
+  for (const auto &[pc, op] : code) {
+    if (!observes_not_lce(*op)) { continue; }
+    const LoopShape *owner = nullptr;
+    for (const auto &[end, shape] : plan.shapes) {
+      if (shape.contains(pc) && (owner == nullptr || shape.length < owner->length)) {
+        owner = &shape;
+      }
+    }
+    const auto previous = code.find((pc - 1) & maximum_pc);
+    if (owner == nullptr || !owner->counted() || owner->short_body() ||
+        ((owner->end - pc) & maximum_pc) > loop_fetch_distance ||
+        (previous != code.end() && loop_setup(*previous->second))) {
+      reject(*op,
+             identity,
+             FaultReason::unsupported_instruction,
+             "NOT LCE outside an admitted counted DO tail");
+    }
+    const bool overlap = std::ranges::any_of(plan.shapes, [owner](const auto &entry) {
+      const auto &child = entry.second;
+      const auto gap = (owner->end - child.end) & maximum_pc;
+      return gap != 0 && gap <= loop_fetch_distance &&
+             owner->contains((child.start - 1) & maximum_pc);
+    });
+    if (overlap) {
+      reject(
+          *op, identity, FaultReason::unsupported_instruction, "NOT LCE at an overlapping DO tail");
+    }
+    plan.not_lce.emplace(pc, *owner);
+    plan.lce_endpoints.insert(owner->end);
+  }
+}
+
 LoopPlan validate_loop_bodies(const InstructionMap &code, std::string_view identity) {
   LoopPlan plan;
   for (const auto &entry : code) {
@@ -3827,6 +3921,7 @@ LoopPlan validate_loop_bodies(const InstructionMap &code, std::string_view ident
     validate_loop_body(code, op, plan, identity);
   }
   validate_loop_aborts(code, plan, identity);
+  validate_not_lce(code, plan, identity);
   return plan;
 }
 

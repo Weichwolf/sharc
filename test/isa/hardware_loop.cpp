@@ -1333,6 +1333,94 @@ void counted_sample_before_second_call() {
 
 constexpr auto short_call_sub = base + 8;
 
+constexpr std::uint64_t if_not_lce(std::uint64_t op) {
+  constexpr auto field = 31ULL << 33;
+  constexpr auto not_lce = 15ULL << 33;
+  return (op & ~field) | not_lce;
+}
+
+void counted_not_lce_compute() {
+  std::array<std::uint64_t, 7> words{};
+  words[0] = do_immediate | (std::uint64_t{2} << count_shift) | 5;
+  for (unsigned pc = 2; pc <= 5; ++pc) { words[pc] = if_not_lce(fixture::add(pc, pc, 1)); }
+  fixture::Program program(words);
+  auto initial = starting();
+  initial.pe[0].data[0][1] = 1U << raw_shift;
+  Timeline trace{.registers = initial, .prefixes = {}};
+  trace.registers.lcntr = 2;
+  entered(trace, {.address = counted_address | (base + 5), .count = 2});
+  for (const bool repeats : {true, false}) {
+    parent_count_sample(trace, repeats);
+    counted_call_boundary(trace, 2, repeats, 1);
+    for (unsigned pc = 2; pc <= 5; ++pc) {
+      // The first compute still sees the old condition. The second sees expiry.
+      if (repeats || pc == 2) { trace.registers.pe[0].data[0][pc] += 1U << raw_shift; }
+      const auto next = pc == 5 && repeats ? 1U : pc + 1;
+      counted_call_boundary(trace, next, repeats, 1);
+    }
+  }
+  verify_timeline(program, initial, trace);
+}
+
+struct NotLceCall {
+  unsigned site;
+  bool stall;
+};
+
+void not_lce_call_turn(Timeline &trace, NotLceCall call, bool repeats) {
+  auto &state = trace.registers;
+  state.pe[0].data[0][7] = 2U << raw_shift;
+  parent_count_sample(trace, repeats);
+  counted_call_boundary(trace, 2, repeats, 1);
+  // Both early branch positions see the previous condition without an interlock.
+  const bool branches = repeats || (call.site <= 3 && !call.stall);
+  const auto tags = call_tag | (!repeats && call.site == 2 ? termination_tag : 0);
+  for (unsigned pc = 2; pc <= 5; ++pc) {
+    if (call.stall && pc == call.site - 1) { state.dag[0][8].index = short_call_sub; }
+    if (pc == call.site + 1 && repeats) { state.pe[0].data[0][6] += 1U << raw_shift; }
+    const bool taken = pc == call.site && branches;
+    const unsigned interlock = call.stall && pc == call.site ? 2U : 0U;
+    const auto next = pc == 5 && repeats ? 1U : pc + 1;
+    if (taken) {
+      entered_call(
+          trace, {.target = short_call_sub, .raw_return = tags | (base + next)}, 4 + interlock);
+      popped_call(state);
+    }
+    counted_call_boundary(trace, next, repeats, taken ? 4U : 1 + interlock);
+  }
+}
+
+void counted_not_lce_call(unsigned site, bool stall = false) {
+  constexpr unsigned index_register = 0x18;
+  std::array<std::uint64_t, 9> words{};
+  words[0] = do_immediate | (std::uint64_t{2} << count_shift) | 5;
+  words[1] = fixture::add(7, 1, 1);
+  if (stall) { words[site - 1] = fixture::immediate(index_register, short_call_sub); }
+  words[site] = if_not_lce(stall ? call_dag2 : call_direct | short_call_sub);
+  words[site + 1] = if_not_lce(fixture::add(6, 6, 1));
+  words[8] = rts | lr;
+  fixture::Program program(words);
+  program.code.variants.front().entries.push_back(short_call_sub);
+  auto initial = starting();
+  initial.pe[0].data[0][1] = 1U << raw_shift;
+  Timeline trace{.registers = initial, .prefixes = {}};
+  trace.registers.lcntr = 2;
+  entered(trace, {.address = counted_address | (base + 5), .count = 2});
+  for (const bool repeats : {true, false}) {
+    not_lce_call_turn(trace, {.site = site, .stall = stall}, repeats);
+  }
+  verify_timeline(program, initial, trace);
+}
+
+void refused_not_lce_without_loop() {
+  const std::array words{if_not_lce(fixture::add(0, 0, 1))};
+  const fixture::Program program(words);
+  const auto fault = fixture::refusal(program.code, "NOT LCE without a counted DO was prepared");
+  check(fault.reason == sharc::FaultReason::unsupported_instruction && fault.address == base &&
+            fault.instruction == words.front(),
+        "unqualified NOT LCE fault lost the instruction");
+}
+
 void callee_short_loop(Timeline &trace) {
   auto &state = trace.registers;
   const auto depth = state.loop_address_depth;
@@ -2229,6 +2317,12 @@ void fixture::hardware_loop_control_flow() {
   counted_sample_call(CountedSampleCall::delayed);
   counted_sample_call(CountedSampleCall::predicated);
   counted_sample_before_second_call();
+  counted_not_lce_compute();
+  counted_not_lce_call(2);
+  counted_not_lce_call(3);
+  counted_not_lce_call(4);
+  counted_not_lce_call(3, true);
+  refused_not_lce_without_loop();
   four_word_loop_call(FourWordCall::direct);
   four_word_loop_call(FourWordCall::delayed);
   four_word_loop_call(FourWordCall::predicated);

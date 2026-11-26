@@ -65,6 +65,9 @@ A counted DO loads LCNTR once. The current count then evolves on the loop
 counter stack while LCNTR continues to hold the setup value.
 A qualified CALL saves a suspended terminating tail with its PC-stack entry.
 For a delayed `RTS (LR)`, the tail becomes active after the two return slots.
+When a prepared DO tail uses IF NOT LCE, the counted tail also carries
+the clocks elapsed after its terminal fetch. This observation survives a
+stack pop, a return refill and a cross-Core snapshot.
 Admitted CALLs in counted two-, three- and four-word loops keep the
 buffered instruction count with the PC-stack entry. The callee can use its
 own loop buffer. The saved buffer is restored at the prepared return

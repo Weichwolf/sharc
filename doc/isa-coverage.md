@@ -223,6 +223,14 @@ runs its own DO, and a precise fault for an ordinary RTS on a suspended tail.
 An interlock that holds the CALL in Decode delays its address stage past
 the counter sample. The saved PC has no termination tag in that case.
 Installed-image fixtures exercise this timing in short and long bodies.
+Qualified classic IF NOT LCE uses the end-fetch decision in a long
+counted DO tail. The condition changes at different clocks for a branch
+and an Execute-stage consumer. The tail retains the decision after the
+loop stacks pop and across CALL and RTS (LR). The tests exercise the two
+condition latencies, a DAG2 interlock, replay at exact bounds, and
+unchanged full-turn grants for nonterminating counted passes. Explicit
+loop-resource changes, short bodies and overlapping samples remain
+unqualified for this predicate.
 An immediate CALL at the endpoint stores the next loop header or the word
 after the loop as its return address. On a terminating arithmetic turn the
 taken call replaces the loop refill. A false predicate keeps the normal
