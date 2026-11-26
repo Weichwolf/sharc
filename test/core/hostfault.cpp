@@ -2,12 +2,13 @@
 #include "../support/check.hpp"
 #include "../support/isa.hpp"
 #include "../support/native_provider.hpp"
+#include "../support/signal_handler.hpp"
 #include "../support/signals.h"
+#include "../support/word_space.hpp"
 
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <exception>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -29,25 +30,8 @@ constexpr std::uint64_t load_r0 = 0xa00000000000, store_r0 = 0xa10000000000;
 constexpr std::uint64_t program_dag = std::uint64_t{1} << 44;
 constexpr std::uint64_t raw_x = 0x12345678ab, raw_y = 0x98765432cd;
 constexpr std::uint32_t simd = 1U << 21, expected_word = 0x13579bdf;
-constexpr unsigned instruction_bits = 48, byte_bits = 8, raw_shift = 8;
+constexpr unsigned instruction_bits = 48, raw_shift = 8;
 constexpr int handler_failure = 90, unexpected_return = 92;
-
-int claim_fault(const void *address, int writing, unsigned long pc) noexcept {
-  return sharc::Core::host_fault(reinterpret_cast<std::uintptr_t>(address), writing != 0, pc) ? 1
-                                                                                              : 0;
-}
-
-class ConsumerHandler {
-public:
-  ConsumerHandler() {
-    check(sharc_test_signals_begin(claim_fault) == 0, "could not install consumer fault handler");
-  }
-
-  ~ConsumerHandler() { sharc_test_signals_end(); }
-
-  ConsumerHandler(const ConsumerHandler &) = delete;
-  ConsumerHandler &operator=(const ConsumerHandler &) = delete;
-};
 
 void check_mask() {
   check(sharc_test_mask_restored() != 0,
@@ -62,85 +46,45 @@ struct Cell {
 
 class Space {
 public:
-  explicit Space(bool truncated_file = false) {
-    const auto page = sysconf(_SC_PAGESIZE);
-    check(page > 0, "invalid host page size");
-    page_size_ = static_cast<std::size_t>(page);
-    const int fd = truncated_file ? memfd_create("sharc-hostfault", MFD_CLOEXEC) : -1;
-    if (truncated_file && (fd < 0 || ftruncate(fd, page) != 0)) {
-      if (fd >= 0) { (void)close(fd); }
-      throw std::runtime_error("could not create short backing file");
-    }
-    data_ = mmap(nullptr,
-                 view_bytes,
-                 truncated_file ? PROT_READ | PROT_WRITE : PROT_NONE,
-                 MAP_PRIVATE | MAP_NORESERVE | (truncated_file ? 0 : MAP_ANONYMOUS),
-                 fd,
-                 0);
-    if (fd >= 0) { (void)close(fd); }
-    check(data_ != MAP_FAILED, "could not reserve complete word space");
-  }
+  explicit Space(bool truncated_file = false) : mapping_(reserve(truncated_file, page_size_)) {}
 
-  ~Space() { (void)munmap(data_, view_bytes); }
-
-  Space(const Space &) = delete;
-  Space &operator=(const Space &) = delete;
-
-  [[nodiscard]] std::span<std::byte> bytes() const {
-    return {static_cast<std::byte *>(data_), view_bytes};
-  }
+  [[nodiscard]] std::span<std::byte> bytes() const { return mapping_.bytes(); }
 
   void allow(std::uint32_t address, Protection protection) const {
     const auto offset = (std::uint64_t{address} * 4 / page_size_) * page_size_;
-    check(mprotect(bytes().data() + offset, page_size_, static_cast<int>(protection)) == 0,
-          "could not protect page");
+    mapping_.protect(offset, page_size_, static_cast<int>(protection));
   }
 
   void put(Cell cell) const {
-    const auto offset = std::uint64_t{cell.address} * 4;
-    // LLVM 19 SLP truncates large pointer distances. Keep this host-side
-    // initialization independent of the guest compiler under test.
-    volatile std::byte *data = bytes().data();
-    for (unsigned byte = 0; byte < 4; ++byte) {
-      data[offset + byte] = static_cast<std::byte>(cell.word >> (byte * byte_bits));
-    }
+    fixture::put_word(bytes().data() + (std::uint64_t{cell.address} * 4), cell.word);
   }
 
   [[nodiscard]] std::uint32_t get(std::uint32_t address) const {
-    std::uint32_t result{};
-    const auto offset = std::uint64_t{address} * 4;
-    const volatile std::byte *data = bytes().data();
-    for (unsigned byte = 0; byte < 4; ++byte) {
-      result |= std::uint32_t{std::to_integer<std::uint8_t>(data[offset + byte])}
-                << (byte * byte_bits);
-    }
-    return result;
+    return fixture::get_word(bytes().data() + (std::uint64_t{address} * 4));
   }
 
   [[nodiscard]] std::size_t page_size() const { return page_size_; }
 
 private:
-  std::size_t page_size_{};
-  void *data_{};
+  static fixture::Mapping reserve(bool truncated_file, std::size_t page) {
+    if (!truncated_file) { return fixture::Mapping(view_bytes, PROT_NONE); }
+    const fixture::Backing backing(page);
+    return fixture::Mapping(view_bytes, PROT_READ | PROT_WRITE, backing.descriptor());
+  }
+
+  std::size_t page_size_{fixture::page_size()};
+  fixture::Mapping mapping_;
 };
 
 sharc::Memory lend(fixture::Program &program,
                    const Space &space,
                    sharc::MemorySpace target,
                    bool writable = true) {
-  program.code.variants[0].layout.regions.push_back({.space = target,
-                                                     .view = sharc::MemoryView::normal_word,
-                                                     .first = 0,
-                                                     .count = words,
-                                                     .storage_id = ram_id,
-                                                     .byte_offset = 0,
-                                                     .byte_stride = 4,
-                                                     .readable = true,
-                                                     .writable = writable,
-                                                     .initialized = true});
-  auto memory = program.memory();
-  memory.regions.push_back({.storage_id = ram_id, .bytes = space.bytes(), .generation = 1});
-  return memory;
+  auto region = fixture::normal_region(0, words, ram_id);
+  region.space = target;
+  region.writable = writable;
+  program.code.variants[0].layout.regions.push_back(region);
+  return program.memory(ram_id, space.bytes());
 }
 
 sharc::Registers initial(std::uint32_t pc, sharc::MemorySpace target, std::uint32_t address) {
@@ -224,8 +168,7 @@ void terminal_access(sharc::ExecutionMode mode, Case item) {
   sharc::Core core(memory, mode);
   auto registers = initial(item.pc, item.space, address);
   registers.mode1 = item.paired ? simd : 0;
-  core.set_registers(registers);
-  (void)core.install(native, fixture::Program::variant_id);
+  fixture::install(core, native, registers);
   if (item.split) {
     check(core.run(1).progress.instructions == 1 &&
               core.registers().pe[0].data[0][1] == (std::uint64_t{7} << raw_shift),
@@ -269,7 +212,7 @@ void chaining(bool outside_view) {
   check(child >= 0, "could not fork chaining fixture");
   if (child == 0) {
     if (sharc_test_chain_previous() != 0) { _exit(handler_failure); }
-    const ConsumerHandler handlers;
+    const fixture::ConsumerHandler handlers;
     const Space space;
     const Space outside;
     const std::array op{load_r0};
@@ -285,8 +228,7 @@ void chaining(bool outside_view) {
     const auto native = consumer_compile(
         program.code, {.memory_mode = MemoryMode::direct, .callbacks = {}}, effects);
     sharc::Core core(memory);
-    core.set_registers(initial(0, sharc::MemorySpace::data, ram_address));
-    (void)core.install(native, fixture::Program::variant_id);
+    fixture::install(core, native, initial(0, sharc::MemorySpace::data, ram_address));
     (void)core.run(1);
     _exit(unexpected_return);
   }
@@ -317,44 +259,33 @@ void exact_reference(sharc::ExecutionMode mode) {
   invalid.memory_mode = static_cast<MemoryMode>(std::numeric_limits<std::uint8_t>::max());
   fixture::throws<sharc::PreparationError>([&] { (void)sharc::Core::lower(program.code, invalid); },
                                            "unknown memory mode accepted");
-  const auto native = sharc::Core::compile(program.code, defaults);
-  sharc::Core core(memory, mode);
-  auto expected = initial(0, sharc::MemorySpace::data, ram_address);
-  core.set_registers(expected);
-  (void)core.install(native, fixture::Program::variant_id);
-  const auto snapshot = core.save();
-  const auto before_signal = sharc_test_signal_count();
-  const auto result = core.run(2);
-  expected.pe[0].data[0][1] = std::uint64_t{7} << raw_shift;
-  expected.pc = 1;
-  expected.faddr = 5;
-  expected.daddr = 3;
-  expected.emuclk = 1;
-  check(result.has_fault && result.fault.reason == sharc::FaultReason::access_fault &&
-            result.fault.address == 1 && result.fault.instruction == store_r0 &&
-            result.progress == sharc::Progress{.instructions = 1, .base_cycles = 1} &&
-            core.registers() == expected && sharc_test_signal_count() == before_signal,
-        "exact fault lost precise prefix or entered consumer host handler");
-  core.restore(snapshot);
-  check(core.run(1).progress.instructions == 1 && core.registers() == expected,
-        "architectural checked fault incorrectly terminated the instance");
-
   auto &region = program.code.variants[0].layout.regions.back();
-  region.first = ram_address;
-  region.count = 1;
-  const auto sparse = sharc::Core::compile(program.code, direct);
-  sharc::Core fallback(memory, mode);
-  fallback.set_registers(initial(0, sharc::MemorySpace::data, ram_address));
-  (void)fallback.install(sparse, fixture::Program::variant_id);
-  const auto boundary = fallback.save();
-  const auto denied = fallback.run(2);
-  check(denied.has_fault && denied.fault.reason == sharc::FaultReason::access_fault &&
-            denied.fault.address == 1 && denied.progress == result.progress &&
-            fallback.registers() == expected && sharc_test_signal_count() == before_signal,
-        "sparse Direct layout lost precise checked fallback");
-  fallback.restore(boundary);
-  check(!fallback.run(1).has_fault && fallback.registers() == expected,
-        "checked Direct fallback incorrectly terminated the instance");
+  for (const auto &options : {defaults, direct}) {
+    const bool sparse = options.memory_mode == MemoryMode::direct;
+    if (sparse) {
+      region.first = ram_address;
+      region.count = 1;
+    }
+    const auto native = sharc::Core::compile(program.code, options);
+    sharc::Core core(memory, mode);
+    auto expected = initial(0, sharc::MemorySpace::data, ram_address);
+    fixture::install(core, native, expected);
+    const auto snapshot = core.save();
+    const auto before_signal = sharc_test_signal_count();
+    const auto result = core.run(2);
+    expected.pe[0].data[0][1] = std::uint64_t{7} << raw_shift;
+    fixture::boundary(expected, {.pc = 1, .clock = 1});
+    check(result.has_fault && result.fault.reason == sharc::FaultReason::access_fault &&
+              result.fault.address == 1 && (sparse || result.fault.instruction == store_r0) &&
+              result.progress == sharc::Progress{.instructions = 1, .base_cycles = 1} &&
+              core.registers() == expected && sharc_test_signal_count() == before_signal,
+          "checked memory fault lost precise prefix or entered consumer host handler");
+    core.restore(snapshot);
+    const auto resumed = core.run(1);
+    check((sparse ? !resumed.has_fault : resumed.progress.instructions == 1) &&
+              core.registers() == expected,
+          "checked memory fault incorrectly terminated the instance");
+  }
 }
 
 void wrapping(sharc::ExecutionMode mode, sharc::MemorySpace target) {
@@ -368,36 +299,24 @@ void wrapping(sharc::ExecutionMode mode, sharc::MemorySpace target) {
   const std::array instructions{load_r0 | dag, store_r0 | dag};
   fixture::Program program(instructions, 0);
   const auto memory = lend(program, space, target);
-  const auto native = sharc::Core::compile(
-      program.code, {.mode = mode, .memory_mode = MemoryMode::direct, .callbacks = {}});
+  const auto native = fixture::compile(program.code, mode, MemoryMode::direct);
   sharc::Core core(memory, mode);
   auto expected = initial(0, target, last);
   expected.mode1 = simd;
-  core.set_registers(expected);
-  (void)core.install(native, fixture::Program::variant_id);
+  fixture::install(core, native, expected);
   const auto first = core.run(1);
   expected.pe[0].data[0][0] = std::uint64_t{~expected_word} << raw_shift;
   expected.pe[1].data[0][0] = std::uint64_t{expected_word} << raw_shift;
-  expected.pc = 1;
-  expected.faddr = 5;
-  expected.daddr = 3;
-  expected.emuclk = 1;
-  check(!first.has_fault &&
-            first.progress == sharc::Progress{.instructions = 1, .base_cycles = 1} &&
-            core.registers() == expected,
+  fixture::boundary(expected, {.pc = 1, .clock = 1});
+  check(fixture::completed(first, 1, 1) && core.registers() == expected,
         "direct SIMD load lost normal-word top-to-zero wrap");
   expected.pe[0].data[0][0] = raw_x;
   expected.pe[1].data[0][0] = raw_y;
   core.set_registers(expected);
   const auto second = core.run(1);
-  expected.pc = 2;
-  expected.faddr = 6;
-  expected.daddr = 4;
-  expected.emuclk = 2;
-  check(!second.has_fault &&
-            second.progress == sharc::Progress{.instructions = 1, .base_cycles = 1} &&
-            core.registers() == expected && space.get(last) == raw_x >> raw_shift &&
-            space.get(0) == raw_y >> raw_shift,
+  fixture::boundary(expected, {.pc = 2, .clock = 2});
+  check(fixture::completed(second, 1, 1) && core.registers() == expected &&
+            space.get(last) == raw_x >> raw_shift && space.get(0) == raw_y >> raw_shift,
         "direct SIMD store lost wrap or changed raw register extensions");
 }
 
@@ -410,23 +329,17 @@ void constant_wrapping(sharc::ExecutionMode mode, MemoryMode memory_mode) {
   const std::array instructions{fixture::immediate(i0_code, last), store_r0};
   fixture::Program program(instructions, 0);
   const auto memory = lend(program, space, sharc::MemorySpace::data);
-  const auto native = sharc::Core::compile(
-      program.code, {.mode = mode, .memory_mode = memory_mode, .callbacks = {}});
+  const auto native = fixture::compile(program.code, mode, memory_mode);
   sharc::Core core(memory, mode);
   auto expected = initial(0, sharc::MemorySpace::data, 0);
   expected.mode1 = simd;
-  core.set_registers(expected);
-  (void)core.install(native, fixture::Program::variant_id);
+  fixture::install(core, native, expected);
   const auto result = core.run(2);
   expected.dag[0][0].index = last;
-  expected.pc = 2;
-  expected.faddr = 6;
-  expected.daddr = 4;
-  expected.emuclk = 4; // Two complete instructions and the documented two-cycle DAG interlock.
-  check(!result.has_fault &&
-            result.progress == sharc::Progress{.instructions = 2, .base_cycles = 4} &&
-            core.registers() == expected && space.get(last) == raw_x >> raw_shift &&
-            space.get(0) == raw_y >> raw_shift,
+  // Two complete instructions and the two-cycle DAG interlock.
+  fixture::boundary(expected, {.pc = 2, .clock = 4});
+  check(fixture::completed(result, 2, 4) && core.registers() == expected &&
+            space.get(last) == raw_x >> raw_shift && space.get(0) == raw_y >> raw_shift,
         "constant SIMD wrap was merged across the end of the lent word space");
 }
 
@@ -443,8 +356,7 @@ void effect_order(sharc::ExecutionMode mode, bool writing) {
   fixture::Program program(instructions, 0);
   const auto memory = lend(program, space, sharc::MemorySpace::data, !writing);
   program.code.variants[0].layout.ordinary_regions = true;
-  const auto native = sharc::Core::compile(
-      program.code, {.mode = mode, .memory_mode = MemoryMode::direct, .callbacks = {}});
+  const auto native = fixture::compile(program.code, mode, MemoryMode::direct);
   sharc::Core core(memory, mode);
   core.set_registers(initial(0, sharc::MemorySpace::data, ram_address));
   (void)core.install(native, fixture::Program::variant_id);
@@ -463,13 +375,11 @@ void cross_unit_fault(sharc::ExecutionMode mode) {
   fixture::Program program(instructions, 0);
   program.code.variants[0].entries.push_back(target);
   const auto memory = lend(program, space, sharc::MemorySpace::data);
-  const auto native = sharc::Core::compile(
-      program.code, {.mode = mode, .memory_mode = MemoryMode::direct, .callbacks = {}});
+  const auto native = fixture::compile(program.code, mode, MemoryMode::direct);
   sharc::Core core(memory, mode);
   auto registers = initial(0, sharc::MemorySpace::data, ram_address);
   registers.dag[0][8].index = target;
-  core.set_registers(registers);
-  (void)core.install(native, fixture::Program::variant_id);
+  fixture::install(core, native, registers);
   const auto snapshot = core.save();
   const auto result = core.run(instructions.size());
   // A native unit exit can materialize unpinned registers before the owner returns.
@@ -531,13 +441,10 @@ void nested_owners(sharc::ExecutionMode mode) {
   context.nested = &nested;
   current_probe = &context;
   const auto hole = ram_address + static_cast<std::uint32_t>(space.page_size() / 4);
-  nested.set_registers(initial(0, sharc::MemorySpace::data, hole));
-  outer.set_registers(initial(0, sharc::MemorySpace::data, ram_address));
-  (void)nested.install(nested_image, fixture::Program::variant_id);
-  (void)outer.install(outer_image, fixture::Program::variant_id);
+  fixture::install(nested, nested_image, initial(0, sharc::MemorySpace::data, hole));
+  fixture::install(outer, outer_image, initial(0, sharc::MemorySpace::data, ram_address));
   const auto result = outer.run(1);
-  check(!result.has_fault &&
-            result.progress == sharc::Progress{.instructions = 1, .base_cycles = 1} &&
+  check(fixture::completed(result, 1, 1) &&
             outer.registers().pe[0].data[0][0] == std::uint64_t{expected_word} << raw_shift &&
             context.cpp_rejected && context.other_rejected && context.thread_rejected &&
             context.nested_fault && context.destroyed == 1 &&
@@ -553,16 +460,14 @@ void concurrent_owners(sharc::ExecutionMode mode) {
   const std::array instructions{load_r0};
   fixture::Program program(instructions, 0);
   const auto memory = lend(program, space, sharc::MemorySpace::data);
-  const auto native = sharc::Core::compile(
-      program.code, {.mode = mode, .memory_mode = MemoryMode::direct, .callbacks = {}});
+  const auto native = fixture::compile(program.code, mode, MemoryMode::direct);
   std::array<sharc::RunResult, 2> results;
   std::array<std::thread, 2> workers;
   for (std::size_t i = 0; i < workers.size(); ++i) {
     workers[i] = std::thread([&, i] {
       sharc::Core core(memory, mode);
-      core.set_registers(
-          initial(0, sharc::MemorySpace::data, ram_address + static_cast<std::uint32_t>(i)));
-      (void)core.install(native, fixture::Program::variant_id);
+      const auto address = ram_address + static_cast<std::uint32_t>(i);
+      fixture::install(core, native, initial(0, sharc::MemorySpace::data, address));
       results[i] = core.run(1);
     });
   }
@@ -576,43 +481,41 @@ void concurrent_owners(sharc::ExecutionMode mode) {
 }
 } // namespace
 
-int main() try {
-  const ConsumerHandler handlers;
-  check(!sharc::Core::host_fault(0, false, 0), "inactive owner claimed a host fault");
-  // Fork before preparing images or starting fixture threads.
-  chaining(false);
-  chaining(true);
-  for (const auto mode : {sharc::ExecutionMode::strict, sharc::ExecutionMode::fast_fp32}) {
-    effect_order(mode, false);
-    effect_order(mode, true);
-    cross_unit_fault(mode);
-    constant_wrapping(mode, MemoryMode::exact);
-    constant_wrapping(mode, MemoryMode::direct);
-    for (const auto item :
-         {Case{},
-          Case{.writing = true},
-          Case{.space = sharc::MemorySpace::program,
-               .pc = last_pc,
-               .writing = true,
-               .consumer = true},
-          Case{.space = sharc::MemorySpace::program, .consumer = true, .prefix = true},
-          Case{.consumer = true, .prefix = true, .split = true},
-          Case{.writing = true, .paired = true},
-          Case{.paired = true},
-          Case{.bus = true},
-          Case{.writing = true, .consumer = true, .bus = true}}) {
-      terminal_access(mode, item);
+int main() {
+  return fixture::run_test([] {
+    const fixture::ConsumerHandler handlers;
+    check(!sharc::Core::host_fault(0, false, 0), "inactive owner claimed a host fault");
+    // Fork before preparing images or starting fixture threads.
+    chaining(false);
+    chaining(true);
+    for (const auto mode : fixture::numeric_modes) {
+      effect_order(mode, false);
+      effect_order(mode, true);
+      cross_unit_fault(mode);
+      constant_wrapping(mode, MemoryMode::exact);
+      constant_wrapping(mode, MemoryMode::direct);
+      for (const auto item :
+           {Case{},
+            Case{.writing = true},
+            Case{.space = sharc::MemorySpace::program,
+                 .pc = last_pc,
+                 .writing = true,
+                 .consumer = true},
+            Case{.space = sharc::MemorySpace::program, .consumer = true, .prefix = true},
+            Case{.consumer = true, .prefix = true, .split = true},
+            Case{.writing = true, .paired = true},
+            Case{.paired = true},
+            Case{.bus = true},
+            Case{.writing = true, .consumer = true, .bus = true}}) {
+        terminal_access(mode, item);
+      }
+      exact_reference(mode);
+      wrapping(mode, sharc::MemorySpace::data);
+      wrapping(mode, sharc::MemorySpace::program);
+      nested_owners(mode);
+      concurrent_owners(mode);
     }
-    exact_reference(mode);
-    wrapping(mode, sharc::MemorySpace::data);
-    wrapping(mode, sharc::MemorySpace::program);
-    nested_owners(mode);
-    concurrent_owners(mode);
-  }
-  check_mask();
-  std::cout << "native host-fault boundary passed\n";
-} catch (const std::exception &error) {
-
-  std::cerr << error.what() << '\n';
-  return 1;
+    check_mask();
+    std::cout << "native host-fault boundary passed\n";
+  });
 }

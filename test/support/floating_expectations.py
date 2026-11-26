@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: GPL-3.0-only
 """Full scalar FP anchors, exact dyadic arithmetic and raw-field cross-checks."""
 
+from itertools import product as cartesian_product
 from dataclasses import asdict
 from fractions import Fraction
 
+from expectation_check import anchor, require, require_raises
 from reference import (
     IntegerResult, Mode, Unqualified, float_parts, floating_alu, floating_compare,
     floating_multiply,
@@ -116,29 +118,21 @@ COMPARE = [
 ]
 
 
-def require(actual, expected, context):
-    if actual != expected:
-        raise AssertionError((context, expected, actual))
-
-
 def anchors():
     records = []
     for name, operation, left, right, mode, options, expected in ALU:
-        require(floating_alu(operation, left, right, mode=mode, **options), expected, name)
-        records.append(dict(name=name, kind="floating-alu", operation=operation, left=left,
-                            right=right, mode=asdict(mode), options=options, expected=asdict(expected)))
+        records.append(anchor(name, "floating-alu",
+                              floating_alu(operation, left, right, mode=mode, **options), expected,
+                              operation=operation, left=left, right=right,
+                              mode=asdict(mode), options=options))
     for name, operation, raw, mode, options, expected in PARTS:
-        require(float_parts(operation, raw, mode, **options), expected, name)
-        records.append(dict(name=name, kind="floating-parts", operation=operation, left=raw,
-                            mode=asdict(mode), options=options, expected=asdict(expected)))
-    for name, left, right, mode, options, expected in MULTIPLY:
-        require(floating_multiply(left, right, mode, **options), expected, name)
-        records.append(dict(name=name, kind="floating-multiply", left=left, right=right,
-                            mode=asdict(mode), options=options, expected=asdict(expected)))
-    for name, left, right, mode, options, expected in COMPARE:
-        require(floating_compare(left, right, mode, **options), expected, name)
-        records.append(dict(name=name, kind="floating-compare", left=left, right=right,
-                            mode=asdict(mode), options=options, expected=asdict(expected)))
+        records.append(anchor(name, "floating-parts", float_parts(operation, raw, mode, **options),
+                              expected, operation=operation, left=raw, mode=asdict(mode), options=options))
+    for kind, function, cases in (("floating-multiply", floating_multiply, MULTIPLY),
+                                  ("floating-compare", floating_compare, COMPARE)):
+        for name, left, right, mode, options, expected in cases:
+            records.append(anchor(name, kind, function(left, right, mode, **options), expected,
+                                  left=left, right=right, mode=asdict(mode), options=options))
     return records
 
 
@@ -160,107 +154,94 @@ def encode(value):
 def exact_lattice():
     count, refusals = 0, 0
     values = (-4, -2, -1, 0, 1, 2, 4)
-    for width in (32, 40):
-        for rounding in ("nearest", "zero"):
-            mode = Mode(width, rounding)
-            for x in values:
-                for y in values:
-                    left, right = encode(x), encode(y)
-                    outputs = {"add": x + y, "sub": x - y, "absadd": abs(x + y),
-                               "abssub": abs(x - y), "avg": Fraction(x + y, 2),
-                               "min": min(x, y), "max": max(x, y),
-                               "clip": min(abs(x), abs(y)) * (-1 if x < 0 else 1),
-                               "copysign": abs(x) * (-1 if y < 0 else 1), "mul": x * y}
-                    for operation, value in outputs.items():
-                        negative_zero = value == 0 and (
-                            (operation == "clip" and x < 0) or
-                            (operation == "copysign" and y < 0) or
-                            (operation == "mul" and (x < 0) != (y < 0)))
-                        def run():
-                            if operation == "mul":
-                                return floating_multiply(left, right, mode, astat=0xFFFFFFFF, stky=0x44)
-                            return floating_alu(operation, left, right, mode=mode, astat=0xFFFFFFFF, stky=0x44)
-                        if negative_zero:
-                            try:
-                                run()
-                            except Unqualified:
-                                refusals += 1
-                                continue
-                            raise AssertionError("unqualified negative-zero flags generated")
-                        if operation == "mul":
-                            flags, sticky = 0xFFFFFC3F | (int(value < 0) << 6), 0x44
-                        else:
-                            flags = 0xFFFFFFC0 | int(value == 0) | (int(value < 0) << 2)
-                            sticky = 0x44 | int(value == 0 and operation in (
-                                "add", "sub", "absadd", "abssub", "avg"))
-                        require(run(), IntegerResult(encode(value), flags, sticky), (operation, x, y, mode))
-                        count += 1
-                    # History is independently assembled as a textual shift register.
-                    history = int(str(int(x > y)) + "10100101"[:7], 2) << 24
-                    flags = 0x00FFFFC0 | int(x == y) | (int(x < y) << 2) | history
-                    require(floating_compare(left, right, mode, astat=0xA5FFFFFF, stky=0x44),
-                            IntegerResult(None, flags, 0x44), ("compare", x, y, mode))
-                    count += 1
+    for width, rounding in cartesian_product((32, 40), ("nearest", "zero")):
+        mode = Mode(width, rounding)
+        for x, y in cartesian_product(values, values):
+            left, right = encode(x), encode(y)
+            outputs = {"add": x + y, "sub": x - y, "absadd": abs(x + y),
+                       "abssub": abs(x - y), "avg": Fraction(x + y, 2),
+                       "min": min(x, y), "max": max(x, y),
+                       "clip": min(abs(x), abs(y)) * (-1 if x < 0 else 1),
+                       "copysign": abs(x) * (-1 if y < 0 else 1), "mul": x * y}
+            for operation, value in outputs.items():
+                negative_zero = value == 0 and (
+                    (operation == "clip" and x < 0) or
+                    (operation == "copysign" and y < 0) or
+                    (operation == "mul" and (x < 0) != (y < 0)))
+                def run():
+                    if operation == "mul":
+                        return floating_multiply(left, right, mode, astat=0xFFFFFFFF, stky=0x44)
+                    return floating_alu(operation, left, right, mode=mode, astat=0xFFFFFFFF, stky=0x44)
+                if negative_zero:
+                    require_raises(Unqualified, run, 'unqualified negative-zero flags generated')
+                    refusals += 1
+                    continue
+                if operation == "mul":
+                    flags, sticky = 0xFFFFFC3F | (int(value < 0) << 6), 0x44
+                else:
+                    flags = 0xFFFFFFC0 | int(value == 0) | (int(value < 0) << 2)
+                    sticky = 0x44 | int(value == 0 and operation in (
+                        "add", "sub", "absadd", "abssub", "avg"))
+                require(run(), IntegerResult(encode(value), flags, sticky), (operation, x, y, mode))
+                count += 1
+            # History is independently assembled as a textual shift register.
+            history = int(str(int(x > y)) + "10100101"[:7], 2) << 24
+            flags = 0x00FFFFC0 | int(x == y) | (int(x < y) << 2) | history
+            require(floating_compare(left, right, mode, astat=0xA5FFFFFF, stky=0x44),
+                    IntegerResult(None, flags, 0x44), ("compare", x, y, mode))
+            count += 1
     return count, refusals
 
 
 def unary_lattice():
     count, refusals = 0, 0
-    for width in (32, 40):
-        for rounding in ("nearest", "zero"):
-            mode = Mode(width, rounding)
-            for value in (-4, -2, -1, 0, 1, 2, 4):
-                cases = [(operation, None) for operation in ("pass", "neg", "abs", "round")]
-                cases += [(operation, scale) for operation in ("scale", "float")
-                          for scale in (-2, -1, 0, 1, 2)] + [("float", None)]
-                for operation, scale in cases:
-                    source = ((value % 4294967296) * 256 + 255) if operation == "float" else encode(value)
-                    if operation == "neg" and value == 0:
-                        try:
-                            floating_alu(operation, source, mode=mode)
-                        except Unqualified:
-                            refusals += 1
-                            continue
-                        raise AssertionError("unqualified NEG zero flags generated")
-                    output = -value if operation == "neg" else abs(value) if operation == "abs" else value
-                    if scale is not None:
-                        output *= Fraction(2)**scale
-                    flags = 0xFFFFFFC0 | int(output == 0) | (int(output < 0) << 2)
-                    flags |= 0x10 if operation == "abs" and value < 0 else 0
-                    sticky = 0x44 | int(output == 0 and scale is not None)
-                    require(floating_alu(operation, source, mode=mode, scale=scale,
-                                         astat=0xFFFFFFFF, stky=0x44),
-                            IntegerResult(encode(output), flags, sticky), (operation, value, mode, scale))
-                    count += 1
+    for width, rounding in cartesian_product((32, 40), ("nearest", "zero")):
+        mode = Mode(width, rounding)
+        for value in (-4, -2, -1, 0, 1, 2, 4):
+            cases = [(operation, None) for operation in ("pass", "neg", "abs", "round")]
+            cases += [(operation, scale) for operation in ("scale", "float")
+                      for scale in (-2, -1, 0, 1, 2)] + [("float", None)]
+            for operation, scale in cases:
+                source = ((value % 4294967296) * 256 + 255) if operation == "float" else encode(value)
+                if operation == "neg" and value == 0:
+                    require_raises(Unqualified, floating_alu, 'unqualified NEG zero flags generated',
+                                   operation, source, mode=mode)
+                    refusals += 1
+                    continue
+                output = -value if operation == "neg" else abs(value) if operation == "abs" else value
+                if scale is not None:
+                    output *= Fraction(2)**scale
+                flags = 0xFFFFFFC0 | int(output == 0) | (int(output < 0) << 2)
+                flags |= 0x10 if operation == "abs" and value < 0 else 0
+                sticky = 0x44 | int(output == 0 and scale is not None)
+                require(floating_alu(operation, source, mode=mode, scale=scale,
+                                     astat=0xFFFFFFFF, stky=0x44),
+                        IntegerResult(encode(output), flags, sticky), (operation, value, mode, scale))
+                count += 1
     return count, refusals
 
 
 def parts_lattice():
     count, refusals = 0, 0
     for exponent in range(1, 255):
-        for fraction in (0, 1, 127, 128, 255, 256, 0x7FFFFF00, 0x7FFFFFFF):
-            for negative in (False, True):
-                raw = (int(negative) << 39) | (exponent << 31) | fraction
-                for width in (32, 40):
-                    for rounding in ("nearest", "zero"):
-                        for operation in ("mant", "logb"):
-                            if operation == "mant" and width == 32 and fraction % 256:
-                                try:
-                                    float_parts(operation, raw, Mode(width, rounding))
-                                except Unqualified:
-                                    refusals += 1
-                                    continue
-                                raise AssertionError("unqualified MANT extension accepted")
-                            if operation == "mant":
-                                value = (2147483648 + fraction) * 256
-                                flags = 0xFFFFFFC0 | (int(negative) << 4)
-                            else:
-                                value = (exponent - 127) % 4294967296 * 256
-                                flags = 0xFFFFFFC0 | int(exponent == 127) | (int(exponent < 127) << 2)
-                            require(float_parts(operation, raw, Mode(width, rounding),
-                                                astat=0xFFFFFFFF, stky=0x44),
-                                    IntegerResult(value, flags, 0x44), (operation, raw, width, rounding))
-                            count += 1
+        for fraction, negative in cartesian_product((0, 1, 127, 128, 255, 256, 0x7FFFFF00, 0x7FFFFFFF), (False, True)):
+            raw = (int(negative) << 39) | (exponent << 31) | fraction
+            for width, rounding, operation in cartesian_product((32, 40), ("nearest", "zero"), ("mant", "logb")):
+                if operation == "mant" and width == 32 and fraction % 256:
+                    require_raises(Unqualified, float_parts, 'unqualified MANT extension accepted',
+                                   operation, raw, Mode(width, rounding))
+                    refusals += 1
+                    continue
+                if operation == "mant":
+                    value = (2147483648 + fraction) * 256
+                    flags = 0xFFFFFFC0 | (int(negative) << 4)
+                else:
+                    value = (exponent - 127) % 4294967296 * 256
+                    flags = 0xFFFFFFC0 | int(exponent == 127) | (int(exponent < 127) << 2)
+                require(float_parts(operation, raw, Mode(width, rounding),
+                                    astat=0xFFFFFFFF, stky=0x44),
+                        IntegerResult(value, flags, 0x44), (operation, raw, width, rounding))
+                count += 1
     return count, refusals
 
 
@@ -272,8 +253,4 @@ def explicit_gaps():
         lambda: floating_compare(0x7FC0000000, 0, Mode(40)),
         lambda: float_parts("logb", 0x7FC0000000, Mode(40)),
     ):
-        try:
-            call()
-        except Unqualified:
-            continue
-        raise AssertionError("unqualified floating flags generated")
+        require_raises(Unqualified, call, 'unqualified floating flags generated')

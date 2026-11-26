@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: GPL-3.0-only
 """Independent dual/multifunction effects and authored two-lane expectations."""
 
+from itertools import product as cartesian_product
 from dataclasses import asdict, is_dataclass
 from fractions import Fraction
 
 from floating_expectations import encode
 from multiplier_expectations import _limb_accumulate, _limb_product
+from expectation_check import require, require_raises
 from reference import (
     IntegerResult, Mode, ParallelResult, Unqualified, dual_alu, fixed, floating_alu,
     floating_multiply, parallel_compute,
@@ -81,11 +83,6 @@ LANES = [
      (0x00000001FF, 0xFFFFFFFFFF), (0, 0), {"astat": (0xFFFF, 0), "stky": (4, 0x20)},
      (IntegerResult(0x0000000100, 0xFBC0, 4), IntegerResult(0xFFFFFFFF00, 4, 0x20))),
 ]
-
-
-def require(actual, expected, context):
-    if actual != expected:
-        raise AssertionError((context, expected, actual))
 
 
 def record_value(value):
@@ -175,43 +172,41 @@ def fixed_lattice():
                     mflags |= int(0 < abs(signed) < 1 << 32) << 8
                     product = None if destination == "mr" else (parts[2] + parts[3] * 65536) * 256
                     mr = computed if destination == "mr" else old
-                    for saturate in (False, True):
-                        for truncate in (False, True):
-                            values, aflags, sticky = _fixed_alu(alu, a, b, saturate, truncate)
-                            expected = ParallelResult((product, *values), 0xFFFFF800 | mflags | aflags,
-                                                      0x20 | (0x40 if overflow else 0) | sticky, mr)
-                            actual = parallel_compute("fixed", x * 256 + 255, y * 256 + 255,
-                                                      a * 256 + 255, b * 256 + 255, alu=alu,
-                                                      multiplier=multiplier, destination=destination,
-                                                      modifier=modifier, accumulator=old,
-                                                      saturate=saturate, truncate=truncate,
-                                                      astat=0xFFFFFFFF, stky=0x20)
-                            require(actual, expected, (x, y, a, b, old, multiplier, destination, alu))
-                            count += 1
+                    for saturate, truncate in cartesian_product((False, True), (False, True)):
+                        values, aflags, sticky = _fixed_alu(alu, a, b, saturate, truncate)
+                        expected = ParallelResult((product, *values), 0xFFFFF800 | mflags | aflags,
+                                                  0x20 | (0x40 if overflow else 0) | sticky, mr)
+                        actual = parallel_compute("fixed", x * 256 + 255, y * 256 + 255,
+                                                  a * 256 + 255, b * 256 + 255, alu=alu,
+                                                  multiplier=multiplier, destination=destination,
+                                                  modifier=modifier, accumulator=old,
+                                                  saturate=saturate, truncate=truncate,
+                                                  astat=0xFFFFFFFF, stky=0x20)
+                        require(actual, expected, (x, y, a, b, old, multiplier, destination, alu))
+                        count += 1
     return count
 
 
 def floating_lattice():
     count = 0
-    for width in (32, 40):
-        for rounding in ("nearest", "zero"):
-            for x, y in ((1, 2), (-1, 2), (4, 4), (0, 1)):
-                for a, b in ((1, 1), (1, -1), (-1, 1), (4, 2), (0, 0), (2, 4), (4, -2)):
-                    for alu in ("add", "sub", "avg", "abs", "min", "max", "dual"):
-                        outputs = {"add": (a + b,), "sub": (a - b,), "avg": (Fraction(a + b, 2),),
-                                   "abs": (abs(a),), "min": (min(a, b),), "max": (max(a, b),),
-                                   "dual": (a + b, a - b)}[alu]
-                        az, an = any(value == 0 for value in outputs), any(value < 0 for value in outputs)
-                        flags = 0xFFFFFC00 | int(az) | (int(an) << 2) | (int(x * y < 0) << 6)
-                        flags |= 0x10 if alu == "abs" and a < 0 else 0
-                        sticky = 0x20 | int(az and alu in ("add", "sub", "avg", "dual"))
-                        expected = ParallelResult((encode(x * y), *(encode(value) for value in outputs)),
-                                                  flags, sticky, 0x1234)
-                        require(parallel_compute("float", encode(x), encode(y), encode(a), encode(b),
-                                                 mode=Mode(width, rounding), alu=alu, astat=0xFFFFFFFF,
-                                                 stky=0x20, accumulator=0x1234), expected,
-                                (x, y, a, b, width, rounding, alu))
-                        count += 1
+    for width, rounding in cartesian_product((32, 40), ("nearest", "zero")):
+        for x, y in ((1, 2), (-1, 2), (4, 4), (0, 1)):
+            for a, b in ((1, 1), (1, -1), (-1, 1), (4, 2), (0, 0), (2, 4), (4, -2)):
+                for alu in ("add", "sub", "avg", "abs", "min", "max", "dual"):
+                    outputs = {"add": (a + b,), "sub": (a - b,), "avg": (Fraction(a + b, 2),),
+                               "abs": (abs(a),), "min": (min(a, b),), "max": (max(a, b),),
+                               "dual": (a + b, a - b)}[alu]
+                    az, an = any(value == 0 for value in outputs), any(value < 0 for value in outputs)
+                    flags = 0xFFFFFC00 | int(az) | (int(an) << 2) | (int(x * y < 0) << 6)
+                    flags |= 0x10 if alu == "abs" and a < 0 else 0
+                    sticky = 0x20 | int(az and alu in ("add", "sub", "avg", "dual"))
+                    expected = ParallelResult((encode(x * y), *(encode(value) for value in outputs)),
+                                              flags, sticky, 0x1234)
+                    require(parallel_compute("float", encode(x), encode(y), encode(a), encode(b),
+                                             mode=Mode(width, rounding), alu=alu, astat=0xFFFFFFFF,
+                                             stky=0x20, accumulator=0x1234), expected,
+                            (x, y, a, b, width, rounding, alu))
+                    count += 1
     return count
 
 
@@ -223,17 +218,9 @@ def explicit_refusals():
         lambda: parallel_compute("float", 0, 0, 0, 0, mode=Mode(40), multiplier="mac"),
     ]
     for call in invalid:
-        try:
-            call()
-        except ValueError:
-            continue
-        raise AssertionError("unsupported multifunction combination accepted")
+        require_raises(ValueError, call, 'unsupported multifunction combination accepted')
     for call in (
         lambda: dual_alu("float", 0x8000000000, 0x8000000000, mode=Mode(40)),
         lambda: parallel_compute("float", 0, 0xBF80000000, 0, 0, mode=Mode(40)),
     ):
-        try:
-            call()
-        except Unqualified:
-            continue
-        raise AssertionError("partial parallel result escaped an unqualified scalar result")
+        require_raises(Unqualified, call, 'partial parallel result escaped an unqualified scalar result')

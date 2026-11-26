@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: GPL-3.0-only
 """Authored accumulator anchors and independent limb-based expectation checks."""
 
+from itertools import product as cartesian_product
 from dataclasses import asdict
 
+from expectation_check import anchor, require, require_raises
 from reference import (
     MultiplierResult, accumulator_move, accumulator_unary, multiply,
 )
@@ -111,25 +113,15 @@ def _record(fields):
 def anchors():
     records = []
     for name, operation, left, right, options, expected in MULTIPLIES:
-        actual = multiply(operation, left, right, **options)
-        if actual != expected:
-            raise AssertionError(f"{name}: expected {expected}, got {actual}")
-        records.append({"name": name, "kind": "fixed-multiplier", "operation": operation,
-                        "left": left, "right": right, "options": options,
-                        "expected": asdict(expected)})
+        records.append(anchor(name, "fixed-multiplier", multiply(operation, left, right, **options),
+                              expected, operation=operation, left=left, right=right, options=options))
     for name, operation, value, options, expected in UNARY:
-        actual = accumulator_unary(operation, value, **options)
-        if actual != expected:
-            raise AssertionError(f"{name}: expected {expected}, got {actual}")
-        records.append({"name": name, "kind": "accumulator", "operation": operation,
-                        "accumulator": value, "options": options, "expected": asdict(expected)})
+        records.append(anchor(name, "accumulator", accumulator_unary(operation, value, **options),
+                              expected, operation=operation, accumulator=value, options=options))
     for name, direction, part, value, options, expected in MOVES:
-        actual = accumulator_move(direction, part, value, **options)
-        if actual != expected:
-            raise AssertionError(f"{name}: expected {expected}, got {actual}")
-        records.append({"name": name, "kind": "accumulator-transfer", "direction": direction,
-                        "part": part, "accumulator": value, "options": options,
-                        "expected": asdict(expected)})
+        records.append(anchor(name, "accumulator-transfer",
+                              accumulator_move(direction, part, value, **options), expected,
+                              direction=direction, part=part, accumulator=value, options=options))
     return [_record(record) for record in records]
 
 
@@ -175,44 +167,37 @@ def product_lattice():
         lambda: accumulator_move("read", 3, 0),
     ]
     for call in invalid:
-        try:
-            call()
-        except ValueError:
-            continue
-        raise AssertionError("invalid accumulator expectation request accepted")
+        require_raises(ValueError, call, 'invalid accumulator expectation request accepted')
     words = (0, 1, 0xFFFF, 0x10000, 0x12345678, 0x7FFFFFFF, 0x80000000, 0xFFFFFFFF)
     modifiers = ("SSI", "SUI", "USI", "UUI", "SSF", "SUF", "USF", "UUF",
                  "SSFR", "SUFR", "USFR", "UUFR")
     accumulators = (0, 0xFFFFFFFF, 0x123456789ABCDEF01234,
                     0x7FFFFFFFFFFFFFFFFFFF, 0x80000000000000000000, 0xFFFFFFFFFFFFFFFFFFFF)
     count = 0
-    for x in words:
-        for y in words:
-            for modifier in modifiers:
-                for old in accumulators:
-                    for operation in ("mul", "mac", "msub"):
-                        parts = _limb_product(x, y, modifier)
-                        value = _limb_accumulate(parts, old, operation, modifier.endswith("R"))
-                        fractional, signed = modifier[2] == "F", "S" in modifier
-                        guard_bits = (17 if signed else 16) if fractional else (49 if signed else 48)
-                        guard = value >> (80 - guard_bits)
-                        overflow = guard not in ((0, (1 << guard_bits) - 1) if signed else (0,))
-                        number = value - (1 << 80) if signed and value >> 79 else value
-                        underflow = fractional and 0 < abs(number) < 1 << 32
-                        flags = (0x40 if value >> 79 else 0) | (0x80 if overflow else 0)
-                        flags |= 0x100 if underflow else 0
-                        for destination in ("mr", "register"):
-                            actual = multiply(operation, (x << 8) | 0xA5, (y << 8) | 0x5A,
-                                              modifier=modifier, accumulator=old,
-                                              destination=destination, astat=0xFFFFFFFF, stky=0x200)
-                            first = 2 if fractional else 0
-                            raw = (parts[first] | (parts[first + 1] << 16)) << 8
-                            expected = MultiplierResult(value if destination == "mr" else old,
-                                                        None if destination == "mr" else raw,
-                                                        0xFFFFFC3F | flags,
-                                                        0x200 | (0x40 if overflow else 0))
-                            if actual != expected:
-                                raise AssertionError(f"limb product mismatch: {modifier} {operation} "
-                                                     f"{x:x} {y:x} {old:x} {destination}")
-                            count += 1
+    for x, y in cartesian_product(words, words):
+        for modifier in modifiers:
+            for old in accumulators:
+                for operation in ("mul", "mac", "msub"):
+                    parts = _limb_product(x, y, modifier)
+                    value = _limb_accumulate(parts, old, operation, modifier.endswith("R"))
+                    fractional, signed = modifier[2] == "F", "S" in modifier
+                    guard_bits = (17 if signed else 16) if fractional else (49 if signed else 48)
+                    guard = value >> (80 - guard_bits)
+                    overflow = guard not in ((0, (1 << guard_bits) - 1) if signed else (0,))
+                    number = value - (1 << 80) if signed and value >> 79 else value
+                    underflow = fractional and 0 < abs(number) < 1 << 32
+                    flags = (0x40 if value >> 79 else 0) | (0x80 if overflow else 0)
+                    flags |= 0x100 if underflow else 0
+                    for destination in ("mr", "register"):
+                        actual = multiply(operation, (x << 8) | 0xA5, (y << 8) | 0x5A,
+                                          modifier=modifier, accumulator=old,
+                                          destination=destination, astat=0xFFFFFFFF, stky=0x200)
+                        first = 2 if fractional else 0
+                        raw = (parts[first] | (parts[first + 1] << 16)) << 8
+                        expected = MultiplierResult(value if destination == "mr" else old,
+                                                    None if destination == "mr" else raw,
+                                                    0xFFFFFC3F | flags,
+                                                    0x200 | (0x40 if overflow else 0))
+                        require(actual, expected, (modifier, operation, x, y, old, destination))
+                        count += 1
     return count

@@ -5,6 +5,7 @@
 #include <array>
 #include <cstdint>
 #include <sharc/core.hpp>
+#include <string_view>
 #include <vector>
 
 namespace {
@@ -66,11 +67,60 @@ sharc::Registers initial(unsigned configuration) {
   return before;
 }
 
+std::vector<std::uint32_t> bit_patterns() {
+  std::vector<std::uint32_t> result{0, word_mask};
+  for (unsigned bit = 0; bit < 32; ++bit) { result.push_back(1U << bit); }
+  return result;
+}
+
+struct PrefixDiagnostics {
+  std::string_view instruction, deadline;
+};
+
+void verify_prefix(sharc::Core &core,
+                   const sharc::Registers &expected,
+                   PrefixDiagnostics messages) {
+  const auto boundary = core.save();
+  check(fixture::completed(core.run(1), 1, 1) && core.registers() == expected,
+        messages.instruction);
+  core.restore(boundary);
+  check(!core.run_until(core.state().progress.base_cycles + 1).has_fault &&
+            core.registers() == expected,
+        messages.deadline);
+}
+
+void apply_rotation(sharc::Registers &expected,
+                    Registers registers,
+                    const std::array<std::uint32_t, 2> &counts) {
+  const auto lanes = ((expected.mode1 >> simd_bit) & 1) != 0 ? 2U : 1U;
+  for (unsigned lane = 0; lane < lanes; ++lane) {
+    auto &pe = expected.pe[lane];
+    if ((pe.astat & 1) == 0) { continue; }
+    const auto source = static_cast<std::uint32_t>(
+        pe.data[bank(expected, registers.source)][registers.source] >> 8);
+    const auto result = rotate({.word = source, .count = counts[lane]});
+    pe.data[bank(expected, registers.destination)][registers.destination] = std::uint64_t{result}
+                                                                            << 8;
+    pe.astat = (pe.astat & ~shift_flags) | (result == 0 ? zero_flag : 0);
+  }
+}
+
+void exercise_configurations(fixture::Program &program,
+                             Registers registers,
+                             void (*verify)(sharc::Core &, Registers, unsigned)) {
+  for (const auto mode : fixture::numeric_modes) {
+    const auto native = fixture::compile(program.code, mode);
+    sharc::Core core(program.memory(), mode);
+    (void)core.install(native, fixture::Program::variant_id);
+    for (unsigned configuration = 0; configuration < 128; ++configuration) {
+      verify(core, registers, configuration);
+    }
+  }
+}
+
 void verify(sharc::Core &core, Registers registers, unsigned configuration) {
   auto before = initial(configuration);
-  std::vector<std::uint32_t> words{0, word_mask};
-  for (unsigned bit = 0; bit < 32; ++bit) { words.push_back(1U << bit); }
-  for (const auto word : words) {
+  for (const auto word : bit_patterns()) {
     for (const auto count : counts) {
       const std::array values{word, word ^ word_mask};
       const std::array amounts{count, ~count};
@@ -81,28 +131,15 @@ void verify(sharc::Core &core, Registers registers, unsigned configuration) {
             (std::uint64_t{amounts[lane]} << 8) | count_extension;
       }
       auto expected = before;
-      for (unsigned lane = 0; lane < (((before.mode1 >> simd_bit) & 1) != 0 ? 2U : 1U); ++lane) {
-        if ((before.pe[lane].astat & 1) == 0) { continue; }
-        const auto result = rotate({.word = values[lane], .count = amounts[lane]});
-        expected.pe[lane].data[bank(before, registers.destination)][registers.destination] =
-            std::uint64_t{result} << 8;
-        expected.pe[lane].astat =
-            (before.pe[lane].astat & ~shift_flags) | (result == 0 ? zero_flag : 0);
-      }
-      ++expected.pc;
-      expected.faddr = expected.pc + 4;
-      expected.daddr = expected.pc + 2;
-      expected.emuclk = 1;
+      apply_rotation(expected, registers, amounts);
+      fixture::boundary(expected, {.pc = expected.pc + 1, .clock = 1});
       core.set_registers(before);
-      const auto saved = core.save();
-      const auto result = core.run(1);
-      check(!result.has_fault && core.registers() == expected &&
-                result.progress == sharc::Progress{.instructions = 1, .base_cycles = 1},
-            "ROT changed raw extensions, flags, signed count, physical bank or predicate lane");
-      core.restore(saved);
-      const auto bounded = core.run_until(core.state().progress.base_cycles + 1);
-      check(!bounded.has_fault && core.registers() == expected,
-            "ROT differs under an exact cycle deadline");
+      verify_prefix(
+          core,
+          expected,
+          {.instruction =
+               "ROT changed raw extensions, flags, signed count, physical bank or predicate lane",
+           .deadline = "ROT differs under an exact cycle deadline"});
     }
   }
 }
@@ -114,8 +151,8 @@ void branch_interlock(bool immediate) {
   const std::array words{
       immediate ? rotate_r2_r0_minus_one : rotate_r2_r0_r6, jump_sz_next, std::uint64_t{0}};
   fixture::Program program(words);
-  for (const auto mode : {sharc::ExecutionMode::strict, sharc::ExecutionMode::fast_fp32}) {
-    const auto native = sharc::Core::compile(program.code, {.mode = mode, .callbacks = {}});
+  for (const auto mode : fixture::numeric_modes) {
+    const auto native = fixture::compile(program.code, mode);
     for (const bool simd : {false, true}) {
       sharc::Core core(program.memory(), mode);
       sharc::Core resumed(program.memory(), mode);
@@ -123,20 +160,15 @@ void branch_interlock(bool immediate) {
       expected.pc = fixture::code_address;
       expected.mode1 = unsigned{simd} << simd_bit;
       expected.pe[0].data[0][6] = std::uint64_t{word_mask} << 8;
-      core.set_registers(expected);
-      (void)core.install(native, fixture::Program::variant_id);
+      fixture::install(core, native, expected);
       (void)resumed.install(native, fixture::Program::variant_id);
       check(!core.run(1).has_fault, "ROT prefix before a shifter-condition branch failed");
       resumed.restore(core.save());
       const auto result = resumed.run_until(resumed.state().progress.base_cycles + 1);
       expected.pe[0].astat = zero_flag;
       if (simd) { expected.pe[1].astat = zero_flag; }
-      expected.pc += 2;
-      expected.faddr = expected.pc + 4;
-      expected.daddr = expected.pc + 2;
-      expected.emuclk = 6;
-      check(!result.has_fault && resumed.registers() == expected &&
-                result.progress == sharc::Progress{.instructions = 1, .base_cycles = 5},
+      fixture::boundary(expected, {.pc = expected.pc + 2, .clock = 6});
+      check(fixture::completed(result, 1, 5) && resumed.registers() == expected,
             "ROT shifter flags or branch interlock did not survive a cross-Core snapshot");
     }
   }
@@ -144,9 +176,7 @@ void branch_interlock(bool immediate) {
 
 void immediate_verify(sharc::Core &core, Registers registers, unsigned configuration) {
   constexpr unsigned count_values = 256;
-  std::vector<std::uint32_t> inputs{0, word_mask};
-  for (unsigned bit = 0; bit < 32; ++bit) { inputs.push_back(1U << bit); }
-  for (const auto input : inputs) {
+  for (const auto input : bit_patterns()) {
     auto expected = initial(configuration);
     const std::array sources{input, input ^ word_mask};
     for (unsigned lane = 0; lane < 2; ++lane) {
@@ -156,35 +186,17 @@ void immediate_verify(sharc::Core &core, Registers registers, unsigned configura
     core.set_registers(expected);
     const auto start = core.save();
     for (unsigned count = 0; count < count_values; ++count) {
-      for (unsigned lane = 0; lane < (((expected.mode1 >> simd_bit) & 1) != 0 ? 2U : 1U); ++lane) {
-        auto &pe = expected.pe[lane];
-        if ((pe.astat & 1) == 0) { continue; }
-        const auto source = static_cast<std::uint32_t>(
-            pe.data[bank(expected, registers.source)][registers.source] >> 8);
-        const auto result = rotate({.word = source, .count = count});
-        pe.data[bank(expected, registers.destination)][registers.destination] =
-            std::uint64_t{result} << 8;
-        pe.astat = (pe.astat & ~shift_flags) | (result == 0 ? zero_flag : 0);
-      }
-      ++expected.pc;
-      expected.faddr = expected.pc + 4;
-      expected.daddr = expected.pc + 2;
-      ++expected.emuclk;
-      const auto snapshot = core.save();
-      const auto retired = core.run(1);
-      check(!retired.has_fault && core.registers() == expected &&
-                retired.progress == sharc::Progress{.instructions = 1, .base_cycles = 1},
-            "immediate ROT lost its count, source alias, predicate, bank, flags or raw extension");
-      core.restore(snapshot);
-      const auto bounded = core.run_until(core.state().progress.base_cycles + 1);
-      check(!bounded.has_fault && core.registers() == expected,
-            "immediate ROT differs at an instruction or cycle prefix");
+      apply_rotation(expected, registers, {count, count});
+      fixture::boundary(expected, {.pc = expected.pc + 1, .clock = expected.emuclk + 1});
+      verify_prefix(core,
+                    expected,
+                    {.instruction = "immediate ROT lost its count, source alias, predicate, bank, "
+                                    "flags or raw extension",
+                     .deadline = "immediate ROT differs at an instruction or cycle prefix"});
     }
     core.restore(start);
     const auto granted = core.run(count_values);
-    check(!granted.has_fault && core.registers() == expected &&
-              granted.progress ==
-                  sharc::Progress{.instructions = count_values, .base_cycles = count_values},
+    check(fixture::completed(granted, count_values, count_values) && core.registers() == expected,
           "immediate ROT whole-unit execution differs from exact prefixes");
   }
 }
@@ -208,14 +220,7 @@ void immediate_rotations() {
                      (std::uint64_t{registers.destination} << 4) | registers.source;
     }
     fixture::Program program(words);
-    for (const auto mode : {sharc::ExecutionMode::strict, sharc::ExecutionMode::fast_fp32}) {
-      const auto native = sharc::Core::compile(program.code, {.mode = mode, .callbacks = {}});
-      sharc::Core core(program.memory(), mode);
-      (void)core.install(native, fixture::Program::variant_id);
-      for (unsigned configuration = 0; configuration < 128; ++configuration) {
-        immediate_verify(core, registers, configuration);
-      }
-    }
+    exercise_configurations(program, registers, immediate_verify);
   }
 }
 
@@ -233,14 +238,7 @@ void rotations() {
                            (std::uint64_t{registers.destination} << destination_shift) |
                            (std::uint64_t{registers.source} << source_shift) | registers.count};
     Program program(words);
-    for (const auto mode : {sharc::ExecutionMode::strict, sharc::ExecutionMode::fast_fp32}) {
-      const auto native = sharc::Core::compile(program.code, {.mode = mode, .callbacks = {}});
-      sharc::Core core(program.memory(), mode);
-      (void)core.install(native, Program::variant_id);
-      for (unsigned configuration = 0; configuration < 128; ++configuration) {
-        verify(core, registers, configuration);
-      }
-    }
+    exercise_configurations(program, registers, verify);
   }
 }
 } // namespace fixture

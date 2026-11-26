@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: GPL-3.0-only
 """Authored shifter cases and bit-position/list based cross-checks."""
 
+from itertools import product as cartesian_product
 from dataclasses import asdict
 from fractions import Fraction
 
+from expectation_check import require, require_raises
 from reference import (
     FifoResult, IntegerResult, Unqualified, bit_fifo, field, float_unpack, leading, shift,
 )
@@ -96,11 +98,6 @@ UNPACK = [
 ]
 
 
-def require(actual, expected, context):
-    if actual != expected:
-        raise AssertionError((context, expected, actual))
-
-
 def anchors():
     records = []
     for name, operation, raw, amount, expected in SHIFTS:
@@ -160,34 +157,32 @@ def bit_lattice():
                 require(shift(operation, word * 256 + 255, amount, astat=0xFFFFFFFF, stky=0x55),
                         expected, (operation, word, amount))
                 count += 1
-        for position in range(64):
-            for length in range(64):
-                for sign_extend in (False, True):
-                    if sign_extend and length == 0:
-                        continue
-                    for operation in ("deposit", "deposit_or", "extract"):
-                        output = []
-                        for target in range(32):
-                            source = target - position if operation != "extract" else target + position
-                            active = (0 <= source < min(length, 32) if operation != "extract" else
-                                      target < length and source < 32)
-                            bit = bits[source] if active else 0
-                            above = target >= (position + length if operation != "extract" else length)
-                            if sign_extend and position + length <= 32 and above:
-                                bit = bits[length - 1 if operation != "extract" else position + length - 1]
-                            if operation == "deposit_or":
-                                bit |= (target % 3 == 0)
-                            output.append(bit)
-                        value = sum(bit * 2**index for index, bit in enumerate(output))
-                        flags = 0xFFFFC7FF | (int(position + length > 32) << 11)
-                        flags |= int(not any(output)) << 12
-                        expected = IntegerResult(value * 256, flags, 0x55)
-                        old = sum(2**bit for bit in range(0, 32, 3)) * 256 + 255
-                        require(field(operation, word * 256 + 255, position, length,
-                                      sign_extend=sign_extend, old_destination=old,
-                                      astat=0xFFFFFFFF, stky=0x55), expected,
-                                (operation, word, position, length, sign_extend))
-                        count += 1
+        for position, length, sign_extend in cartesian_product(range(64), range(64), (False, True)):
+            if sign_extend and length == 0:
+                continue
+            for operation in ("deposit", "deposit_or", "extract"):
+                output = []
+                for target in range(32):
+                    source = target - position if operation != "extract" else target + position
+                    active = (0 <= source < min(length, 32) if operation != "extract" else
+                              target < length and source < 32)
+                    bit = bits[source] if active else 0
+                    above = target >= (position + length if operation != "extract" else length)
+                    if sign_extend and position + length <= 32 and above:
+                        bit = bits[length - 1 if operation != "extract" else position + length - 1]
+                    if operation == "deposit_or":
+                        bit |= (target % 3 == 0)
+                    output.append(bit)
+                value = sum(bit * 2**index for index, bit in enumerate(output))
+                flags = 0xFFFFC7FF | (int(position + length > 32) << 11)
+                flags |= int(not any(output)) << 12
+                expected = IntegerResult(value * 256, flags, 0x55)
+                old = sum(2**bit for bit in range(0, 32, 3)) * 256 + 255
+                require(field(operation, word * 256 + 255, position, length,
+                              sign_extend=sign_extend, old_destination=old,
+                              astat=0xFFFFFFFF, stky=0x55), expected,
+                        (operation, word, position, length, sign_extend))
+                count += 1
     return count
 
 
@@ -195,35 +190,33 @@ def fifo_lattice():
     count = 0
     for data in (0, 0xFFFFFFFFFFFFFFFF, 0xA35C7E19B2468DF0):
         bits = [int(char) for char in f"{data:064b}"]
-        for pointer in range(65):
-            for length in range(33):
-                for operation in ("deposit", "extract"):
-                    if operation == "deposit" and pointer + length > 64:
-                        continue
-                    if operation == "extract" and length > pointer:
-                        continue
-                    for no_update in ((False, True) if operation == "extract" else (False,)):
-                        output = bits.copy()
-                        updated, result = pointer, None
-                        if operation == "deposit":
-                            incoming = [int(char) for char in f"{0xB2468DF0:032b}"][-length:] if length else []
-                            for index, bit in enumerate(incoming, start=pointer):
-                                output[index] |= bit
-                            updated += length
-                        else:
-                            result = int("".join(map(str, bits[:length])) or "0", 2) * 256
-                            if not no_update:
-                                output = bits[length:] + [0] * length
-                                updated -= length
-                        flags = 0xFFFF87FF | (int(operation == "extract" and result == 0) << 12)
-                        flags |= 0x4000 if (pointer if no_update else updated) >= 32 else 0
-                        expected = FifoResult(int("".join(map(str, output)), 2), updated,
-                                              result, flags, 0x55)
-                        old_flags = (0xFFFFFFFF & ~0x4000) | (0x4000 if pointer >= 32 else 0)
-                        require(bit_fifo(operation, data, pointer, raw=0xB2468DF0FF, length=length,
-                                         no_update=no_update, astat=old_flags, stky=0x55),
-                                expected, (operation, data, pointer, length, no_update))
-                        count += 1
+        for pointer, length, operation in cartesian_product(range(65), range(33), ("deposit", "extract")):
+            if operation == "deposit" and pointer + length > 64:
+                continue
+            if operation == "extract" and length > pointer:
+                continue
+            for no_update in ((False, True) if operation == "extract" else (False,)):
+                output = bits.copy()
+                updated, result = pointer, None
+                if operation == "deposit":
+                    incoming = [int(char) for char in f"{0xB2468DF0:032b}"][-length:] if length else []
+                    for index, bit in enumerate(incoming, start=pointer):
+                        output[index] |= bit
+                    updated += length
+                else:
+                    result = int("".join(map(str, bits[:length])) or "0", 2) * 256
+                    if not no_update:
+                        output = bits[length:] + [0] * length
+                        updated -= length
+                flags = 0xFFFF87FF | (int(operation == "extract" and result == 0) << 12)
+                flags |= 0x4000 if (pointer if no_update else updated) >= 32 else 0
+                expected = FifoResult(int("".join(map(str, output)), 2), updated,
+                                      result, flags, 0x55)
+                old_flags = (0xFFFFFFFF & ~0x4000) | (0x4000 if pointer >= 32 else 0)
+                require(bit_fifo(operation, data, pointer, raw=0xB2468DF0FF, length=length,
+                                 no_update=no_update, astat=old_flags, stky=0x55),
+                        expected, (operation, data, pointer, length, no_update))
+                count += 1
     return count
 
 
@@ -306,8 +299,4 @@ def explicit_gaps():
         lambda: bit_fifo("extract", 0, 0, length=1),
         lambda: bit_fifo("deposit", 0, 0, length=33),
     ):
-        try:
-            call()
-        except Unqualified:
-            continue
-        raise AssertionError("unqualified shifter result generated")
+        require_raises(Unqualified, call, 'unqualified shifter result generated')

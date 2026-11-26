@@ -1,91 +1,40 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #include "../support/check.hpp"
 #include "../support/isa.hpp"
-#include "sharc/memory.hpp"
+#include "../support/native_provider.hpp"
 
 #include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <exception>
-#include <iostream>
-#include <llvm/Bitcode/BitcodeReader.h>
-#include <llvm/ExecutionEngine/Orc/Core.h>
-#include <llvm/ExecutionEngine/Orc/LLJIT.h>
-#include <llvm/ExecutionEngine/Orc/Shared/ExecutorAddress.h>
-#include <llvm/ExecutionEngine/Orc/ThreadSafeModule.h>
-#include <llvm/IR/BasicBlock.h>
-#include <llvm/IR/Function.h>
-#include <llvm/IR/GlobalValue.h>
-#include <llvm/IR/IRBuilder.h>
-#include <llvm/IR/Module.h>
-#include <llvm/Support/Error.h>
-#include <llvm/Support/TargetSelect.h>
 #include <memory>
 #include <sharc/core.hpp>
+#include <sharc/memory.hpp>
 #include <span>
 #include <stdexcept>
-#include <utility>
 #include <vector>
 
 namespace {
 using fixture::check;
-constexpr std::uint32_t variant_id = 7;
-constexpr std::uint32_t storage_id = 9;
-constexpr std::uint32_t instruction_bytes = 6;
+constexpr auto variant_id = fixture::Program::variant_id;
+constexpr auto instruction_bytes = fixture::Program::word_bytes;
 constexpr unsigned byte_shift = 8;
 constexpr std::uint64_t preserved_raw = 0x81234567ef;
 constexpr std::uint64_t negative_one_raw = 0xffffffff00;
 constexpr std::uint64_t initial_clock = 123;
 
-struct Program {
-  sharc::CodeImage image;
-  std::vector<std::byte> bytes;
-
-  Program() {
-    const std::array words{fixture::immediate(0, 0xffffffff),
-                           fixture::immediate(1, 1),
-                           fixture::add(2, 0, 1),
-                           fixture::add(3, 2, 1),
-                           std::uint64_t{0}};
-    sharc::CodeVariant variant;
-    variant.id = variant_id;
-    variant.entries = {fixture::code_address};
-    sharc::CodeSpan span{.address = fixture::code_address,
-                         .instruction_set = sharc::InstructionSet::isa,
-                         .parcels = {}};
-    for (const auto word : words) {
-      fixture::append(span, word);
-      for (unsigned byte = 0; byte < instruction_bytes; ++byte) {
-        bytes.push_back(static_cast<std::byte>(word >> (byte * byte_shift)));
-      }
-    }
-    variant.spans.push_back(std::move(span));
-    variant.layout.regions.push_back({.space = sharc::MemorySpace::program,
-                                      .view = sharc::MemoryView::instruction,
-                                      .first = fixture::code_address,
-                                      .count = words.size(),
-                                      .storage_id = storage_id,
-                                      .byte_offset = 0,
-                                      .byte_stride = instruction_bytes,
-                                      .readable = true,
-                                      .writable = false,
-                                      .initialized = true});
-    image.variants.push_back(std::move(variant));
-  }
-
-  sharc::Memory memory() {
-    return {.regions = {{.storage_id = storage_id, .bytes = bytes, .generation = 1}}, .io = {}};
-  }
-};
+constexpr std::array sample_words{fixture::immediate(0, 0xffffffff),
+                                  fixture::immediate(1, 1),
+                                  fixture::add(2, 0, 1),
+                                  fixture::add(3, 2, 1),
+                                  std::uint64_t{0}};
 
 sharc::Registers initial_registers() {
   sharc::Registers result;
   result.pc = fixture::code_address;
   result.emuclk = initial_clock;
+  for (auto &lane : result.pe) { lane.data[1].fill(preserved_raw); }
   result.pe[1].data[0].fill(preserved_raw);
-  result.pe[0].data[1].fill(preserved_raw);
-  result.pe[1].data[1].fill(preserved_raw);
   return result;
 }
 
@@ -93,10 +42,6 @@ std::uint64_t consumer_calls{};
 
 void consumer_probe() noexcept {
   ++consumer_calls;
-}
-
-void llvm_check(llvm::Error error) {
-  if (error) { throw std::runtime_error(llvm::toString(std::move(error))); }
 }
 
 struct CodeReader {
@@ -133,9 +78,9 @@ struct CodeReader {
 };
 
 void installation_callbacks() {
-  Program program;
-  program.image.variants[0].layout.regions.clear();
-  const auto native = sharc::Core::compile(program.image);
+  fixture::Program program(sample_words);
+  program.code.variants[0].layout.regions.clear();
+  const auto native = sharc::Core::compile(program.code);
   CodeReader reader{
       .core = nullptr, .bytes = program.bytes, .reads = 0, .reentry_refusals = 0, .refuse = false};
   sharc::Core core(
@@ -161,68 +106,33 @@ void installation_callbacks() {
 }
 
 sharc::NativeSymbols consumer_compile(const sharc::SemanticImage &image) {
-  check(!llvm::InitializeNativeTarget() && !llvm::InitializeNativeTargetAsmPrinter(),
-        "consumer could not initialize LLVM");
-  auto created = llvm::orc::LLJITBuilder().create();
-  if (!created) { throw std::runtime_error(llvm::toString(created.takeError())); }
-  auto engine = std::shared_ptr<llvm::orc::LLJIT>(std::move(*created));
-  auto context = std::make_unique<llvm::LLVMContext>();
-  const auto bytes = image.bitcode();
-  auto parsed = llvm::parseBitcodeFile(
-      {llvm::StringRef(reinterpret_cast<const char *>(bytes.data()), bytes.size()), "consumer"},
-      *context);
-  if (!parsed) { throw std::runtime_error(llvm::toString(parsed.takeError())); }
-  auto module = std::move(*parsed);
-  module->setDataLayout(engine->getDataLayout());
-  module->setTargetTriple(engine->getTargetTriple().str());
-  auto *probe =
-      llvm::Function::Create(llvm::FunctionType::get(llvm::Type::getVoidTy(*context), false),
-                             llvm::GlobalValue::ExternalLinkage,
-                             "consumer_probe",
-                             *module);
-  for (const auto &name : image.exports()) {
-    auto *guest = module->getFunction(name);
-    check(guest != nullptr, "consumer did not find semantic export");
-    guest->setName(name + "_guest");
-    auto *wrapper = llvm::Function::Create(
-        guest->getFunctionType(), llvm::GlobalValue::ExternalLinkage, name, *module);
-    llvm::IRBuilder<> builder(llvm::BasicBlock::Create(*context, "entry", wrapper));
-    builder.CreateCall(probe);
-    std::vector<llvm::Value *> arguments;
-    for (auto &argument : wrapper->args()) { arguments.push_back(&argument); }
-    builder.CreateCall(guest, arguments);
-    builder.CreateRetVoid();
-  }
-  llvm::orc::SymbolMap external;
-  external[engine->mangleAndIntern("consumer_probe")] = {
-      llvm::orc::ExecutorAddr::fromPtr(&consumer_probe), llvm::JITSymbolFlags::Exported};
-  llvm_check(engine->getMainJITDylib().define(llvm::orc::absoluteSymbols(std::move(external))));
-  llvm_check(
-      engine->addIRModule(llvm::orc::ThreadSafeModule(std::move(module), std::move(context))));
-  sharc::NativeSymbols symbols;
-  symbols.lifetime = engine;
-  for (const auto &name : image.exports()) {
-    auto address = engine->lookup(name);
-    if (!address) { throw std::runtime_error(llvm::toString(address.takeError())); }
-    symbols.entries.push_back({name, static_cast<std::uintptr_t>(address->getValue())});
-  }
-  return symbols;
+  return fixture::link(image,
+                       std::make_shared<fixture::Provider>(),
+                       false,
+                       {.probe = consumer_probe, .wrap_exports = true});
+}
+
+sharc::NativeImage consumer_roundtrip(const sharc::CodeImage &code,
+                                      const sharc::CompileOptions &options = {}) {
+  const auto semantic = sharc::Core::lower(code, options);
+  const auto loaded = sharc::Core::load(code, options, semantic.artifact());
+  return sharc::Core::bind(loaded, consumer_compile(loaded));
 }
 
 void lifecycle() {
-  Program program;
-  const auto semantic = sharc::Core::lower(program.image);
+  fixture::Program program(sample_words);
+  const auto semantic = sharc::Core::lower(program.code);
   check(!semantic.bitcode().empty() && !semantic.exports().empty(),
         "lower returned an empty image");
   const auto artifact = semantic.artifact();
-  const auto loaded = sharc::Core::load(program.image, {}, artifact);
+  const auto loaded = sharc::Core::load(program.code, {}, artifact);
   check(loaded.identity() == semantic.identity() &&
             std::ranges::equal(loaded.bitcode(), semantic.bitcode()) &&
             std::ranges::equal(loaded.exports(), semantic.exports()),
         "artifact round trip changed image");
   fixture::throws<sharc::PreparationError>([&] { (void)sharc::Core::bind(loaded, {}); },
                                            "bind accepted missing native symbols");
-  const auto native = sharc::Core::compile(program.image);
+  const auto native = sharc::Core::compile(program.code);
   check(native.report().native_bytes != 0 && native.report().seconds > 0,
         "stand-alone preparation did not measure native code/time");
   sharc::Core core(program.memory());
@@ -231,23 +141,19 @@ void lifecycle() {
   (void)core.install(native, variant_id);
   check(core.state() == original, "installation changed state or time");
   const auto prefix = core.run(2);
-  check(!prefix.has_fault &&
-            prefix.progress == sharc::Progress{.instructions = 2, .base_cycles = 2},
-        "immediate prefix failed");
+  check(fixture::completed(prefix, 2, 2), "immediate prefix failed");
   check(core.registers().pe[0].data[0][0] == negative_one_raw &&
             core.registers().pe[0].data[0][1] == 0x100,
         "immediate moves have wrong raw views");
   const auto compute = core.run(1);
-  check(!compute.has_fault &&
-            compute.progress == sharc::Progress{.instructions = 1, .base_cycles = 1} &&
-            core.registers().pe[0].data[0][2] == 0 && core.registers().pe[0].astat == 9,
+  check(fixture::completed(compute, 1, 1) && core.registers().pe[0].data[0][2] == 0 &&
+            core.registers().pe[0].astat == 9,
         "native ADD lost result, flags or precise prefix");
   const auto saved = core.save();
   const auto saved_state = core.state();
   const auto finish = core.run_until(5);
-  check(!finish.has_fault &&
-            finish.progress == sharc::Progress{.instructions = 2, .base_cycles = 2} &&
-            core.registers().pe[0].data[0][3] == 0x100 && core.registers().pe[0].astat == 0,
+  check(fixture::completed(finish, 2, 2) && core.registers().pe[0].data[0][3] == 0x100 &&
+            core.registers().pe[0].astat == 0,
         "deadline did not finish the remaining native prefix");
   check(core.state().progress == sharc::Progress{.instructions = 5, .base_cycles = 5} &&
             core.registers().pc == fixture::code_address + 5 &&
@@ -281,16 +187,16 @@ void lifecycle() {
     auto changed = artifact;
     changed[position] ^= std::byte{1};
     fixture::throws<sharc::PreparationError>(
-        [&] { (void)sharc::Core::load(program.image, {}, changed); }, "corrupt artifact accepted");
+        [&] { (void)sharc::Core::load(program.code, {}, changed); }, "corrupt artifact accepted");
   }
-  auto changed_code = program.image;
+  auto changed_code = program.code;
   changed_code.variants[0].spans[0].parcels.back() ^= 1;
   fixture::throws<sharc::PreparationError>(
       [&] { (void)sharc::Core::load(changed_code, {}, artifact); }, "cache accepted changed code");
   fixture::throws<sharc::PreparationError>(
       [&] {
         (void)sharc::Core::load(
-            program.image, {.mode = sharc::ExecutionMode::fast_fp32, .callbacks = {}}, artifact);
+            program.code, {.mode = sharc::ExecutionMode::fast_fp32, .callbacks = {}}, artifact);
       },
       "cache accepted a different numerical mode");
   core.restore(saved);
@@ -324,19 +230,14 @@ void connected_entries() {
                          std::uint64_t{0}};
   fixture::Program program(words);
   program.code.variants[0].entries = {base + 7, base, base + 2};
-  const auto semantic = sharc::Core::lower(program.code);
-  const auto loaded = sharc::Core::load(program.code, {}, semantic.artifact());
-  const auto linked = sharc::Core::bind(loaded, consumer_compile(loaded));
+  const auto linked = consumer_roundtrip(program.code);
   const auto native = sharc::Core::compile(program.code);
   sharc::Core core(program.memory());
   auto initial = initial_registers();
   initial.pe[0].data[0][1] = 2U << byte_shift;
-  core.set_registers(initial);
-  (void)core.install(native, fixture::Program::variant_id);
+  fixture::install(core, native, initial);
   const auto first = core.run(2);
-  check(!first.has_fault &&
-            first.progress == sharc::Progress{.instructions = 2, .base_cycles = 5} &&
-            core.registers().pc == base + 4,
+  check(fixture::completed(first, 2, 5) && core.registers().pc == base + 4,
         "connected branch did not stop at its exact boundary");
   const auto saved = core.save();
   sharc::Core replay(program.memory());
@@ -347,13 +248,8 @@ void connected_entries() {
   expected.pe[0].data[0][0] = 3U << byte_shift;
   expected.pe[0].data[0][2] = 5U << byte_shift;
   expected.pe[0].data[0][3] = 7U << byte_shift;
-  expected.pc = base + 6;
-  expected.faddr = expected.pc + 4;
-  expected.daddr = expected.pc + 2;
-  expected.emuclk += 7;
-  check(!resumed.has_fault &&
-            resumed.progress == sharc::Progress{.instructions = 2, .base_cycles = 2} &&
-            replay.registers() == expected,
+  fixture::boundary(expected, {.pc = base + 6, .clock = expected.emuclk + 7});
+  check(fixture::completed(resumed, 2, 2) && replay.registers() == expected,
         "artifact-bound replay lost its connected region or full state");
   for (const auto entry : {base + 2, base + 7}) {
     auto registers = initial;
@@ -363,13 +259,10 @@ void connected_entries() {
     const auto result = core.run(first_path ? 3 : 2);
     if (first_path) { registers.pe[0].data[0][8] = alternate_marker << byte_shift; }
     registers.pe[0].data[0][9] = 11U << byte_shift;
-    registers.pc = first_path ? base + 8 : base + 9;
-    registers.faddr = registers.pc + 4;
-    registers.daddr = registers.pc + 2;
-    registers.emuclk += first_path ? 6 : 2;
-    check(!result.has_fault &&
-              result.progress == sharc::Progress{.instructions = first_path ? 3U : 2U,
-                                                 .base_cycles = first_path ? 6U : 2U} &&
+    fixture::boundary(
+        registers,
+        {.pc = first_path ? base + 8 : base + 9, .clock = registers.emuclk + (first_path ? 6 : 2)});
+    check(fixture::completed(result, first_path ? 3U : 2U, first_path ? 6U : 2U) &&
               core.registers() == registers,
           "declared entry selected another region or changed unreachable state");
   }
@@ -382,65 +275,31 @@ void connected_entries() {
         "owner PC replacement retained the previous region continuation");
 }
 
-void cached_call() {
-  constexpr std::uint64_t call = 0x06be00000000;
-  constexpr std::uint64_t rts = 0x0a3e00000000;
-  constexpr std::uint32_t call_tag = 1U << 24;
-  constexpr std::uint32_t empty = 1U << 22;
-  const auto base = fixture::code_address;
-  const std::array words{call | (base + 2), std::uint64_t{0}, rts};
-  fixture::Program program(words);
-  const auto semantic = sharc::Core::lower(program.code);
-  const auto loaded = sharc::Core::load(program.code, {}, semantic.artifact());
-  const auto native = sharc::Core::bind(loaded, consumer_compile(loaded));
-  sharc::Core core(program.memory());
-  auto expected = initial_registers();
-  core.set_registers(expected);
-  (void)core.install(native, fixture::Program::variant_id);
-  const auto result = core.run(3);
-  expected.pc = base + 2;
-  expected.faddr = expected.pc + 4;
-  expected.daddr = expected.pc + 2;
-  expected.pc_stack[0] = (base + 1) | call_tag;
-  expected.pe[0].stky = empty;
-  expected.emuclk += 9;
-  check(!result.has_fault &&
-            result.progress == sharc::Progress{.instructions = 3, .base_cycles = 9} &&
-            core.registers() == expected,
-        "cached consumer-bound CALL/RTS lost architectural stack or bound state");
-}
-
-void cached_indirect_call() {
+void cached_call(bool indirect, sharc::ExecutionMode mode) {
+  constexpr std::uint64_t direct_call = 0x06be00000000;
   constexpr std::uint64_t call_m8_i8 = 0x08be00000000;
   constexpr std::uint64_t rts = 0x0a3e00000000;
   constexpr std::uint32_t call_tag = 1U << 24;
   constexpr std::uint32_t empty = 1U << 22;
   const auto base = fixture::code_address;
-  const std::array words{call_m8_i8, std::uint64_t{0}, rts};
+  const std::array words{indirect ? call_m8_i8 : direct_call | (base + 2), std::uint64_t{0}, rts};
   fixture::Program program(words);
-  program.code.variants[0].entries.push_back(base + 2);
-  for (const auto mode : {sharc::ExecutionMode::strict, sharc::ExecutionMode::fast_fp32}) {
-    const sharc::CompileOptions options{.mode = mode, .callbacks = {}};
-    const auto semantic = sharc::Core::lower(program.code, options);
-    const auto loaded = sharc::Core::load(program.code, options, semantic.artifact());
-    const auto native = sharc::Core::bind(loaded, consumer_compile(loaded));
-    sharc::Core core(program.memory(), mode);
-    auto expected = initial_registers();
-    expected.dag[0][8].index = base + 2;
-    core.set_registers(expected);
-    (void)core.install(native, fixture::Program::variant_id);
-    const auto result = core.run(3);
-    expected.pc = base + 2;
-    expected.faddr = expected.pc + 4;
-    expected.daddr = expected.pc + 2;
-    expected.pc_stack[0] = (base + 1) | call_tag;
-    expected.pe[0].stky = empty;
-    expected.emuclk += 9;
-    check(!result.has_fault &&
-              result.progress == sharc::Progress{.instructions = 3, .base_cycles = 9} &&
-              core.registers() == expected,
-          "cached consumer-bound indirect CALL lost its private return continuation");
-  }
+  if (indirect) { program.code.variants[0].entries.push_back(base + 2); }
+  const sharc::CompileOptions options{.mode = mode, .callbacks = {}};
+  const auto native = consumer_roundtrip(program.code, options);
+  sharc::Core core(program.memory(), mode);
+  auto expected = initial_registers();
+  if (indirect) { expected.dag[0][8].index = base + 2; }
+  fixture::install(core, native, expected);
+  const auto result = core.run(3);
+  expected.pc = base + 2;
+  fixture::fetch_addresses(expected);
+  expected.pc_stack[0] = (base + 1) | call_tag;
+  expected.pe[0].stky = empty;
+  expected.emuclk += 9;
+  check(fixture::completed(result, 3, 9) && core.registers() == expected,
+        indirect ? "cached consumer-bound indirect CALL lost its private return continuation"
+                 : "cached consumer-bound CALL/RTS lost architectural stack or bound state");
 }
 
 void cached_memory() {
@@ -456,37 +315,22 @@ void cached_memory() {
   auto ram = initial_bytes;
   const std::array words{load};
   fixture::Program program(words);
-  program.code.variants[0].layout.regions.push_back({.space = sharc::MemorySpace::data,
-                                                     .view = sharc::MemoryView::normal_word,
-                                                     .first = ram_address,
-                                                     .count = 1,
-                                                     .storage_id = ram_id,
-                                                     .byte_offset = 1,
-                                                     .byte_stride = 4,
-                                                     .readable = true,
-                                                     .writable = false,
-                                                     .initialized = true});
-  auto memory = program.memory();
-  memory.regions.push_back({.storage_id = ram_id, .bytes = ram, .generation = 1});
-  const auto semantic = sharc::Core::lower(program.code);
-  const auto loaded = sharc::Core::load(program.code, {}, semantic.artifact());
-  const auto native = sharc::Core::bind(loaded, consumer_compile(loaded));
+  auto region = fixture::normal_region(ram_address, 1, ram_id);
+  region.writable = false;
+  region.byte_offset = 1;
+  program.code.variants[0].layout.regions.push_back(region);
+  auto memory = program.memory(ram_id, ram);
+  const auto native = consumer_roundtrip(program.code);
   sharc::Core core(memory);
   auto expected = initial_registers();
   expected.mode1 = broadcast | dag_alternate | data_alternate;
   expected.dag[1][1].index = ram_address;
-  core.set_registers(expected);
-  (void)core.install(native, fixture::Program::variant_id);
+  fixture::install(core, native, expected);
   const auto result = core.run(1);
   expected.pe[0].data[1][0] = raw;
   expected.pe[1].data[1][0] = raw;
-  ++expected.pc;
-  expected.faddr = expected.pc + 4;
-  expected.daddr = expected.pc + 2;
-  ++expected.emuclk;
-  check(!result.has_fault &&
-            result.progress == sharc::Progress{.instructions = 1, .base_cycles = 1} &&
-            core.registers() == expected && ram == initial_bytes,
+  fixture::boundary(expected, {.pc = expected.pc + 1, .clock = expected.emuclk + 1});
+  check(fixture::completed(result, 1, 1) && core.registers() == expected && ram == initial_bytes,
         "cached consumer-bound memory lost storage, broadcast or bank context");
 }
 
@@ -506,41 +350,33 @@ void cached_dag() {
                          fixture::immediate(i7_code, base + length - 1),
                          modify_i7};
   fixture::Program program(words);
-  const auto semantic = sharc::Core::lower(program.code);
-  const auto loaded = sharc::Core::load(program.code, {}, semantic.artifact());
-  const auto native = sharc::Core::bind(loaded, consumer_compile(loaded));
+  const auto native = consumer_roundtrip(program.code);
   sharc::Core core(program.memory());
   auto expected = initial_registers();
   expected.mode1 = (1U << circular_bit) | (1U << bank_bit);
   expected.dag[1][7] = {};
-  core.set_registers(expected);
-  (void)core.install(native, fixture::Program::variant_id);
+  fixture::install(core, native, expected);
   const auto result = core.run(4);
   expected.dag[1][7] = {.index = base, .modifier = 0, .length = length, .base = base};
   expected.pe[0].stky |= 1U << sticky_bit;
   expected.irptl |= 1U << interrupt_bit;
-  expected.pc += 4;
-  expected.faddr = expected.pc + 4;
-  expected.daddr = expected.pc + 2;
-  expected.emuclk += 6;
+  fixture::boundary(expected, {.pc = expected.pc + 4, .clock = expected.emuclk + 6});
   check(
-      !result.has_fault && core.registers() == expected &&
-          result.progress == sharc::Progress{.instructions = 4, .base_cycles = 6},
+      fixture::completed(result, 4, 6) && core.registers() == expected,
       "cached consumer-bound DAG load/update lost dependency cycles, mode, flags or bank metadata");
 }
 
 } // namespace
 
-int main() try {
-  lifecycle();
-  installation_callbacks();
-  connected_entries();
-  cached_call();
-  cached_indirect_call();
-  cached_memory();
-  cached_dag();
-} catch (const std::exception &error) {
-
-  std::cerr << error.what() << '\n';
-  return 1;
+int main() {
+  return fixture::run_test([] {
+    lifecycle();
+    installation_callbacks();
+    connected_entries();
+    cached_call(false, sharc::ExecutionMode::strict);
+    cached_call(true, sharc::ExecutionMode::strict);
+    cached_call(true, sharc::ExecutionMode::fast_fp32);
+    cached_memory();
+    cached_dag();
+  });
 }

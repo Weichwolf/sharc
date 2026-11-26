@@ -6,14 +6,13 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <exception>
-#include <iostream>
 #include <sharc/core.hpp>
 #include <sharc/memory.hpp>
 #include <span>
-#include <stdexcept>
 #include <string>
 #if defined(__linux__)
+#include "../support/word_space.hpp"
+
 #include <sys/mman.h>
 #endif
 
@@ -36,23 +35,10 @@ struct Program {
   std::array<std::byte, 8> ram = initial_ram;
 
   explicit Program(std::span<const std::uint64_t> words) : code(words) {
-    code.code.variants[0].layout.regions.push_back({.space = sharc::MemorySpace::data,
-                                                    .view = sharc::MemoryView::normal_word,
-                                                    .first = ram_address,
-                                                    .count = 2,
-                                                    .storage_id = ram_id,
-                                                    .byte_offset = 0,
-                                                    .byte_stride = 4,
-                                                    .readable = true,
-                                                    .writable = true,
-                                                    .initialized = true});
+    code.code.variants[0].layout.regions.push_back(fixture::normal_region(ram_address, 2, ram_id));
   }
 
-  sharc::Memory memory() {
-    auto result = code.memory();
-    result.regions.push_back({.storage_id = ram_id, .bytes = ram, .generation = 1});
-    return result;
-  }
+  sharc::Memory memory() { return code.memory(ram_id, ram); }
 };
 
 sharc::Registers initial() {
@@ -71,16 +57,12 @@ void fault_prefixes() {
     layout.initialized = denied;
     const auto native = sharc::Core::compile(program.code.code);
     sharc::Core core(program.memory());
-    core.set_registers(initial());
-    (void)core.install(native, fixture::Program::variant_id);
+    fixture::install(core, native, initial());
     const auto saved = core.save();
     auto expected = initial();
     expected.pe[0].data[0][2] = 5U << 8;
     expected.pe[0].data[0][3] = 10U << 8;
-    expected.pc += 2;
-    expected.faddr = expected.pc + 4;
-    expected.daddr = expected.pc + 2;
-    expected.emuclk = 2;
+    fixture::boundary(expected, {.pc = expected.pc + 2, .clock = 2});
     const auto result = core.run(3);
     check(result.has_fault &&
               result.fault.reason == (denied ? sharc::FaultReason::access_fault
@@ -113,27 +95,19 @@ void unexecuted_failure() {
   sharc::Core core(program.memory());
   auto expected = initial();
   expected.pe[0].astat = 1;
-  core.set_registers(expected);
-  (void)core.install(native, fixture::Program::variant_id);
+  fixture::install(core, native, expected);
   const auto saved = core.save();
   const auto result = core.run(3);
   expected.pe[0].data[0][1] = 7U << 8;
-  expected.pc += 4;
-  expected.faddr = expected.pc + 4;
-  expected.daddr = expected.pc + 2;
-  expected.emuclk = 6;
-  check(!result.has_fault &&
-            result.progress == sharc::Progress{.instructions = 3, .base_cycles = 6} &&
-            core.registers() == expected && program.ram == initial_ram,
+  fixture::boundary(expected, {.pc = expected.pc + 4, .clock = 6});
+  check(fixture::completed(result, 3, 6) && core.registers() == expected &&
+            program.ram == initial_ram,
         "unit memory proof faulted an unexecuted branch");
   core.restore(saved);
   expected = initial();
   core.set_registers(expected);
   const auto fault = core.run(3);
-  expected.pc += 1;
-  expected.faddr = expected.pc + 4;
-  expected.daddr = expected.pc + 2;
-  expected.emuclk = 1;
+  fixture::boundary(expected, {.pc = expected.pc + 1, .clock = 1});
   check(fault.has_fault && fault.fault.reason == sharc::FaultReason::access_fault &&
             fault.progress == sharc::Progress{.instructions = 1, .base_cycles = 1} &&
             core.registers() == expected && program.ram == initial_ram,
@@ -159,18 +133,14 @@ void changing_sparse_indices() {
   const auto native = sharc::Core::compile(program.code.code);
   sharc::Core core(program.memory());
   auto expected = initial();
-  core.set_registers(expected);
-  (void)core.install(native, fixture::Program::variant_id);
+  fixture::install(core, native, expected);
   check(!core.run(2).has_fault, "sparse index prefix failed");
   const auto saved = core.save();
   const auto result = core.run(7);
   expected.pe[0].data[0][0] = first_raw;
   expected.pe[0].data[0][1] = second_raw;
   expected.dag[0][0].index += 2;
-  expected.pc += 8;
-  expected.faddr = expected.pc + 4;
-  expected.daddr = expected.pc + 2;
-  expected.emuclk = 8;
+  fixture::boundary(expected, {.pc = expected.pc + 8, .clock = 8});
   check(result.has_fault && result.fault.address == expected.pc &&
             result.progress == sharc::Progress{.instructions = 6, .base_cycles = 6} &&
             core.registers() == expected && program.ram == initial_ram,
@@ -183,36 +153,6 @@ void changing_sparse_indices() {
 }
 
 #if defined(__linux__)
-class VirtualWords {
-public:
-  static constexpr auto words = std::uint64_t{1} << 32;
-  static constexpr auto bytes = std::size_t{1} << 34;
-
-  VirtualWords()
-      : data_(mmap(nullptr,
-                   bytes,
-                   PROT_READ | PROT_WRITE,
-                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
-                   -1,
-                   0)) {
-    if (data_ == MAP_FAILED) { throw std::runtime_error("cannot reserve complete word space"); }
-  }
-
-  ~VirtualWords() { (void)munmap(data_, bytes); }
-
-  VirtualWords(const VirtualWords &) = delete;
-  VirtualWords &operator=(const VirtualWords &) = delete;
-  VirtualWords(VirtualWords &&) = delete;
-  VirtualWords &operator=(VirtualWords &&) = delete;
-
-  [[nodiscard]] std::span<std::byte> storage() const {
-    return {static_cast<std::byte *>(data_), bytes};
-  }
-
-private:
-  void *data_;
-};
-
 void complete_word_space() {
   constexpr std::uint32_t index_before_wrap = 0xfffffffe;
   constexpr unsigned simd_mode_bit = 21;
@@ -220,16 +160,16 @@ void complete_word_space() {
   constexpr std::uint64_t first_raw = 0x4433221100;
   const std::array words{load_r0 | 1, store_r0 | 2};
   Program program(words);
-  const VirtualWords mapping;
-  auto storage = mapping.storage();
+  const fixture::Mapping mapping(fixture::word_space_bytes, PROT_READ | PROT_WRITE);
+  auto storage = mapping.bytes();
   const auto last = storage.size() - 4;
   auto &layout = program.code.code.variants[0].layout.regions.back();
   layout.first = 0;
-  layout.count = VirtualWords::words;
+  layout.count = fixture::word_count;
   auto memory = program.memory();
   memory.regions.back().bytes = storage;
-  for (const auto mode : {sharc::ExecutionMode::strict, sharc::ExecutionMode::fast_fp32}) {
-    const auto native = sharc::Core::compile(program.code.code, {.mode = mode, .callbacks = {}});
+  for (const auto mode : fixture::numeric_modes) {
+    const auto native = fixture::compile(program.code.code, mode);
     for (const bool simd : {false, true}) {
       std::ranges::copy(initial_ram, storage.begin());
       std::ranges::copy_n(
@@ -238,17 +178,12 @@ void complete_word_space() {
       auto expected = initial();
       expected.dag[0][0].index = index_before_wrap;
       expected.mode1 = simd ? 1U << simd_mode_bit : 0;
-      core.set_registers(expected);
-      (void)core.install(native, fixture::Program::variant_id);
+      fixture::install(core, native, expected);
       const auto result = core.run(2);
       expected.pe[0].data[0][0] = last_raw;
       if (simd) { expected.pe[1].data[0][0] = first_raw; }
-      expected.pc += 2;
-      expected.faddr = expected.pc + 4;
-      expected.daddr = expected.pc + 2;
-      expected.emuclk = 2;
-      check(!result.has_fault && core.registers() == expected &&
-                result.progress == sharc::Progress{.instructions = 2, .base_cycles = 2} &&
+      fixture::boundary(expected, {.pc = expected.pc + 2, .clock = 2});
+      check(fixture::completed(result, 2, 2) && core.registers() == expected &&
                 std::ranges::equal(storage.first(4), std::span(initial_ram).last(4)) &&
                 std::ranges::equal(storage.subspan(4, 4),
                                    simd ? std::span(initial_ram).first(4)
@@ -276,8 +211,8 @@ void changing_complete_space() {
   constexpr unsigned x_sum = 256;
   constexpr unsigned y_sum = 272;
   constexpr std::byte untouched{0xa5};
-  const VirtualWords mapping;
-  auto storage = mapping.storage();
+  const fixture::Mapping mapping(fixture::word_space_bytes, PROT_READ | PROT_WRITE);
+  auto storage = mapping.bytes();
   auto input = storage.subspan(std::size_t{ram_address} * 4, std::size_t{input_words} * 4);
   auto output =
       storage.subspan(std::size_t{output_address} * 4, (std::size_t{input_words} + 1) * 4);
@@ -301,11 +236,11 @@ void changing_complete_space() {
     Program program(words);
     auto &layout = program.code.code.variants[0].layout.regions.back();
     layout.first = 0;
-    layout.count = VirtualWords::words;
+    layout.count = fixture::word_count;
     auto memory = program.memory();
     memory.regions.back().bytes = storage;
-    for (const auto mode : {sharc::ExecutionMode::strict, sharc::ExecutionMode::fast_fp32}) {
-      const auto native = sharc::Core::compile(program.code.code, {.mode = mode, .callbacks = {}});
+    for (const auto mode : fixture::numeric_modes) {
+      const auto native = fixture::compile(program.code.code, mode);
       sharc::Core core(memory, mode);
       auto expected = initial();
       expected.mode1 = simd ? 1U << simd_bit : 0;
@@ -314,8 +249,7 @@ void changing_complete_space() {
         lane.data[0][2] = turns << 8;
         lane.astat = old_status;
       }
-      core.set_registers(expected);
-      (void)core.install(native, fixture::Program::variant_id);
+      fixture::install(core, native, expected);
       std::ranges::fill(output, untouched);
       const auto result = core.run(instructions);
       expected.dag[0][0].index += copied;
@@ -330,13 +264,10 @@ void changing_complete_space() {
         expected.pe[1].data[0][3] = y_sum << 8;
         expected.pe[1].astat = old_status | 9;
       }
-      expected.pc += static_cast<std::uint32_t>(words.size());
-      expected.faddr = expected.pc + 4;
-      expected.daddr = expected.pc + 2;
-      expected.emuclk = cycles;
-      check(!result.has_fault && core.registers() == expected &&
-                result.progress ==
-                    sharc::Progress{.instructions = instructions, .base_cycles = cycles} &&
+      fixture::boundary(
+          expected,
+          {.pc = expected.pc + static_cast<std::uint32_t>(words.size()), .clock = cycles});
+      check(fixture::completed(result, instructions, cycles) && core.registers() == expected &&
                 std::ranges::equal(output.first(copied_bytes), input.first(copied_bytes)) &&
                 std::ranges::all_of(output.subspan(copied_bytes),
                                     [](std::byte byte) { return byte == untouched; }),
@@ -354,8 +285,7 @@ void rebound_snapshot() {
   second.ram[0] = changed_byte;
   const auto native = sharc::Core::compile(first.code.code);
   sharc::Core core(first.memory());
-  core.set_registers(initial());
-  (void)core.install(native, fixture::Program::variant_id);
+  fixture::install(core, native, initial());
   const auto saved = core.save();
   constexpr std::uint64_t first_raw = 0x4433221100;
   constexpr std::uint64_t second_raw = 0x443322ff00;
@@ -370,28 +300,6 @@ void rebound_snapshot() {
         "snapshot or install retained an obsolete host storage pointer");
 }
 
-void refused_code_alias() {
-  const std::array words{store_r0};
-  Program program(words);
-  auto &layout = program.code.code.variants[0].layout.regions.back();
-  layout.storage_id = fixture::Program::storage_id;
-  layout.count = 1;
-  const auto original = program.code.bytes;
-  const auto native = sharc::Core::compile(program.code.code);
-  sharc::Core core(program.memory());
-  auto registers = initial();
-  constexpr std::uint64_t raw = 0x12345678ab;
-  registers.pe[0].data[0][0] = raw;
-  core.set_registers(registers);
-  (void)core.install(native, fixture::Program::variant_id);
-  const auto result = core.run(1);
-  check(result.has_fault && result.fault.reason == sharc::FaultReason::unsupported_feature &&
-            result.fault.detail.contains("instruction storage") &&
-            result.progress == sharc::Progress{} && core.registers() == registers &&
-            program.code.bytes == original,
-        "unimplemented code-alias store changed code, registers or progress");
-}
-
 void code_alias_read() {
   const std::array words{load_r0, std::uint64_t{0}};
   Program program(words);
@@ -404,18 +312,13 @@ void code_alias_read() {
   const auto native = sharc::Core::compile(program.code.code);
   sharc::Core core(program.memory());
   auto expected = initial();
-  core.set_registers(expected);
-  (void)core.install(native, fixture::Program::variant_id);
+  fixture::install(core, native, expected);
   const auto result = core.run(1);
   constexpr std::uint64_t projected_opcode = 0xa000000000;
   expected.pe[0].data[0][0] = projected_opcode;
-  ++expected.pc;
-  expected.faddr = expected.pc + 4;
-  expected.daddr = expected.pc + 2;
-  expected.emuclk = 1;
-  check(!result.has_fault &&
-            result.progress == sharc::Progress{.instructions = 1, .base_cycles = 1} &&
-            core.registers() == expected && program.code.bytes == original,
+  fixture::boundary(expected, {.pc = expected.pc + 1, .clock = 1});
+  check(fixture::completed(result, 1, 1) && core.registers() == expected &&
+            program.code.bytes == original,
         "normal-word projection through a declared code-storage alias differs");
 }
 
@@ -470,17 +373,11 @@ void ordinary_region_alias() {
   auto registers = initial();
   registers.dag[0][8].index = ram_address;
   registers.pe[0].data[0][0] = raw;
-  core.set_registers(registers);
-  (void)core.install(native, fixture::Program::variant_id);
+  fixture::install(core, native, registers);
   const auto result = core.run(2);
   registers.pe[0].data[0][1] = loaded;
-  registers.pc += 2;
-  registers.faddr = registers.pc + 4;
-  registers.daddr = registers.pc + 2;
-  registers.emuclk = 2;
-  check(!result.has_fault &&
-            result.progress == sharc::Progress{.instructions = 2, .base_cycles = 2} &&
-            core.registers() == registers,
+  fixture::boundary(registers, {.pc = registers.pc + 2, .clock = 2});
+  check(fixture::completed(result, 2, 2) && core.registers() == registers,
         "ordinary PM and DM lost their declared physical alias");
 }
 
@@ -497,15 +394,11 @@ void incomplete_simd_store() {
   expected.mode1 = simd;
   expected.pe[0].data[0][0] = raw_x;
   expected.pe[1].data[0][0] = raw_y;
-  core.set_registers(expected);
-  (void)core.install(native, fixture::Program::variant_id);
+  fixture::install(core, native, expected);
   const auto result = core.run(2);
   expected.pe[0].data[0][1] = 9U << 8;
   expected.pe[1].data[0][1] = 9U << 8;
-  ++expected.pc;
-  expected.faddr = expected.pc + 4;
-  expected.daddr = expected.pc + 2;
-  expected.emuclk = 1;
+  fixture::boundary(expected, {.pc = expected.pc + 1, .clock = 1});
   check(result.has_fault && result.fault.reason == sharc::FaultReason::unsupported_feature &&
             result.progress == sharc::Progress{.instructions = 1, .base_cycles = 1} &&
             core.registers() == expected && program.ram == initial_ram,
@@ -536,57 +429,64 @@ void hidden_storage_alias() {
   }
 }
 
-void opaque_code_store() {
+bool read_store(void * /*owner*/,
+                sharc::MemorySpace space,
+                sharc::MemoryView view,
+                std::uint32_t address,
+                std::uint64_t &value) noexcept {
+  if (space != sharc::MemorySpace::program || view != sharc::MemoryView::instruction ||
+      address != fixture::code_address) {
+    return false;
+  }
+  value = store_r0;
+  return true;
+}
+
+void refused_code_store(bool declared_alias) {
   const std::array words{store_r0};
   Program program(words);
   auto &regions = program.code.code.variants[0].layout.regions;
-  regions.erase(regions.begin());
-  const auto native = sharc::Core::compile(program.code.code);
   auto memory = program.memory();
-  auto word = store_r0;
-  memory.io.owner = &word;
-  memory.io.read = [](void *owner,
-                      sharc::MemorySpace space,
-                      sharc::MemoryView view,
-                      std::uint32_t address,
-                      std::uint64_t &value) noexcept {
-    if (space != sharc::MemorySpace::program || view != sharc::MemoryView::instruction ||
-        address != fixture::code_address) {
-      return false;
-    }
-    value = *static_cast<std::uint64_t *>(owner);
-    return true;
-  };
+  auto registers = initial();
+  if (declared_alias) {
+    regions.back().storage_id = fixture::Program::storage_id;
+    regions.back().count = 1;
+    constexpr std::uint64_t raw = 0x12345678ab;
+    registers.pe[0].data[0][0] = raw;
+  } else {
+    regions.erase(regions.begin());
+    memory.io.read = read_store;
+  }
+  const auto original = program.code.bytes;
+  const auto native = sharc::Core::compile(program.code.code);
   sharc::Core core(memory);
-  core.set_registers(initial());
-  (void)core.install(native, fixture::Program::variant_id);
+  fixture::install(core, native, registers);
   const auto result = core.run(1);
   check(result.has_fault && result.fault.reason == sharc::FaultReason::unsupported_feature &&
             result.fault.detail.contains("instruction storage") &&
-            result.progress == sharc::Progress{} && core.registers() == initial() &&
-            program.ram == initial_ram,
-        "store ran without a declared physical code-storage dependency");
+            result.progress == sharc::Progress{} && core.registers() == registers &&
+            program.code.bytes == original && program.ram == initial_ram,
+        declared_alias ? "store through a declared code alias changed state"
+                       : "store ran without a declared physical code-storage dependency");
 }
 } // namespace
 
-int main() try {
-  fault_prefixes();
-  unexecuted_failure();
-  changing_sparse_indices();
+int main() {
+  return fixture::run_test([] {
+    fault_prefixes();
+    unexecuted_failure();
+    changing_sparse_indices();
 #if defined(__linux__)
-  complete_word_space();
-  changing_complete_space();
+    complete_word_space();
+    changing_complete_space();
 #endif
-  rebound_snapshot();
-  refused_code_alias();
-  code_alias_read();
-  layout_validation();
-  ordinary_region_alias();
-  incomplete_simd_store();
-  hidden_storage_alias();
-  opaque_code_store();
-} catch (const std::exception &error) {
-
-  std::cerr << error.what() << '\n';
-  return 1;
+    rebound_snapshot();
+    refused_code_store(true);
+    code_alias_read();
+    layout_validation();
+    ordinary_region_alias();
+    incomplete_simd_store();
+    hidden_storage_alias();
+    refused_code_store(false);
+  });
 }

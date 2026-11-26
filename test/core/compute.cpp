@@ -4,9 +4,7 @@
 
 #include <array>
 #include <cstdint>
-#include <exception>
 #include <initializer_list>
-#include <iostream>
 #include <sharc/core.hpp>
 #include <string_view>
 
@@ -111,11 +109,9 @@ void shifts() {
 }
 } // namespace
 
-int main() try {
-  computations();
-  shifts();
-} catch (const std::exception &error) {
-
-  std::cerr << error.what() << '\n';
-  return 1;
+int main() {
+  return fixture::run_test([] {
+    computations();
+    shifts();
+  });
 }

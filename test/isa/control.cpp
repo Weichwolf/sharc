@@ -47,14 +47,12 @@ void verify_predicate(const fixture::BranchCase &expected,
   registers.mode1 =
       (unsigned{expected.saturate} << saturation_bit) | (unsigned{expected.simd} << simd_bit);
   for (unsigned lane = 0; lane < 2; ++lane) { registers.pe[lane].astat = expected.astat[lane]; }
-  core.set_registers(registers);
-  (void)core.install(native, fixture::Program::variant_id);
+  fixture::install(core, native, registers);
   const auto snapshot = core.save();
   const sharc::Progress progress{.instructions = 1, .base_cycles = expected.taken ? 4U : 1U};
-  registers.pc += expected.taken ? 4U : 1U;
-  registers.faddr = registers.pc + 4;
-  registers.daddr = registers.pc + 2;
-  registers.emuclk += progress.base_cycles;
+  fixture::boundary(registers,
+                    {.pc = registers.pc + (expected.taken ? 4U : 1U),
+                     .clock = registers.emuclk + progress.base_cycles});
   const auto fast = core.run(1);
   check(!fast.has_fault && fast.progress == progress && core.registers() == registers,
         "direct branch predicate, lane AND, target or state differs");
@@ -76,14 +74,11 @@ void predicates() {
           std::uint64_t{0},
           std::uint64_t{0}};
       fixture::Program program(words);
-      for (const auto mode : {sharc::ExecutionMode::strict, sharc::ExecutionMode::fast_fp32}) {
+      for (const auto mode : fixture::numeric_modes) {
         const Key key{expected.condition, relative, mode};
         auto found = images.find(key);
         if (found == images.end()) {
-          found =
-              images
-                  .emplace(key, sharc::Core::compile(program.code, {.mode = mode, .callbacks = {}}))
-                  .first;
+          found = images.emplace(key, fixture::compile(program.code, mode)).first;
         }
         verify_predicate(expected, program, found->second, mode);
       }
@@ -107,20 +102,16 @@ void counted_control_flow() {
   sharc::Core core(program.memory());
   sharc::Registers registers;
   registers.pc = fixture::code_address;
-  core.set_registers(registers);
-  (void)core.install(native, fixture::Program::variant_id);
+  fixture::install(core, native, registers);
   const auto complete = core.run(14);
   registers.pe[0].data[0][0] = 3U << 8;
   registers.pe[0].data[0][2] = 1U << 8;
   registers.pe[0].data[0][3] = final_marker << 8;
   registers.pe[0].astat = 9;
-  registers.pc += static_cast<std::uint32_t>(words.size());
-  registers.faddr = registers.pc + 4;
-  registers.daddr = registers.pc + 2;
-  registers.emuclk = loop_cycles;
-  check(!complete.has_fault &&
-            complete.progress == sharc::Progress{.instructions = 14, .base_cycles = loop_cycles} &&
-            core.registers() == registers,
+  fixture::boundary(
+      registers,
+      {.pc = registers.pc + static_cast<std::uint32_t>(words.size()), .clock = loop_cycles});
+  check(fixture::completed(complete, 14, loop_cycles) && core.registers() == registers,
         "native backward branch lost loop-carried state or cycles");
 }
 
@@ -129,10 +120,8 @@ std::vector<sharc::Registers> loop_prefixes(sharc::Registers registers, bool sim
   constexpr unsigned turns = 5;
   std::vector<sharc::Registers> result;
   const auto record = [&](unsigned pc, unsigned cycles) {
-    registers.pc = fixture::code_address + pc;
-    registers.faddr = registers.pc + 4;
-    registers.daddr = registers.pc + 2;
-    registers.emuclk += cycles;
+    fixture::boundary(registers,
+                      {.pc = fixture::code_address + pc, .clock = registers.emuclk + cycles});
     result.push_back(registers);
   };
   for (unsigned turn = 1; turn <= turns; ++turn) {
@@ -164,8 +153,8 @@ void loop_grant_boundaries() {
                          fixture::immediate(3, final_marker),
                          std::uint64_t{0}};
   fixture::Program program(words);
-  for (const auto mode : {sharc::ExecutionMode::strict, sharc::ExecutionMode::fast_fp32}) {
-    const auto native = sharc::Core::compile(program.code, {.mode = mode, .callbacks = {}});
+  for (const auto mode : fixture::numeric_modes) {
+    const auto native = fixture::compile(program.code, mode);
     for (const bool simd : {false, true}) {
       for (const unsigned bank : {0U, 1U}) {
         auto initial = initial_registers();
@@ -179,8 +168,7 @@ void loop_grant_boundaries() {
         }
         const auto expected = loop_prefixes(initial, simd, bank);
         sharc::Core core(program.memory(), mode);
-        core.set_registers(initial);
-        (void)core.install(native, fixture::Program::variant_id);
+        fixture::install(core, native, initial);
         const auto saved = core.save();
         for (std::size_t i = 0; i < expected.size(); ++i) {
           core.restore(saved);
@@ -214,8 +202,7 @@ void wrapped_target() {
   sharc::Core wrapped(wrap.memory());
   auto registers = initial_registers();
   registers.pc = address_mask;
-  wrapped.set_registers(registers);
-  (void)wrapped.install(wrap_native, fixture::Program::variant_id);
+  fixture::install(wrapped, wrap_native, registers);
   check(!wrapped.run(1).has_fault && wrapped.registers().pc == 0,
         "relative branch did not wrap its 24-bit target");
 }
@@ -229,42 +216,17 @@ void long_native_loop() {
   sharc::Core core(program.memory());
   auto registers = initial_registers();
   registers.emuclk = clock_before_wrap;
-  core.set_registers(registers);
-  (void)core.install(native, fixture::Program::variant_id);
+  fixture::install(core, native, registers);
   const auto result = core.run(iterations);
-  registers.faddr = registers.pc + 4;
-  registers.daddr = registers.pc + 2;
+  fixture::fetch_addresses(registers);
   registers.emuclk += iterations * 4;
-  check(!result.has_fault &&
-            result.progress ==
-                sharc::Progress{.instructions = iterations, .base_cycles = iterations * 4} &&
-            core.registers() == registers,
+  check(fixture::completed(result, iterations, iterations * 4) && core.registers() == registers,
         "native control loop lost progress, clock carry or bounded host stack");
 }
 
 void rejected_branch_forms() {
-  constexpr std::array reserved_bits{25U, 27U, 28U, 29U, 30U, 31U, 32U};
-  for (const auto bit : reserved_bits) {
-    const auto word =
-        jump(true_condition, fixture::code_address, false) | (std::uint64_t{1} << bit);
-    const auto image = fixture::image(sharc::InstructionSet::isa, word);
-    try {
-      (void)sharc::Core::lower(image);
-      check(false, "reserved direct-branch bit was accepted");
-    } catch (const sharc::PreparationError &error) {
-      check(error.fault().reason == sharc::FaultReason::invalid_encoding &&
-                error.fault().instruction == word && error.fault().address == fixture::code_address,
-            "reserved branch lost fault identity or location");
-    }
-  }
-  constexpr std::array unsupported_bits{24U, 26U, 38U};
-  for (const auto bit : unsupported_bits) {
-    const auto word =
-        jump(true_condition, fixture::code_address, false) | (std::uint64_t{1} << bit);
-    fixture::throws<sharc::PreparationError>(
-        [&] { (void)sharc::Core::lower(fixture::image(sharc::InstructionSet::isa, word)); },
-        "unimplemented direct-branch modifier was accepted");
-  }
+  constexpr std::array reserved{25U, 27U, 28U, 29U, 30U, 31U, 32U};
+  fixture::verify_branch_fields(jump(true_condition, fixture::code_address, false), reserved);
 }
 
 struct CallBoundary {
@@ -312,10 +274,9 @@ sharc::Registers call_state(sharc::Registers initial, std::size_t completed) {
     initial.pe[0].stky &= ~stack_empty;
     if (initial.pc_stack_pointer == 0) { initial.pe[0].stky |= stack_empty; }
   }
-  initial.pc = fixture::code_address + boundary.pc;
-  initial.faddr = initial.pc + 4;
-  initial.daddr = initial.pc + 2;
-  initial.emuclk += boundary.cycles;
+  fixture::boundary(
+      initial,
+      {.pc = fixture::code_address + boundary.pc, .clock = initial.emuclk + boundary.cycles});
   return initial;
 }
 
@@ -338,8 +299,8 @@ void static_calls() {
                          rts,
                          std::uint64_t{0}};
   fixture::Program program(words);
-  for (const auto mode : {sharc::ExecutionMode::strict, sharc::ExecutionMode::fast_fp32}) {
-    const auto native = sharc::Core::compile(program.code, {.mode = mode, .callbacks = {}});
+  for (const auto mode : fixture::numeric_modes) {
+    const auto native = fixture::compile(program.code, mode);
     for (const bool simd : {false, true}) {
       for (const unsigned depth : {0U, 2U}) {
         sharc::Core core(program.memory(), mode);
@@ -353,16 +314,12 @@ void static_calls() {
         for (std::size_t i = 0; i < initial.pc_stack.size(); ++i) {
           initial.pc_stack[i] = static_cast<std::uint32_t>(i);
         }
-        core.set_registers(initial);
-        (void)core.install(native, fixture::Program::variant_id);
+        fixture::install(core, native, initial);
         const auto saved = core.save();
         for (std::size_t count = 1; count <= call_boundaries.size(); ++count) {
           core.restore(saved);
           const auto result = core.run(count);
-          check(!result.has_fault &&
-                    result.progress ==
-                        sharc::Progress{.instructions = count,
-                                        .base_cycles = call_boundaries[count - 1].cycles} &&
+          check(fixture::completed(result, count, call_boundaries[count - 1].cycles) &&
                     core.registers() == call_state(initial, count),
                 "nested static CALL/RTS differs at an instruction boundary");
         }
@@ -397,12 +354,10 @@ void verify_stack_predicate(const fixture::BranchCase &predicate,
   expected.pe[1].stky = old_sticky;
   expected.pc_stack_pointer = returning ? 1 : 0;
   if (returning) { expected.pc_stack[0] = (fixture::code_address + 2) | call_tag; }
-  core.set_registers(expected);
-  (void)core.install(native, fixture::Program::variant_id);
+  fixture::install(core, native, expected);
   const auto saved = core.save();
   expected.pc += predicate.taken ? 2U : 1U;
-  expected.faddr = expected.pc + 4;
-  expected.daddr = expected.pc + 2;
+  fixture::fetch_addresses(expected);
   const sharc::Progress progress{.instructions = 1, .base_cycles = predicate.taken ? 4U : 1U};
   expected.emuclk += progress.base_cycles;
   if (predicate.taken) {
@@ -433,8 +388,8 @@ void conditional_stack() {
     const std::array words{operation, std::uint64_t{0}, std::uint64_t{0}};
     fixture::Program program(words);
     program.code.variants[0].entries.push_back(fixture::code_address + 2);
-    for (const auto mode : {sharc::ExecutionMode::strict, sharc::ExecutionMode::fast_fp32}) {
-      const auto native = sharc::Core::compile(program.code, {.mode = mode, .callbacks = {}});
+    for (const auto mode : fixture::numeric_modes) {
+      const auto native = fixture::compile(program.code, mode);
       for (const auto &predicate : fixture::branch_cases) {
         if (predicate.condition != 0 || predicate.saturate) { continue; }
         verify_stack_predicate(predicate, program, native, mode, operation == rts_eq);

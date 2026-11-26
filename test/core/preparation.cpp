@@ -5,9 +5,7 @@
 
 #include <array>
 #include <cstdint>
-#include <exception>
 #include <initializer_list>
-#include <iostream>
 #include <string>
 
 namespace {
@@ -215,13 +213,11 @@ void identities() {
 }
 } // namespace
 
-int main() try {
-  formats();
-  boundaries();
-  declarations();
-  identities();
-} catch (const std::exception &error) {
-
-  std::cerr << error.what() << '\n';
-  return 1;
+int main() {
+  return fixture::run_test([] {
+    formats();
+    boundaries();
+    declarations();
+    identities();
+  });
 }

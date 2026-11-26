@@ -133,6 +133,19 @@ def swap_writes(old: tuple, x_register: int, y_register: int, *, mode1: int = 0,
                  for lane, register, raw, admitted in halves if admitted)
 
 
+def validate_flags(astat: int, stky: int) -> None:
+    if any(not isinstance(flags, int) or not 0 <= flags <= WORD_MASK
+           for flags in (astat, stky)):
+        raise ValueError("old flags must be raw 32-bit values")
+
+
+def compare_result(a, b, astat: int, stky: int, *, floating_point: bool = False) -> IntegerResult:
+    flags = (AF if floating_point else 0) | (AZ if a == b else 0) | (AN if a < b else 0)
+    history = ((astat & CACC) >> 1) & CACC
+    history |= 1 << 31 if a > b else 0
+    return IntegerResult(None, (astat & ~(ALU_FLAGS | CACC)) | history | flags, stky)
+
+
 def fixed(operation: str, left: int, right: int = 0, *, astat: int = 0,
           stky: int = 0, saturate: bool = False, truncate: bool = False) -> IntegerResult:
     """One ALU numeric operation on raw register views, not an ISA executor.
@@ -140,17 +153,13 @@ def fixed(operation: str, left: int, right: int = 0, *, astat: int = 0,
     astat/stky are old lane flags. None means a compare writes flags only.
     Memory, predicates, parallel priority and register selection are not modeled.
     """
-    if any(not isinstance(flags, int) or not 0 <= flags <= WORD_MASK
-           for flags in (astat, stky)):
-        raise ValueError("old flags must be raw 32-bit values")
+    validate_flags(astat, stky)
     x, y = raw_word(left), raw_word(right)
     sx, sy = signed(x), signed(y)
     carry_in = int(bool(astat & AC))
     if operation in ("cmp", "cmpu"):
         a, b = (x, y) if operation == "cmpu" else (sx, sy)
-        flags = (AZ if a == b else 0) | (AN if a < b else 0)
-        history = ((astat >> 1) & (CACC >> 1) & CACC) | ((1 << 31) if a > b else 0)
-        return IntegerResult(None, (astat & ~(ALU_FLAGS | CACC)) | history | flags, stky)
+        return compare_result(a, b, astat, stky)
 
     carry, overflow, input_negative = False, False, False
     arithmetic = {
@@ -381,9 +390,7 @@ def _floating_order(raw: int):
 def _floating_effects(result: FloatingResult, astat: int, stky: int, *,
                       zero_sticky: bool = False, overflow_sticky: bool = True,
                       absolute: bool = False, input_sign: bool = False) -> IntegerResult:
-    if any(not isinstance(flags, int) or not 0 <= flags <= WORD_MASK
-           for flags in (astat, stky)):
-        raise ValueError("old flags must be raw 32-bit values")
+    validate_flags(astat, stky)
     x = Operand(result.raw)
     negative = False if absolute else _floating_negative(x.raw)
     flags = AF | (AZ if x.kind == "zero" else 0)
@@ -461,25 +468,18 @@ def floating_alu(operation: str, left: int, right: int = 0, *, mode: Mode,
 
 def floating_compare(left: int, right: int, mode: Mode, *, astat: int = 0,
                      stky: int = 0) -> IntegerResult:
-    if any(not isinstance(flags, int) or not 0 <= flags <= WORD_MASK
-           for flags in (astat, stky)):
-        raise ValueError("old flags must be raw 32-bit values")
+    validate_flags(astat, stky)
     x, y = operand(left, mode), operand(right, mode)
     if "nan" in (x.kind, y.kind):
         raise Unqualified("unordered floating compare flags require qualification")
     a, b = _floating_order(x.raw), _floating_order(y.raw)
-    flags = AF | (AZ if a == b else 0) | (AN if a < b else 0)
-    history = ((astat & CACC) >> 1) & CACC
-    history |= 1 << 31 if a > b else 0
-    return IntegerResult(None, (astat & ~(ALU_FLAGS | CACC)) | history | flags, stky)
+    return compare_result(a, b, astat, stky, floating_point=True)
 
 
 def float_parts(operation: str, raw: int, mode: Mode, *, saturate: bool = False,
                 astat: int = 0, stky: int = 0) -> IntegerResult:
     """MANT/LOGB: mixed fixed/floating outputs with instruction-specific flags."""
-    if any(not isinstance(flags, int) or not 0 <= flags <= WORD_MASK
-           for flags in (astat, stky)):
-        raise ValueError("old flags must be raw 32-bit values")
+    validate_flags(astat, stky)
     if operation == "mant":
         if mode.precision == 32 and raw & 255:
             raise Unqualified("MANT extension input with RND32 requires qualification")
@@ -524,9 +524,7 @@ def fixed_from_float(operation: str, raw: int, mode: Mode, *, scale: int = 0,
         raise Unqualified(f"unmodeled float-to-fixed conversion: {operation}")
     if not isinstance(scale, int) or not -(1 << 31) <= scale < 1 << 31:
         raise ValueError("scale must be a signed 32-bit integer")
-    if any(not isinstance(flags, int) or not 0 <= flags <= WORD_MASK
-           for flags in (astat, stky)):
-        raise ValueError("old flags must be raw 32-bit values")
+    validate_flags(astat, stky)
     x = operand(raw, mode)
     if x.kind == "nan":
         raise Unqualified("FIX/TRUNC NaN sentinel status requires qualification")
@@ -566,9 +564,7 @@ SHIFTER_FLAGS = SV | SZ | SS
 
 def _shifter_result(value: int, astat: int, stky: int, *, overflow: bool = False,
                     negative: bool = False, write: bool = True) -> IntegerResult:
-    if any(not isinstance(flags, int) or not 0 <= flags <= WORD_MASK
-           for flags in (astat, stky)):
-        raise ValueError("old flags must be raw 32-bit values")
+    validate_flags(astat, stky)
     value &= WORD_MASK
     flags = (SV if overflow else 0) | (SZ if value == 0 else 0) | (SS if negative else 0)
     return IntegerResult(value << 8 if write else None, (astat & ~SHIFTER_FLAGS) | flags, stky)
@@ -736,9 +732,7 @@ def floating_seed(operation: str, raw: int, mode: Mode, *, astat: int = 0,
     """RECIPS/RSQRTS special cases; ordinary ROM seeds are never approximated."""
     if operation not in ("recips", "rsqrts"):
         raise Unqualified(f"unmodeled seed operation: {operation}")
-    if any(not isinstance(flags, int) or not 0 <= flags <= WORD_MASK
-           for flags in (astat, stky)):
-        raise ValueError("old flags must be raw 32-bit values")
+    validate_flags(astat, stky)
     x = operand(raw, mode)
     zero_input = x.kind in ("zero", "denormal")
     invalid = x.kind == "nan" or (operation == "rsqrts" and x.negative and not zero_input)
@@ -769,9 +763,7 @@ MOS = 1 << 6
 
 def floating_multiply(left: int, right: int, mode: Mode, *, astat: int = 0,
                       stky: int = 0) -> IntegerResult:
-    if any(not isinstance(flags, int) or not 0 <= flags <= WORD_MASK
-           for flags in (astat, stky)):
-        raise ValueError("old flags must be raw 32-bit values")
+    validate_flags(astat, stky)
     result = floating("mul", left, right, mode)
     flags = (MN if _floating_negative(result.raw) else 0)
     flags |= (MV if result.overflow else 0) | (MU if result.underflow else 0)
@@ -793,9 +785,7 @@ class MultiplierResult:
 def _accumulator_input(accumulator: int, astat: int, stky: int):
     if not isinstance(accumulator, int) or not 0 <= accumulator <= ACCUMULATOR_MASK:
         raise ValueError("accumulator must be raw 80-bit storage")
-    if any(not isinstance(flags, int) or not 0 <= flags <= WORD_MASK
-           for flags in (astat, stky)):
-        raise ValueError("old flags must be raw 32-bit values")
+    validate_flags(astat, stky)
 
 
 def _signed_accumulator(accumulator: int) -> int:

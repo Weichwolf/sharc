@@ -2,8 +2,9 @@
 """Independent register-bank and parallel writeback expectations from PRM 2-5..7."""
 
 from dataclasses import asdict
-from itertools import product
+from itertools import product as cartesian_product
 
+from expectation_check import require, require_raises
 from reference import IntegerResult, RegisterWrite, Unqualified, fixed, register_writeback, swap_writes
 
 
@@ -16,11 +17,6 @@ def replaced(old, lane, bank, register, value):
     # Independently form every expected physical cell; no model bank selector.
     return tuple(tuple(tuple(value if (p, b, r) == (lane, bank, register) else old[p][b][r]
                              for r in range(16)) for b in range(2)) for p in range(2))
-
-
-def require(actual, expected, context):
-    if actual != expected:
-        raise AssertionError((context, expected, actual))
 
 
 def anchors():
@@ -70,31 +66,27 @@ def bank_priority_lattice():
         # Unrelated MODE1 bits must not select a different physical data bank.
         mode |= 0xA5A5A5A5 & ~0x480
         require(register_writeback(old, (), mode1=mode), old, "empty writeback")
-        for lane in (0, 1):
-            for reg in range(16):
-                expected = replaced(old, lane, low_bank if reg < 8 else high_bank, reg, winning)
-                for row_index, row in enumerate(rows):
-                    for source in row:
-                        higher = RegisterWrite(source, lane, reg, winning)
-                        require(register_writeback(old, (higher,), mode1=mode), expected,
-                                (mode, lane, reg, source))
-                        count += 1
-                        for lower in rows[row_index + 1:]:
-                            for other in lower:
-                                weaker = RegisterWrite(other, lane, reg, losing)
-                                for writes in ((higher, weaker), (weaker, higher)):
-                                    require(register_writeback(old, writes, mode1=mode), expected,
-                                            (mode, lane, reg, source, other))
-                                    count += 1
-                for sources in (("dag1", "ureg"), ("alu_x", "alu_x")):
-                    proposals = tuple(RegisterWrite(source, lane, reg, raw)
-                                      for source, raw in zip(sources, (winning, losing)))
-                    try:
-                        register_writeback(old, proposals, mode1=mode)
-                    except Unqualified:
-                        refusals += 1
-                    else:
-                        raise AssertionError("unqualified winning-priority tie was accepted")
+        for lane, reg in cartesian_product((0, 1), range(16)):
+            expected = replaced(old, lane, low_bank if reg < 8 else high_bank, reg, winning)
+            for row_index, row in enumerate(rows):
+                for source in row:
+                    higher = RegisterWrite(source, lane, reg, winning)
+                    require(register_writeback(old, (higher,), mode1=mode), expected,
+                            (mode, lane, reg, source))
+                    count += 1
+                    for lower in rows[row_index + 1:]:
+                        for other in lower:
+                            weaker = RegisterWrite(other, lane, reg, losing)
+                            for writes in ((higher, weaker), (weaker, higher)):
+                                require(register_writeback(old, writes, mode1=mode), expected,
+                                        (mode, lane, reg, source, other))
+                                count += 1
+            for sources in (("dag1", "ureg"), ("alu_x", "alu_x")):
+                proposals = tuple(RegisterWrite(source, lane, reg, raw)
+                                  for source, raw in zip(sources, (winning, losing)))
+                require_raises(Unqualified, register_writeback, 'unqualified winning-priority tie was accepted',
+                               old, proposals, mode1=mode)
+                refusals += 1
     # A tie between losing sources cannot affect the unique higher-priority write.
     proposals = (RegisterWrite("alu_x", 0, 0, losing), RegisterWrite("alu_x", 0, 0, 0),
                  RegisterWrite("dag2", 0, 0, winning))
@@ -114,11 +106,7 @@ def invalid_inputs():
         lambda: register_writeback(replaced(old, 0, 1, 15, -1), ()),
     )
     for call in calls:
-        try:
-            call()
-        except ValueError:
-            continue
-        raise AssertionError("invalid writeback input was accepted")
+        require_raises(ValueError, call, 'invalid writeback input was accepted')
 
 
 def swap_anchors():
@@ -168,7 +156,7 @@ def swap_lattice():
     tables = (((False, False), (False, False), (True, True), (True, True)),
               ((False, False), (False, True), (True, False), (True, True)))
     count = 0
-    axes = product(bank_modes, enumerate(tables), (0, 0xA5A5A5A5 & ~0x200480),
+    axes = cartesian_product(bank_modes, enumerate(tables), (0, 0xA5A5A5A5 & ~0x200480),
                    range(4), range(16), range(16))
     for (mode, low_bank, high_bank), (simd, table), noise, index, x_reg, y_reg in axes:
         context = mode | (simd << 21) | noise
@@ -186,9 +174,6 @@ def swap_lattice():
         count += 1
     for args in ((-1, 0, (True, True)), (0, 16, (True, True)), (0, 1, (True,)),
                  (0, 1, (1, True))):
-        try:
-            swap_writes(old, args[0], args[1], selected=args[2])
-        except ValueError:
-            continue
-        raise AssertionError("invalid swap operands or predicates were accepted")
+        require_raises(ValueError, swap_writes, 'invalid swap operands or predicates were accepted',
+                       old, args[0], args[1], selected=args[2])
     return count

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #pragma once
 
+#include <exception>
+#include <iostream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -16,5 +18,15 @@ void throws(Function function, std::string_view message) {
     function();
   } catch (const Exception &) { return; }
   check(false, message);
+}
+
+template <class Function> int run_test(Function function) {
+  try {
+    function();
+    return 0;
+  } catch (const std::exception &error) {
+    std::cerr << error.what() << '\n';
+    return 1;
+  }
 }
 } // namespace fixture

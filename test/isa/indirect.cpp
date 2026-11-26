@@ -18,7 +18,6 @@ constexpr std::uint64_t relative_opcode = 0x090000000000, initial_clock = 123;
 constexpr std::uint32_t old_sticky = 0x80000400;
 constexpr std::uint32_t index_seed = 0x10203040, modifier_seed = 0x23456789, buffer_base = 0x5555;
 constexpr std::uint32_t near_wrap = 0xfffffff0;
-constexpr std::array modes{sharc::ExecutionMode::strict, sharc::ExecutionMode::fast_fp32};
 
 std::uint64_t indirect(unsigned index, unsigned modifier, unsigned condition = 31) {
   return 0x080000000000 | (std::uint64_t{condition} << condition_shift) |
@@ -88,9 +87,7 @@ void verify_selector(sharc::Core &core, Selector selector) {
     core.restore(saved);
     const auto result =
         deadline ? core.run_until(core.state().progress.base_cycles + 1) : core.run(1);
-    check(!result.has_fault &&
-              result.progress == sharc::Progress{.instructions = 1, .base_cycles = 4} &&
-              core.registers() == expected,
+    check(fixture::completed(result, 1, 4) && core.registers() == expected,
           "indirect selector, bank, wrapping, pre-modify or unchanged DAG state differs");
   }
 }
@@ -109,8 +106,8 @@ void selectors() {
   for (unsigned i = 1; i < words.size(); ++i) {
     program.code.variants[0].entries.push_back(base + i);
   }
-  for (const auto mode : modes) {
-    const auto native = sharc::Core::compile(program.code, {.mode = mode, .callbacks = {}});
+  for (const auto mode : fixture::numeric_modes) {
+    const auto native = fixture::compile(program.code, mode);
     sharc::Core core(program.memory(), mode);
     (void)core.install(native, fixture::Program::variant_id);
     for (unsigned row = 0; row < 16; ++row) {
@@ -126,20 +123,17 @@ void displacements() {
     for (const int displacement : {-32, -31, -1, 0, 1, 30, 31}) {
       const std::array words{relative(displacement)};
       fixture::Program program(words, address);
-      for (const auto mode : modes) {
-        const auto native = sharc::Core::compile(program.code, {.mode = mode, .callbacks = {}});
+      for (const auto mode : fixture::numeric_modes) {
+        const auto native = fixture::compile(program.code, mode);
         sharc::Core core(program.memory(), mode);
         auto expected = initial();
         expected.pc = address;
-        core.set_registers(expected);
-        (void)core.install(native, fixture::Program::variant_id);
+        fixture::install(core, native, expected);
         advance(expected,
                 {.pc = (address + static_cast<std::uint32_t>(displacement)) & address_mask,
                  .cycles = 4});
         const auto result = core.run(1);
-        check(!result.has_fault &&
-                  result.progress == sharc::Progress{.instructions = 1, .base_cycles = 4} &&
-                  core.registers() == expected,
+        check(fixture::completed(result, 1, 4) && core.registers() == expected,
               "signed six-bit PC-relative target or 24-bit wrap differs");
       }
     }
@@ -173,9 +167,7 @@ void verify_parallel(sharc::Core &core, bool otherwise, unsigned row) {
     core.restore(saved);
     const auto result =
         deadline ? core.run_until(core.state().progress.base_cycles + 1) : core.run(1);
-    check(!result.has_fault &&
-              result.progress == sharc::Progress{.instructions = 1, .base_cycles = cycles} &&
-              core.registers() == expected,
+    check(fixture::completed(result, 1, cycles) && core.registers() == expected,
           "parallel branch used new flags or incorrect SISD/SIMD/ELSE compute lanes");
   }
 }
@@ -190,8 +182,8 @@ void parallel_predicates() {
                              std::uint64_t{0}};
       fixture::Program program(words);
       program.code.variants[0].entries.push_back(base + 2);
-      for (const auto mode : modes) {
-        const auto native = sharc::Core::compile(program.code, {.mode = mode, .callbacks = {}});
+      for (const auto mode : fixture::numeric_modes) {
+        const auto native = fixture::compile(program.code, mode);
         sharc::Core core(program.memory(), mode);
         (void)core.install(native, fixture::Program::variant_id);
         for (unsigned row = 0; row < 8; ++row) { verify_parallel(core, otherwise, row); }
@@ -239,8 +231,8 @@ void cross_unit_call(bool relative_call) {
                                           {base + 2, base + 4, base + 6});
   constexpr std::array pcs{base + 4, base + 5, base + 1, base + 2, base + 6, base + 7};
   constexpr std::array cycles{4U, 5U, 9U, 10U, 14U, 15U};
-  for (const auto mode : modes) {
-    const auto native = sharc::Core::compile(program.code, {.mode = mode, .callbacks = {}});
+  for (const auto mode : fixture::numeric_modes) {
+    const auto native = fixture::compile(program.code, mode);
     const auto states = call_states();
     sharc::Core core(program.memory(), mode);
     sharc::Core resumed(program.memory(), mode);
@@ -249,9 +241,8 @@ void cross_unit_call(bool relative_call) {
     for (unsigned count = 1; count < states.size(); ++count) {
       core.set_registers(states[0]);
       const auto result = core.run(count);
-      check(!result.has_fault && core.registers() == states[count] &&
-                result.progress ==
-                    sharc::Progress{.instructions = count, .base_cycles = cycles[count - 1]},
+      check(fixture::completed(result, count, cycles[count - 1]) &&
+                core.registers() == states[count],
             "indirect call/return differs at an owner instruction bound");
       resumed.restore(core.save());
       if (count < pcs.size()) {
@@ -298,8 +289,8 @@ void cross_unit_call(bool relative_call) {
 void full_parallel_call() {
   const std::array words{indirect(8, 8, 0) | (std::uint64_t{1} << 39) | 0x1012, std::uint64_t{0}};
   fixture::Program program(words);
-  for (const auto mode : modes) {
-    const auto native = sharc::Core::compile(program.code, {.mode = mode, .callbacks = {}});
+  for (const auto mode : fixture::numeric_modes) {
+    const auto native = fixture::compile(program.code, mode);
     sharc::Core core(program.memory(), mode);
     (void)core.install(native, fixture::Program::variant_id);
     for (const bool taken : {false, true}) {
@@ -327,8 +318,8 @@ void full_parallel_call() {
 void parallel_interlock() {
   const std::array words{relative(2, 0) | 0x1012, relative(2, 0), std::uint64_t{0}, relative(0, 0)};
   fixture::Program program(words);
-  for (const auto mode : modes) {
-    const auto native = sharc::Core::compile(program.code, {.mode = mode, .callbacks = {}});
+  for (const auto mode : fixture::numeric_modes) {
+    const auto native = fixture::compile(program.code, mode);
     sharc::Core core(program.memory(), mode);
     sharc::Core resumed(program.memory(), mode);
     (void)core.install(native, fixture::Program::variant_id);
@@ -355,8 +346,7 @@ void parallel_interlock() {
       if (zero) {
         const auto following = resumed.run(1);
         advance(expected, {.pc = base + 3, .cycles = 4});
-        check(!following.has_fault && resumed.registers() == expected &&
-                  following.progress == sharc::Progress{.instructions = 1, .base_cycles = 4},
+        check(fixture::completed(following, 1, 4) && resumed.registers() == expected,
               "taken branch failed to clear its preceding compute interlock");
       }
     }
@@ -364,22 +354,8 @@ void parallel_interlock() {
 }
 
 void refused_forms() {
-  constexpr std::array unsupported_bits{24U, 26U, 38U};
-  for (const unsigned bit : unsupported_bits) {
-    const auto word = indirect(8, 8) | (std::uint64_t{1} << bit);
-    fixture::throws<sharc::PreparationError>(
-        [&] { (void)sharc::Core::lower(fixture::image(sharc::InstructionSet::isa, word)); },
-        "unsupported computed-branch modifier was accepted");
-  }
-  const auto word = indirect(8, 8) | (std::uint64_t{1} << 23);
-  try {
-    (void)sharc::Core::lower(fixture::image(sharc::InstructionSet::isa, word));
-    check(false, "reserved computed-branch bit was accepted");
-  } catch (const sharc::PreparationError &error) {
-    check(error.fault().reason == sharc::FaultReason::invalid_encoding &&
-              error.fault().instruction == word && error.fault().address == base,
-          "computed-branch refusal lost identity or reason");
-  }
+  constexpr std::array reserved{23U};
+  fixture::verify_branch_fields(indirect(8, 8), reserved);
 }
 
 void long_indirect_chain() {
@@ -387,18 +363,15 @@ void long_indirect_chain() {
   constexpr std::uint64_t total_cycles = std::uint64_t{count} * 4;
   const std::array words{indirect(8, 8)};
   fixture::Program program(words);
-  for (const auto mode : modes) {
-    const auto native = sharc::Core::compile(program.code, {.mode = mode, .callbacks = {}});
+  for (const auto mode : fixture::numeric_modes) {
+    const auto native = fixture::compile(program.code, mode);
     sharc::Core core(program.memory(), mode);
     auto expected = initial();
     expected.dag[0][8].index = base;
-    core.set_registers(expected);
-    (void)core.install(native, fixture::Program::variant_id);
+    fixture::install(core, native, expected);
     const auto result = core.run(count);
     advance(expected, {.pc = base, .cycles = count * 4});
-    check(!result.has_fault && core.registers() == expected &&
-              result.progress ==
-                  sharc::Progress{.instructions = count, .base_cycles = total_cycles},
+    check(fixture::completed(result, count, total_cycles) && core.registers() == expected,
           "indirect native chaining lost progress or used recursive host calls");
   }
 }

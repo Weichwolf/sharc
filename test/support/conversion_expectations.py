@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: GPL-3.0-only
 """Authored FIX/TRUNC anchors and direct signed-quotient cross-checks."""
 
+from itertools import product as cartesian_product
 from dataclasses import asdict
 
+from expectation_check import anchor, require, require_raises
 from reference import IntegerResult, Mode, Unqualified, fixed_from_float
 
 
@@ -70,12 +72,8 @@ CONVERSIONS = [
 def anchors():
     records = []
     for name, operation, raw, mode, options, expected in CONVERSIONS:
-        actual = fixed_from_float(operation, raw, mode, **options)
-        if actual != expected:
-            raise AssertionError(f"{name}: expected {expected}, got {actual}")
-        records.append({"name": name, "kind": "conversion", "operation": operation,
-                        "left": raw, "mode": asdict(mode), "options": options,
-                        "expected": asdict(expected)})
+        records.append(anchor(name, "conversion", fixed_from_float(operation, raw, mode, **options),
+                              expected, operation=operation, left=raw, mode=asdict(mode), options=options))
     return records
 
 
@@ -87,46 +85,39 @@ def quotient_lattice():
     """
     count, refusals = 0, 0
     for exponent in (1, 125, 126, 127, 128, 156, 157, 158, 159, 254):
-        for fraction in (0, 1, 127, 128, 255, 256, 0x7FFFFF00, 0x7FFFFFFF):
-            for width in (32, 40):
-                mantissa = (1 << 31) + (fraction if width == 40 else fraction & ~255)
-                for scale in (-2, -1, 0, 1, 2):
-                    shift = exponent - 158 + scale
-                    numerator = mantissa << max(shift, 0)
-                    denominator = 1 << max(-shift, 0)
-                    for negative in (False, True):
-                        number = -numerator if negative else numerator
-                        raw = (int(negative) << 39) | (exponent << 31) | fraction
-                        for rounding in ("nearest", "zero"):
-                            for operation in ("fix", "trunc"):
-                                quotient, remainder = divmod(number, denominator)
-                                if operation == "trunc":
-                                    quotient += int(negative and remainder != 0)
-                                elif rounding == "nearest":
-                                    quotient += int(2 * remainder > denominator or (
-                                        2 * remainder == denominator and quotient & 1))
-                                for saturate in (False, True):
-                                    options = dict(scale=scale, saturate=saturate,
-                                                   astat=0xFFFFFFFF, stky=0x100)
-                                    overflow = not -(1 << 31) <= quotient < 1 << 31
-                                    if overflow and not saturate:
-                                        try:
-                                            fixed_from_float(operation, raw, Mode(width, rounding),
-                                                             **options)
-                                        except Unqualified:
-                                            refusals += 1
-                                            continue
-                                        raise AssertionError("unqualified conversion accepted")
-                                    value = min(max(quotient, -(1 << 31)), (1 << 31) - 1)
-                                    av = exponent + scale > 157
-                                    flags = 0xFFFFFFC0 | int(value == 0) | (int(av) << 1)
-                                    flags |= int(value < 0) << 2
-                                    sticky = 0x100 | int(0 < abs(number) < denominator) | (int(av) << 1)
-                                    expected = IntegerResult((value & 0xFFFFFFFF) << 8, flags, sticky)
-                                    actual = fixed_from_float(operation, raw, Mode(width, rounding),
-                                                              **options)
-                                    if actual != expected:
-                                        raise AssertionError((operation, raw, rounding, options,
-                                                              expected, actual))
-                                    count += 1
+        for fraction, width in cartesian_product((0, 1, 127, 128, 255, 256, 0x7FFFFF00, 0x7FFFFFFF), (32, 40)):
+            mantissa = (1 << 31) + (fraction if width == 40 else fraction & ~255)
+            for scale in (-2, -1, 0, 1, 2):
+                shift = exponent - 158 + scale
+                numerator = mantissa << max(shift, 0)
+                denominator = 1 << max(-shift, 0)
+                for negative in (False, True):
+                    number = -numerator if negative else numerator
+                    raw = (int(negative) << 39) | (exponent << 31) | fraction
+                    for rounding, operation in cartesian_product(("nearest", "zero"), ("fix", "trunc")):
+                        quotient, remainder = divmod(number, denominator)
+                        if operation == "trunc":
+                            quotient += int(negative and remainder != 0)
+                        elif rounding == "nearest":
+                            quotient += int(2 * remainder > denominator or (
+                                2 * remainder == denominator and quotient & 1))
+                        for saturate in (False, True):
+                            options = dict(scale=scale, saturate=saturate,
+                                           astat=0xFFFFFFFF, stky=0x100)
+                            overflow = not -(1 << 31) <= quotient < 1 << 31
+                            if overflow and not saturate:
+                                require_raises(Unqualified, fixed_from_float, 'unqualified conversion accepted',
+                                               operation, raw, Mode(width, rounding), **options)
+                                refusals += 1
+                                continue
+                            value = min(max(quotient, -(1 << 31)), (1 << 31) - 1)
+                            av = exponent + scale > 157
+                            flags = 0xFFFFFFC0 | int(value == 0) | (int(av) << 1)
+                            flags |= int(value < 0) << 2
+                            sticky = 0x100 | int(0 < abs(number) < denominator) | (int(av) << 1)
+                            expected = IntegerResult((value & 0xFFFFFFFF) << 8, flags, sticky)
+                            actual = fixed_from_float(operation, raw, Mode(width, rounding),
+                                                      **options)
+                            require(actual, expected, (operation, raw, rounding, options))
+                            count += 1
     return count, refusals

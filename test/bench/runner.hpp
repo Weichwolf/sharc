@@ -2,8 +2,11 @@
 #pragma once
 
 #include "../support/check.hpp"
+#include "../support/isa.hpp"
+#include "../support/word_space.hpp"
 #include "counters.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -14,6 +17,7 @@
 #include <sharc/core.hpp>
 #include <span>
 #include <stdexcept>
+#include <string>
 #include <string_view>
 #include <sys/mman.h>
 
@@ -22,42 +26,44 @@ using Clock = std::chrono::steady_clock;
 
 class WordSpace {
 public:
-  static constexpr auto bytes = std::size_t{1} << 34;
-  static constexpr unsigned word_bytes = 4;
+  void protect_read_only() const { mapping_.protect(0, fixture::word_space_bytes, PROT_READ); }
 
-  WordSpace()
-      : base_(mmap(nullptr,
-                   bytes,
-                   PROT_READ | PROT_WRITE,
-                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
-                   -1,
-                   0)) {
-    if (base_ == MAP_FAILED) {
-      throw std::runtime_error("benchmark complete-space reservation failed");
+  [[nodiscard]] std::span<std::byte> all() const { return mapping_.bytes(); }
+
+  [[nodiscard]] std::span<std::byte> at(std::uint32_t address, std::size_t size) const {
+    return all().subspan(std::size_t{address} * 4, size);
+  }
+
+  void write_words(std::uint32_t address, std::span<const std::uint32_t> words) const {
+    auto target = at(address, words.size_bytes());
+    for (std::size_t i = 0; i < words.size(); ++i) {
+      fixture::put_word(target.data() + (i * sizeof(std::uint32_t)), words[i]);
     }
   }
 
-  ~WordSpace() { (void)munmap(base_, bytes); }
-
-  WordSpace(const WordSpace &) = delete;
-  WordSpace &operator=(const WordSpace &) = delete;
-  WordSpace(WordSpace &&) = delete;
-  WordSpace &operator=(WordSpace &&) = delete;
-
-  void protect_read_only() const {
-    fixture::check(mprotect(base_, bytes, PROT_READ) == 0, "benchmark read protection failed");
+  void check_words(std::uint32_t address,
+                   std::span<const std::uint32_t> words,
+                   std::string_view message) const {
+    const auto source = at(address, words.size_bytes());
+    for (std::size_t i = 0; i < words.size(); ++i) {
+      fixture::check(fixture::get_word(source.data() + (i * sizeof(std::uint32_t))) == words[i],
+                     message);
+    }
   }
 
-  [[nodiscard]] std::span<std::byte> all() const {
-    return {static_cast<std::byte *>(base_), bytes};
-  }
-
-  [[nodiscard]] std::span<std::byte> at(std::uint32_t address, std::size_t size) const {
-    return all().subspan(std::size_t{address} * word_bytes, size);
+  void check_guards(std::uint32_t before,
+                    std::uint32_t after,
+                    std::byte guard,
+                    std::string_view message) const {
+    for (const auto address : {before, after}) {
+      fixture::check(std::ranges::all_of(at(address, sizeof(std::uint32_t)),
+                                         [guard](std::byte byte) { return byte == guard; }),
+                     message);
+    }
   }
 
 private:
-  void *base_;
+  fixture::Mapping mapping_{fixture::word_space_bytes, PROT_READ | PROT_WRITE};
 };
 
 inline int pin_cpu() {
@@ -99,6 +105,17 @@ inline Options start(int argc, char **argv) {
   return {.measure = argc >= 2 && std::string_view(argv[1]) == "--measure",
           .memory_mode = argc == 3 ? sharc::CompileOptions::MemoryMode::direct
                                    : sharc::CompileOptions::MemoryMode::exact};
+}
+
+template <class Run> int run_modes(int argc, char **argv, Run run) {
+  return fixture::run_test([&] {
+    const auto options = start(argc, argv);
+    for (const auto mode : fixture::numeric_modes) { run(mode, options); }
+  });
+}
+
+inline std::string counter_value(bool measured, std::uint64_t value) {
+  return measured ? std::to_string(value) : "null";
 }
 
 struct Kernel {
@@ -148,19 +165,10 @@ void sample(Kernel kernel,
     check(result);
     if (repeat != 0) { std::cout << ','; }
     std::cout << "{\"nanoseconds\":" << nanoseconds(start, end)
-              << ",\"reference_nanoseconds\":" << native_time << ",\"host_instructions\":";
-    if (measure) {
-      std::cout << counts.instructions;
-    } else {
-      std::cout << "null";
-    }
-    std::cout << ",\"host_cycles\":";
-    if (measure) {
-      std::cout << counts.cycles;
-    } else {
-      std::cout << "null";
-    }
-    std::cout << ",\"enabled\":" << counts.enabled << ",\"running\":" << counts.running << '}';
+              << ",\"reference_nanoseconds\":" << native_time
+              << ",\"host_instructions\":" << counter_value(measure, counts.instructions)
+              << ",\"host_cycles\":" << counter_value(measure, counts.cycles)
+              << ",\"enabled\":" << counts.enabled << ",\"running\":" << counts.running << '}';
   }
   std::cout << "]}\n";
 }
