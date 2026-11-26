@@ -141,8 +141,8 @@ struct LoopPipeline {
   std::uint64_t short_parent_tail{};
   std::array<std::uint64_t, detail::short_state_words> short_loop{};
   std::array<std::uint64_t, Registers::pc_stack_capacity> calls{};
-  std::array<std::uint64_t, Registers::pc_stack_capacity * detail::short_call_state_words>
-      short_calls{};
+  std::array<std::uint64_t, Registers::pc_stack_capacity * detail::suspended_call_state_words>
+      suspended_calls{};
   std::uint64_t return_tail{};
 
   [[nodiscard]] bool active() const {
@@ -250,7 +250,7 @@ struct Core::Impl {
     }
     pointers[detail::short_counted_tail_slot] = &loops.short_counted_tail;
     pointers[detail::short_parent_tail_slot] = &loops.short_parent_tail;
-    pointers[detail::short_call_state_slot] = loops.short_calls.data();
+    pointers[detail::suspended_call_state_slot] = loops.suspended_calls.data();
     pointers[detail::interrupt_latch_slot] = &state.registers.irptl;
     for (unsigned bank = 0; bank < 2; ++bank) {
       for (unsigned index = 0; index < 16; ++index) {

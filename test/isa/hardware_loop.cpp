@@ -766,14 +766,15 @@ void parent_lce_add(Timeline &trace, unsigned pc) {
 
 enum class OverlapTail : std::uint8_t { ordinary, endpoint_call, not_lce };
 
-void parent_count_tail(Timeline &trace, unsigned end, bool repeats, OverlapTail tail) {
+void parent_count_tail(
+    Timeline &trace, unsigned end, bool repeats, OverlapTail tail, unsigned entry_cycles = 3) {
   for (unsigned pc = first_parent_word; pc <= end; ++pc) {
     if (tail == OverlapTail::not_lce && pc > first_parent_word &&
         (repeats || (end == first_parent_word + 3 && pc == first_parent_word + 1))) {
       // At gap four the first parent compute still sees the old condition.
       parent_lce_add(trace, pc - 1);
     }
-    trace.boundary(base + pc, pc == first_parent_word ? 3U : 1U);
+    trace.boundary(base + pc, pc == first_parent_word ? entry_cycles : 1U);
     if (repeats) {
       constexpr std::array fetch{4U, 3U, 2U, 1U};
       const auto distance = end - pc;
@@ -3163,6 +3164,233 @@ void conditional_endpoint_call(bool call_if_nonzero) {
   verify_timeline(program, initial, trace);
 }
 
+constexpr unsigned refill_call_end = first_parent_word - 1;
+constexpr unsigned refill_call_sub = 16;
+
+struct RefillCall {
+  unsigned pc, gap;
+  bool delayed{};
+  bool child_repeats{};
+};
+
+unsigned refill_call_return(Timeline &trace, RefillCall call, unsigned resume, bool tagged) {
+  entered_call(trace,
+               {.target = base + refill_call_sub,
+                .raw_return = call_tag | (tagged ? termination_tag : 0) | (base + resume)});
+  trace.boundary(base + refill_call_sub + 1);
+  trace.record();
+  popped_call(trace.registers);
+  if (call.delayed) {
+    short_boundary(trace,
+                   {.pc = refill_call_sub + 2, .fetch = resume + 1, .decode = refill_call_sub + 4});
+    short_boundary(trace, {.pc = refill_call_sub + 3, .fetch = resume + 2, .decode = resume});
+  }
+  return call.delayed ? 2U : 4U;
+}
+
+void counted_ancestor_refill_call_turn(Timeline &trace, RefillCall call, bool repeats) {
+  auto &state = trace.registers;
+  if (call.child_repeats) { state.pe[0].data[0][0] = 2U << raw_shift; }
+  trace.boundary(base + 2);
+  trace.record();
+  enter_arithmetic_child(trace);
+  if (call.child_repeats) {
+    state.pe[0].data[0][0] = 1U << raw_shift;
+    state.pe[0].astat = ac;
+    short_boundary(trace, {.pc = 4, .fetch = 3, .decode = 6});
+    short_boundary(trace, {.pc = 5, .fetch = 4, .decode = 7});
+    short_boundary(trace, {.pc = 6, .fetch = 5, .decode = 3});
+    short_boundary(trace, {.pc = 7, .fetch = 6, .decode = 4});
+    const auto clocks = refill_call_return(trace, call, 3, false);
+    trace.boundary(base + 3, clocks);
+    trace.record();
+    state.pe[0].data[0][0] = 0;
+  }
+  state.pe[0].astat = az | (call.child_repeats ? ac : 0);
+  short_boundary(trace, {.pc = 4, .fetch = 3, .decode = 6});
+  short_boundary(trace, {.pc = 5, .fetch = 4, .decode = 7});
+  leave_nested_child(state);
+  short_boundary(trace, {.pc = 6, .fetch = 8, .decode = 3});
+
+  const auto drain = call.pc == 6 ? refill_call_return(trace, call, 7, true) : 1U;
+  if (call.gap == 1) { parent_count_sample(trace, repeats); }
+  short_boundary(trace, {.pc = 7, .fetch = call.gap == 1 && repeats ? 1U : 9U, .decode = 4}, drain);
+  const auto entry =
+      call.pc == 7 ? refill_call_return(trace, call, 8, call.gap == 1 && !repeats) : 3U;
+  if (call.gap != 1) { parent_count_sample(trace, repeats); }
+  const auto end = refill_call_end + call.gap;
+  parent_count_tail(trace, end, repeats, OverlapTail::not_lce, entry);
+  if (repeats) { parent_lce_add(trace, end); }
+  finish_overlapping_outer(trace, base + (repeats ? 1U : end + 1), false);
+}
+
+void counted_ancestor_refill_call(RefillCall call) {
+  constexpr auto twice = do_immediate | (std::uint64_t{2} << count_shift);
+  const auto end = refill_call_end + call.gap;
+  std::array<std::uint64_t, refill_call_sub + 5> words{};
+  words[0] = twice | end;
+  words[2] = do_eq | 5;
+  words[3] = fixture::add(0, 0, 0);
+  if (call.child_repeats) {
+    words[1] = fixture::immediate(0, 2);
+    words[3] = fixture::add(0, 0, 1);
+  }
+  words[call.pc] = call.delayed ? call_dag2 : call_direct | (base + refill_call_sub);
+  words[refill_call_sub + 1] = rts | lr | (call.delayed ? db : 0);
+  for (unsigned pc = first_parent_word; pc <= end; ++pc) {
+    const auto reg = pc - first_parent_word + 2;
+    words[pc] = if_not_lce(fixture::add(reg, reg, 7));
+  }
+  fixture::Program program(words);
+  auto initial = starting();
+  initial.pe[0].data[0][7] = 1U << raw_shift;
+  if (call.child_repeats) {
+    initial.pe[0].data[0][1] = std::uint64_t{std::numeric_limits<std::uint32_t>::max()}
+                               << raw_shift;
+  }
+  if (call.delayed) {
+    initial.dag[0][8].index = base + refill_call_sub;
+    program.code.variants[0].entries.push_back(base + refill_call_sub);
+    program.code.variants[0].entries.push_back(base + call.pc + 1);
+  }
+  Timeline trace{.registers = initial, .prefixes = {}};
+  trace.registers.lcntr = 2;
+  entered(trace, {.address = counted_address | (base + end), .count = 2});
+  for (const bool repeats : {true, false}) {
+    counted_ancestor_refill_call_turn(trace, call, repeats);
+  }
+  verify_timeline(program, initial, trace);
+}
+
+void refill_call_arithmetic_callee(Timeline &trace, bool ending) {
+  constexpr auto sub = refill_call_sub;
+  auto &state = trace.registers;
+  state.pc_stack[2] = base + sub + 1;
+  state.pc_stack_pointer = 3;
+  state.loop_address_depth = state.loop_counter_depth = 2;
+  state.loop_address_stack[1] = base + sub + 4;
+  state.loop_counter_stack[1] = old_lcntr;
+  short_boundary(trace, {.pc = sub + 1, .fetch = sub + 1, .decode = sub + 3});
+  short_boundary(trace, {.pc = sub + 2, .fetch = sub + 2, .decode = sub + 4});
+  state.pc_stack_pointer = 2;
+  state.loop_address_depth = state.loop_counter_depth = 1;
+  short_boundary(trace, {.pc = sub + 3, .fetch = sub + 5, .decode = sub + 1});
+  short_boundary(trace, {.pc = sub + 4, .fetch = sub + 6, .decode = sub + 2});
+  trace.boundary(base + sub + 5, 3);
+  trace.record();
+  popped_call(state);
+  short_boundary(trace, {.pc = sub + 6, .fetch = 9, .decode = sub + 8});
+  short_boundary(trace, {.pc = sub + 7, .fetch = 10, .decode = 8});
+  state.pe[1].astat = ending ? az : 0;
+  state.pe[1].data[0][3] = ending ? 0 : 2U << raw_shift;
+}
+
+void arithmetic_ancestor_refill_call(bool ending) {
+  constexpr auto sub = refill_call_sub;
+  constexpr auto simd = 1U << 21;
+  std::array<std::uint64_t, sub + 8> words{};
+  words[0] = do_eq | 9;
+  words[2] = do_eq | 5;
+  words[3] = fixture::add(0, 0, 0);
+  words[7] = call_dag2;
+  words[sub] = do_eq | 4;
+  words[sub + 5] = rts | db | lr;
+  words[sub + 7] = fixture::add(3, 4, 4);
+  fixture::Program program(words);
+  program.code.variants[0].entries.push_back(base + sub);
+  program.code.variants[0].entries.push_back(base + 8);
+  auto initial = starting();
+  initial.mode1 = simd;
+  initial.dag[0][8].index = base + sub;
+  initial.pe[1].data[0][4] = ending ? 0 : 1U << raw_shift;
+  Timeline trace{.registers = initial, .prefixes = {}};
+  auto &state = trace.registers;
+  entered(trace, {.address = base + 9, .count = old_lcntr});
+  trace.boundary(base + 2);
+  trace.record();
+  enter_arithmetic_child(trace);
+  for (auto &lane : state.pe) { lane.astat = az; }
+  short_boundary(trace, {.pc = 4, .fetch = 3, .decode = 6});
+  short_boundary(trace, {.pc = 5, .fetch = 4, .decode = 7});
+  leave_nested_child(state);
+  short_boundary(trace, {.pc = 6, .fetch = 8, .decode = 3});
+  short_boundary(trace, {.pc = 7, .fetch = 9, .decode = 4});
+  entered_call(trace, {.target = base + sub, .raw_return = call_tag | (base + 8)});
+  refill_call_arithmetic_callee(trace, ending);
+  // The last return slot is visible to both lanes of the displaced sample.
+  if (ending) { popped(state); }
+  short_boundary(trace, {.pc = 8, .fetch = ending ? 10U : 3U, .decode = 1}, 2);
+  short_boundary(trace, {.pc = 9, .fetch = ending ? 11U : 4U, .decode = 2});
+  trace.boundary(base + (ending ? 10U : 1U), ending ? 3U : 1U);
+  trace.record();
+  verify_timeline(program, initial, trace);
+}
+
+void two_counted_ancestors_refill_calls() {
+  constexpr auto once = do_immediate | (std::uint64_t{1} << count_shift);
+  constexpr auto sub = refill_call_sub;
+  std::array<std::uint64_t, sub + 5> words{};
+  words[0] = once | 9;
+  words[1] = once | 7;
+  words[2] = do_eq | 5;
+  words[3] = fixture::add(0, 0, 0);
+  words[6] = words[7] = call_dag2;
+  words[8] = if_not_lce(fixture::add(2, 2, 1));
+  words[9] = if_not_lce(fixture::add(3, 3, 1));
+  words[sub + 1] = rts | lr | db;
+  fixture::Program program(words);
+  for (const auto pc : {7U, 8U, sub}) { program.code.variants[0].entries.push_back(base + pc); }
+  auto initial = starting();
+  initial.dag[0][8].index = base + sub;
+  initial.pe[0].data[0][1] = 1U << raw_shift;
+  Timeline trace{.registers = initial, .prefixes = {}};
+  auto &state = trace.registers;
+  state.lcntr = 1;
+  entered(trace, {.address = counted_address | (base + 9), .count = 1});
+  state.pc_stack_pointer = state.loop_address_depth = state.loop_counter_depth = 2;
+  state.pc_stack[1] = base + 2;
+  state.loop_address_stack[1] = counted_address | (base + 8);
+  state.loop_counter_stack[1] = 1;
+  trace.boundary(base + 2);
+  trace.record();
+  state.pc_stack_pointer = state.loop_address_depth = state.loop_counter_depth = 3;
+  state.pc_stack[2] = base + 3;
+  state.loop_address_stack[2] = base + 7;
+  state.loop_counter_stack[2] = 1;
+  trace.boundary(base + 3);
+  trace.record();
+  state.pe[0].astat = az;
+  short_boundary(trace, {.pc = 4, .fetch = 3, .decode = 6});
+  short_boundary(trace, {.pc = 5, .fetch = 4, .decode = 7});
+  state.pc_stack_pointer = state.loop_address_depth = state.loop_counter_depth = 2;
+  short_boundary(trace, {.pc = 6, .fetch = 8, .decode = 3});
+  const auto penultimate = refill_call_return(trace, {.pc = 6, .gap = 1, .delayed = true}, 7, true);
+  state.loop_counter_stack[1] = 0;
+  leave_nested_child(state);
+  short_boundary(trace, {.pc = 7, .fetch = 9, .decode = 4}, penultimate);
+  const auto endpoint = refill_call_return(trace, {.pc = 7, .gap = 2, .delayed = true}, 8, true);
+  parent_count_sample(trace, false);
+  trace.boundary(base + 8, endpoint);
+  trace.record();
+  trace.boundary(base + 9);
+  trace.record();
+  trace.boundary(base + 10);
+  trace.record();
+  verify_timeline(program, initial, trace);
+}
+
+void arithmetic_refill_call_cases() {
+  for (const auto gap : {1U, 2U, 3U, 4U}) {
+    counted_ancestor_refill_call({.pc = refill_call_end - 1, .gap = gap, .delayed = gap == 1});
+    counted_ancestor_refill_call({.pc = refill_call_end, .gap = gap, .delayed = gap % 2 == 0});
+  }
+  counted_ancestor_refill_call(
+      {.pc = refill_call_end, .gap = 1, .delayed = true, .child_repeats = true});
+  arithmetic_ancestor_refill_call(false);
+  arithmetic_ancestor_refill_call(true);
+  two_counted_ancestors_refill_calls();
+}
+
 void arithmetic_call_reentry() {
   constexpr auto sub = base + 8;
   constexpr auto ret = base + 13;
@@ -3600,6 +3828,7 @@ void fixture::hardware_loop_control_flow() {
   arithmetic_fetch_call();
   conditional_endpoint_call(false);
   conditional_endpoint_call(true);
+  arithmetic_refill_call_cases();
   arithmetic_call_reentry();
   predicated_loop_abort();
   arithmetic_loop_abort();

@@ -244,6 +244,7 @@ struct LoopShape {
   unsigned length{}, term{};
   bool has_reentry{};
   bool has_tail_abort{};
+  bool suspends_enclosing_tail{};
 
   [[nodiscard]] bool counted() const { return term == loop_counter_expired; }
 
@@ -282,6 +283,7 @@ constexpr std::uint64_t return_loop_fetch = 1ULL << 50;
 constexpr std::uint64_t return_loop_condition = 1ULL << 51;
 constexpr unsigned counted_tail_index_shift = 52;
 constexpr std::uint64_t counted_tail_index_mask = 7ULL << counted_tail_index_shift;
+constexpr std::uint64_t return_enclosing_tail = 1ULL << 55;
 // A four-word loop can have at most 2^34-1 words left after a CALL.
 constexpr unsigned return_short_left_shift = 24;
 constexpr std::uint64_t return_short_left_mask = (unsigned_limit * loop_fetch_distance) - 1;
@@ -300,6 +302,9 @@ constexpr auto lce_clock_mask = lce_age_mask | lce_before_credit;
 
 std::uint64_t loop_return_payload(std::uint32_t call_pc, const LoopShape &shape) {
   if (shape.short_body()) { return return_short_loop | ((call_pc + 1) & maximum_pc); }
+  if (shape.suspends_enclosing_tail) {
+    return return_enclosing_tail | ((call_pc + 1) & maximum_pc);
+  }
   const auto address = (std::uint64_t{shape.end} << loop_refill_end_shift) | shape.start;
   if (call_pc == ((shape.end - loop_fetch_distance) & maximum_pc)) {
     return address | return_loop_fetch;
@@ -703,6 +708,8 @@ struct OverlappingLoopFetch {
   LoopShape parent;
 };
 
+enum class RefillSample : std::uint8_t { instruction, whole_turn, call_return };
+
 bool overlapping_tail(const LoopShape &child, const LoopShape &parent) {
   const auto gap = (parent.end - child.end) & maximum_pc;
   return gap != 0 && gap <= loop_fetch_distance && parent.contains((child.start - 1) & maximum_pc);
@@ -710,6 +717,11 @@ bool overlapping_tail(const LoopShape &child, const LoopShape &parent) {
 
 bool overlapping_refill(const LoopShape &child, const LoopShape &parent) {
   return child.arithmetic() && !child.short_body() && overlapping_tail(child, parent);
+}
+
+bool late_arithmetic_call(const LoopShape &shape, std::uint32_t pc) {
+  return shape.arithmetic() && !shape.short_body() &&
+         ((shape.end - pc) & maximum_pc) < loop_decode_distance;
 }
 
 bool overlapping_short_tail(const LoopShape &child, const LoopShape &parent) {
@@ -969,7 +981,7 @@ private:
   void overlapping_loop_fetches(Values &values,
                                 std::uint32_t pc,
                                 llvm::Value *refill,
-                                bool whole_turn = false);
+                                RefillSample sample = RefillSample::instruction);
   void loop_refill(Values &values, const Instruction &op);
   void check_loop_end(const Values &values, const Instruction &op, bool partial);
 
@@ -1049,11 +1061,13 @@ private:
   void push_pc(Values &values, llvm::Value *address);
   void call(Values &values, const Instruction &op, bool partial);
   llvm::Value *loop_call_address(Values &values, const Instruction &op, const LoopShape &shape);
+  llvm::Value *parent_exit_before_call(const LoopShape &shape, llvm::Value *terminating);
   llvm::Value *
   call_termination_tag(const Values &values, const Instruction &op, llvm::Value *terminated);
   llvm::Value *suspend_short_call(Values &values, const Instruction &op, const LoopShape &shape);
   [[nodiscard]] bool overlapping_short_call(const LoopShape &shape) const;
-  void transfer_short_call_state(llvm::Value *depth, bool saving);
+  void transfer_call_state(llvm::Value *depth, bool saving);
+  void suspend_call_state(const Values &values, llvm::Value *live);
   void restore_short_call(Values &values,
                           const LoopShape &shape,
                           std::uint32_t pc,
@@ -1068,8 +1082,12 @@ private:
                                  llvm::Value *popped_depth,
                                  bool partial);
   void restore_loop_tail(llvm::Value *tail);
-  void resume_loop_tail(llvm::Value *target);
+  void resume_loop_tail(const Values &values, llvm::Value *target);
   void finish_loop_return(Values &values, const Instruction &op);
+  void finish_enclosing_tail(Values &values,
+                             const LoopShape &shape,
+                             std::uint32_t pc,
+                             llvm::Value *payload);
   void return_to_caller(Values values, llvm::Value *target, bool partial);
   std::vector<BlockCost> block_costs() const;
   void emit_exit();
@@ -1130,6 +1148,7 @@ private:
   bool has_plain_loop_returns_{};
   bool has_loop_sample_returns_{};
   bool has_short_loop_returns_{};
+  bool has_enclosing_tail_returns_{};
   std::vector<BlockCost> costs_;
   std::map<std::size_t, std::size_t> loop_headers_;
   std::map<std::size_t, BlockCost> loop_ends_;
@@ -1835,19 +1854,29 @@ Lowering::loop_call_address(Values &values, const Instruction &op, const LoopSha
   // The call redirects Fetch1 before the unsampled word arrives. The
   // return refill reaches that fetch after the three frozen fetch clocks.
   const auto sample_payload = loop_return_payload(op.address, shape);
-  if (sample_payload != 0) {
-    auto *unsampled = frame.matches;
-    if ((sample_payload & return_loop_fetch) != 0) {
-      unsampled = builder_.CreateAnd(unsampled, builder_.CreateNot(repeat_scheduled(frame)));
+  llvm::Value *parent_exit = builder_.getFalse();
+  if (shape.suspends_enclosing_tail) {
+    if (endpoint) { parent_exit = parent_exit_before_call(shape, terminating); }
+    suspend_call_state(values, in_loop);
+    saved = builder_.getInt64(sample_payload);
+  } else {
+    store(builder_.CreateSelect(terminating, builder_.getInt64(0), pending), tail_slot);
+    if (sample_payload != 0) {
+      auto *unsampled = frame.matches;
+      if ((sample_payload & return_loop_fetch) != 0) {
+        unsampled = builder_.CreateAnd(unsampled, builder_.CreateNot(repeat_scheduled(frame)));
+      }
+      saved = builder_.CreateSelect(unsampled, builder_.getInt64(sample_payload), saved);
     }
-    saved = builder_.CreateSelect(unsampled, builder_.getInt64(sample_payload), saved);
   }
   auto *call_state = builder_.CreateSelect(
       in_loop, builder_.CreateOr(saved, builder_.getInt64(loop_call_live)), builder_.getInt64(0));
   builder_.CreateStore(call_state, loop_cell(loop_call_slot, values[pc_stack_depth_value], 64));
-  store(builder_.CreateSelect(terminating, builder_.getInt64(0), pending), tail_slot);
   llvm::Value *address = builder_.getInt32(call_resume(op) | pc_call_tag);
   if (endpoint) {
+    if (shape.suspends_enclosing_tail) {
+      address = builder_.CreateOr(address, call_termination_tag(values, op, parent_exit));
+    }
     auto *repeat = builder_.CreateAnd(frame.matches, repeat_scheduled(frame));
     auto *backedge = llvm::BasicBlock::Create(module_.getContext(), "call.loop.repeat", function_);
     auto *ready = llvm::BasicBlock::Create(module_.getContext(), "call.loop.resume", function_);
@@ -1863,6 +1892,17 @@ Lowering::loop_call_address(Values &values, const Instruction &op, const LoopSha
       shape.counted() ? (shape.end - loop_fetch_distance) & maximum_pc : shape.condition_pc();
   if (shape.term == true_condition || op.address != ((sample + 1) & maximum_pc)) { return address; }
   return builder_.CreateOr(address, call_termination_tag(values, op, terminating));
+}
+
+llvm::Value *Lowering::parent_exit_before_call(const LoopShape &shape, llvm::Value *terminating) {
+  const auto earlier = overlapping_fetches_.find((shape.end - 1) & maximum_pc);
+  if (earlier == overlapping_fetches_.end()) { return builder_.getFalse(); }
+  const auto &samples = earlier->second;
+  const auto parent = std::ranges::find(samples, shape.end, &OverlappingLoopFetch::child_end);
+  if (parent == samples.end()) { return builder_.getFalse(); }
+  // A counted parent ending one word later samples while the endpoint CALL
+  // is in Address. The child itself already sampled at E-2.
+  return builder_.CreateAnd(terminating, counted_tail_matches(parent->parent));
 }
 
 llvm::Value *Lowering::call_termination_tag(const Values &values,
@@ -1918,13 +1958,7 @@ Lowering::suspend_short_call(Values &values, const Instruction &op, const LoopSh
   if (overlapping_short_call(shape)) {
     // Even a final endpoint CALL has to finish the enclosing fetch stream on return.
     terminal = builder_.CreateOr(payload, builder_.getInt64(return_short_done));
-    auto *save = llvm::BasicBlock::Create(module_.getContext(), "short.call.save", function_);
-    auto *next = llvm::BasicBlock::Create(module_.getContext(), "short.call.ready", function_);
-    builder_.CreateCondBr(active, save, next);
-    builder_.SetInsertPoint(save);
-    transfer_short_call_state(values[pc_stack_depth_value], true);
-    builder_.CreateBr(next);
-    builder_.SetInsertPoint(next);
+    suspend_call_state(values, active);
   }
   auto *saved = builder_.CreateSelect(done, terminal, payload);
   auto *slot = loop_cell(loop_call_slot, values[pc_stack_depth_value], 64);
@@ -1945,12 +1979,22 @@ bool Lowering::overlapping_short_call(const LoopShape &shape) const {
   return short_nested_.contains(shape.end) || short_parents_.contains(shape.end);
 }
 
-void Lowering::transfer_short_call_state(llvm::Value *depth, bool saving) {
-  auto *first = builder_.CreateMul(depth, builder_.getInt32(short_call_state_words));
+void Lowering::suspend_call_state(const Values &values, llvm::Value *live) {
+  auto *save = llvm::BasicBlock::Create(module_.getContext(), "loop.call.save", function_);
+  auto *next = llvm::BasicBlock::Create(module_.getContext(), "loop.call.ready", function_);
+  builder_.CreateCondBr(live, save, next);
+  builder_.SetInsertPoint(save);
+  transfer_call_state(values[pc_stack_depth_value], true);
+  builder_.CreateBr(next);
+  builder_.SetInsertPoint(next);
+}
+
+void Lowering::transfer_call_state(llvm::Value *depth, bool saving) {
+  auto *first = builder_.CreateMul(depth, builder_.getInt32(suspended_call_state_words));
   unsigned word = 0;
   const auto transfer = [&](llvm::Value *cell, bool has_age = false) {
     auto *index = builder_.CreateAdd(first, builder_.getInt32(word++));
-    auto *saved = loop_cell(short_call_state_slot, index, 64);
+    auto *saved = loop_cell(suspended_call_state_slot, index, 64);
     auto *source = saving ? cell : saved;
     auto *target = saving ? saved : cell;
     llvm::Value *value = builder_.CreateLoad(builder_.getInt64Ty(), source);
@@ -2052,7 +2096,7 @@ void Lowering::restore_loop_tail(llvm::Value *tail) {
   }
 }
 
-void Lowering::resume_loop_tail(llvm::Value *target) {
+void Lowering::resume_loop_tail(const Values &values, llvm::Value *target) {
   auto *payload = load(64, return_loop_tail_slot);
   auto *zero = builder_.getInt64(0);
   llvm::Value *short_ready = builder_.getFalse();
@@ -2067,6 +2111,19 @@ void Lowering::resume_loop_tail(llvm::Value *target) {
   }
   restore_loop_tail(long_payload);
   llvm::Value *valid = short_ready;
+  if (has_enclosing_tail_returns_) {
+    auto *saved = short_flag(long_payload, return_enclosing_tail);
+    auto *restore = llvm::BasicBlock::Create(module_.getContext(), "loop.call.restore", function_);
+    auto *next = llvm::BasicBlock::Create(module_.getContext(), "loop.call.continue", function_);
+    builder_.CreateCondBr(saved, restore, next);
+    builder_.SetInsertPoint(restore);
+    transfer_call_state(values[pc_stack_depth_value], false);
+    builder_.CreateBr(next);
+    builder_.SetInsertPoint(next);
+    auto *address = builder_.CreateTrunc(long_payload, builder_.getInt32Ty());
+    valid =
+        builder_.CreateOr(valid, builder_.CreateAnd(saved, builder_.CreateICmpEQ(target, address)));
+  }
   if (has_loop_sample_returns_) {
     auto *kind = builder_.CreateAnd(long_payload,
                                     builder_.getInt64(return_loop_fetch | return_loop_condition));
@@ -2096,6 +2153,10 @@ void Lowering::finish_loop_return(Values &values, const Instruction &op) {
     restore_short_call(values, *shape, op.address, payload);
     return;
   }
+  if (shape->suspends_enclosing_tail) {
+    finish_enclosing_tail(values, *shape, op.address, payload);
+    return;
+  }
   const auto sample = loop_return_payload((op.address - 1) & maximum_pc, *shape);
   auto *ready = builder_.CreateICmpEQ(payload, builder_.getInt64(sample | return_loop_ready));
   store(builder_.CreateSelect(ready, builder_.getInt64(0), payload), return_loop_tail_slot);
@@ -2104,6 +2165,32 @@ void Lowering::finish_loop_return(Values &values, const Instruction &op) {
   } else {
     loop_test(values, values[status_value], *shape, ready);
   }
+}
+
+void Lowering::finish_enclosing_tail(Values &values,
+                                     const LoopShape &shape,
+                                     std::uint32_t pc,
+                                     llvm::Value *payload) {
+  auto *ready = builder_.CreateICmpEQ(
+      payload, builder_.getInt64(pc | return_enclosing_tail | return_loop_ready));
+  auto *fetch = llvm::BasicBlock::Create(module_.getContext(), "loop.return.fetch", function_);
+  auto next = node("loop.return.continue");
+  next.incoming(values, builder_.GetInsertBlock());
+  builder_.CreateCondBr(ready, fetch, next.block);
+  builder_.SetInsertPoint(fetch);
+  store(builder_.getInt64(0), return_loop_tail_slot);
+  const auto call_pc = (pc - 1) & maximum_pc;
+  auto *refill = load(64, loop_refill_slot);
+  if (call_pc == shape.end) {
+    // The taken endpoint CALL replaces the child's exit refill. Keep its
+    // identity for the enclosing samples reached by the return fill.
+    store(builder_.CreateSelect(refill_at(refill, shape.end), builder_.getInt64(0), refill),
+          loop_refill_slot);
+  }
+  overlapping_loop_fetches(values, call_pc, refill, RefillSample::call_return);
+  jump(next, values);
+  builder_.SetInsertPoint(next.block);
+  values = next.values();
 }
 
 void Lowering::restore_short_call(Values &values,
@@ -2123,7 +2210,7 @@ void Lowering::restore_short_call(Values &values,
                          builder_.getInt64(return_short_left_mask));
   const bool overlap = overlapping_short_call(shape);
   if (overlap) {
-    transfer_short_call_state(values[pc_stack_depth_value], false);
+    transfer_call_state(values[pc_stack_depth_value], false);
   } else {
     write_short(short_fetch_progress, builder_.getInt64(0));
   }
@@ -2361,7 +2448,7 @@ void Lowering::complete(Values values,
 void Lowering::redirect(Values values, const Instruction &op, llvm::Value *target, bool partial) {
   if (op.type == return_branch_type) {
     if (!reentry_calls_.empty() && ((op.word & loop_reentry) != 0 || has_plain_loop_returns_)) {
-      resume_loop_tail(target);
+      resume_loop_tail(values, target);
     }
     return_to_caller(values, target, partial);
   } else if (indirect_branch(op)) {
@@ -2471,7 +2558,7 @@ void Lowering::plan_overlapping_loop_fetches(const LoopMap &shapes) {
       }
       if (!overlapping_refill(child, parent->second)) { continue; }
       const auto pc = (end - (gap == 1 ? 1U : 0U)) & maximum_pc;
-      if (!addresses_.contains(pc)) { continue; }
+      if (!addresses_.contains(pc) && !addresses_.contains((pc + 1) & maximum_pc)) { continue; }
       overlapping_fetches_[pc].push_back({.child_end = end, .parent = parent->second});
       shifted_fetches_.insert(parent->first);
     }
@@ -3339,7 +3426,7 @@ llvm::Value *Lowering::refill_at(llvm::Value *refill, std::uint32_t child_end) {
 void Lowering::overlapping_loop_fetches(Values &values,
                                         std::uint32_t pc,
                                         llvm::Value *refill,
-                                        bool whole_turn) {
+                                        RefillSample sample) {
   const auto overlaps = overlapping_fetches_.find(pc);
   if (overlaps == overlapping_fetches_.end()) { return; }
   llvm::Value *redirected = builder_.getFalse();
@@ -3349,9 +3436,10 @@ void Lowering::overlapping_loop_fetches(Values &values,
     const auto gap = (parent.end - child_end) & maximum_pc;
     // Gaps 2 through 4 sample during the endpoint or the two refill clocks.
     // Gap 1 samples one word earlier. A whole-turn grant already retired it.
-    const auto early_age = whole_turn ? lce_branch_age : 1U;
+    const auto early_age = sample == RefillSample::whole_turn ? lce_branch_age : 1U;
     const auto age = gap == 1 ? early_age : loop_fetch_distance + 1 - gap;
-    loop_fetch(values, parent, enabled, false, builder_.getInt64(age));
+    loop_fetch(
+        values, parent, enabled, sample == RefillSample::call_return, builder_.getInt64(age));
     const auto frame = active_loop(values, parent);
     auto *repeat =
         builder_.CreateAnd(enabled, builder_.CreateAnd(frame.matches, repeat_scheduled(frame)));
@@ -3545,7 +3633,7 @@ void Lowering::emit_hardware_turns(const Node &body,
   values[hazard_value] = builder_.getFalse();
   auto *refill = builder_.getInt64(
       loop_refill_live | (std::uint64_t{shape.end} << loop_refill_end_shift) | shape.start);
-  overlapping_loop_fetches(values, (shape.end - 1) & maximum_pc, refill, true);
+  overlapping_loop_fetches(values, (shape.end - 1) & maximum_pc, refill, RefillSample::whole_turn);
   overlapping_loop_fetches(values, shape.end, refill);
   credit(
       values, retired, builder_.CreateAdd(retired, builder_.getInt64(loop_decode_distance)), false);
@@ -4001,6 +4089,8 @@ void Lowering::emit(const LoopMap &shapes) {
       });
   has_short_loop_returns_ = std::ranges::any_of(
       reentry_calls_, [](const auto &site) { return site.second.short_body(); });
+  has_enclosing_tail_returns_ = std::ranges::any_of(
+      reentry_calls_, [](const auto &site) { return site.second.suspends_enclosing_tail; });
   for (const auto &op : instructions_) {
     if (!delayed(op)) { continue; }
     delay_slots_.insert(next_pc(op));
@@ -4152,6 +4242,14 @@ std::uint32_t context_mask(const std::vector<Instruction> &instructions, const L
     }
     const auto *resumed = loop_return_at(instruction.address, plan.reentry_calls);
     if (resumed == nullptr || !resumed->arithmetic()) { continue; }
+    if (resumed->suspends_enclosing_tail &&
+        instruction.address == ((resumed->end + 1) & maximum_pc)) {
+      const auto parent = plan.shapes.find((resumed->end + loop_decode_distance) & maximum_pc);
+      if (parent != plan.shapes.end() && parent->second.arithmetic() &&
+          overlapping_refill(*resumed, parent->second)) {
+        mask |= simd_mode | saturation_mode;
+      }
+    }
     const auto sample = resumed->condition_pc();
     const auto resume = sample == resumed->end ? resumed->start : ((sample + 1) & maximum_pc);
     if (instruction.address == resume) { mask |= simd_mode | saturation_mode; }
@@ -4201,12 +4299,24 @@ void validate_loop_call(LoopPlan &plan,
   }
   shape.has_reentry = true;
   const auto [site, inserted] = plan.reentry_calls.try_emplace(op.address, shape);
-  if (inserted) { return; }
-  const bool inner = shape.length < site->second.length;
-  if (!(inner ? shape : site->second).short_body()) {
-    reject(op, identity, FaultReason::unsupported_instruction, "overlapping loop CALL");
+  if (!inserted && shape.length < site->second.length) { site->second = shape; }
+}
+
+void qualify_loop_calls(const InstructionMap &code, LoopPlan &plan, std::string_view identity) {
+  // The same instruction can be in several tails. Qualify it after choosing
+  // the innermost owner, independent of the order of the DO instructions.
+  for (auto &[pc, shape] : plan.reentry_calls) {
+    bool shared{};
+    for (unsigned gap = 1; gap <= loop_fetch_distance; ++gap) {
+      const auto parent = plan.shapes.find((shape.end + gap) & maximum_pc);
+      if (parent == plan.shapes.end() || !overlapping_tail(shape, parent->second)) { continue; }
+      shared = shared || ((parent->first - pc) & maximum_pc) <= loop_fetch_distance;
+      shape.suspends_enclosing_tail = late_arithmetic_call(shape, pc);
+    }
+    if (shared && !shape.short_body() && !shape.suspends_enclosing_tail) {
+      reject(*code.at(pc), identity, FaultReason::unsupported_instruction, "overlapping loop CALL");
+    }
   }
-  if (inner) { site->second = shape; }
 }
 
 void validate_nested_loop(const InstructionMap &code,
@@ -4229,8 +4339,8 @@ void validate_nested_loop(const InstructionMap &code,
     for (unsigned distance = 0; distance < overlap_words; ++distance) {
       const auto word = code.find((child.end - distance) & maximum_pc);
       if (word != code.end() && branch(*word->second)) {
-        if (child.short_body() && call_branch_instruction(*word->second) &&
-            !delayed(*word->second)) {
+        if ((child.short_body() || late_arithmetic_call(child, word->first)) &&
+            call_branch_instruction(*word->second) && !delayed(*word->second)) {
           continue;
         }
         reject(*word->second,
@@ -4380,6 +4490,7 @@ LoopPlan validate_loop_bodies(const InstructionMap &code, std::string_view ident
     if (!loop_setup(op)) { continue; }
     validate_loop_body(code, op, plan, identity);
   }
+  qualify_loop_calls(code, plan, identity);
   validate_loop_aborts(code, plan, identity);
   validate_not_lce(code, plan, identity);
   plan_counted_tails(plan);

@@ -322,9 +322,20 @@ and `RTS (DB, LR)` restore that context. The return can finish a displaced
 ancestor sample or resume a short parent after a terminal child CALL.
 Fixtures exercise an already sampled ancestor, an unsampled ancestor,
 callee-owned nested short loops and the last return slot's arithmetic
-flags. Overlapping CALLs in long children and other branches in an
-overlapping refill remain unqualified. The combined timing awaits
-hardware comparison.
+flags.
+An immediate CALL on either of the final two words of a long arithmetic
+child suspends the enclosing tail and the child's pending refill.
+`RTS (LR)` and `RTS (DB, LR)` restore the tail. On a returning backedge
+the child continues at its header. On a terminating pass the return
+refill reaches enclosing end fetches displaced by the CALL. A taken
+endpoint CALL replaces the child's own final two refill clocks.
+Fixtures exercise all four gaps to a counted parent, its `NOT LCE`
+latency and termination tag, and a displaced arithmetic parent sample
+after a separate callee runs its own DO and sets SIMD flags in the last
+return slot. Consecutive CALLs can independently sample two counted
+ancestors. Other overlapping long CALL sites and other branches in an
+overlapping refill remain unqualified. The combined timing awaits hardware
+comparison.
 
 Classic type 5 transfers raw data among R/S and I/M/L/B registers, including
 cross-PE data moves and raw40 register swaps, with supported single-function fixed
