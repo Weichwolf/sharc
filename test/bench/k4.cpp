@@ -23,6 +23,7 @@ constexpr std::uint32_t table_address = 0x90000, ram_id = 11;
 constexpr std::uint32_t handlers_address = 0x200, common_address = 0x300;
 constexpr std::uint32_t initial_accumulator = 0x2468ace0, final_accumulator = 0x24d0ace0;
 constexpr std::uint32_t call_tag = 1U << 24, stack_empty = 1U << 22;
+constexpr std::uint32_t rotate_right = 0xffffffff;
 constexpr std::uint64_t guests = (std::uint64_t{transitions} * 18) + 1;
 constexpr std::uint64_t cycles = (std::uint64_t{transitions} * 38) - 2;
 constexpr unsigned prepared_instructions = 61;
@@ -82,7 +83,7 @@ fixture::Program kernel() {
   constexpr std::uint64_t backward = 0x072000fffff9;
   constexpr std::uint64_t direct_call = 0x06be00000000;
   constexpr std::uint64_t rts = 0x0a3e00000000;
-  constexpr std::uint64_t rotate_r2_r0_minus_one = 0x023e0002ff20;
+  constexpr std::uint64_t rotate_r2_r0_r6 = 0x013e00208206;
   constexpr unsigned bit_and = 0x40;
   constexpr unsigned bit_xor = 0x42;
   const std::array main{fixed(bit_and, 0, 0, 7),
@@ -107,8 +108,7 @@ fixture::Program kernel() {
     handlers.insert(handlers.end(), body.begin(), body.end());
   }
   append_segment(program, handlers_address, handlers);
-  const std::array common{
-      rotate_r2_r0_minus_one, fixed(bit_xor, 1, 1, 2), fixture::add(1, 1, 3), rts};
+  const std::array common{rotate_r2_r0_r6, fixed(bit_xor, 1, 1, 2), fixture::add(1, 1, 3), rts};
   append_segment(program, common_address, common);
   return program;
 }
@@ -159,6 +159,7 @@ sharc::Registers registers() {
   state.pe[0].data[0][3] = std::uint64_t{3} << raw_shift;
   state.pe[0].data[0][4] = std::uint64_t{transitions} << raw_shift;
   state.pe[0].data[0][5] = std::uint64_t{table_address} << raw_shift;
+  state.pe[0].data[0][6] = std::uint64_t{rotate_right} << raw_shift;
   state.pe[0].data[0][7] = std::uint64_t{7} << raw_shift;
   state.pe[0].stky = stack_empty;
   return state;
