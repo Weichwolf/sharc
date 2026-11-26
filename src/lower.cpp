@@ -1230,9 +1230,12 @@ llvm::Value *Lowering::memory_pointer(const Values &values,
 }
 
 void Lowering::memory_instruction(Values &values, const Instruction &op, bool partial) {
-  // Lent read/write and PM/DM views can alias behind distinct virtual addresses.
-  // Preserve word width and guest access order in both memory contracts.
   const auto move = memory_move(op);
+  // Checked regions can share backing with protected Direct views.
+  const bool observable =
+      !variant_.layout.ordinary_regions ||
+      std::ranges::any_of(variant_.layout.regions,
+                          [&](const RegionLayout &layout) { return host_protected(layout); });
   const bool broadcast = !move.write && ((move.index == 1 && (context_ & broadcast1_mode) != 0) ||
                                          (move.index == 9 && (context_ & broadcast9_mode) != 0));
   const bool paired = broadcast || (context_ & simd_mode) != 0;
@@ -1255,13 +1258,13 @@ void Lowering::memory_instruction(Values &values, const Instruction &op, bool pa
           builder_.CreateLShr(raw, builder_.getInt64(raw_extension_bits)), builder_.getInt32Ty());
       auto *write = builder_.CreateStore(word, transfer == 0 ? explicit_pointer : implicit_pointer);
       write->setAlignment(llvm::Align(1));
-      write->setVolatile(true);
+      write->setVolatile(observable);
     }
     return;
   }
   auto *word = builder_.CreateLoad(builder_.getInt32Ty(), explicit_pointer);
   word->setAlignment(llvm::Align(1));
-  word->setVolatile(true);
+  word->setVolatile(observable);
   auto *raw = builder_.CreateShl(builder_.CreateZExt(word, builder_.getInt64Ty()),
                                  builder_.getInt64(raw_extension_bits));
   values[move.reg] =
@@ -1271,7 +1274,7 @@ void Lowering::memory_instruction(Values &values, const Instruction &op, bool pa
     if (!broadcast) {
       auto *read = builder_.CreateLoad(builder_.getInt32Ty(), implicit_pointer);
       read->setAlignment(llvm::Align(1));
-      read->setVolatile(true);
+      read->setVolatile(observable);
       other = read;
     }
     auto *other_raw = builder_.CreateShl(builder_.CreateZExt(other, builder_.getInt64Ty()),

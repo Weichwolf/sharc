@@ -117,6 +117,8 @@ loop counters, indices, final PC, clock, ASTAT/STKY and public progress.
 
 The consumer reserves a complete 32-bit normal-word space with a 16 GiB lazy
 virtual mapping, commits only touched pages, and lends the bytes through Memory.
+The K5 variant declares ordinary regions. Exact uses canonical pointers with
+ordinary accesses, and Direct retains ordered volatile accesses.
 Generated accesses use current SSA indices over that binding. Code storage is
 separate. This is an all-RAM benchmark binding, not a model of the chip's memory
 map or peripheral protection. No handler, device or firmware asset is involved.

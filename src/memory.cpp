@@ -152,6 +152,15 @@ direct_memory(const PreparedImage &image, std::uint32_t variant_id, const Memory
   if (const auto error = complete_views_error(memory.views()); !error.empty()) {
     refuse(FaultReason::invalid_image, image.identity, variant_id, 0, std::string(error));
   }
+  if (variant->layout.ordinary_regions &&
+      std::ranges::any_of(memory.views().read,
+                          [](const auto &view) { return !view.data.empty(); })) {
+    refuse(FaultReason::invalid_image,
+           image.identity,
+           variant_id,
+           0,
+           "ordinary region layout cannot bind complete views");
+  }
   const auto count = variant->layout.regions.size();
   std::vector<void *> result(count * 2);
   for (std::size_t i = 0; i < count; ++i) {

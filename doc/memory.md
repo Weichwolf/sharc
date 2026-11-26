@@ -82,9 +82,15 @@ Backing identity and tail aliasing are consumer declarations and are not probed.
 The implemented paired normal-word transfers explicitly wrap their second word;
 formats that require a contiguous access across the tail remain unimplemented.
 
-Guest word accesses are volatile LLVM operations in both memory modes because
-distinct virtual views can alias physical storage without LLVM knowing it.
-Every access must occur
+The default layout uses volatile LLVM word accesses in both memory modes because
+distinct virtual views can alias physical storage without LLVM knowing it. An
+ordinary-region variant declares canonical storage with
+`VariantLayout::ordinary_regions`. The declaration is part of the prepared
+identity and installation rejects complete-view bindings for that variant.
+Ordinary-region variants without host protection use ordinary LLVM accesses.
+Variants with Direct host protection retain volatile accesses so host faults
+stay observable, including where regions share the protected backing.
+Each volatile access must occur
 at its original width and in guest order, including a load whose result is dead
 or a store overwritten later. This preserves the first protected access as the
 faulting instruction. SIMD uses separate explicit and implicit word accesses;

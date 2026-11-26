@@ -133,6 +133,8 @@ struct CodeSpan {
 
 struct VariantLayout {
   std::vector<RegionLayout> regions;
+  // Bind this variant through canonical regions without complete views.
+  bool ordinary_regions{};
 };
 
 struct InterruptRequest {

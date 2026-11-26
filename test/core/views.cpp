@@ -297,6 +297,13 @@ void geometry() {
   fixture::throws<sharc::PreparationError>(
       [&] { (void)core.install(native, fixture::Program::variant_id); },
       "install trusted corrupted view geometry");
+
+  program.code.variants[0].layout.ordinary_regions = true;
+  const auto ordinary = sharc::Core::compile(program.code);
+  sharc::Core split_views(borrow(program, aliases, sharc::MemorySpace::data));
+  fixture::throws<sharc::PreparationError>(
+      [&] { (void)split_views.install(ordinary, fixture::Program::variant_id); },
+      "ordinary native accesses accepted a complete-view binding");
 }
 } // namespace
 

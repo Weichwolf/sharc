@@ -138,6 +138,7 @@ void run(sharc::ExecutionMode mode, bench::Options options) {
   const Storage storage;
   storage.initialize(input);
   auto program = kernel();
+  program.code.variants[0].layout.ordinary_regions = true;
   program.code.variants[0].layout.regions.push_back({.space = sharc::MemorySpace::data,
                                                      .view = sharc::MemoryView::normal_word,
                                                      .first = 0,
