@@ -83,11 +83,11 @@ struct CallTransfer {
   std::uint32_t target, raw_return;
 };
 
-void entered_call(Timeline &trace, CallTransfer call) {
+void entered_call(Timeline &trace, CallTransfer call, unsigned cycles = 4) {
   auto &state = trace.registers;
   state.pc_stack[state.pc_stack_pointer++] = call.raw_return;
   state.pe[0].stky &= ~pc_empty;
-  trace.boundary(call.target, 4);
+  trace.boundary(call.target, cycles);
   trace.record();
 }
 
@@ -1577,10 +1577,12 @@ void single_iteration_two_word_call() {
         "taken CALL in one-iteration two-word DO failed to preserve the boundary");
 }
 
-void single_iteration_three_word_call() {
+void single_iteration_three_word_call(bool interlock) {
+  constexpr std::uint64_t call_eq = 0x068000000000;
   std::array<std::uint64_t, 9> words{};
   words[0] = do_immediate | (std::uint64_t{1} << count_shift) | 3;
-  words[3] = call_direct | short_call_sub;
+  if (interlock) { words[2] = fixture::add(0, 0, 0); }
+  words[3] = (interlock ? call_eq : call_direct) | short_call_sub;
   words[8] = rts | lr;
   fixture::Program program(words);
   const auto initial = starting();
@@ -1592,12 +1594,36 @@ void single_iteration_three_word_call() {
   trace.prefixes.back().registers = trace.registers;
   short_boundary(trace, {.pc = 2, .fetch = 3, .decode = 3});
   parent_count_sample(trace, false);
+  if (interlock) { trace.registers.pe[0].astat = az; }
   short_boundary(trace, {.pc = 3, .fetch = 4, .decode = 3});
   // The taken CALL replaces the empty clocks of the compact loop's exit.
-  entered_call(trace,
-               {.target = short_call_sub, .raw_return = call_tag | termination_tag | (base + 4)});
+  const auto tags = call_tag | (interlock ? 0 : termination_tag);
+  entered_call(
+      trace, {.target = short_call_sub, .raw_return = tags | (base + 4)}, interlock ? 5U : 4U);
   popped_call(trace.registers);
   short_boundary(trace, {.pc = 4, .fetch = 8, .decode = 6}, 4);
+  verify_timeline(program, initial, trace);
+}
+
+void late_address_long_loop_call() {
+  constexpr std::uint64_t call_eq = 0x068000000000;
+  std::array<std::uint64_t, 9> words{};
+  words[0] = do_immediate | (std::uint64_t{1} << count_shift) | 5;
+  words[1] = fixture::add(0, 0, 0);
+  words[2] = call_eq | short_call_sub;
+  words[8] = rts | lr;
+  fixture::Program program(words);
+  const auto initial = starting();
+  Timeline trace{.registers = initial, .prefixes = {}};
+  trace.registers.lcntr = 1;
+  entered(trace, {.address = counted_address | (base + 5), .count = 1});
+  parent_count_sample(trace, false);
+  trace.registers.pe[0].astat = az;
+  counted_call_boundary(trace, 2, false, 1);
+  entered_call(trace, {.target = short_call_sub, .raw_return = call_tag | (base + 3)}, 5);
+  popped_call(trace.registers);
+  counted_call_boundary(trace, 3, false, 4);
+  for (unsigned pc = 4; pc <= 6; ++pc) { counted_call_boundary(trace, pc, false, 1); }
   verify_timeline(program, initial, trace);
 }
 
@@ -2144,7 +2170,9 @@ void fixture::hardware_loop_control_flow() {
   counted_short_endpoint_call(3, false);
   counted_short_endpoint_call(3, true);
   single_iteration_two_word_call();
-  single_iteration_three_word_call();
+  single_iteration_three_word_call(false);
+  single_iteration_three_word_call(true);
+  late_address_long_loop_call();
   refused_plain_short_loop_return();
   refused_overlapping_short_call();
   arithmetic_sample_call(ArithmeticSampleCall::immediate);

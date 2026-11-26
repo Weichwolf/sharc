@@ -981,6 +981,8 @@ private:
   llvm::Value *
   loop_call_address(const Values &values, const Instruction &op, const LoopShape &shape);
   llvm::Value *
+  call_termination_tag(const Values &values, const Instruction &op, llvm::Value *terminated);
+  llvm::Value *
   suspend_short_call(const Values &values, const Instruction &op, const LoopShape &shape);
   void restore_short_call(Values &values,
                           const LoopShape &shape,
@@ -1770,10 +1772,17 @@ Lowering::loop_call_address(const Values &values, const Instruction &op, const L
   const auto sample =
       shape.counted() ? (shape.end - loop_fetch_distance) & maximum_pc : shape.condition_pc();
   if (shape.term == true_condition || op.address != ((sample + 1) & maximum_pc)) { return address; }
-  return builder_.CreateOr(address,
-                           builder_.CreateSelect(terminating,
-                                                 builder_.getInt32(pc_sequencer_tag),
-                                                 builder_.getInt32(0)));
+  return builder_.CreateOr(address, call_termination_tag(values, op, terminating));
+}
+
+llvm::Value *Lowering::call_termination_tag(const Values &values,
+                                            const Instruction &op,
+                                            llvm::Value *terminated) {
+  // An interlock holds the CALL in Decode while the previous word retires.
+  auto *same_clock = builder_.CreateICmpEQ(pipeline_stall(values, op), builder_.getInt64(0));
+  return builder_.CreateSelect(builder_.CreateAnd(terminated, same_clock),
+                               builder_.getInt32(pc_sequencer_tag),
+                               builder_.getInt32(0));
 }
 
 llvm::Value *
@@ -1801,8 +1810,8 @@ Lowering::suspend_short_call(const Values &values, const Instruction &op, const 
   llvm::Value *tags = builder_.getInt32(pc_call_tag);
   if (shape.length == 3) {
     auto *exit = short_flag(short_word(short_descriptor), short_call_exit);
-    tags = builder_.CreateSelect(
-        builder_.CreateAnd(active, exit), builder_.getInt32(pc_call_tag | pc_sequencer_tag), tags);
+    tags =
+        builder_.CreateOr(tags, call_termination_tag(values, op, builder_.CreateAnd(active, exit)));
   }
   return builder_.CreateOr(target, tags);
 }

@@ -212,6 +212,9 @@ tag when the loop terminates during the call's address stage. Tests cover
 continued and terminating counted turns, a DAG2 call into a separate prepared
 entry, delayed return slots, suspension of an arithmetic refill while the callee
 runs its own DO, and a precise fault for an ordinary RTS on a suspended tail.
+An interlock that holds the CALL in Decode delays its address stage past
+the counter sample. The saved PC has no termination tag in that case.
+Installed-image fixtures exercise this timing in short and long bodies.
 An immediate CALL at the endpoint stores the next loop header or the word
 after the loop as its return address. On a terminating arithmetic turn the
 taken call replaces the loop refill. A false predicate keeps the normal
