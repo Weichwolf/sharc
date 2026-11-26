@@ -232,11 +232,12 @@ four-word startup fetch also ages through the entry bubble. The tests
 exercise both condition latencies, a DAG2 interlock, replay at exact
 bounds, and complete-turn grants for nonterminating counted passes.
 An admitted long counted parent tracks the sample clock during a short
-counted child's drain or a long arithmetic child's refill. A short
-counted child preserves its own observation while the parent samples.
-The installed-image fixtures cover simultaneous pops and parent outcomes
-at successive refill clocks. Observations immediately after DO, explicit
-loop-resource changes, other overlapping configurations and unlooped
+child's drain or a long arithmetic child's refill. A short counted child
+preserves its own observation while the parent samples. Installed-image
+fixtures cover simultaneous pops, all four endpoint gaps for arithmetic
+children of one to three words, parent samples preceding child setup,
+and parent outcomes at successive refill clocks. Observations immediately
+after DO, explicit loop-resource changes, other overlapping configurations and unlooped
 predicates remain unqualified. Combined condition timing awaits hardware
 comparison.
 An immediate CALL at the endpoint stores the next loop header or the word

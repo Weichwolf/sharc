@@ -3977,8 +3977,7 @@ void validate_not_lce(const InstructionMap &code, LoopPlan &plan, std::string_vi
     }
     const auto unqualified_overlap = [](const LoopShape &parent, const LoopShape &child) {
       const auto gap = (parent.end - child.end) & maximum_pc;
-      const bool qualified_child =
-          (child.short_body() && child.counted()) || (!child.short_body() && child.arithmetic());
+      const bool qualified_child = child.arithmetic() || (child.short_body() && child.counted());
       return gap != 0 && gap <= loop_fetch_distance &&
              parent.contains((child.start - 1) & maximum_pc) &&
              (parent.short_body() || !qualified_child);

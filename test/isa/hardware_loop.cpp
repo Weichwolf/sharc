@@ -1198,6 +1198,133 @@ void short_arithmetic_child_overlap() {
   verify_timeline(program, initial, trace);
 }
 
+struct ShortArithmeticRefill {
+  unsigned length, gap;
+  std::size_t pop_after;
+  std::span<const ShortAddress> drain;
+
+  [[nodiscard]] unsigned child_end() const { return short_setup_pc + length; }
+
+  [[nodiscard]] unsigned parent_end() const { return child_end() + gap; }
+
+  [[nodiscard]] unsigned nominal_sample() const { return parent_end() - 4; }
+
+  [[nodiscard]] bool sampled_before_child() const { return nominal_sample() < short_setup_pc; }
+};
+
+void short_arithmetic_parent_boundary(Timeline &trace,
+                                      const ShortArithmeticRefill &body,
+                                      unsigned pc,
+                                      bool repeats,
+                                      unsigned cycles = 1) {
+  trace.boundary(base + pc, cycles);
+  if (repeats) {
+    const auto distance = body.parent_end() - pc;
+    trace.registers.faddr = base + 4 - distance;
+    if (distance < 2) { trace.registers.daddr = base + 2 - distance; }
+  }
+  trace.record();
+}
+
+void short_arithmetic_lce_turn(Timeline &trace, const ShortArithmeticRefill &body, bool repeats) {
+  auto &state = trace.registers;
+  const bool early = body.sampled_before_child();
+  for (unsigned pc = 1; pc < short_setup_pc; ++pc) {
+    if (early && pc == body.nominal_sample()) { parent_count_sample(trace, repeats); }
+    const bool redirected = early && repeats && pc >= body.nominal_sample();
+    short_arithmetic_parent_boundary(trace, body, pc + 1, redirected);
+  }
+  constexpr std::array fetch{1U, 2U, 2U};
+  constexpr auto single_word_type = 1U << 29;
+  const auto loop_address = (base + body.child_end()) | (body.length == 1 ? single_word_type : 0);
+  enter_nested_short(trace,
+                     {.pc = 1, .fetch = fetch[body.length - 1], .decode = body.length, .count = 2},
+                     loop_address);
+  state.pe[0].astat = az;
+  for (std::size_t i = 0; i < body.drain.size(); ++i) {
+    const auto &next = body.drain[i];
+    if (i == body.pop_after) {
+      if (state.loop_address_depth == 2) {
+        leave_nested_child(state);
+      } else {
+        popped(state);
+      }
+    }
+    const bool last_buffered = i + 1 == body.drain.size();
+    if (last_buffered && !early && body.gap == 1) { parent_count_sample(trace, repeats); }
+    const auto fetch_address =
+        last_buffered && repeats && body.gap == 1 ? 1U : short_setup_pc + next.fetch;
+    short_boundary(trace,
+                   {.pc = short_setup_pc + next.pc,
+                    .fetch = fetch_address,
+                    .decode = short_setup_pc + next.decode},
+                   i == 0 && body.length != 3 ? 2U : 1U);
+  }
+  if (!early && body.gap != 1) { parent_count_sample(trace, repeats); }
+  short_arithmetic_parent_boundary(trace, body, body.child_end() + 1, repeats, 3);
+}
+
+void short_arithmetic_not_lce(const ShortArithmeticRefill &body) {
+  const auto end = body.parent_end();
+  std::vector<std::uint64_t> words(end + 2);
+  words[0] = do_immediate | (std::uint64_t{2} << count_shift) | end;
+  words[short_setup_pc] = do_eq | body.length;
+  words[short_setup_pc + 1] = fixture::add(0, 0, 0);
+  for (unsigned i = 0; i < body.gap; ++i) {
+    words[body.child_end() + i + 1] = if_not_lce(fixture::add(i + 2, i + 2, 1));
+  }
+  fixture::Program program(words);
+  auto initial = starting();
+  initial.pe[0].data[0][1] = 1U << raw_shift;
+  Timeline trace{.registers = initial, .prefixes = {}};
+  trace.registers.lcntr = 2;
+  entered(trace, {.address = counted_address | (base + end), .count = 2});
+  for (const bool repeats : {true, false}) {
+    short_arithmetic_lce_turn(trace, body, repeats);
+    for (unsigned i = 0; i < body.gap; ++i) {
+      // Only the second refill clock leaves a fresh sample at the first parent word.
+      if (repeats || (i == 0 && body.gap == 4)) {
+        auto &lane = trace.registers.pe[0];
+        lane.data[0][i + 2] += 1U << raw_shift;
+        lane.astat = 0;
+      }
+      const auto pc = body.child_end() + i + 1;
+      if (pc == end && repeats) {
+        trace.boundary(base + 1);
+        trace.record();
+      } else {
+        short_arithmetic_parent_boundary(trace, body, pc + 1, repeats);
+      }
+    }
+  }
+  verify_timeline(program, initial, trace);
+}
+
+void short_arithmetic_refill_not_lce() {
+  constexpr std::array one{ShortAddress{.pc = 1, .fetch = 1, .decode = 1},
+                           ShortAddress{.pc = 1, .fetch = 2, .decode = 1},
+                           ShortAddress{.pc = 1, .fetch = 3, .decode = 1}};
+  constexpr std::array two{ShortAddress{.pc = 2, .fetch = 2, .decode = 2},
+                           ShortAddress{.pc = 1, .fetch = 3, .decode = 1},
+                           ShortAddress{.pc = 2, .fetch = 4, .decode = 2}};
+  constexpr ShortAddress three_second{.pc = 2, .fetch = 3, .decode = 1};
+  constexpr ShortAddress three_last{.pc = 3, .fetch = 1, .decode = 2};
+  constexpr ShortAddress three_header{.pc = 1, .fetch = 2, .decode = 3};
+  constexpr std::array three{three_second,
+                             three_last,
+                             three_header,
+                             three_second,
+                             three_last,
+                             three_header,
+                             ShortAddress{.pc = 2, .fetch = 4, .decode = 1},
+                             ShortAddress{.pc = 3, .fetch = 5, .decode = 2}};
+  for (const unsigned gap : {1U, 2U, 3U, 4U}) {
+    short_arithmetic_not_lce({.length = 1, .gap = gap, .pop_after = 0, .drain = one});
+    short_arithmetic_not_lce({.length = 2, .gap = gap, .pop_after = 1, .drain = two});
+    short_arithmetic_not_lce({.length = 3, .gap = gap, .pop_after = 3, .drain = three});
+  }
+}
+
 void short_child_after_parent_fetch() {
   constexpr auto child_end = short_setup_pc + 1;
   constexpr auto parent_end = child_end + 1;
@@ -2435,6 +2562,7 @@ void fixture::hardware_loop_control_flow() {
   short_counted_parent_arithmetic(false);
   short_counted_parent_arithmetic(true);
   short_arithmetic_child_overlap();
+  short_arithmetic_refill_not_lce();
   short_child_after_parent_fetch();
   nested_short_do();
   counted_call_reentry();
