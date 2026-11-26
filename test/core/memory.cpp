@@ -448,6 +448,42 @@ void layout_validation() {
   }
 }
 
+void ordinary_region_alias() {
+  constexpr std::uint64_t load_pm_r1 = 0xb00100000000;
+  constexpr std::uint64_t raw = 0x12345678ab;
+  constexpr std::uint64_t loaded = 0x1234567800;
+  const std::array words{store_r0, load_pm_r1};
+  Program program(words);
+  auto &image = program.code.code;
+  auto &layout = image.variants[0].layout;
+  auto pm = layout.regions.back();
+  pm.space = sharc::MemorySpace::program;
+  layout.regions.push_back(pm);
+  const auto generic = sharc::Core::lower(image);
+  layout.ordinary_regions = true;
+  fixture::throws<sharc::PreparationError>(
+      [&] { (void)sharc::Core::load(image, {}, generic.artifact()); },
+      "ordinary layout accepted an artifact for an unspecified loan");
+
+  const auto native = sharc::Core::compile(image);
+  sharc::Core core(program.memory());
+  auto registers = initial();
+  registers.dag[0][8].index = ram_address;
+  registers.pe[0].data[0][0] = raw;
+  core.set_registers(registers);
+  (void)core.install(native, fixture::Program::variant_id);
+  const auto result = core.run(2);
+  registers.pe[0].data[0][1] = loaded;
+  registers.pc += 2;
+  registers.faddr = registers.pc + 4;
+  registers.daddr = registers.pc + 2;
+  registers.emuclk = 2;
+  check(!result.has_fault &&
+            result.progress == sharc::Progress{.instructions = 2, .base_cycles = 2} &&
+            core.registers() == registers,
+        "ordinary PM and DM lost their declared physical alias");
+}
+
 void incomplete_simd_store() {
   const std::array words{fixture::immediate(1, 9), store_r0};
   Program program(words);
@@ -545,6 +581,7 @@ int main() try {
   refused_code_alias();
   code_alias_read();
   layout_validation();
+  ordinary_region_alias();
   incomplete_simd_store();
   hidden_storage_alias();
   opaque_code_store();

@@ -299,6 +299,7 @@ void exact_reference(sharc::ExecutionMode mode) {
   const std::array instructions{fixture::immediate(1, 7), store_r0};
   fixture::Program program(instructions, 0);
   const auto memory = lend(program, space, sharc::MemorySpace::data, false);
+  program.code.variants[0].layout.ordinary_regions = true;
   const sharc::CompileOptions defaults{.mode = mode, .callbacks = {}};
   check(defaults.memory_mode == MemoryMode::exact, "memory mode does not default to exact");
   const auto exact = sharc::Core::lower(program.code, defaults);
@@ -441,6 +442,7 @@ void effect_order(sharc::ExecutionMode mode, bool writing) {
                                 writing ? store_r0 : std::uint64_t{0}};
   fixture::Program program(instructions, 0);
   const auto memory = lend(program, space, sharc::MemorySpace::data, !writing);
+  program.code.variants[0].layout.ordinary_regions = true;
   const auto native = sharc::Core::compile(
       program.code, {.mode = mode, .memory_mode = MemoryMode::direct, .callbacks = {}});
   sharc::Core core(memory, mode);
