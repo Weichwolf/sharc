@@ -15,7 +15,7 @@ is claimed.
 | FastFP32 numerical mode (opt-in) | Independent approximation expectations, rounding/flags, unchanged raw moves/integer behavior, separate translations | Unimplemented |
 | Parallel operations | Old operands, memory aliases, register exchanges and ordered partial effects | Partial: raw register moves/swaps with supported fixed ALU writeback |
 | Address generation and memory | Both DAGs, modulo/reverse addressing, PM/DM and physical view aliases | Partial: normal-word pre-indexing, immediate modify/reverse and DAG register-load dependencies |
-| Sequencer and control | Delayed flow, DO/loop endpoints, LR, stacks, reset and interrupts | Partial: classic direct/indirect transfers, two delay slots, classic hardware DO, counted nesting and admitted loop reentry |
+| Sequencer and control | Delayed flow, DO/loop endpoints, LR, stacks, reset and interrupts | Partial: classic direct/indirect transfers, hardware DO and admitted reentry, reset, declared maskable vectors, admitted RTI and IDLE |
 | Chip-profile boundaries | ADSP-21489 memory/vector parameters and explicit I/O ownership | Unimplemented |
 | JIT coherence and hosts | Self-modifying aliases, natural loops, precise exits, x86-64 and ARM64 | Unimplemented |
 
@@ -40,8 +40,8 @@ reason.
 
 `test/core/state.cpp` checks raw banks, DAGs, stacks, state replacement, snapshot
 mode compatibility and clearing a later unprepared-execution fault. These are
-storage/interface checks; hardware reset, interrupted continuation and execution
-semantics are not qualified. See [state.md](state.md).
+storage/interface checks. Core reset and IDLE have additional execution tests in
+`test/core/control.cpp`. See [state.md](state.md).
 
 S1 provides the original contract declarations, an installable `sharc::core` package,
 top-level ISA/VISA and compute decoding, independent preparation fixtures, and
@@ -109,9 +109,16 @@ a compute adds one interlock cycle, including when not taken (Programming
 Reference 2.4, 4-19–4-21 and 4-115–4-116). The preceding-compute history is SSA
 state, stored at exits and included in snapshots. Cycle bounds may cross the
 deadline to finish the current instruction; cycle credit cannot wrap under zero.
-External-flag and loop conditions refuse preparation. VISA, floating computation,
-multiplier, remaining shifter and memory forms, timer, reset and
-interrupt entry remain unimplemented. `interrupt_ready` reports false.
+External conditions refuse preparation. VISA, floating computation, multiplier,
+timer evolution and remaining shifter and memory forms remain unimplemented.
+
+Classic `IDLE` stops at retirement under either run bound. Tests cover both
+numerical modes, frozen progression, reset and snapshot replay. IDLE in either
+slot of a taken delayed branch keeps the delayed transfer pending. An eligible
+declared interrupt wakes ordinary IDLE. Public installed-image tests cover
+vector entry, masks, nesting, RTI and RTI (DB), absolute deadlines, a suspended
+long DO fetch, and replay into another Core. See [state.md](state.md) for the
+admitted event model and open cases.
 
 Non-delayed direct CALL and plain conditional RTS keep static call targets and
 known return addresses inside the same LLVM function. CALL and RTS access one

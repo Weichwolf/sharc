@@ -53,6 +53,35 @@ resumes through a declared entry. A VISA restart records its address and mode
 in state. VISA execution remains open. A previously claimed terminal host
 fault prevents reset under the owner contract.
 
+Classic `IDLE` retires once and stops execution before its successor. In
+straight-line code Decode holds the successor and Fetch1 stops two words
+ahead, as shown in Table 4-12. Later runs return `sleeping` with zero progress.
+A taken delayed branch held by `IDLE` in a slot remains pending and blocks
+interrupt release. The consumer accounts for elapsed time outside the run
+bound while the core sleeps. A snapshot preserves the sleeping boundary.
+
+## Interrupts
+
+`InterruptRequest::source` is the IVT priority slot in Programming Reference
+Table B-2. Its bit in IRPTL/IMASK/IMASKP or LIRPTL follows Tables A-12 and A-13.
+The consumer chooses a pending source and supplies its declared vector PC.
+`interrupt_ready` checks the installed route, the global and individual masks,
+the active service priority, the first ISR instruction and a pending delayed
+transfer. A successful `interrupt` clears the source latch, marks the source
+active and pushes the tagged return PC. It charges the four nominal vector
+refill cycles without retiring a guest instruction. A sleeping core wakes
+through the vector and resumes after IDLE on RTI.
+
+IRQ2 through IRQ0 and the two timer priorities also push both ASTAT registers
+and MODE1, then clear the MODE1 bits selected by MMASK. Classic RTI restores
+that frame and clears the source's latch and active bit. RTI (DB) is admitted
+for sources without automatic status stacking. The PC stack pops and service
+ends when RTI retires. The two slots complete before the redirect. A snapshot
+captures the nested service frames, the interrupted native continuation and
+suspended loop fetch state, including during a delayed return. Unsupported emulation
+events, internal timer evolution, extra loop interrupt shadows and software
+interrupt control instructions still require qualification.
+
 ## Continuations
 
 `State` adds cumulative instruction/base-cycle progress, instruction set, execution
@@ -68,8 +97,8 @@ replacing PC starts a fresh declared entry and clears its pipeline history.
 Snapshots retain the preceding-compute interlock, two recent physical DAG
 register-load tags and a taken classic delayed transfer's destination and slot
 phase. Cross-Core replay preserves the destination even when a slot changes a
-contributing DAG register. Pending interrupts, mode-register writes and
-declared code transfers still need execution and snapshot qualification.
+contributing DAG register. Mode-register writes and declared code transfers
+still need execution and snapshot qualification.
 
 For admitted DO forms, snapshots retain the PC-stack ownership of each
 hardware loop frame and its fetch decision. They also retain the pending
@@ -137,7 +166,5 @@ original endpoint retires. With DB, the two slots execute after the stack effect
 
 Peripheral interrupt routing (PICR), SRU, DMA and peripheral timers remain consumer
 state. TAP emulation controls and physical instruction-cache contents are not
-implemented. Instruction pipeline observations beyond the admitted classic
-transfers and loop reentry, interrupt eligibility/shadows and timer evolution
-remain open. Straight-line ISA and admitted direct and indirect
-transfers update PC, FADDR, DADDR and EMUCLK at owner boundaries.
+implemented. Straight-line ISA and admitted classic transfers, loop reentry and
+interrupts update PC, FADDR, DADDR and EMUCLK at owner boundaries.

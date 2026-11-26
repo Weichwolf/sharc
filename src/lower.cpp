@@ -68,9 +68,13 @@ constexpr unsigned immediate_shift_type = 6;
 constexpr unsigned register_move_type = 5;
 constexpr unsigned immediate_move_type = 17;
 constexpr unsigned nop_type = 21;
+constexpr unsigned idle_type = 22;
+constexpr std::uint64_t idle_word = std::uint64_t{1} << 39;
 constexpr unsigned direct_branch_type = 8;
 constexpr unsigned computed_branch_type = 9;
 constexpr unsigned return_branch_type = 11;
+constexpr unsigned flow_opcode_shift = 40;
+constexpr unsigned rti_opcode = 0x0b;
 constexpr unsigned counted_loop_type = 12;
 constexpr unsigned conditional_loop_type = 13;
 constexpr unsigned memory_move_type = 15;
@@ -198,6 +202,14 @@ unsigned loaded_register(const Instruction &op) {
 bool branch(const Instruction &op) {
   return op.type == direct_branch_type || op.type == computed_branch_type ||
          op.type == return_branch_type;
+}
+
+bool idle(const Instruction &op) {
+  return op.type == idle_type && op.word == idle_word;
+}
+
+bool interrupt_return(const Instruction &op) {
+  return op.type == return_branch_type && (op.word >> flow_opcode_shift) == rti_opcode;
 }
 
 bool call_branch_instruction(const Instruction &op) {
@@ -509,21 +521,20 @@ void validate_register_move(const Instruction &instruction, std::string_view ide
 }
 
 void validate_return(const Instruction &instruction, std::string_view identity) {
-  constexpr unsigned opcode_shift = 40;
-  constexpr auto prefix = std::uint64_t{0x0b} << opcode_shift;
+  constexpr auto prefix = std::uint64_t{rti_opcode} << flow_opcode_shift;
   constexpr auto modifiers = std::uint64_t{7} << 24;
   constexpr auto allowed =
       prefix | (std::uint64_t{true_condition} << condition_shift) | modifiers | 0x7fffff;
   if ((instruction.word & ~allowed) != 0) {
     reject(instruction, identity, FaultReason::invalid_encoding, "reserved return bits");
   }
-  if ((instruction.word >> opcode_shift) != 0x0a ||
-      (instruction.word & (modifiers & ~(delayed_branch | loop_reentry))) != 0 ||
+  const auto supported = delayed_branch | (interrupt_return(instruction) ? 0 : loop_reentry);
+  if ((instruction.word & (modifiers & ~supported)) != 0 ||
       instruction.compute.kind != ComputeKind::none) {
     reject(instruction,
            identity,
            FaultReason::unsupported_instruction,
-           "RTI, modified return or parallel return compute is not lowered");
+           "modified return or parallel return compute is not lowered");
   }
   validate_condition(instruction, identity);
 }
@@ -589,7 +600,7 @@ void validate(const Instruction &instruction, std::string_view identity) {
            FaultReason::unsupported_instruction,
            "VISA native pipeline lowering is not implemented");
   }
-  if (instruction.type == nop_type && instruction.word == 0) { return; }
+  if ((instruction.type == nop_type && instruction.word == 0) || idle(instruction)) { return; }
   if (instruction.type == index_modify_type) { return; }
   if (instruction.type == register_move_type) {
     validate_register_move(instruction, identity);
@@ -941,6 +952,7 @@ private:
                       NativeExit reason,
                       bool partial);
   void finish(Values values, std::uint32_t next, bool partial);
+  void finish_instruction(Values values, const Instruction &op, std::uint32_t next, bool partial);
   void readmit(const Values &values, std::uint32_t next);
   void credit(Values &values, llvm::Value *count, llvm::Value *cycles, bool partial);
   void advance_lce(llvm::Value *cycles, std::size_t slot);
@@ -1081,7 +1093,8 @@ private:
                                        ShortFetchWindow window,
                                        llvm::Value *selected);
   void retire_short_observation(std::uint32_t pc);
-  void loop_backedge(const Values &values, const LoopShape &shape, bool partial);
+  void
+  loop_backedge(const Values &values, const Instruction &op, const LoopShape &shape, bool partial);
   void
   loop_retirement(Values &values, const Instruction &op, llvm::Value *old_status, bool partial);
   llvm::Value *branch_lanes(const Values &values, const Instruction &op, bool partial);
@@ -1839,7 +1852,8 @@ void Lowering::stack_guard(const Values &values,
   }
   if (reason == NativeExit::unsupported_loop_stack ||
       reason == NativeExit::unsupported_loop_reentry || reason == NativeExit::invalid_loop_abort ||
-      reason == NativeExit::invalid_short_loop_call) {
+      reason == NativeExit::invalid_short_loop_call ||
+      reason == NativeExit::invalid_interrupt_return) {
     auto *word = builder_.CreateGEP(builder_.getInt64Ty(),
                                     function_->getArg(unit_controls),
                                     builder_.getInt64(fault_instruction));
@@ -2113,6 +2127,35 @@ void Lowering::transfer_call_state(llvm::Value *depth, bool saving) {
 
 llvm::Value *Lowering::pop(Values &values, const Instruction &op, bool partial) {
   auto *depth = values[pc_stack_depth_value];
+  if (interrupt_return(op)) {
+    auto *guard = load(32, interrupt_frame_slot);
+    auto *pc_depth = builder_.CreateAnd(guard, builder_.getInt32(loop_pc_index_mask));
+    auto *has_frame = builder_.CreateAnd(builder_.CreateICmpEQ(depth, pc_depth),
+                                         builder_.CreateICmpNE(depth, builder_.getInt32(0)));
+    auto *status_bit = builder_.CreateAnd(guard, builder_.getInt32(interrupt_status_frame));
+    auto *pops_status = builder_.CreateICmpNE(status_bit, builder_.getInt32(0));
+    auto *status_ready = delayed(op)
+                             ? builder_.CreateNot(pops_status)
+                             : builder_.CreateOr(builder_.CreateNot(pops_status),
+                                                 builder_.CreateICmpNE(load(8, status_depth_slot),
+                                                                       builder_.getInt8(0)));
+    stack_guard(values,
+                op,
+                builder_.CreateAnd(has_frame, status_ready),
+                partial,
+                NativeExit::invalid_interrupt_return);
+    auto *popped_depth = builder_.CreateSub(depth, builder_.getInt32(1));
+    auto *top = builder_.CreateLoad(builder_.getInt32Ty(), stack_cell(popped_depth));
+    auto *tag = builder_.CreateAnd(top, builder_.getInt32(pc_call_tag | pc_sequencer_tag));
+    stack_guard(values,
+                op,
+                builder_.CreateICmpEQ(tag, builder_.getInt32(pc_sequencer_tag)),
+                partial,
+                NativeExit::invalid_interrupt_return);
+    values[pc_stack_depth_value] = popped_depth;
+    stack_status(values);
+    return builder_.CreateAnd(top, builder_.getInt32(maximum_pc));
+  }
   stack_guard(values,
               op,
               builder_.CreateAnd(
@@ -2491,7 +2534,7 @@ void Lowering::complete(Values values,
   if (!branch(op)) {
     retire_short_observation(op.address);
     credit(values, count, builder_.CreateAdd(count, values[extra_cycles_value]), partial);
-    finish(values, next, partial);
+    finish_instruction(values, op, next, partial);
     return;
   }
   auto *cycles =
@@ -2517,7 +2560,11 @@ void Lowering::complete(Values values,
             ? jump_fetch(branch_values, target, op, target, {.clock = 0, .clocks_retired = 1})
             : nullptr;
     store(pack_delayed_target(target, before_first_delay_slot, fetch), delayed_target_slot);
-    finish(branch_values, next, partial);
+    if (interrupt_return(op)) {
+      exit(branch_values, builder_.getInt32(next), NativeExit::interrupt_return_slots);
+    } else {
+      finish(branch_values, next, partial);
+    }
   } else {
     branch_values[hazard_value] = builder_.getFalse();
     branch_values[dag_history_value] = builder_.getInt32(0);
@@ -2540,6 +2587,12 @@ void Lowering::complete(Values values,
 }
 
 void Lowering::redirect(Values values, const Instruction &op, llvm::Value *target, bool partial) {
+  if (interrupt_return(op)) {
+    const auto reason =
+        delayed(op) ? NativeExit::interrupt_return_redirect : NativeExit::interrupt_return;
+    exit(values, target, reason);
+    return;
+  }
   if (!delayed(op) && jump_refills_.contains(op.address)) {
     auto *entry = target != nullptr ? target : builder_.getInt32(branch_target(op));
     auto *fetch = entry;
@@ -2585,6 +2638,16 @@ void Lowering::delayed_slot(const Values &values,
   builder_.CreateCondBr(builder_.CreateICmpNE(pending, builder_.getInt64(0)), slot, ordinary);
   builder_.SetInsertPoint(slot);
   auto retired = values;
+  if (idle(op)) {
+    // The pending branch blocks interrupt service even though this slot idles.
+    credit(retired,
+           builder_.getInt64(1),
+           builder_.CreateAdd(builder_.getInt64(1), retired[extra_cycles_value]),
+           partial);
+    exit(retired, builder_.getInt32(op.address), NativeExit::sleeping);
+    builder_.SetInsertPoint(ordinary);
+    return;
+  }
   if (branch(op)) {
     // An adjacent complementary delayed JUMP is suppressed on the taken path.
     retired[hazard_value] = builder_.getFalse();
@@ -3283,7 +3346,7 @@ void Lowering::short_loop_retirement(Values values,
     auto *finished = llvm::BasicBlock::Create(module_.getContext(), "short.finished", function_);
     builder_.CreateCondBr(done, finished, repeat);
     builder_.SetInsertPoint(repeat);
-    finish(values, shape.start, partial);
+    finish_instruction(values, op, shape.start, partial);
     builder_.SetInsertPoint(finished);
     if (const auto parent = short_nested_.find(shape.end); parent != short_nested_.end()) {
       resume_short_parent(values, shape, parent->second);
@@ -3293,7 +3356,7 @@ void Lowering::short_loop_retirement(Values values,
       }
     }
   }
-  finish(values, next_pc(op), partial);
+  finish_instruction(values, op, next_pc(op), partial);
   builder_.SetInsertPoint(ordinary);
 }
 
@@ -3607,7 +3670,10 @@ void Lowering::clear_loop_repeat(const LoopFrame &frame) {
   builder_.CreateStore(metadata, loop_cell(loop_frames_slot, frame.index));
 }
 
-void Lowering::loop_backedge(const Values &values, const LoopShape &shape, bool partial) {
+void Lowering::loop_backedge(const Values &values,
+                             const Instruction &op,
+                             const LoopShape &shape,
+                             bool partial) {
   const auto frame = active_loop(values, shape);
   auto *repeat = llvm::BasicBlock::Create(module_.getContext(), "loop.repeat", function_);
   auto *next = llvm::BasicBlock::Create(module_.getContext(), "loop.next", function_);
@@ -3619,7 +3685,7 @@ void Lowering::loop_backedge(const Values &values, const LoopShape &shape, bool 
          builder_.getInt64(1),
          builder_.CreateAdd(builder_.getInt64(1), values[extra_cycles_value]),
          partial);
-  finish(turn, shape.start, partial);
+  finish_instruction(turn, op, shape.start, partial);
   builder_.SetInsertPoint(next);
 }
 
@@ -3687,7 +3753,7 @@ void Lowering::loop_retirement(Values &values,
     }
   }
   loop_samples(values, old_status, op.address, refill);
-  if (end != hardware_ends_.end()) { loop_backedge(values, end->second, partial); }
+  if (end != hardware_ends_.end()) { loop_backedge(values, op, end->second, partial); }
 }
 
 void Lowering::loop_samples(Values &values,
@@ -3724,7 +3790,7 @@ void Lowering::plan_hardware_grants(const LoopMap &shapes) {
     if (!std::ranges::all_of(body, [this, &shape](const Instruction &op) {
           const auto fetch = loop_fetches_.find(op.address);
           const auto test = loop_tests_.find(op.address);
-          return !branch(op) && !loop_setup(op) && !delay_boundary(op.address) &&
+          return !branch(op) && !idle(op) && !loop_setup(op) && !delay_boundary(op.address) &&
                  (test == loop_tests_.end() || test->second.end == shape.end ||
                   overlapping_refill(shape, test->second) ||
                   overlapping_short_tail(shape, test->second)) &&
@@ -3863,6 +3929,17 @@ void Lowering::emit_hardware_turns(const Node &body,
   readmit(values, (shape.end + 1) & maximum_pc);
 }
 
+void Lowering::finish_instruction(Values values,
+                                  const Instruction &op,
+                                  std::uint32_t next,
+                                  bool partial) {
+  if (idle(op)) {
+    exit(values, builder_.getInt32(next), NativeExit::sleeping);
+  } else {
+    finish(values, next, partial);
+  }
+}
+
 void Lowering::finish(Values values, std::uint32_t next, bool partial) {
   const auto target = addresses_.find(next);
   if (target != addresses_.end()) {
@@ -3958,6 +4035,7 @@ std::vector<BlockCost> Lowering::block_costs() const {
       leaders.insert(op.address);
       continue;
     }
+    if (idle(op)) { continue; }
     if (branch(op)) {
       result[index].cycles += branch_penalty;
       if (((op.word >> condition_shift) & true_condition) != true_condition) {
@@ -4125,7 +4203,7 @@ std::set<std::uint32_t> grant_successors(const Instruction &op) {
     next.insert(branch_target(op));
   }
   // A taken return ends this grant. Its checked continuation admits a new one.
-  if (!is_branch || ((op.word >> condition_shift) & true_condition) != true_condition) {
+  if ((!is_branch && !idle(op)) || (is_branch && branch_condition(op) != true_condition)) {
     next.insert((op.address + 1) & maximum_pc);
   }
   return next;

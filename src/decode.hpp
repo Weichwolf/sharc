@@ -13,6 +13,7 @@ inline constexpr std::uint8_t full_instruction_bits = 48;
 inline constexpr std::uint8_t wide_instruction_bits = 32;
 inline constexpr std::uint8_t short_instruction_bits = 16;
 inline constexpr std::uint32_t maximum_pc = 0xffffff;
+inline constexpr unsigned interrupt_source_count = 42;
 
 enum class ComputeKind : std::uint8_t {
   none,

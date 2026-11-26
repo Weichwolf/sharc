@@ -46,7 +46,9 @@ inline constexpr std::size_t counted_tail_slot = return_loop_tail_slot + 1;
 inline constexpr std::size_t short_counted_tail_slot = counted_tail_slot + loop_stack_capacity;
 inline constexpr std::size_t short_parent_tail_slot = short_counted_tail_slot + 1;
 inline constexpr std::size_t suspended_call_state_slot = short_parent_tail_slot + 1;
-inline constexpr std::size_t register_pointer_count = suspended_call_state_slot + 1;
+inline constexpr std::size_t interrupt_frame_slot = suspended_call_state_slot + 1;
+inline constexpr std::size_t status_depth_slot = interrupt_frame_slot + 1;
+inline constexpr std::size_t register_pointer_count = status_depth_slot + 1;
 // Three short-buffer words, the arithmetic refill, and all counted tails.
 inline constexpr unsigned suspended_call_state_words = 4 + loop_stack_capacity + 2;
 inline constexpr std::uint32_t loop_pc_index_mask = 31;
@@ -60,6 +62,7 @@ inline constexpr std::uint64_t counted_loop_tail = 1ULL << 49;
 inline constexpr std::uint64_t loop_call_live = 1ULL << 63;
 inline constexpr std::uint32_t pc_call_tag = 1U << 24;
 inline constexpr std::uint32_t pc_sequencer_tag = 1U << 25;
+inline constexpr std::uint32_t interrupt_status_frame = 1U << 8;
 
 enum ShortLoopWord : std::uint8_t {
   short_remaining,
@@ -129,7 +132,12 @@ enum class NativeExit : std::uint8_t {
   unsupported_loop_stack,
   unsupported_loop_reentry,
   invalid_loop_abort,
-  invalid_short_loop_call
+  invalid_short_loop_call,
+  sleeping,
+  interrupt_return,
+  invalid_interrupt_return,
+  interrupt_return_slots,
+  interrupt_return_redirect
 };
 using NativeEntry = void (*)(void **, std::uint64_t *);
 using RegisterPointers = std::vector<void *>;

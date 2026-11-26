@@ -138,6 +138,7 @@ struct VariantLayout {
 };
 
 struct InterruptRequest {
+  // Priority slot in the IVT (0 through 41); the consumer supplies the vector PC.
   std::uint8_t source{};
   std::uint32_t vector{};
 };

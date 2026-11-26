@@ -322,7 +322,6 @@ public:
     for (const auto address : code.entries) { entry(code.id, address); }
     std::set<std::uint8_t> sources;
     for (const auto &vector : code.interrupt_vectors) {
-      constexpr unsigned interrupt_source_count = 32;
       if (vector.source >= interrupt_source_count || !sources.insert(vector.source).second) {
         invalid(code.id, vector.vector, "invalid or duplicate interrupt source");
       }
