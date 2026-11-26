@@ -214,8 +214,15 @@ LLVM grant for full child turns share the transition logic. Installed-image
 tests cover countdown timing at all four gaps, snapshot replay, an arithmetic
 parent and a child refill overlapping an already-popped counted parent with
 a pending CALL. These combined pipeline timings are derived from the manual.
-Calls coinciding with a loop sample, short-loop calls, overlapping short
-loops and branches in the overlapping child refill remain open.
+For short children within long loops, Fetch1 can reach a parent endpoint
+while buffered child words still execute, including during a compact entry
+or exit bubble. The parent keeps any earlier fetch decision across the
+short child fill. Tests exercise counted bodies of one through four words,
+a short arithmetic child, a late arithmetic parent sample and snapshot
+replay with both active and already-popped frames. The overlap timing is
+derived from the documented pipeline observations.
+Calls coinciding with a loop sample, short-loop calls, short outer loops
+and branches in the overlapping child refill remain open.
 
 Classic type 5 transfers raw data among R/S and I/M/L/B registers, including
 cross-PE data moves and raw40 register swaps, with supported single-function fixed

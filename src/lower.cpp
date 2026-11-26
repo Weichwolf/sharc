@@ -646,6 +646,12 @@ bool overlapping_refill(const LoopShape &child, const LoopShape &parent) {
          parent.contains((child.start - 1) & maximum_pc);
 }
 
+bool overlapping_short_tail(const LoopShape &child, const LoopShape &parent) {
+  const auto gap = (parent.end - child.end) & maximum_pc;
+  return child.short_body() && gap != 0 && gap <= loop_fetch_distance &&
+         parent.contains((child.start - 1) & maximum_pc);
+}
+
 void debug_scope(llvm::DIBuilder &debug, llvm::Function &function, const std::string &filename) {
   auto *file = debug.createFile(filename, "");
   function.setSubprogram(
@@ -877,6 +883,14 @@ private:
     llvm::Value *fetch{}, *decode{};
   };
 
+  struct ShortRetirement {
+    llvm::Value *left{}, *old_status{};
+  };
+
+  struct ShortFetchWindow {
+    llvm::Value *before{}, *after{}, *old_status{};
+  };
+
   void write_short_addresses(ShortLookahead addresses, llvm::Value *live);
   llvm::Value *short_flag(llvm::Value *descriptor, std::uint64_t mask);
   void setup_short_loop(const LoopShape &shape, llvm::Value *count);
@@ -896,7 +910,21 @@ private:
   llvm::Value *short_loop_refill(const LoopShape &shape, llvm::Value *done);
   llvm::Value *
   short_stage(const LoopShape &shape, const Instruction &op, llvm::Value *left, unsigned lag);
-  void short_loop_observation(const Instruction &op, const LoopShape &shape, llvm::Value *left);
+  ShortLookahead short_lookahead(const Instruction &op, const LoopShape &shape, llvm::Value *left);
+  void short_loop_observation(Values &values,
+                              const Instruction &op,
+                              const LoopShape &shape,
+                              ShortRetirement retirement);
+  ShortLookahead overlapping_short_fetches(Values &values,
+                                           const LoopShape &shape,
+                                           ShortLookahead stages,
+                                           llvm::Value *old_status);
+  llvm::Value *short_fetch_crossed(ShortFetchWindow window, unsigned offset);
+  ShortLookahead redirect_short_parent(ShortLookahead stages,
+                                       const LoopShape &child,
+                                       const LoopShape &parent,
+                                       ShortFetchWindow window,
+                                       llvm::Value *selected);
   void retire_short_observation(std::uint32_t pc);
   void loop_backedge(const Values &values, const LoopShape &shape, bool partial);
   void
@@ -956,6 +984,7 @@ private:
   std::map<std::uint32_t, const Instruction *> delay_ends_;
   std::map<std::uint32_t, LoopShape> loop_fetches_, loop_tests_, hardware_ends_;
   std::map<std::uint32_t, std::vector<OverlappingLoopFetch>> overlapping_fetches_;
+  std::map<std::uint32_t, std::vector<LoopShape>> short_parents_;
   std::set<std::uint32_t> shifted_fetches_;
   std::map<std::uint32_t, LoopShape> hardware_grants_, short_bodies_;
   std::set<std::uint32_t> short_successors_;
@@ -1955,12 +1984,16 @@ void Lowering::plan_hardware_loops(const LoopMap &shapes) {
 
 void Lowering::plan_overlapping_loop_fetches(const LoopMap &shapes) {
   for (const auto &[end, child] : shapes) {
-    if (!child.arithmetic() || child.short_body()) { continue; }
+    if (!child.arithmetic() && !child.short_body()) { continue; }
     // A given child appends the candidate fetches in refill clock order.
     // Events for other children are gated by the active refill identity.
     for (unsigned gap = 1; gap <= loop_fetch_distance; ++gap) {
       const auto parent = shapes.find((end + gap) & maximum_pc);
-      if (parent == shapes.end() || !overlapping_refill(child, parent->second)) { continue; }
+      if (parent == shapes.end()) { continue; }
+      if (overlapping_short_tail(child, parent->second)) {
+        short_parents_[end].push_back(parent->second);
+      }
+      if (!overlapping_refill(child, parent->second)) { continue; }
       const auto pc = (end - (gap == 1 ? 1U : 0U)) & maximum_pc;
       if (!addresses_.contains(pc)) { continue; }
       overlapping_fetches_[pc].push_back({.child_end = end, .parent = parent->second});
@@ -2052,6 +2085,7 @@ void Lowering::setup_short_loop(const LoopShape &shape, llvm::Value *count) {
   }
   write_short(short_remaining, remaining);
   write_short(short_descriptor, descriptor);
+  write_short(short_fetch_progress, builder_.getInt64(0));
   write_short_addresses({.fetch = builder_.getInt64(shape.start + fetch_offsets[index]),
                          .decode = builder_.getInt64(shape.start + decode_offsets[index])},
                         builder_.getTrue());
@@ -2145,9 +2179,8 @@ llvm::Value *Lowering::short_stage(const LoopShape &shape,
       builder_.CreateICmpUGT(left, builder_.getInt64(lag)), builder_.getInt64(body_pc), following);
 }
 
-void Lowering::short_loop_observation(const Instruction &op,
-                                      const LoopShape &shape,
-                                      llvm::Value *left) {
+Lowering::ShortLookahead
+Lowering::short_lookahead(const Instruction &op, const LoopShape &shape, llvm::Value *left) {
   if (!shape.counted()) {
     auto *repeat = builder_.getInt64(short_unbounded);
     auto *fetch = short_stage(shape, op, repeat, loop_fetch_distance);
@@ -2155,9 +2188,7 @@ void Lowering::short_loop_observation(const Instruction &op,
     auto *redirect = builder_.CreateICmpULE(left, builder_.getInt64(loop_decode_distance));
     fetch =
         builder_.CreateSelect(redirect, short_stage(shape, op, left, loop_decode_distance), fetch);
-    write_short_addresses({.fetch = fetch, .decode = decode},
-                          builder_.CreateICmpNE(left, builder_.getInt64(0)));
-    return;
+    return {.fetch = fetch, .decode = decode};
   }
   auto *descriptor = short_word(short_descriptor);
   auto *fetch = short_stage(shape, op, left, loop_fetch_distance);
@@ -2182,10 +2213,92 @@ void Lowering::short_loop_observation(const Instruction &op,
     fetch = builder_.CreateSelect(compact, compact_fetch, fetch);
     decode = builder_.CreateSelect(compact, builder_.getInt64(shape.end), decode);
   }
-  auto *live = shape.length == loop_fetch_distance
-                   ? static_cast<llvm::Value *>(builder_.getTrue())
-                   : builder_.CreateICmpNE(left, builder_.getInt64(0));
-  write_short_addresses({.fetch = fetch, .decode = decode}, live);
+  return {.fetch = fetch, .decode = decode};
+}
+
+void Lowering::short_loop_observation(Values &values,
+                                      const Instruction &op,
+                                      const LoopShape &shape,
+                                      ShortRetirement retirement) {
+  const auto [left, old_status] = retirement;
+  auto stages = short_lookahead(op, shape, left);
+  auto *live = builder_.CreateICmpNE(left, builder_.getInt64(0));
+  if (short_parents_.contains(shape.end)) {
+    stages.fetch = builder_.CreateSelect(
+        live, stages.fetch, builder_.getInt64(shape.end + 1 + loop_fetch_distance));
+    stages = overlapping_short_fetches(values, shape, stages, old_status);
+  }
+  if (shape.length == loop_fetch_distance) { live = builder_.getTrue(); }
+  write_short_addresses(stages, live);
+}
+
+llvm::Value *Lowering::short_fetch_crossed(ShortFetchWindow window, unsigned offset) {
+  auto *limit = builder_.getInt64(offset);
+  return builder_.CreateAnd(builder_.CreateICmpULE(window.before, limit),
+                            builder_.CreateICmpUGT(window.after, limit));
+}
+
+Lowering::ShortLookahead Lowering::redirect_short_parent(ShortLookahead stages,
+                                                         const LoopShape &child,
+                                                         const LoopShape &parent,
+                                                         ShortFetchWindow window,
+                                                         llvm::Value *selected) {
+  const auto gap = (parent.end - child.end) & maximum_pc;
+  auto *delta = builder_.CreateSub(window.after, builder_.getInt64(gap));
+  auto *fetch = builder_.CreateAdd(builder_.getInt64(parent.start - 1), delta);
+  if (parent.arithmetic()) {
+    auto *terminating = refill_at(load(64, loop_refill_slot), parent.end);
+    auto *following =
+        builder_.CreateAdd(builder_.getInt64(parent.end - loop_decode_distance), delta);
+    fetch = builder_.CreateSelect(terminating, following, fetch);
+  }
+  constexpr unsigned normal_decode_lag = loop_decode_distance;
+  const unsigned decode_lag = child.length == loop_fetch_distance ? 3U : normal_decode_lag;
+  auto *decoder_redirected =
+      builder_.CreateAnd(selected, builder_.CreateICmpUGT(delta, builder_.getInt64(decode_lag)));
+  auto *decode = builder_.CreateSub(builder_.CreateAdd(builder_.getInt64(parent.start), delta),
+                                    builder_.getInt64(decode_lag + 1));
+  return {.fetch = builder_.CreateSelect(selected, fetch, stages.fetch),
+          .decode = builder_.CreateSelect(decoder_redirected, decode, stages.decode)};
+}
+
+Lowering::ShortLookahead Lowering::overlapping_short_fetches(Values &values,
+                                                             const LoopShape &shape,
+                                                             ShortLookahead stages,
+                                                             llvm::Value *old_status) {
+  auto *distance =
+      builder_.CreateAnd(builder_.CreateSub(stages.fetch, builder_.getInt64(shape.end)),
+                         builder_.getInt64(maximum_pc));
+  auto *linear = builder_.CreateICmpULE(distance, builder_.getInt64(loop_fetch_distance + 1));
+  const ShortFetchWindow window{.before = short_word(short_fetch_progress),
+                                .after =
+                                    builder_.CreateSelect(linear, distance, builder_.getInt64(0)),
+                                .old_status = old_status};
+  write_short(short_fetch_progress, window.after);
+  llvm::Value *redirected = builder_.getFalse();
+  for (const auto &parent : short_parents_.at(shape.end)) {
+    const auto gap = (parent.end - shape.end) & maximum_pc;
+    auto *reachable = builder_.CreateNot(redirected);
+    loop_fetch(values, parent, builder_.CreateAnd(reachable, short_fetch_crossed(window, gap)));
+    const auto frame = active_loop(values, parent);
+    auto *repeat = builder_.CreateAnd(frame.matches, repeat_scheduled(frame));
+    llvm::Value *selection = repeat;
+    if (parent.arithmetic()) {
+      const auto sample = gap + loop_decode_distance;
+      auto *at_execute = builder_.CreateICmpEQ(window.before, builder_.getInt64(sample));
+      auto *status = builder_.CreateSelect(at_execute, window.old_status, values[status_value]);
+      auto *sampled = builder_.CreateAnd(builder_.CreateAnd(reachable, repeat),
+                                         short_fetch_crossed(window, sample));
+      loop_test(values, status, parent, sampled);
+      selection = builder_.CreateOr(repeat, refill_at(load(64, loop_refill_slot), parent.end));
+    }
+    auto *selected =
+        builder_.CreateAnd(builder_.CreateAnd(reachable, selection),
+                           builder_.CreateICmpUGT(window.after, builder_.getInt64(gap)));
+    stages = redirect_short_parent(stages, shape, parent, window, selected);
+    redirected = builder_.CreateOr(redirected, selected);
+  }
+  return stages;
 }
 
 llvm::Value *Lowering::short_loop_refill(const LoopShape &shape, llvm::Value *done) {
@@ -2241,9 +2354,9 @@ void Lowering::short_loop_retirement(Values values,
       values[dag_history_value]);
   auto *cycles = builder_.CreateAdd(builder_.CreateAdd(builder_.getInt64(1), refill),
                                     values[extra_cycles_value]);
+  short_loop_observation(values, op, shape, {.left = left, .old_status = old_status});
   credit(values, builder_.getInt64(1), cycles, partial);
   write_short(short_remaining, left);
-  short_loop_observation(op, shape, left);
   write_short(short_descriptor, builder_.CreateAnd(descriptor, builder_.getInt64(~short_startup)));
   if (op.address == shape.end) {
     auto *repeat = llvm::BasicBlock::Create(module_.getContext(), "short.repeat", function_);
@@ -2595,10 +2708,12 @@ void Lowering::plan_hardware_grants(const LoopMap &shapes) {
           const auto test = loop_tests_.find(op.address);
           return !branch(op) && !loop_setup(op) && !delay_boundary(op.address) &&
                  (test == loop_tests_.end() || test->second.end == shape.end ||
-                  overlapping_refill(shape, test->second)) &&
+                  overlapping_refill(shape, test->second) ||
+                  overlapping_short_tail(shape, test->second)) &&
                  (op.address == shape.end || !hardware_ends_.contains(op.address)) &&
                  (fetch == loop_fetches_.end() || fetch->second.end == shape.end ||
-                  overlapping_refill(shape, fetch->second)) &&
+                  overlapping_refill(shape, fetch->second) ||
+                  overlapping_short_tail(shape, fetch->second)) &&
                  op.type != index_modify_type && !dag_register(loaded_register(op));
         })) {
       continue;
@@ -2712,7 +2827,8 @@ void Lowering::emit_hardware_turns(const Node &body,
   if (shape.short_body()) {
     auto *buffered = builder_.getInt64(shape.short_condition_tail());
     write_short(short_remaining, buffered);
-    short_loop_observation(words.back(), shape, buffered);
+    short_loop_observation(
+        values, words.back(), shape, {.left = buffered, .old_status = values[status_value]});
     credit(values, retired, retired, false);
     jump(partial_[start], values);
     return;
@@ -3373,7 +3489,7 @@ void validate_nested_loop(const InstructionMap &code,
     reject(op, identity, FaultReason::invalid_encoding, "nested DO crosses or shares its endpoint");
   }
   const auto gap = remaining - child.length;
-  if (outer.short_body() || (child.short_body() && gap <= loop_fetch_distance)) {
+  if (outer.short_body()) {
     reject(op,
            identity,
            FaultReason::unsupported_instruction,
