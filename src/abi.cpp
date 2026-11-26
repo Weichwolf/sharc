@@ -86,7 +86,6 @@ NativeAbi::NativeAbi(llvm::Module &module,
                                   builder.getInt64Ty(),
                                   builder.getInt64Ty(),
                                   builder.getInt64Ty(),
-                                  builder.getInt64Ty(),
                                   builder.getInt32Ty(),
                                   builder.getInt32Ty(),
                                   builder.getInt32Ty(),
@@ -146,10 +145,9 @@ void NativeAbi::emit_reload() {
   args[unit_root] = reload_->getArg(3);
   args[unit_pipeline] = load(builder.getInt32Ty(), pipeline_slot);
   args[unit_reason] = builder.getInt64(0);
-  args[unit_retired_instructions] = builder.getInt64(0);
-  args[unit_retired_cycles] = builder.getInt64(0);
-  for (const auto [arg, slot] : {std::pair{unit_instructions, remaining_instructions},
-                                 std::pair{unit_cycles, remaining_cycles}}) {
+  args[unit_cycle_overrun] = builder.getInt64(0);
+  for (const auto [arg, slot] :
+       {std::pair{unit_instructions, instruction_budget}, std::pair{unit_cycles, cycle_budget}}) {
     args[arg] = builder.CreateLoad(
         builder.getInt64Ty(),
         builder.CreateGEP(builder.getInt64Ty(), args[unit_controls], builder.getInt64(slot)));
@@ -213,8 +211,18 @@ void NativeAbi::emit_spill() {
   }
   auto *pc = spill_->getArg(unit_pc);
   write(pc, pc_slot);
-  auto *retired =
-      builder.CreateICmpNE(spill_->getArg(unit_retired_instructions), builder.getInt64(0));
+  const auto control = [&](ControlSlot slot) {
+    return builder.CreateGEP(
+        builder.getInt64Ty(), spill_->getArg(unit_controls), builder.getInt64(slot));
+  };
+  const auto consumed = [&](ControlSlot slot, UnitArgument remaining) {
+    return builder.CreateSub(builder.CreateLoad(builder.getInt64Ty(), control(slot)),
+                             spill_->getArg(remaining));
+  };
+  auto *instructions = consumed(instruction_budget, unit_instructions);
+  auto *cycles =
+      builder.CreateAdd(consumed(cycle_budget, unit_cycles), spill_->getArg(unit_cycle_overrun));
+  auto *retired = builder.CreateICmpNE(instructions, builder.getInt64(0));
   for (const auto [slot, displacement] : {std::pair{faddr_slot, 4U}, std::pair{daddr_slot, 2U}}) {
     auto *next = builder.CreateAnd(builder.CreateAdd(pc, builder.getInt32(displacement)),
                                    builder.getInt32(maximum_pc));
@@ -224,20 +232,16 @@ void NativeAbi::emit_spill() {
               builder.CreateLoad(builder.getInt32Ty(), pointer(builder, pointers, slot))),
           slot);
   }
-  write(builder.CreateAdd(
-            builder.CreateLoad(builder.getInt64Ty(), pointer(builder, pointers, clock_slot)),
-            spill_->getArg(unit_retired_cycles)),
-        clock_slot);
+  write(
+      builder.CreateAdd(
+          builder.CreateLoad(builder.getInt64Ty(), pointer(builder, pointers, clock_slot)), cycles),
+      clock_slot);
   write(spill_->getArg(unit_pipeline), pipeline_slot);
-  for (const auto [slot, arg] : {std::pair{retired_instructions, unit_retired_instructions},
-                                 std::pair{retired_cycles, unit_retired_cycles},
-                                 std::pair{exit_reason, unit_reason},
-                                 std::pair{resume_entry, unit_root}}) {
-    builder.CreateStore(builder.CreateZExtOrTrunc(spill_->getArg(arg), builder.getInt64Ty()),
-                        builder.CreateGEP(builder.getInt64Ty(),
-                                          spill_->getArg(unit_controls),
-                                          builder.getInt64(slot)));
-  }
+  builder.CreateStore(instructions, control(retired_instructions));
+  builder.CreateStore(cycles, control(retired_cycles));
+  builder.CreateStore(spill_->getArg(unit_reason), control(exit_reason));
+  builder.CreateStore(builder.CreateZExt(spill_->getArg(unit_root), builder.getInt64Ty()),
+                      control(resume_entry));
   builder.CreateRetVoid();
 }
 
@@ -248,14 +252,10 @@ void NativeAbi::emit_dispatch(std::uint32_t variant) {
   llvm::IRBuilder<> builder(llvm::BasicBlock::Create(module_.getContext(), "dispatch", function));
   auto args = arguments(*function);
   auto *done = llvm::BasicBlock::Create(module_.getContext(), "cold.spill", function);
-  auto *select = llvm::BasicBlock::Create(module_.getContext(), "target", function);
+  auto *impossible = llvm::BasicBlock::Create(module_.getContext(), "unreachable.mode", function);
+  llvm::IRBuilder<>(impossible).CreateUnreachable();
   auto *returned = builder.CreateICmpEQ(
       args[unit_reason], builder.getInt64(static_cast<unsigned>(NativeExit::returned)));
-  auto *available = builder.CreateOr(
-      returned,
-      builder.CreateAnd(builder.CreateICmpNE(args[unit_instructions], builder.getInt64(0)),
-                        builder.CreateICmpNE(args[unit_cycles], builder.getInt64(0))));
-  builder.CreateCondBr(available, select, done);
   std::map<std::uint32_t, std::uint32_t> targets;
   std::set<std::uint32_t> roots;
   for (const auto &unit : units_) {
@@ -267,7 +267,6 @@ void NativeAbi::emit_dispatch(std::uint32_t variant) {
   for (const auto &point : continuations_) {
     if (point.variant == variant) { targets.try_emplace(point.address, point.root); }
   }
-  builder.SetInsertPoint(select);
   auto *dispatch = builder.CreateSwitch(args[unit_pc], done);
   for (const auto [address, root] : targets) {
     auto *target = llvm::BasicBlock::Create(module_.getContext(), "target.mode", function);
@@ -282,7 +281,8 @@ void NativeAbi::emit_dispatch(std::uint32_t variant) {
       return candidate.variant == variant && candidate.entry == root;
     });
     auto *mode = builder.CreateAnd(args[unit_mode], builder.getInt32(unit->mask));
-    auto *modes = builder.CreateSwitch(mode, done);
+    // Preparation enumerates every subset of this mask for the selected root.
+    auto *modes = builder.CreateSwitch(mode, impossible);
     for (const auto &candidate : units_) {
       if (candidate.variant != variant || candidate.entry != root) { continue; }
       auto *hit = llvm::BasicBlock::Create(module_.getContext(), "unit", function);
@@ -304,14 +304,12 @@ void NativeAbi::leave(llvm::IRBuilder<> &builder,
       module_.getContext(), "cold.transfer", builder.GetInsertBlock()->getParent());
   auto *done = llvm::BasicBlock::Create(
       module_.getContext(), "cold.spill", builder.GetInsertBlock()->getParent());
-  builder.CreateCondBr(
-      builder.CreateOr(
-          builder.CreateICmpEQ(args[unit_reason],
-                               builder.getInt64(static_cast<unsigned>(NativeExit::indirect))),
-          builder.CreateICmpEQ(args[unit_reason],
-                               builder.getInt64(static_cast<unsigned>(NativeExit::returned)))),
-      dispatch,
-      done);
+  auto *indirect = builder.CreateICmpEQ(
+      args[unit_reason], builder.getInt64(static_cast<unsigned>(NativeExit::indirect)));
+  auto *returned = builder.CreateICmpEQ(
+      args[unit_reason], builder.getInt64(static_cast<unsigned>(NativeExit::returned)));
+  // The selected unit admits or stops at its own entry, including at a bound.
+  builder.CreateCondBr(builder.CreateOr(indirect, returned), dispatch, done);
   builder.SetInsertPoint(dispatch);
   tail(builder, module_.getFunction(dispatcher(unit.variant)), args);
   builder.SetInsertPoint(done);

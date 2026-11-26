@@ -272,12 +272,25 @@ void cross_unit_call(bool relative_call) {
     redirected.pc = base + 2;
     redirected.dag[0][9].index = base + 1;
     core.set_registers(redirected);
+    const auto at_bound = core.run(1);
+    auto target = redirected;
+    advance(target, {.pc = base + 1, .cycles = 4});
+    check(!at_bound.has_fault && core.registers() == target &&
+              at_bound.progress == sharc::Progress{.instructions = 1, .base_cycles = 4},
+          "undeclared indirect target caused an early fault at the bound");
+    resumed.restore(core.save());
+    const auto refused_resume = resumed.run(1);
+    check(refused_resume.has_fault &&
+              refused_resume.fault.reason == sharc::FaultReason::undeclared_entry &&
+              refused_resume.fault.address == base + 1 &&
+              refused_resume.progress == sharc::Progress{} && resumed.registers() == target,
+          "resuming the bound acquired a private return entry");
+    core.set_registers(redirected);
     const auto refused = core.run(2);
-    advance(redirected, {.pc = base + 1, .cycles = 4});
     check(refused.has_fault && refused.fault.reason == sharc::FaultReason::undeclared_entry &&
               refused.fault.address == base + 1 &&
               refused.progress == sharc::Progress{.instructions = 1, .base_cycles = 4} &&
-              core.registers() == redirected,
+              core.registers() == target,
           "ordinary indirect jump acquired a private return entry");
   }
 }

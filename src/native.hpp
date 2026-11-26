@@ -56,8 +56,8 @@ inline constexpr std::uint32_t circular_mode = 1U << 24;
 }
 
 enum ControlSlot : std::uint8_t {
-  remaining_instructions,
-  remaining_cycles,
+  instruction_budget,
+  cycle_budget,
   retired_instructions,
   retired_cycles,
   exit_reason,
