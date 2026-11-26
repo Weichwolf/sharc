@@ -299,7 +299,16 @@ short child fill. Tests exercise counted bodies of one through four words,
 a short arithmetic child, a late arithmetic parent sample and snapshot
 replay with both active and already-popped frames. The overlap timing is
 derived from the documented pipeline observations.
-Short outer loops and branches in the overlapping child refill remain open.
+Counted three- and four-word outer loops and three-word `DO FOREVER`
+can nest a short DO with a distinct earlier endpoint. The outer buffer
+survives the child, including when the outer counted frame has already
+popped. Tests cover one- and two-word counted children, a one-word
+arithmetic child, both child positions in a four-word parent, and a
+counted child that admits complete native turns. Fetch and decode
+observations across the handoff are derived from the short-loop timing.
+Three overlapping tails, IF NOT LCE in a short outer overlap and branches
+in an overlapping child refill remain unqualified. The combined timing
+awaits hardware comparison.
 
 Classic type 5 transfers raw data among R/S and I/M/L/B registers, including
 cross-PE data moves and raw40 register swaps, with supported single-function fixed

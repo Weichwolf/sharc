@@ -1165,6 +1165,201 @@ void steady_counted_short_overlap() {
   verify_timeline(program, initial, trace);
 }
 
+struct ShortChildSetup {
+  unsigned pc, width;
+  unsigned iterations{};
+
+  [[nodiscard]] unsigned end() const { return pc + width; }
+
+  [[nodiscard]] constexpr unsigned count() const { return iterations == 0 ? width : iterations; }
+};
+
+void push_short_child(Timeline &trace,
+                      ShortChildSetup child,
+                      unsigned cycles,
+                      bool arithmetic = false) {
+  auto &state = trace.registers;
+  const auto depth = state.loop_address_depth;
+  state.pc_stack[depth] = base + child.pc + 1;
+  constexpr auto one_word_arithmetic = 1U << 29;
+  const auto type = arithmetic ? one_word_arithmetic : short_counted_types[child.width - 1];
+  state.loop_address_stack[depth] = type | (base + child.end());
+  if (!arithmetic) { state.lcntr = child.count(); }
+  state.loop_counter_stack[depth] = state.lcntr;
+  state.loop_address_depth = state.loop_counter_depth = state.pc_stack_pointer = depth + 1;
+  state.pe[0].stky &= ~empty;
+  short_boundary(trace, {.pc = child.pc + 1, .fetch = child.end(), .decode = child.end()}, cycles);
+}
+
+void pop_short_child(Timeline &trace, unsigned retained_count) {
+  auto &state = trace.registers;
+  state.loop_counter_stack[state.loop_counter_depth - 1] = retained_count;
+  if (state.loop_address_depth == 1) {
+    popped(state);
+  } else {
+    leave_nested_child(state);
+  }
+}
+
+void four_word_short_child(Timeline &trace, ShortChildSetup child, bool repeats) {
+  auto &result = trace.registers.pe[0].data[0][0];
+  const auto next = child.end() + 1;
+  const auto fetch = repeats ? next : next + 4;
+  const auto endpoint_decode = repeats ? 1U : 5U;
+  const auto decode = next == 3 ? 4U : endpoint_decode;
+  result += 1U << raw_shift;
+  if (child.width == 1) {
+    pop_short_child(trace, 0);
+    short_boundary(trace, {.pc = next, .fetch = fetch, .decode = decode}, 5);
+    return;
+  }
+  pop_short_child(trace, 1);
+  // The second parent pass is already in Fetch1 behind the three buffered child words.
+  short_boundary(trace, {.pc = 3, .fetch = repeats ? 1U : 5U, .decode = 3}, 2);
+  short_boundary(trace, {.pc = 2, .fetch = repeats ? 2U : 6U, .decode = 4});
+  result += 1U << raw_shift;
+  short_boundary(trace, {.pc = 3, .fetch = repeats ? 3U : 7U, .decode = repeats ? 1U : 5U});
+  short_boundary(trace, {.pc = next, .fetch = fetch, .decode = decode});
+}
+
+void nested_four_word_parent(ShortChildSetup child, unsigned count) {
+  std::array<std::uint64_t, 6> words{};
+  words[0] = do_immediate | (std::uint64_t{count} << count_shift) | 4;
+  words[child.pc] = do_immediate | (std::uint64_t{child.count()} << count_shift) | child.width;
+  words[child.pc + 1] = fixture::add(0, 0, 1);
+  fixture::Program program(words);
+  auto initial = starting();
+  initial.pe[0].data[0][1] = 1U << raw_shift;
+  Timeline trace{.registers = initial, .prefixes = {}};
+  trace.registers.lcntr = count;
+  entered(trace, {.address = counted_address | (base + 4), .count = count});
+  trace.registers.faddr = base + 4;
+  trace.registers.daddr = base + 2;
+  trace.prefixes.back().registers = trace.registers;
+  parent_count_sample(trace, count > 1);
+  for (unsigned turn = 0; turn < count; ++turn) {
+    const bool repeats = turn + 1 < count;
+    auto startup = turn == 0 ? 2U : 1U;
+    if (child.pc == 2) {
+      short_boundary(trace, {.pc = 2, .fetch = repeats ? 2U : 6U, .decode = 3}, startup);
+      startup = 1;
+    }
+    push_short_child(trace, child, startup);
+    four_word_short_child(trace, child, repeats);
+    if (child.end() == 2) {
+      short_boundary(trace, {.pc = 4, .fetch = repeats ? 4U : 8U, .decode = repeats ? 1U : 5U});
+    }
+    if (repeats) {
+      parent_count_sample(trace, false);
+      short_boundary(trace, {.pc = 1, .fetch = 5, .decode = 2});
+    } else {
+      short_boundary(trace, {.pc = 5, .fetch = 9, .decode = 6});
+    }
+  }
+  verify_timeline(program, initial, trace);
+}
+
+void nested_three_word_parent(bool compact) {
+  constexpr ShortChildSetup child{.pc = 1, .width = 1};
+  const auto count = compact ? 1U : 3U;
+  const auto setup = do_immediate | (std::uint64_t{count} << count_shift);
+  const std::array words{setup | 3,
+                         do_immediate | (std::uint64_t{1} << count_shift) | 1,
+                         fixture::add(0, 0, 1),
+                         std::uint64_t{0},
+                         std::uint64_t{0}};
+  fixture::Program program(words);
+  auto initial = starting();
+  initial.pe[0].data[0][1] = 1U << raw_shift;
+  Timeline trace{.registers = initial, .prefixes = {}};
+  trace.registers.lcntr = count;
+  constexpr auto address = short_counted_types[2];
+  entered_arithmetic(trace, {.pc = 1, .fetch = 2, .decode = 3}, address | (base + 3));
+  trace.registers.loop_counter_stack[0] = trace.registers.lcntr;
+  trace.prefixes.back().registers = trace.registers;
+  if (!compact) { parent_count_sample(trace, true); }
+  constexpr std::array counted_exit{1U, 4U, 7U};
+  for (unsigned turn = 0; turn < count; ++turn) {
+    push_short_child(trace, child, 1);
+    trace.registers.pe[0].data[0][0] += 1U << raw_shift;
+    pop_short_child(trace, 0);
+    if (turn == 0) { parent_count_sample(trace, false); }
+    const auto fetch = compact ? 4U : counted_exit[turn];
+    auto decode = turn == 2 ? 5U : 2U;
+    if (compact) { decode = 3; }
+    short_boundary(trace, {.pc = 3, .fetch = fetch, .decode = decode}, 5);
+    if (turn + 1 < count) {
+      short_boundary(trace, {.pc = 1, .fetch = turn == 1 ? 5U : 2U, .decode = 3});
+    } else {
+      short_boundary(trace, {.pc = 4, .fetch = 8, .decode = 6}, compact ? 4U : 1U);
+    }
+  }
+  verify_timeline(program, initial, trace);
+}
+
+void short_forever_child_drain(Timeline &trace, bool arithmetic) {
+  constexpr std::array counted{ShortAddress{.pc = 2, .fetch = 2, .decode = 2},
+                               ShortAddress{.pc = 2, .fetch = 2, .decode = 2},
+                               ShortAddress{.pc = 2, .fetch = 3, .decode = 2},
+                               ShortAddress{.pc = 2, .fetch = 1, .decode = 2},
+                               ShortAddress{.pc = 2, .fetch = 2, .decode = 3},
+                               ShortAddress{.pc = 2, .fetch = 3, .decode = 1}};
+  constexpr std::array conditional{counted[0], counted[2], counted[3]};
+  const auto drain = arithmetic ? std::span<const ShortAddress>(conditional)
+                                : std::span<const ShortAddress>(counted);
+  auto &state = trace.registers;
+  state.pe[0].astat = 0;
+  for (std::size_t i = 0; i < drain.size(); ++i) {
+    state.pe[0].data[0][0] += 1U << raw_shift;
+    if (arithmetic && i == 0) {
+      pop_short_child(trace, old_lcntr);
+    } else if (!arithmetic && i < 3) {
+      state.loop_counter_stack[1] = static_cast<std::uint32_t>(5 - i);
+      if (i == 2) { leave_nested_child(state); }
+    }
+    short_boundary(trace, drain[i], i == 0 ? 2U : 1U);
+  }
+  state.pe[0].data[0][0] += 1U << raw_shift;
+  short_boundary(trace, {.pc = 3, .fetch = 1, .decode = 2}, arithmetic ? 3U : 1U);
+}
+
+void nested_forever_child_drain(bool arithmetic) {
+  constexpr auto do_forever_three = 0x0e3e00000003;
+  constexpr auto forever_address = 0x1f000000 | (base + 3);
+  constexpr ShortChildSetup child{.pc = 1, .width = 1, .iterations = 7};
+  constexpr auto counted_setup = do_immediate | (std::uint64_t{child.count()} << count_shift) | 1;
+  const std::array words{std::uint64_t{do_forever_three},
+                         arithmetic ? do_eq | 1 : counted_setup,
+                         fixture::add(0, 0, 1),
+                         arithmetic ? fixture::add(7, 7, 7) : std::uint64_t{0}};
+  fixture::Program program(words);
+  auto initial = starting();
+  initial.pe[0].data[0][1] = 1U << raw_shift;
+  if (arithmetic) { initial.pe[0].astat = az; }
+  Timeline trace{.registers = initial, .prefixes = {}};
+  entered_arithmetic(trace, {.pc = 1, .fetch = 2, .decode = 3}, forever_address);
+  for (unsigned turn = 0; turn < 2; ++turn) {
+    push_short_child(trace, child, 1, arithmetic);
+    short_forever_child_drain(trace, arithmetic);
+    if (arithmetic) { trace.registers.pe[0].astat = az; }
+    short_boundary(trace, {.pc = 1, .fetch = 2, .decode = 3});
+  }
+  verify_timeline(program, initial, trace);
+}
+
+void refused_three_overlapping_short_tails() {
+  constexpr auto count_two = do_immediate | (std::uint64_t{2} << count_shift);
+  std::array<std::uint64_t, 9> words{};
+  words[0] = count_two | 8;
+  words[1] = count_two | 3;
+  words[2] = count_two | 1;
+  const fixture::Program program(words);
+  const auto fault = fixture::refusal(program.code, "three overlapping DO tails were prepared");
+  check(fault.reason == sharc::FaultReason::unsupported_instruction && fault.address == base + 2 &&
+            fault.instruction == words[2],
+        "overlapping short parent fault lost the inner DO");
+}
+
 void short_arithmetic_child_overlap() {
   constexpr auto child_end = short_setup_pc + 2;
   constexpr auto parent_end = child_end + 2;
@@ -2884,6 +3079,15 @@ void fixture::hardware_loop_control_flow() {
   short_arithmetic_refill_not_lce();
   short_child_after_parent_fetch();
   nested_short_do();
+  nested_four_word_parent({.pc = 1, .width = 1}, 1);
+  nested_four_word_parent({.pc = 1, .width = 1}, 2);
+  nested_four_word_parent({.pc = 1, .width = 2}, 2);
+  nested_four_word_parent({.pc = 2, .width = 1}, 2);
+  nested_three_word_parent(true);
+  nested_three_word_parent(false);
+  nested_forever_child_drain(false);
+  nested_forever_child_drain(true);
+  refused_three_overlapping_short_tails();
   counted_call_reentry();
   counted_sample_call(CountedSampleCall::plain);
   counted_sample_call(CountedSampleCall::direct);

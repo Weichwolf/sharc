@@ -62,6 +62,8 @@ enum ShortLoopWord : std::uint8_t {
   short_descriptor,
   short_addresses,
   short_fetch_progress,
+  short_parent_remaining,
+  short_parent_descriptor,
   short_state_words
 };
 

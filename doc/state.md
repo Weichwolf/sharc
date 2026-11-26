@@ -61,6 +61,11 @@ A pending counted tail and an arithmetic refill have distinct storage, so
 the outer counter may terminate while the inner arithmetic tail is draining.
 For a short child, the snapshot also preserves how far Fetch1 has advanced
 past its endpoint while buffered child words remain.
+A short outer DO keeps its remaining body words and descriptor while the
+inner DO owns the short fetch buffer. The child's drain can see addresses
+from the next outer pass. The child endpoint restores the outer suffix
+after the inner frame has popped, even when the outer stack frame popped
+earlier. Exact bounds and snapshots retain both buffers during the handoff.
 A counted DO loads LCNTR once. The current count then evolves on the loop
 counter stack while LCNTR continues to hold the setup value.
 A qualified CALL saves a suspended terminating tail with its PC-stack entry.

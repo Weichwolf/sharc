@@ -143,8 +143,9 @@ struct LoopPipeline {
   std::uint64_t return_tail{};
 
   [[nodiscard]] bool active() const {
-    return short_loop[detail::short_remaining] != 0 || refill != 0 || short_counted_tail != 0 ||
-           return_tail != 0 ||
+    return short_loop[detail::short_remaining] != 0 ||
+           short_loop[detail::short_parent_remaining] != 0 || refill != 0 ||
+           short_counted_tail != 0 || return_tail != 0 ||
            std::ranges::any_of(counted_tails, [](auto tail) { return tail != 0; }) ||
            std::ranges::any_of(frames, [](auto frame) { return frame != 0; }) ||
            std::ranges::any_of(calls, [](auto call) { return call != 0; });
