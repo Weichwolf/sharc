@@ -110,6 +110,10 @@ void shifts() {
          "reserved immediate-shift bit 22");
 }
 
+sharc::Accumulator accumulator(const std::array<std::uint32_t, 3> &limbs) {
+  return {.low = limbs[0], .middle = limbs[1], .high = static_cast<std::uint16_t>(limbs[2])};
+}
+
 void fixed_multiplier() {
   constexpr std::uint64_t compute_true = 0x013e00000000;
   constexpr std::uint32_t simd = 1U << 21;
@@ -120,10 +124,6 @@ void fixed_multiplier() {
     words[i] = compute_true | fixture::multiplier_cases[i].field;
   }
   fixture::Program program(words);
-  const auto accumulator = [](const std::array<std::uint32_t, 3> &limbs) {
-    return sharc::Accumulator{
-        .low = limbs[0], .middle = limbs[1], .high = static_cast<std::uint16_t>(limbs[2])};
-  };
   for (const auto mode : fixture::numeric_modes) {
     const auto native = fixture::compile(program.code, mode);
     sharc::Core core(program.memory(), mode);
@@ -162,6 +162,50 @@ void fixed_multiplier() {
                            core.registers() == expected,
                        test.name);
       }
+    }
+  }
+}
+
+void fixed_multifunction() {
+  constexpr std::uint32_t swap = 1U << 2;
+  constexpr std::uint64_t tied_dual_results = 0x013e00600000;
+  const auto tie = fixture::refusal(fixture::image(sharc::InstructionSet::isa, tied_dual_results),
+                                    "duplicate ALU destinations were admitted");
+  fixture::check(tie.reason == sharc::FaultReason::unsupported_instruction &&
+                     tie.detail.contains("duplicate dual-ALU output"),
+                 "duplicate ALU destinations lost their priority diagnostic");
+  std::array<std::uint64_t, fixture::multifunction_cases.size()> words{};
+  for (std::size_t i = 0; i < words.size(); ++i) {
+    words[i] = fixture::multifunction_cases[i].word;
+  }
+  fixture::Program program(words);
+  for (const auto mode : fixture::numeric_modes) {
+    const auto native = fixture::compile(program.code, mode);
+    sharc::Core core(program.memory(), mode);
+    (void)core.install(native, fixture::Program::variant_id);
+    core.reset(fixture::code_address);
+    for (const auto &test : fixture::multifunction_cases) {
+      auto initial = core.registers();
+      initial.mode1 = test.mode1;
+      const auto bank = (test.mode1 & swap) != 0 ? 1U : 0U;
+      auto expected = initial;
+      for (std::size_t lane = 0; lane < initial.pe.size(); ++lane) {
+        const auto &reference = test.lanes[lane];
+        auto &pe = initial.pe[lane];
+        pe.data = reference.old_registers;
+        pe.multiplier[bank] = accumulator(reference.old_mr);
+        pe.astat = reference.old_astat;
+        pe.stky = reference.old_stky;
+        auto &finished = expected.pe[lane];
+        finished.data = reference.result_registers;
+        finished.multiplier[bank] = accumulator(reference.result_mr);
+        finished.astat = reference.astat;
+        finished.stky = reference.stky;
+      }
+      core.set_registers(initial);
+      fixture::boundary(expected, {.pc = initial.pc + 1, .clock = initial.emuclk + 1});
+      fixture::check(fixture::completed(core.run(1), 1, 1) && core.registers() == expected,
+                     test.name);
     }
   }
 }
@@ -211,6 +255,7 @@ int main() {
     computations();
     shifts();
     fixed_multiplier();
+    fixed_multifunction();
     accumulator_continuation();
   });
 }

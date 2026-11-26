@@ -153,9 +153,35 @@ bool fixed_multiplier(const Compute &compute) {
   return compute.kind == ComputeKind::multiplier && compute.opcode != float_multiply_opcode;
 }
 
+bool fixed_multifunction(const Compute &compute) {
+  constexpr unsigned first_floating_packet = 0x18;
+  constexpr unsigned fixed_butterfly = 6;
+  return (compute.kind == ComputeKind::multiply_alu && compute.opcode < first_floating_packet) ||
+         (compute.kind == ComputeKind::multiply_dual_alu && compute.opcode == fixed_butterfly);
+}
+
+std::uint8_t multifunction_product_opcode(const Compute &compute) {
+  constexpr unsigned signed_fraction = fractional_product | product_signed_x | product_signed_y;
+  constexpr std::uint8_t rounded_product = product_opcode | signed_fraction | 1;
+  if (compute.kind == ComputeKind::multiply_dual_alu) { return rounded_product; }
+  // Table 12-12 groups three ALU operations under each multiplier form.
+  constexpr std::array<std::uint8_t, 5> products{rounded_product,
+                                                 mac_opcode | signed_fraction | destination_mr,
+                                                 mac_opcode | signed_fraction | 1,
+                                                 msub_opcode | signed_fraction | destination_mr,
+                                                 msub_opcode | signed_fraction | 1};
+  return products[(compute.opcode >> 2) - 1];
+}
+
+unsigned multifunction_alu_opcode(const Compute &compute) {
+  constexpr std::array operations{alu::add, alu::subtract, alu::average};
+  return compute.kind == ComputeKind::multiply_dual_alu ? alu::add
+                                                        : operations[compute.opcode & 3U];
+}
+
 bool supported_compute(const Compute &compute) {
   return compute.kind == ComputeKind::none || fixed_multiplier(compute) ||
-         compute.kind == ComputeKind::mr_transfer ||
+         fixed_multifunction(compute) || compute.kind == ComputeKind::mr_transfer ||
          (compute.kind == ComputeKind::alu &&
           std::ranges::find(fixed_operations, compute.opcode) != fixed_operations.end()) ||
          ((compute.kind == ComputeKind::shifter || compute.kind == ComputeKind::shift_immediate) &&
@@ -627,6 +653,14 @@ void validate(const Instruction &instruction, std::string_view identity) {
            FaultReason::unsupported_instruction,
            "VISA native pipeline lowering is not implemented");
   }
+  const auto &compute = instruction.compute;
+  if (compute.kind == ComputeKind::multiply_dual_alu && fixed_multifunction(compute) &&
+      compute.outputs[1] == compute.outputs[2]) {
+    reject(instruction,
+           identity,
+           FaultReason::unsupported_instruction,
+           "duplicate dual-ALU output priority is unqualified");
+  }
   if ((instruction.type == nop_type && instruction.word == 0) || idle(instruction)) { return; }
   if (instruction.type == index_modify_type) { return; }
   if (instruction.type == register_move_type) {
@@ -671,7 +705,6 @@ void validate(const Instruction &instruction, std::string_view identity) {
              "reserved conditional-compute bits");
     }
     validate_condition(instruction, identity);
-    const auto &compute = instruction.compute;
     if (supported_compute(compute)) { return; }
     if (compute.kind == ComputeKind::dual_alu && compute.opcode == alu::dual_add_subtract) {
       if (compute.outputs[0] == compute.outputs[1]) {
@@ -973,6 +1006,14 @@ private:
   llvm::Value *condition(const Values &values, const Instruction &op);
   Arithmetic arithmetic(const Values &values, const Compute &compute, unsigned opcode);
   Arithmetic multiplier(Values &values, const Compute &compute, llvm::Value *selected);
+  Arithmetic multifunction(Values &values,
+                           const Values &before,
+                           const Compute &compute,
+                           llvm::Value *selected);
+  void compute_instruction(Values &values,
+                           const Values &before,
+                           const Compute &compute,
+                           llvm::Value *selected);
   Arithmetic move_accumulator(Values &values, const Compute &compute, llvm::Value *selected);
   Arithmetic multiplier_result(const Values &values, llvm::Value *value, MultiplierFormat format);
   llvm::Value *product(const Values &values, const Compute &compute);
@@ -1823,6 +1864,63 @@ Lowering::move_accumulator(Values &values, const Compute &compute, llvm::Value *
           .sticky = values[sticky_value]};
 }
 
+Arithmetic Lowering::multifunction(Values &values,
+                                   const Values &before,
+                                   const Compute &compute,
+                                   llvm::Value *selected) {
+  auto multiply = compute;
+  multiply.opcode = multifunction_product_opcode(compute);
+  const auto multiplied = multiplier(values, multiply, selected);
+  if (multiplied.raw != nullptr) {
+    write_register(values, compute.outputs[0], multiplied.raw, selected);
+  }
+  auto alu_inputs = compute;
+  alu_inputs.inputs[0] = compute.inputs[2];
+  alu_inputs.inputs[1] = compute.inputs[3];
+  auto result = arithmetic(before, alu_inputs, multifunction_alu_opcode(compute));
+  // ALU writeback outranks the multiplier on a shared register (2-5).
+  write_register(values, compute.outputs[1], result.raw, selected);
+  if (compute.kind == ComputeKind::multiply_dual_alu) {
+    const auto difference = arithmetic(before, alu_inputs, alu::subtract);
+    write_register(values, compute.outputs[2], difference.raw, selected);
+    result.status = builder_.CreateOr(result.status, difference.status);
+    result.sticky = builder_.CreateOr(result.sticky, difference.sticky);
+  }
+  result.raw = nullptr;
+  result.status =
+      builder_.CreateOr(builder_.CreateAnd(result.status, vector(32, ~multiplier_flags)),
+                        builder_.CreateAnd(multiplied.status, vector(32, multiplier_flags)));
+  result.sticky = builder_.CreateOr(result.sticky, multiplied.sticky);
+  return result;
+}
+
+void Lowering::compute_instruction(Values &values,
+                                   const Values &before,
+                                   const Compute &compute,
+                                   llvm::Value *selected) {
+  Arithmetic result;
+  if (compute.kind == ComputeKind::dual_alu) {
+    result = arithmetic(before, compute, alu::add);
+    const auto difference = arithmetic(before, compute, alu::subtract);
+    result.status = builder_.CreateOr(result.status, difference.status);
+    result.sticky = builder_.CreateOr(result.sticky, difference.sticky);
+    write_register(values, compute.outputs[1], difference.raw, selected);
+  } else if (compute.kind == ComputeKind::shifter || compute.kind == ComputeKind::shift_immediate) {
+    result = rotation(before, compute);
+  } else if (fixed_multiplier(compute)) {
+    result = multiplier(values, compute, selected);
+  } else if (fixed_multifunction(compute)) {
+    result = multifunction(values, before, compute, selected);
+  } else if (compute.kind == ComputeKind::mr_transfer) {
+    result = move_accumulator(values, compute, selected);
+  } else {
+    result = arithmetic(before, compute, compute.opcode);
+  }
+  if (result.raw != nullptr) { write_register(values, compute.outputs[0], result.raw, selected); }
+  values[status_value] = builder_.CreateSelect(selected, result.status, before[status_value]);
+  values[sticky_value] = builder_.CreateSelect(selected, result.sticky, before[sticky_value]);
+}
+
 void Lowering::instruction(Values &values, const Instruction &op, bool partial) {
   if (loop_setup(op)) {
     loop_push(values, op, partial);
@@ -1863,31 +1961,7 @@ void Lowering::instruction(Values &values, const Instruction &op, bool partial) 
       selected = condition(values, true_condition);
     }
   }
-  Arithmetic result;
-  if (compute.kind == ComputeKind::dual_alu) {
-    result = arithmetic(values, compute, alu::add);
-    const auto difference = arithmetic(values, compute, alu::subtract);
-    result.status = builder_.CreateOr(result.status, difference.status);
-    result.sticky = builder_.CreateOr(result.sticky, difference.sticky);
-    const auto reg = compute.outputs[1];
-    values[reg] = builder_.CreateSelect(selected, difference.raw, values[reg]);
-    written_.insert(reg);
-  } else if (compute.kind == ComputeKind::shifter || compute.kind == ComputeKind::shift_immediate) {
-    result = rotation(values, compute);
-  } else if (fixed_multiplier(compute)) {
-    result = multiplier(values, compute, selected);
-  } else if (compute.kind == ComputeKind::mr_transfer) {
-    result = move_accumulator(values, compute, selected);
-  } else {
-    result = arithmetic(values, compute, compute.opcode);
-  }
-  if (result.raw != nullptr) {
-    const auto reg = compute.outputs[0];
-    values[reg] = builder_.CreateSelect(selected, result.raw, values[reg]);
-    written_.insert(reg);
-  }
-  values[status_value] = builder_.CreateSelect(selected, result.status, values[status_value]);
-  values[sticky_value] = builder_.CreateSelect(selected, result.sticky, values[sticky_value]);
+  compute_instruction(values, before, compute, selected);
   if (op.type == register_move_type) { register_instruction(values, op, before); }
 }
 
@@ -4751,7 +4825,8 @@ void Lowering::emit() {
     return op.type == index_modify_type && (index_modify(op).source & 7) == 7;
   });
   uses_multiplier_ = std::ranges::any_of(instructions_, [](const auto &op) {
-    return fixed_multiplier(op.compute) || op.compute.kind == ComputeKind::mr_transfer;
+    return fixed_multiplier(op.compute) || fixed_multifunction(op.compute) ||
+           op.compute.kind == ComputeKind::mr_transfer;
   });
   auto *entry = llvm::BasicBlock::Create(module_.getContext(), "entry", function_);
   builder_.SetInsertPoint(entry);
@@ -4877,13 +4952,17 @@ std::uint32_t instruction_context(const Instruction &instruction) {
     mask |= multiplier_swap_mode;
   } else {
     mask |= saturation_mode;
+    if (fixed_multifunction(instruction.compute)) { mask |= multiplier_swap_mode; }
   }
   const auto high_register = [](std::uint8_t reg) { return reg >= 8; };
   if (std::ranges::any_of(instruction.compute.inputs, high_register) ||
       std::ranges::any_of(instruction.compute.outputs, high_register)) {
     mask |= high_bank_mode;
   }
-  if (instruction.compute.kind == ComputeKind::alu && instruction.compute.opcode == alu::average) {
+  if ((instruction.compute.kind == ComputeKind::alu &&
+       instruction.compute.opcode == alu::average) ||
+      (fixed_multifunction(instruction.compute) &&
+       multifunction_alu_opcode(instruction.compute) == alu::average)) {
     mask |= truncation_mode;
   }
   return mask;

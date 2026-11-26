@@ -10,7 +10,7 @@ is claimed.
 |---|---|---|
 | Classic 48-bit ISA | Every documented instruction class, condition, legal operand and parallel form | Partial: data/DAG transfers, fixed ALU/ROT, direct/indirect flow, normal-word pre-indexed memory, immediate DAG modify/reverse, NOP |
 | VISA 16/32/48 | All compact encodings, fetch boundaries, PC units and mode transitions | Unimplemented |
-| Arithmetic and SIMD | PEx/PEy, fixed point, 32-/40-bit float, rounding, modes, flags and exceptions | Partial: fixed ALU, register-count ROT and bank/SIMD execution |
+| Arithmetic and SIMD | PEx/PEy, fixed point, 32-/40-bit float, rounding, modes, flags and exceptions | Partial: fixed ALU, multiplier/MR, fixed multifunction, register-count ROT and bank/SIMD execution |
 | Strict numerical mode (default) | Exact guest 32-/40-bit behavior, RND32, conversion exceptions and native-path identity | Unimplemented |
 | FastFP32 numerical mode (opt-in) | Independent approximation expectations, rounding/flags, unchanged raw moves/integer behavior, separate translations | Unimplemented |
 | Parallel operations | Old operands, memory aliases, register exchanges and ordered partial effects | Partial: raw register moves/swaps with supported fixed ALU writeback |
@@ -119,7 +119,13 @@ saturation, clear, and MR0/MR1/MR2 transfers. Native code carries both logical
 `test/core/compute.cpp` checks generated independent expectations in Strict and
 FastFP32, with SISD, SIMD, and both bank selections. A multiply-accumulate sequence
 also checks conditional write suppression and snapshot replay across owner bounds.
-Multifunction multiplier/ALU and parallel PM/DM transfer forms remain open.
+The fixed multifunction packets from Programming Reference Table 12-12 include
+multiply or accumulate with ADD, SUB or AVG, plus the multiply/ADD/SUB
+butterfly. Installed-image expectations check both lanes and numerical modes,
+accumulator limbs, separate ALU and multiplier flags, old operands and ALU
+write priority over the multiplier. The suite also checks per-lane predicate
+suppression and rejection of a tied pair of ALU destinations. Floating
+multifunction packets and parallel PM/DM transfer forms remain open.
 
 Classic `IDLE` stops at retirement under either run bound. Tests cover both
 numerical modes, frozen progression, reset and snapshot replay. IDLE in either
