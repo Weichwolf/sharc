@@ -299,6 +299,10 @@ std::uint64_t counted_tail_word(const LoopShape &shape) {
   return counted_loop_tail | (std::uint64_t{shape.end} << loop_refill_end_shift) | shape.start;
 }
 
+std::size_t counted_tail_slot_for(const LoopShape &shape) {
+  return shape.short_body() ? short_counted_tail_slot : counted_tail_slot;
+}
+
 std::uint64_t loop_return_payload(std::uint32_t call_pc, const LoopShape &shape) {
   if (shape.short_body()) { return return_short_loop | ((call_pc + 1) & maximum_pc); }
   const auto address = (std::uint64_t{shape.end} << loop_refill_end_shift) | shape.start;
@@ -349,6 +353,7 @@ struct LoopPlan {
   LoopMap aborts;
   LoopMap not_lce;
   std::set<std::uint32_t> lce_endpoints;
+  std::set<std::size_t> lce_slots;
 };
 
 LoopShape loop_shape(const Instruction &op) {
@@ -760,6 +765,7 @@ public:
         aborts_(loops.aborts),
         not_lce_(loops.not_lce),
         lce_endpoints_(loops.lce_endpoints),
+        lce_slots_(loops.lce_slots),
         instructions_(std::move(instructions)),
         entry_address_(unit.entry),
         context_(unit.context),
@@ -901,7 +907,7 @@ private:
   void finish(Values values, std::uint32_t next, bool partial);
   void readmit(const Values &values, std::uint32_t next);
   void credit(Values &values, llvm::Value *count, llvm::Value *cycles, bool partial);
-  void advance_lce(llvm::Value *cycles);
+  void advance_lce(llvm::Value *cycles, std::size_t slot);
   llvm::Value *lce_age(llvm::Value *tail);
   void complete(Values values,
                 const Instruction &op,
@@ -936,12 +942,18 @@ private:
   [[nodiscard]] LoopFrame active_loop(const Values &values, const LoopShape &shape);
   llvm::Value *repeat_scheduled(const LoopFrame &frame);
   void clear_loop_repeat(const LoopFrame &frame);
-  void
-  loop_fetch(Values &values, const LoopShape &shape, llvm::Value *enabled, bool returning = false);
+  void loop_fetch(Values &values,
+                  const LoopShape &shape,
+                  llvm::Value *enabled,
+                  bool returning = false,
+                  llvm::Value *age = nullptr);
   void
   loop_test(Values &values, llvm::Value *old_status, const LoopShape &shape, llvm::Value *enabled);
   [[nodiscard]] llvm::Value *refill_at(llvm::Value *refill, std::uint32_t child_end);
-  void overlapping_loop_fetches(Values &values, std::uint32_t pc, llvm::Value *refill);
+  void overlapping_loop_fetches(Values &values,
+                                std::uint32_t pc,
+                                llvm::Value *refill,
+                                bool whole_turn = false);
   void loop_refill(Values &values, const Instruction &op);
   void check_loop_end(const Values &values, const Instruction &op, bool partial);
 
@@ -1056,6 +1068,7 @@ private:
   const LoopMap &aborts_;
   const LoopMap &not_lce_;
   const std::set<std::uint32_t> &lce_endpoints_;
+  const std::set<std::size_t> &lce_slots_;
   std::vector<Instruction> instructions_;
   std::uint32_t entry_address_;
   std::uint32_t context_;
@@ -1125,7 +1138,7 @@ llvm::Value *Lowering::condition(const Values &values, unsigned code) {
 llvm::Value *Lowering::condition(const Values &values, const Instruction &op) {
   const auto site = not_lce_.find(op.address);
   if (site == not_lce_.end()) { return condition(values, branch_condition(op)); }
-  auto *age = lce_age(load(64, counted_tail_slot));
+  auto *age = lce_age(load(64, counted_tail_slot_for(site->second)));
   age = builder_.CreateAdd(age, pipeline_stall(values, op));
   const auto limit = branch(op) ? lce_branch_age : lce_compute_age;
   auto *expired = builder_.CreateAnd(counted_tail_matches(site->second),
@@ -1926,11 +1939,13 @@ void Lowering::restore_loop_tail(llvm::Value *tail) {
                                   std::pair{counted_loop_tail, counted_tail_slot}}) {
     auto *present = builder_.CreateICmpNE(builder_.CreateAnd(tail, builder_.getInt64(flag)),
                                           builder_.getInt64(0));
-    auto *restored =
-        slot == counted_tail_slot && !not_lce_.empty()
-            ? builder_.CreateOr(builder_.CreateAnd(tail, builder_.getInt64(~lce_before_credit)),
-                                builder_.getInt64(lce_age_mask))
-            : tail;
+    auto *restored = tail;
+    if (slot == counted_tail_slot && lce_slots_.contains(slot)) {
+      auto *mature =
+          builder_.CreateOr(builder_.CreateAnd(tail, builder_.getInt64(~lce_before_credit)),
+                            builder_.getInt64(lce_age_mask));
+      restored = builder_.CreateSelect(short_flag(tail, lce_clock_mask), mature, tail);
+    }
     store(builder_.CreateSelect(present, restored, load(64, slot)), slot);
   }
 }
@@ -2009,7 +2024,8 @@ void Lowering::restore_short_call(Values &values,
   if (lce_endpoints_.contains(shape.end)) {
     auto *expired = short_flag(payload, return_short_lce);
     auto *tail = builder_.getInt64(counted_tail_word(shape) | lce_age_mask);
-    store(builder_.CreateSelect(expired, tail, load(64, counted_tail_slot)), counted_tail_slot);
+    store(builder_.CreateSelect(expired, tail, load(64, short_counted_tail_slot)),
+          short_counted_tail_slot);
   }
   const bool header = pc == shape.start;
   const auto call_pc = header ? shape.end : ((pc - 1) & maximum_pc);
@@ -2053,7 +2069,7 @@ void Lowering::return_to_caller(Values values, llvm::Value *target, bool partial
 }
 
 void Lowering::credit(Values &values, llvm::Value *count, llvm::Value *cycles, bool partial) {
-  if (!not_lce_.empty()) { advance_lce(cycles); }
+  for (const auto slot : lce_slots_) { advance_lce(cycles, slot); }
   values[instruction_remaining_value] =
       builder_.CreateSub(values[instruction_remaining_value], count);
   auto *available = values[cycle_remaining_value];
@@ -2072,8 +2088,8 @@ llvm::Value *Lowering::lce_age(llvm::Value *tail) {
   return builder_.CreateLShr(masked, builder_.getInt64(lce_age_shift));
 }
 
-void Lowering::advance_lce(llvm::Value *cycles) {
-  auto *tail = load(64, counted_tail_slot);
+void Lowering::advance_lce(llvm::Value *cycles, std::size_t slot) {
+  auto *tail = load(64, slot);
   auto *age = lce_age(tail);
   auto *limit = builder_.getInt64(lce_branch_age);
   auto *elapsed = builder_.CreateBinaryIntrinsic(llvm::Intrinsic::umin, cycles, limit);
@@ -2084,9 +2100,9 @@ void Lowering::advance_lce(llvm::Value *cycles) {
   auto *next = builder_.CreateSelect(short_flag(tail, lce_before_credit), age, advanced);
   auto *clocked = builder_.CreateOr(builder_.CreateAnd(tail, builder_.getInt64(~lce_clock_mask)),
                                     builder_.CreateShl(next, builder_.getInt64(lce_age_shift)));
-  auto *live = builder_.CreateAnd(builder_.CreateICmpNE(tail, builder_.getInt64(0)),
+  auto *live = builder_.CreateAnd(short_flag(tail, lce_clock_mask),
                                   builder_.CreateICmpNE(cycles, builder_.getInt64(0)));
-  store(builder_.CreateSelect(live, clocked, tail), counted_tail_slot);
+  store(builder_.CreateSelect(live, clocked, tail), slot);
 }
 
 llvm::Value *Lowering::branch_taken(llvm::Value *lanes) {
@@ -2598,7 +2614,19 @@ Lowering::ShortLookahead Lowering::overlapping_short_fetches(Values &values,
   for (const auto &parent : short_parents_.at(shape.end)) {
     const auto gap = (parent.end - shape.end) & maximum_pc;
     auto *reachable = builder_.CreateNot(redirected);
-    loop_fetch(values, parent, builder_.CreateAnd(reachable, short_fetch_crossed(window, gap)));
+    llvm::Value *age = nullptr;
+    if (lce_endpoints_.contains(parent.end)) {
+      // The remaining linear fetches are clocks after this sample, including
+      // clocks inside a held or draining short instruction.
+      auto *after_sample = builder_.CreateSub(window.after, builder_.getInt64(gap));
+      age = builder_.CreateBinaryIntrinsic(
+          llvm::Intrinsic::umin, after_sample, builder_.getInt64(lce_branch_age));
+    }
+    loop_fetch(values,
+               parent,
+               builder_.CreateAnd(reachable, short_fetch_crossed(window, gap)),
+               false,
+               age);
     const auto frame = active_loop(values, parent);
     auto *repeat = builder_.CreateAnd(frame.matches, repeat_scheduled(frame));
     llvm::Value *selection = repeat;
@@ -2743,25 +2771,28 @@ void Lowering::loop_pop(Values &values, const LoopFrame &frame) {
 
 llvm::Value *Lowering::counted_tail_matches(const LoopShape &shape) {
   if (!shape.counted()) { return builder_.getFalse(); }
-  auto *saved = load(64, counted_tail_slot);
-  if (!not_lce_.empty()) { saved = builder_.CreateAnd(saved, builder_.getInt64(~lce_clock_mask)); }
+  auto *saved = load(64, counted_tail_slot_for(shape));
+  if (lce_endpoints_.contains(shape.end)) {
+    saved = builder_.CreateAnd(saved, builder_.getInt64(~lce_clock_mask));
+  }
   return builder_.CreateICmpEQ(saved, builder_.getInt64(counted_tail_word(shape)));
 }
 
 void Lowering::save_counted_tail(const LoopShape &shape, llvm::Value *age, bool returning) {
-  const auto marker = !not_lce_.empty() && !returning ? lce_before_credit : 0;
+  const bool tracked = lce_endpoints_.contains(shape.end);
+  const auto marker = tracked && !returning ? lce_before_credit : 0;
   llvm::Value *tail = builder_.getInt64(counted_tail_word(shape) | marker);
-  if (!not_lce_.empty()) {
+  if (tracked) {
     tail = builder_.CreateOr(tail, builder_.CreateShl(age, builder_.getInt64(lce_age_shift)));
   }
-  store(tail, counted_tail_slot);
+  store(tail, counted_tail_slot_for(shape));
 }
 
 void Lowering::clear_counted_tail(const LoopShape &shape, llvm::Value *enabled) {
   auto *clear = counted_tail_matches(shape);
   if (enabled != nullptr) { clear = builder_.CreateAnd(clear, enabled); }
-  store(builder_.CreateSelect(clear, builder_.getInt64(0), load(64, counted_tail_slot)),
-        counted_tail_slot);
+  const auto slot = counted_tail_slot_for(shape);
+  store(builder_.CreateSelect(clear, builder_.getInt64(0), load(64, slot)), slot);
 }
 
 llvm::Value *Lowering::abort_target_in_parent(llvm::Value *target,
@@ -2844,7 +2875,8 @@ void Lowering::retire_loop_abort(Values &values, const LoopShape &shape) {
 void Lowering::loop_fetch(Values &values,
                           const LoopShape &shape,
                           llvm::Value *enabled,
-                          bool returning) {
+                          bool returning,
+                          llvm::Value *age) {
   const auto frame = active_loop(values, shape);
   auto *pending = builder_.CreateAnd(frame.metadata, builder_.getInt32(loop_repeat_scheduled));
   auto *consider = llvm::BasicBlock::Create(module_.getContext(), "loop.fetch.end", function_);
@@ -2870,7 +2902,7 @@ void Lowering::loop_fetch(Values &values,
     auto popped = values;
     loop_pop(popped, frame);
     if (shape.has_reentry || shape.has_tail_abort || lce_endpoints_.contains(shape.end)) {
-      save_counted_tail(shape, builder_.getInt64(1), returning);
+      save_counted_tail(shape, age != nullptr ? age : builder_.getInt64(1), returning);
     }
     jump(continuation, popped);
     builder_.SetInsertPoint(repeat);
@@ -2972,19 +3004,27 @@ llvm::Value *Lowering::refill_at(llvm::Value *refill, std::uint32_t child_end) {
                                builder_.getInt64(signature));
 }
 
-void Lowering::overlapping_loop_fetches(Values &values, std::uint32_t pc, llvm::Value *refill) {
+void Lowering::overlapping_loop_fetches(Values &values,
+                                        std::uint32_t pc,
+                                        llvm::Value *refill,
+                                        bool whole_turn) {
   const auto overlaps = overlapping_fetches_.find(pc);
   if (overlaps == overlapping_fetches_.end()) { return; }
   llvm::Value *redirected = builder_.getFalse();
   for (const auto &[child_end, parent] : overlaps->second) {
     auto *enabled =
         builder_.CreateAnd(builder_.CreateNot(redirected), refill_at(refill, child_end));
-    loop_fetch(values, parent, enabled);
+    const auto gap = (parent.end - child_end) & maximum_pc;
+    // Gaps 2 through 4 sample during the endpoint or the two refill clocks.
+    // Gap 1 samples one word earlier. A whole-turn grant already retired it.
+    const auto early_age = whole_turn ? lce_branch_age : 1U;
+    const auto age = gap == 1 ? early_age : loop_fetch_distance + 1 - gap;
+    loop_fetch(values, parent, enabled, false, builder_.getInt64(age));
     const auto frame = active_loop(values, parent);
     auto *repeat =
         builder_.CreateAnd(enabled, builder_.CreateAnd(frame.matches, repeat_scheduled(frame)));
     redirected = builder_.CreateOr(redirected, repeat);
-    if (parent.arithmetic() && ((parent.end - child_end) & maximum_pc) == loop_decode_distance) {
+    if (parent.arithmetic() && gap == loop_decode_distance) {
       // Fetch1 reaches the parent's second word on the last child refill
       // clock. Decode sees this decision before any more guest work retires.
       loop_test(values, values[status_value], parent, repeat);
@@ -3171,7 +3211,7 @@ void Lowering::emit_hardware_turns(const Node &body,
   values[hazard_value] = builder_.getFalse();
   auto *refill = builder_.getInt64(
       loop_refill_live | (std::uint64_t{shape.end} << loop_refill_end_shift) | shape.start);
-  overlapping_loop_fetches(values, (shape.end - 1) & maximum_pc, refill);
+  overlapping_loop_fetches(values, (shape.end - 1) & maximum_pc, refill, true);
   overlapping_loop_fetches(values, shape.end, refill);
   credit(
       values, retired, builder_.CreateAdd(retired, builder_.getInt64(loop_decode_distance)), false);
@@ -3935,13 +3975,16 @@ void validate_not_lce(const InstructionMap &code, LoopPlan &plan, std::string_vi
              FaultReason::unsupported_instruction,
              "NOT LCE outside an admitted counted DO tail");
     }
-    const auto nearby_tail = [](const LoopShape &parent, const LoopShape &child) {
+    const auto unqualified_overlap = [](const LoopShape &parent, const LoopShape &child) {
       const auto gap = (parent.end - child.end) & maximum_pc;
+      const bool qualified_child =
+          (child.short_body() && child.counted()) || (!child.short_body() && child.arithmetic());
       return gap != 0 && gap <= loop_fetch_distance &&
-             parent.contains((child.start - 1) & maximum_pc);
+             parent.contains((child.start - 1) & maximum_pc) &&
+             (parent.short_body() || !qualified_child);
     };
     const bool overlap = std::ranges::any_of(plan.shapes, [&](const auto &entry) {
-      return nearby_tail(*owner, entry.second) || nearby_tail(entry.second, *owner);
+      return unqualified_overlap(*owner, entry.second) || unqualified_overlap(entry.second, *owner);
     });
     if (overlap) {
       reject(
@@ -3949,6 +3992,7 @@ void validate_not_lce(const InstructionMap &code, LoopPlan &plan, std::string_vi
     }
     plan.not_lce.emplace(pc, *owner);
     plan.lce_endpoints.insert(owner->end);
+    plan.lce_slots.insert(counted_tail_slot_for(*owner));
   }
 }
 

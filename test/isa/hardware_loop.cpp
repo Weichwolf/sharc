@@ -756,9 +756,24 @@ void parent_count_sample(Timeline &trace, bool repeats) {
   if (!repeats) { popped(trace.registers); }
 }
 
-void parent_count_tail(Timeline &trace, unsigned end, bool repeats) {
-  for (unsigned pc = 8; pc <= end; ++pc) {
-    trace.boundary(base + pc, pc == 8 ? 3U : 1U);
+constexpr unsigned first_parent_word = 8;
+
+void parent_lce_add(Timeline &trace, unsigned pc) {
+  auto &lane = trace.registers.pe[0];
+  lane.data[0][pc - first_parent_word + 2] += 1U << raw_shift;
+  lane.astat = 0;
+}
+
+enum class OverlapTail : std::uint8_t { ordinary, endpoint_call, not_lce };
+
+void parent_count_tail(Timeline &trace, unsigned end, bool repeats, OverlapTail tail) {
+  for (unsigned pc = first_parent_word; pc <= end; ++pc) {
+    if (tail == OverlapTail::not_lce && pc > first_parent_word &&
+        (repeats || (end == first_parent_word + 3 && pc == first_parent_word + 1))) {
+      // At gap four the first parent compute still sees the old condition.
+      parent_lce_add(trace, pc - 1);
+    }
+    trace.boundary(base + pc, pc == first_parent_word ? 3U : 1U);
     if (repeats) {
       constexpr std::array fetch{4U, 3U, 2U, 1U};
       const auto distance = end - pc;
@@ -782,6 +797,25 @@ void finish_overlapping_outer(Timeline &trace, std::uint32_t next, bool calls) {
   trace.record();
 }
 
+void counted_arithmetic_turn(Timeline &trace, unsigned end, OverlapTail tail, bool repeats) {
+  trace.registers.pe[0].data[0][0] = 2U << raw_shift;
+  trace.boundary(base + 2);
+  trace.record();
+  enter_arithmetic_child(trace);
+  child_arithmetic_pass(trace, true);
+  child_arithmetic_pass(trace, false);
+  // After termination the child's Fetch1 reaches +8 while +6 executes,
+  // +9 while +7 executes, then +10/+11 on the two bubbles.
+  const bool early = end == first_parent_word;
+  if (early) { parent_count_sample(trace, repeats); }
+  short_boundary(trace, {.pc = 7, .fetch = early && repeats ? 1U : 9U, .decode = 4});
+  if (!early) { parent_count_sample(trace, repeats); }
+  parent_count_tail(trace, end, repeats, tail);
+  if (tail == OverlapTail::not_lce && repeats) { parent_lce_add(trace, end); }
+  finish_overlapping_outer(
+      trace, base + (repeats ? 1U : end + 1), tail == OverlapTail::endpoint_call);
+}
+
 void counted_arithmetic_overlap() {
   constexpr unsigned child_end = 7;
   constexpr auto minus_one = std::numeric_limits<std::uint32_t>::max();
@@ -789,47 +823,43 @@ void counted_arithmetic_overlap() {
 
   struct OverlapCase {
     unsigned gap;
-    bool calls{};
+    OverlapTail tail{OverlapTail::ordinary};
   };
 
   constexpr std::array cases{OverlapCase{.gap = 1},
                              OverlapCase{.gap = 2},
                              OverlapCase{.gap = 3},
                              OverlapCase{.gap = 4},
-                             OverlapCase{.gap = 1, .calls = true}};
-  for (const auto &[gap, calls] : cases) {
+                             OverlapCase{.gap = 1, .tail = OverlapTail::endpoint_call},
+                             OverlapCase{.gap = 1, .tail = OverlapTail::not_lce},
+                             OverlapCase{.gap = 2, .tail = OverlapTail::not_lce},
+                             OverlapCase{.gap = 3, .tail = OverlapTail::not_lce},
+                             OverlapCase{.gap = 4, .tail = OverlapTail::not_lce}};
+  for (const auto &[gap, tail] : cases) {
     const auto end = child_end + gap;
     std::array<std::uint64_t, 13> words{};
     words[0] = counted_two | end;
     words[1] = fixture::immediate(0, 2);
     words[2] = do_eq | 5;
     words[3] = fixture::add(0, 0, 1);
-    if (calls) {
+    if (tail == OverlapTail::endpoint_call) {
       words[end] = call_direct | overlap_subroutine;
       words[overlap_subroutine - base + 1] = rts | lr;
+    }
+    if (tail == OverlapTail::not_lce) {
+      for (unsigned pc = first_parent_word; pc <= end; ++pc) {
+        const auto reg = pc - first_parent_word + 2;
+        words[pc] = if_not_lce(fixture::add(reg, reg, 7));
+      }
     }
     fixture::Program program(words);
     auto initial = starting();
     initial.pe[0].data[0][1] = std::uint64_t{minus_one} << raw_shift;
+    initial.pe[0].data[0][7] = 1U << raw_shift;
     Timeline trace{.registers = initial, .prefixes = {}};
-    auto &state = trace.registers;
-    state.lcntr = 2;
+    trace.registers.lcntr = 2;
     entered(trace, {.address = counted_address | (base + end), .count = 2});
-    for (const bool repeats : {true, false}) {
-      state.pe[0].data[0][0] = 2U << raw_shift;
-      trace.boundary(base + 2);
-      trace.record();
-      enter_arithmetic_child(trace);
-      child_arithmetic_pass(trace, true);
-      child_arithmetic_pass(trace, false);
-      // After termination the child's Fetch1 reaches +8 while +6
-      // executes, +9 while +7 executes, then +10/+11 on the two bubbles.
-      if (gap == 1) { parent_count_sample(trace, repeats); }
-      short_boundary(trace, {.pc = 7, .fetch = gap == 1 && repeats ? 1U : 9U, .decode = 4});
-      if (gap != 1) { parent_count_sample(trace, repeats); }
-      parent_count_tail(trace, end, repeats);
-      finish_overlapping_outer(trace, base + (repeats ? 1U : end + 1), calls);
-    }
+    for (const bool repeats : {true, false}) { counted_arithmetic_turn(trace, end, tail, repeats); }
     verify_timeline(program, initial, trace);
   }
 }
@@ -903,16 +933,53 @@ struct NestedShortCase {
   std::span<const NestedShortBoundary> body;
 };
 
-void counted_short_overlap(const NestedShortCase &sample) {
+struct NestedShortLce {
+  std::span<const bool> child;
+  std::span<const bool> parent;
+  bool parent_call{};
+};
+
+void finish_counted_short_overlap(Timeline &trace, Range parent_tail, const NestedShortLce &lce) {
+  auto &state = trace.registers;
+  for (auto pc = parent_tail.start; pc <= parent_tail.end; ++pc) {
+    unsigned cycles = 1;
+    if (!lce.parent.empty() && lce.parent[pc - parent_tail.start]) {
+      if (lce.parent_call && pc == parent_tail.start) {
+        const auto tags =
+            call_tag | (parent_tail.end - parent_tail.start == 3U ? termination_tag : 0);
+        entered_call(trace, {.target = parent_tail.end + 2, .raw_return = tags | (pc + 1)});
+        popped_call(state);
+        cycles = 4;
+      } else {
+        state.pe[0].data[0][pc - parent_tail.start + 2] += 1U << raw_shift;
+      }
+    }
+    trace.boundary(pc + 1, cycles);
+    trace.record();
+  }
+}
+
+void counted_short_overlap(const NestedShortCase &sample, const NestedShortLce &lce = {}) {
   constexpr auto outer_once = do_immediate | (std::uint64_t{1} << count_shift);
   const auto [length, gap, setup, body] = sample;
   const auto child_end = short_setup_pc + length;
   const auto parent_end = child_end + gap;
-  std::vector<std::uint64_t> words(parent_end + 2);
+  std::vector<std::uint64_t> words(parent_end + (lce.parent_call ? 3U : 2U));
   words[0] = outer_once | parent_end;
   words[short_setup_pc] = do_immediate | (std::uint64_t{setup.count} << count_shift) | length;
   for (unsigned pc = short_setup_pc + 1; pc <= child_end; ++pc) {
     words[pc] = fixture::add(0, 0, 1);
+    if (!lce.child.empty() && pc > short_setup_pc + 1) { words[pc] = if_not_lce(words[pc]); }
+  }
+  if (!lce.parent.empty()) {
+    for (unsigned i = 0; i < gap; ++i) {
+      words[child_end + i + 1] = if_not_lce(fixture::add(i + 2, i + 2, 1));
+    }
+  }
+  if (lce.parent_call) {
+    const auto callee = parent_end + 2;
+    words[child_end + 1] = if_not_lce(call_direct | (base + callee));
+    words[callee] = rts | lr;
   }
   fixture::Program program(words);
   auto initial = starting();
@@ -926,8 +993,9 @@ void counted_short_overlap(const NestedShortCase &sample) {
     trace.record();
   }
   enter_nested_short(trace, setup, short_counted_types[length - 1] | (base + child_end));
-  for (const auto &[child, parent_sample] : body) {
-    state.pe[0].data[0][0] += 1U << raw_shift;
+  for (std::size_t i = 0; i < body.size(); ++i) {
+    const auto &[child, parent_sample] = body[i];
+    if (lce.child.empty() || lce.child[i]) { state.pe[0].data[0][0] += 1U << raw_shift; }
     state.loop_counter_stack[1] = child.count;
     if (!child.frame_live && state.loop_address_depth == 2) { leave_nested_child(state); }
     if (parent_sample) {
@@ -940,10 +1008,8 @@ void counted_short_overlap(const NestedShortCase &sample) {
                     .decode = short_setup_pc + child.decode},
                    child.cycles);
   }
-  for (unsigned pc = child_end + 2; pc <= parent_end + 1; ++pc) {
-    trace.boundary(base + pc);
-    trace.record();
-  }
+  finish_counted_short_overlap(
+      trace, {.start = base + child_end + 1, .end = base + parent_end}, lce);
   verify_timeline(program, initial, trace);
 }
 
@@ -967,6 +1033,25 @@ void compact_counted_short_overlap() {
                          .gap = 2,
                          .setup = {.pc = 1, .fetch = 2, .decode = 2, .count = 1},
                          .body = two});
+  constexpr std::array compact_child{true, false};
+  constexpr std::array gap_two{false, false};
+  constexpr std::array gap_three{false, false, false};
+  constexpr std::array gap_four{true, false, false, false};
+  constexpr ShortBoundary two_setup{.pc = 1, .fetch = 2, .decode = 2, .count = 1};
+  counted_short_overlap({.length = 2, .gap = 2, .setup = two_setup, .body = two},
+                        {.child = compact_child, .parent = gap_two});
+  counted_short_overlap({.length = 2, .gap = 3, .setup = two_setup, .body = two},
+                        {.child = compact_child, .parent = gap_three});
+  counted_short_overlap({.length = 2, .gap = 4, .setup = two_setup, .body = two},
+                        {.child = compact_child, .parent = gap_four});
+  // The branch still sees the old condition when the sample is one clock later.
+  constexpr std::array gap_three_branch{true, false, false};
+  counted_short_overlap({.length = 2, .gap = 2, .setup = two_setup, .body = two},
+                        {.child = compact_child, .parent = gap_two, .parent_call = true});
+  counted_short_overlap({.length = 2, .gap = 3, .setup = two_setup, .body = two},
+                        {.child = compact_child, .parent = gap_three_branch, .parent_call = true});
+  counted_short_overlap({.length = 2, .gap = 4, .setup = two_setup, .body = two},
+                        {.child = compact_child, .parent = gap_four, .parent_call = true});
 
   constexpr std::array three{
       NestedShortBoundary{
@@ -989,6 +1074,15 @@ void compact_counted_short_overlap() {
                          .gap = 1,
                          .setup = {.pc = 1, .fetch = 4, .decode = 2, .count = 1},
                          .body = four});
+  // Both stacks pop while the child enters its second word. Its remaining
+  // predicates still see the short expiration, and the parent's sees its own.
+  constexpr std::array four_child{true, false, false, false};
+  constexpr std::array four_parent{false};
+  counted_short_overlap({.length = 4,
+                         .gap = 1,
+                         .setup = {.pc = 1, .fetch = 4, .decode = 2, .count = 1},
+                         .body = four},
+                        {.child = four_child, .parent = four_parent});
 }
 
 void short_counted_parent_arithmetic(bool ending) {

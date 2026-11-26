@@ -231,9 +231,14 @@ the loop stacks pop and across CALL and RTS (LR). A held two- or
 four-word startup fetch also ages through the entry bubble. The tests
 exercise both condition latencies, a DAG2 interlock, replay at exact
 bounds, and complete-turn grants for nonterminating counted passes.
-Observations immediately after DO, explicit loop-resource changes,
-overlapping samples and unlooped predicates remain unqualified. The
-combined short-loop condition timing awaits hardware comparison.
+An admitted long counted parent tracks the sample clock during a short
+counted child's drain or a long arithmetic child's refill. A short
+counted child preserves its own observation while the parent samples.
+The installed-image fixtures cover simultaneous pops and parent outcomes
+at successive refill clocks. Observations immediately after DO, explicit
+loop-resource changes, other overlapping configurations and unlooped
+predicates remain unqualified. Combined condition timing awaits hardware
+comparison.
 An immediate CALL at the endpoint stores the next loop header or the word
 after the loop as its return address. On a terminating arithmetic turn the
 taken call replaces the loop refill. A false predicate keeps the normal
