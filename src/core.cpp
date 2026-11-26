@@ -151,6 +151,7 @@ struct Core::Impl {
     pointers[detail::daddr_slot] = &state.registers.daddr;
     pointers[detail::clock_slot] = &state.registers.emuclk;
     pointers[detail::pipeline_slot] = &pipeline_history;
+    pointers[detail::delayed_target_slot] = &delayed_target;
     pointers[detail::mode_slot] = &state.registers.mode1;
     pointers[detail::stack_slot] = state.registers.pc_stack.data();
     pointers[detail::stack_depth_slot] = &state.registers.pc_stack_pointer;
@@ -229,6 +230,7 @@ struct Core::Impl {
 
   [[nodiscard]] bool entry_allowed() const {
     if (continuing()) { return true; }
+    if (delayed_target != 0) { return false; }
     const auto &variants = installed->image->code.variants;
     const auto code = std::ranges::find(variants, variant, &CodeVariant::id);
     return code != variants.end() &&
@@ -250,6 +252,7 @@ struct Core::Impl {
   }
 
   RunResult execute(std::uint64_t instructions, std::uint64_t cycles);
+  void update_delay_addresses(Progress retired);
   RunResult host_failure(Progress progress);
   bool enter(std::size_t index, detail::ControlWords &control);
 
@@ -262,6 +265,7 @@ struct Core::Impl {
   detail::NativeCall native_call;
   std::vector<detail::HostView> views;
   std::uint32_t pipeline_history{};
+  std::uint32_t delayed_target{}; // Latched PC and the next slot to execute.
   std::shared_ptr<const NativeImage::Impl> installed;
   std::uint32_t variant{};
   std::optional<Resume> resume;
@@ -274,6 +278,7 @@ struct Snapshot::Impl {
   bool yield_requested{};
   std::optional<Resume> resume;
   std::uint32_t pipeline_history{};
+  std::uint32_t delayed_target{};
 };
 
 Core::Core(Memory memory, ExecutionMode mode)
@@ -490,6 +495,7 @@ void Core::set_registers(const Registers &registers) {
   if (registers.pc != impl_->state.registers.pc) {
     impl_->resume.reset();
     impl_->pipeline_history = 0;
+    impl_->delayed_target = 0;
   }
   impl_->state.registers = registers;
 }
@@ -506,7 +512,8 @@ Snapshot Core::save() const {
                      .state = impl_->state,
                      .yield_requested = impl_->yield_requested,
                      .resume = impl_->resume,
-                     .pipeline_history = impl_->pipeline_history});
+                     .pipeline_history = impl_->pipeline_history,
+                     .delayed_target = impl_->delayed_target});
   return snapshot;
 }
 
@@ -519,6 +526,7 @@ void Core::restore(const Snapshot &snapshot) {
   impl_->yield_requested = snapshot.impl_->yield_requested;
   impl_->resume = snapshot.impl_->resume;
   impl_->pipeline_history = snapshot.impl_->pipeline_history;
+  impl_->delayed_target = snapshot.impl_->delayed_target;
 }
 
 bool Core::Impl::enter(std::size_t index, detail::ControlWords &control) {
@@ -529,6 +537,15 @@ bool Core::Impl::enter(std::size_t index, detail::ControlWords &control) {
     return true;
   }
   return native_call.invoke(installed->entries[index], pointers.data(), control.data());
+}
+
+void Core::Impl::update_delay_addresses(Progress retired) {
+  if (delayed_target == 0 || retired.instructions == 0) { return; }
+  auto &registers = state.registers;
+  const auto target = delayed_target & detail::maximum_pc;
+  const bool first = (delayed_target & detail::before_first_delay_slot) != 0;
+  registers.faddr = (target + (first ? 1U : 2U)) & detail::maximum_pc;
+  registers.daddr = first ? (registers.pc + 2) & detail::maximum_pc : target;
 }
 
 RunResult Core::Impl::execute(std::uint64_t instructions, std::uint64_t cycles) {
@@ -573,6 +590,7 @@ RunResult Core::Impl::execute(std::uint64_t instructions, std::uint64_t cycles) 
     if (!enter(*index, control)) { return host_failure(progress); }
     const Progress retired{.instructions = control[detail::retired_instructions],
                            .base_cycles = control[detail::retired_cycles]};
+    update_delay_addresses(retired);
     progress.instructions += retired.instructions;
     progress.base_cycles += retired.base_cycles;
     state.progress.instructions += retired.instructions;

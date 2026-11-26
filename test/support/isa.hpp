@@ -23,6 +23,7 @@ inline constexpr std::array numeric_modes{sharc::ExecutionMode::strict,
 inline constexpr std::uint32_t code_address = 0x100;
 void control_flow();
 void computed_control_flow();
+void delayed_control_flow();
 void register_transfers();
 void rotations();
 void memory_access();

@@ -15,7 +15,7 @@ is claimed.
 | FastFP32 numerical mode (opt-in) | Independent approximation expectations, rounding/flags, unchanged raw moves/integer behavior, separate translations | Unimplemented |
 | Parallel operations | Old operands, memory aliases, register exchanges and ordered partial effects | Partial: raw register moves/swaps with supported fixed ALU writeback |
 | Address generation and memory | Both DAGs, modulo/reverse addressing, PM/DM and physical view aliases | Partial: normal-word pre-indexing, immediate modify/reverse and DAG register-load dependencies |
-| Sequencer and control | Delayed flow, DO/loop endpoints, LR, stacks, reset and interrupts | Partial: non-delayed direct/indirect flow, calls/returns and branch stalls |
+| Sequencer and control | Delayed flow, DO/loop endpoints, LR, stacks, reset and interrupts | Partial: classic direct/indirect jumps and calls, plain RTS, two delay slots and branch stalls |
 | Chip-profile boundaries | ADSP-21489 memory/vector parameters and explicit I/O ownership | Unimplemented |
 | JIT coherence and hosts | Self-modifying aliases, natural loops, precise exits, x86-64 and ARM64 | Unimplemented |
 
@@ -110,7 +110,7 @@ Reference 2.4, 4-19–4-21 and 4-115–4-116). The preceding-compute history is 
 state, stored at exits and included in snapshots. Cycle bounds may cross the
 deadline to finish the current instruction; cycle credit cannot wrap under zero.
 External-flag and loop conditions refuse preparation. VISA, floating computation,
-multiplier, remaining shifter and memory forms, delayed jumps, hardware loops, timer, reset and
+multiplier, remaining shifter and memory forms, hardware loops, timer, reset and
 interrupt entry remain unimplemented. `interrupt_ready` reports false.
 
 Non-delayed direct CALL and plain conditional RTS keep static call targets and
@@ -123,8 +123,8 @@ cold path to another declared entry; owner dispatch uses a loop, not host recurs
 A completed return respects the current bound before requiring a new entry.
 Empty/overflowed stacks and returns with a loop/interrupt continuation tag fail before
 retiring that instruction, retaining any preceding completed prefix. These are
-qualification gaps, not architectural stack-exception implementations. Delayed,
-loop-reentry, interrupt and parallel-compute returns remain unsupported.
+qualification gaps, not architectural stack-exception implementations.
+Loop-reentry, interrupt and parallel-compute returns remain unsupported.
 
 Classic type 9 adds non-delayed DAG2-indirect and signed six-bit PC-relative
 jumps and calls, optionally with supported single-function fixed ALU computation.
@@ -146,9 +146,20 @@ all I8–I15/M8–M15 selector fields, independent DAG quarters, displacement ex
 and wrap, EQ lane combinations with/without ELSE, complete call/return prefixes,
 cycle bounds, cross-Core snapshots, interlocks and refusal before parallel effects.
 `test/core/native.cpp` also exercises a cached, consumer-linked indirect call.
-System-register transfers, other parallel compute classes, delayed flow and
+System-register transfers, other parallel compute classes and
 architectural stack exceptions remain open. This is
 ISA evidence; the K4 benchmark below exercises nested direct/indirect calls.
+
+Classic delayed jumps, calls and plain RTS latch the destination and commit
+the stack effect at the transfer. A taken CALL records PC+3. Both declared
+slots execute before the redirect, with one refill cycle charged at the
+second slot. Slots inherit pipeline dependencies from the branch and can
+fault at their own PC. A false transfer follows the ordinary sequential
+path. Preparation admits adjacent complementary delayed jumps without
+parallel computation and rejects other branches in slots. The ISA tests in
+`test/isa/delay.cpp` cover instruction and cycle prefixes, cross-Core replay,
+absolute, relative and DAG2 calls, 24-bit PC wrap, stack refusal and a slot
+memory fault. RTI and loop reentry remain open.
 
 Classic type 5 transfers raw data among R/S and I/M/L/B registers, including
 cross-PE data moves and raw40 register swaps, with supported single-function fixed

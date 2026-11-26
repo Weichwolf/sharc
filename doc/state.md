@@ -48,16 +48,15 @@ stopped is observed by the guarded native return. Restore replaces that
 state, including clearing a later fault. It does not replace consumer memory or
 bindings. `set_registers` preserves hidden continuation when PC is unchanged;
 replacing PC starts a fresh declared entry and clears its pipeline history.
-Snapshots retain the preceding-compute interlock and two recent physical DAG
-register-load tags, including their remaining dependency distance. The current execution implementation has no pending instruction,
-branch, mode-register write or code transfer; their hidden continuation must be
-added to snapshots together with the corresponding execution implementation.
-Interrupted/delayed execution snapshots are not qualified yet.
+Snapshots retain the preceding-compute interlock, two recent physical DAG
+register-load tags and a taken classic delayed transfer's destination and slot
+phase. Cross-Core replay preserves the destination even when a slot changes a
+contributing DAG register. Pending interrupts, mode-register writes and
+declared code transfers still need execution and snapshot qualification.
 
 Peripheral interrupt routing (PICR), SRU, DMA and peripheral timers remain consumer
 state. TAP emulation controls and physical instruction-cache contents are not
-implemented. Delayed register visibility, instruction pipeline observations,
-loop reentry, interrupt eligibility/shadows, timer evolution and reset values
-remain open. Straight-line ISA and non-delayed direct jumps update PC, FADDR,
-DADDR and EMUCLK;
-this does not qualify delayed transfers or arbitrary pipeline observations.
+implemented. Instruction pipeline observations beyond the admitted classic
+transfers, loop reentry, interrupt eligibility/shadows, timer evolution and
+reset values remain open. Straight-line ISA and admitted direct and indirect
+transfers update PC, FADDR, DADDR and EMUCLK at owner boundaries.

@@ -10,7 +10,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
-#include <iterator>
 #include <limits>
 #include <llvm/ADT/SmallVector.h>
 #include <llvm/BinaryFormat/Dwarf.h>
@@ -82,6 +81,7 @@ constexpr std::uint64_t else_compute = std::uint64_t{1} << 25;
 constexpr std::uint64_t clear_interrupt_branch = std::uint64_t{1} << 24;
 // Programming Reference 2.4, 4-19: three pipeline bubbles on a taken jump.
 constexpr unsigned branch_penalty = 3;
+constexpr unsigned delay_slot_count = 2;
 constexpr std::uint32_t true_condition = 31;
 constexpr unsigned condition_shift = 33;
 constexpr unsigned immediate_register_shift = 32;
@@ -199,6 +199,22 @@ bool indirect_branch(const Instruction &op) {
   return op.type == computed_branch_type && (op.word & relative_branch) == 0;
 }
 
+unsigned branch_condition(const Instruction &op) {
+  return static_cast<unsigned>((op.word >> condition_shift) & true_condition);
+}
+
+bool delayed(const Instruction &op) {
+  return branch(op) && (op.word & delayed_branch) != 0;
+}
+
+std::uint32_t next_pc(const Instruction &op, unsigned words = 1) {
+  return (op.address + words) & maximum_pc;
+}
+
+std::uint32_t call_resume(const Instruction &op) {
+  return next_pc(op, delayed(op) ? delay_slot_count + 1 : 1);
+}
+
 unsigned branch_index(const Instruction &op) {
   constexpr unsigned shift = 30;
   return 8U + static_cast<unsigned>((op.word >> shift) & 7);
@@ -228,11 +244,11 @@ void validate_branch(const Instruction &instruction, std::string_view identity) 
   if ((instruction.word & ~allowed) != 0) {
     reject(instruction, identity, FaultReason::invalid_encoding, "reserved direct-branch bits");
   }
-  if ((instruction.word & (modifiers & ~call_branch)) != 0) {
+  if ((instruction.word & (abort_branch | clear_interrupt_branch)) != 0) {
     reject(instruction,
            identity,
            FaultReason::unsupported_instruction,
-           "delayed, loop-abort or interrupt-clear branch is not lowered");
+           "loop-abort or interrupt-clear branch is not lowered");
   }
   validate_condition(instruction, identity);
 }
@@ -255,7 +271,7 @@ void validate_computed_branch(const Instruction &instruction, std::string_view i
   if ((instruction.word & reserved) != 0) {
     reject(instruction, identity, FaultReason::invalid_encoding, "reserved computed-branch bit");
   }
-  if ((instruction.word & (abort_branch | delayed_branch | clear_interrupt_branch)) != 0 ||
+  if ((instruction.word & (abort_branch | clear_interrupt_branch)) != 0 ||
       !supported_compute(instruction.compute)) {
     reject(instruction,
            identity,
@@ -293,7 +309,8 @@ void validate_return(const Instruction &instruction, std::string_view identity) 
   if ((instruction.word & ~allowed) != 0) {
     reject(instruction, identity, FaultReason::invalid_encoding, "reserved return bits");
   }
-  if ((instruction.word >> opcode_shift) != 0x0a || (instruction.word & modifiers) != 0 ||
+  if ((instruction.word >> opcode_shift) != 0x0a ||
+      (instruction.word & (modifiers & ~delayed_branch)) != 0 ||
       instruction.compute.kind != ComputeKind::none) {
     reject(instruction,
            identity,
@@ -647,6 +664,9 @@ private:
                 bool partial,
                 llvm::Value *lanes,
                 PipelineEffects pipeline);
+  void delayed_slot(const Values &values, const Instruction &op, bool partial);
+  void redirect(Values values, const Instruction &op, llvm::Value *target, bool partial);
+  [[nodiscard]] bool delay_boundary(std::uint32_t pc) const;
   llvm::Value *branch_lanes(const Values &values, const Instruction &op, bool partial);
   llvm::Value *branch_taken(llvm::Value *lanes);
   void stack_guard(const Values &values, const Instruction &op, llvm::Value *allowed, bool partial);
@@ -684,6 +704,8 @@ private:
   llvm::IRBuilder<> builder_;
   llvm::Function *function_{};
   std::map<std::uint32_t, std::size_t> addresses_;
+  std::set<std::uint32_t> delay_slots_;
+  std::map<std::uint32_t, const Instruction *> delay_ends_;
   std::vector<Node> admission_, fast_entry_, fast_, partial_;
   std::map<std::uint32_t, MemoryPlan> memory_plan_;
   llvm::Value *memory_admitted_{};
@@ -1339,8 +1361,7 @@ void Lowering::call(Values &values, const Instruction &op, bool partial) {
                 builder_.CreateICmpULT(depth, builder_.getInt32(Registers::pc_stack_capacity)),
                 partial);
   }
-  builder_.CreateStore(builder_.getInt32(((op.address + 1) & maximum_pc) | call_tag),
-                       stack_cell(depth));
+  builder_.CreateStore(builder_.getInt32(call_resume(op) | call_tag), stack_cell(depth));
   depth = builder_.CreateAdd(depth, builder_.getInt32(1));
   values[pc_stack_depth_value] = depth;
   values[interrupt_latch_value] = builder_.CreateOr(
@@ -1378,7 +1399,7 @@ void Lowering::return_to_caller(Values values, llvm::Value *target, bool partial
   auto *dispatch = builder_.CreateSwitch(target, unknown);
   std::set<std::uint32_t> returns;
   for (const auto &op : instructions_) {
-    if (call_branch_instruction(op)) { returns.insert((op.address + 1) & maximum_pc); }
+    if (call_branch_instruction(op)) { returns.insert(call_resume(op)); }
   }
   for (const auto address : returns) {
     const auto found = addresses_.find(address);
@@ -1436,8 +1457,9 @@ void Lowering::complete(Values values,
     return;
   }
   auto *count = partial ? builder_.getInt64(1) : values[credit_value];
-  const auto next = (op.address + 1) & maximum_pc;
+  const auto next = next_pc(op);
   if (!branch(op)) {
+    delayed_slot(values, op, partial);
     credit(values, count, builder_.CreateAdd(count, values[extra_cycles_value]), partial);
     finish(values, next, partial);
     return;
@@ -1452,21 +1474,27 @@ void Lowering::complete(Values values,
   auto branch_values = values;
   if (call_branch_instruction(op)) { call(branch_values, op, partial); }
   auto *target = op.type == return_branch_type ? pop(branch_values, op, partial) : nullptr;
-  retire_pipeline(branch_values, pipeline);
-  branch_values[hazard_value] = builder_.getFalse();
-  branch_values[dag_history_value] = builder_.getInt32(0);
-  credit(
-      branch_values, count, builder_.CreateAdd(cycles, builder_.getInt64(branch_penalty)), partial);
-  if (target != nullptr) {
-    return_to_caller(branch_values, target, partial);
-  } else if (indirect_branch(op)) {
+  if (indirect_branch(op)) {
     auto *address = builder_.CreateAdd(values[index_value + branch_index(op)],
                                        values[modifier_value + branch_modifier(op)]);
-    exit(branch_values,
-         builder_.CreateAnd(address, builder_.getInt32(maximum_pc)),
-         NativeExit::indirect);
+    target = builder_.CreateAnd(address, builder_.getInt32(maximum_pc));
+  }
+  retire_pipeline(branch_values, pipeline);
+  if (delayed(op)) {
+    if (target == nullptr) { target = builder_.getInt32(branch_target(op)); }
+    store(builder_.CreateOr(target, builder_.getInt32(before_first_delay_slot)),
+          delayed_target_slot);
+    branch_values[hazard_value] = builder_.getInt1(op.compute.kind != ComputeKind::none);
+    credit(branch_values, count, cycles, partial);
+    finish(branch_values, next, partial);
   } else {
-    finish(branch_values, branch_target(op), partial);
+    branch_values[hazard_value] = builder_.getFalse();
+    branch_values[dag_history_value] = builder_.getInt32(0);
+    credit(branch_values,
+           count,
+           builder_.CreateAdd(cycles, builder_.getInt64(branch_penalty)),
+           partial);
+    redirect(branch_values, op, target, partial);
   }
   builder_.SetInsertPoint(fallthrough);
   retire_pipeline(values, pipeline);
@@ -1475,11 +1503,73 @@ void Lowering::complete(Values values,
   finish(values, next, partial);
 }
 
+void Lowering::redirect(Values values, const Instruction &op, llvm::Value *target, bool partial) {
+  if (op.type == return_branch_type) {
+    return_to_caller(values, target, partial);
+  } else if (indirect_branch(op)) {
+    exit(values, target, NativeExit::indirect);
+  } else {
+    finish(values, branch_target(op), partial);
+  }
+}
+
+void Lowering::delayed_slot(const Values &values, const Instruction &op, bool partial) {
+  if (!delay_slots_.contains(op.address)) { return; }
+  auto *pending = load(32, delayed_target_slot);
+  auto *slot = llvm::BasicBlock::Create(module_.getContext(), "delay.slot", function_);
+  auto *ordinary = llvm::BasicBlock::Create(module_.getContext(), "delay.none", function_);
+  builder_.CreateCondBr(builder_.CreateICmpNE(pending, builder_.getInt32(0)), slot, ordinary);
+  builder_.SetInsertPoint(slot);
+  auto retired = values;
+  if (branch(op)) {
+    // An adjacent complementary delayed JUMP is suppressed on the taken path.
+    retired[hazard_value] = builder_.getFalse();
+    retire_pipeline(retired, {.stall = builder_.getInt64(0), .tag = builder_.getInt32(0)});
+  }
+  auto *target = builder_.CreateAnd(pending, builder_.getInt32(maximum_pc));
+  const auto origin = delay_ends_.find(op.address);
+  llvm::BasicBlock *last = nullptr;
+  if (origin != delay_ends_.end()) {
+    last = llvm::BasicBlock::Create(module_.getContext(), "delay.last", function_);
+    auto *first = llvm::BasicBlock::Create(module_.getContext(), "delay.first", function_);
+    auto *phase = builder_.CreateAnd(pending, builder_.getInt32(before_second_delay_slot));
+    builder_.CreateCondBr(builder_.CreateICmpNE(phase, builder_.getInt32(0)), last, first);
+    builder_.SetInsertPoint(first);
+  }
+  auto first_values = retired;
+  store(builder_.CreateOr(target, builder_.getInt32(before_second_delay_slot)),
+        delayed_target_slot);
+  credit(first_values,
+         builder_.getInt64(1),
+         builder_.CreateAdd(builder_.getInt64(1), retired[extra_cycles_value]),
+         partial);
+  finish(first_values, next_pc(op), partial);
+  if (last != nullptr) {
+    builder_.SetInsertPoint(last);
+    store(builder_.getInt32(0), delayed_target_slot);
+    retired[hazard_value] = builder_.getFalse();
+    // One refill cycle follows the second slot. It also ages the DAG dependency.
+    retire_pipeline(retired, {.stall = builder_.getInt64(0), .tag = builder_.getInt32(0)});
+    credit(retired,
+           builder_.getInt64(1),
+           builder_.CreateAdd(builder_.getInt64(2), retired[extra_cycles_value]),
+           partial);
+    redirect(retired, *origin->second, target, partial);
+  }
+  builder_.SetInsertPoint(ordinary);
+}
+
+bool Lowering::delay_boundary(std::uint32_t pc) const {
+  return delay_slots_.contains(pc) || delay_ends_.contains((pc + delay_slot_count) & maximum_pc);
+}
+
 void Lowering::finish(Values values, std::uint32_t next, bool partial) {
   const auto target = addresses_.find(next);
   if (target != addresses_.end()) {
     const auto i = target->second;
-    if (partial && loop_headers_.contains(i)) {
+    if (delay_boundary(next)) {
+      jump(partial_[i], values);
+    } else if (partial && loop_headers_.contains(i)) {
       partial_[i].incoming(values, builder_.GetInsertBlock());
       admission_[i].incoming(values, builder_.GetInsertBlock());
       builder_.CreateCondBr(values[tail_value], partial_[i].block, admission_[i].block);
@@ -1541,6 +1631,7 @@ void Lowering::emit_exit() {
 
 std::vector<BlockCost> Lowering::block_costs() const {
   std::set<std::uint32_t> leaders(variant_.entries.begin(), variant_.entries.end());
+  leaders.insert(delay_slots_.begin(), delay_slots_.end());
   for (const auto &vector : variant_.interrupt_vectors) { leaders.insert(vector.vector); }
   std::vector<BlockCost> result(instructions_.size());
   for (const auto &op : instructions_) {
@@ -1552,6 +1643,10 @@ std::vector<BlockCost> Lowering::block_costs() const {
   for (std::size_t i = instructions_.size(); i != 0; --i) {
     const auto index = i - 1;
     const auto &op = instructions_[index];
+    if (delay_boundary(op.address)) {
+      leaders.insert(op.address);
+      continue;
+    }
     if (branch(op)) {
       result[index].cycles += branch_penalty;
       if (((op.word >> condition_shift) & true_condition) != true_condition) {
@@ -1606,7 +1701,10 @@ void Lowering::load_indices() {
 void Lowering::plan_loops() {
   for (std::size_t end = 0; end < instructions_.size(); ++end) {
     const auto &op = instructions_[end];
-    if (op.type != direct_branch_type || (op.word & call_branch) != 0) { continue; }
+    if (op.type != direct_branch_type || (op.word & call_branch) != 0 ||
+        delay_boundary(op.address)) {
+      continue;
+    }
     const auto header = addresses_.find(branch_target(op));
     if (header == addresses_.end() || header->second > end) { continue; }
     const auto start = header->second;
@@ -1743,12 +1841,13 @@ std::vector<std::optional<BlockCost>> Lowering::unit_costs() const {
     if (visited[i] != 0) { return visited[i] == 2 ? result[i] : std::nullopt; }
     visited[i] = 1;
     const auto &op = instructions_[i];
+    if (delay_boundary(op.address)) { return std::nullopt; }
     const bool is_branch = branch(op);
     const auto next = grant_successors(op);
     BlockCost suffix{.instructions = 0, .cycles = 0};
     for (const auto address : next) {
       const auto found = addresses_.find(address);
-      if (found == addresses_.end()) { continue; }
+      if (found == addresses_.end() || delay_boundary(address)) { continue; }
       const auto cost = visit(found->second);
       if (!cost.has_value()) {
         visited[i] = 2;
@@ -1851,6 +1950,7 @@ void Lowering::emit_instruction(std::size_t i,
   auto pipeline =
       PipelineEffects{.stall = pipeline_stall(values, op), .tag = loaded_tag(values, op)};
   auto *old_status = values[status_value];
+  if (branch(op)) { delayed_slot(values, op, false); }
   instruction(values, op, false);
   // Admitted memory accesses have no resumable exit inside this block.
   if (dead_status) { values[status_value] = old_status; }
@@ -1873,6 +1973,7 @@ void Lowering::emit_instruction(std::size_t i,
   builder_.SetInsertPoint(bound);
   exit(values, builder_.getInt32(op.address), NativeExit::bound);
   builder_.SetInsertPoint(execute);
+  if (branch(op)) { delayed_slot(values, op, true); }
   lanes = branch_lanes(values, op, true);
   pipeline = {.stall = pipeline_stall(values, op), .tag = loaded_tag(values, op)};
   instruction(values, op, true);
@@ -1889,6 +1990,12 @@ void Lowering::emit_instruction(std::size_t i,
 }
 
 void Lowering::emit() {
+  for (const auto &op : instructions_) {
+    if (!delayed(op)) { continue; }
+    delay_slots_.insert(next_pc(op));
+    delay_slots_.insert(next_pc(op, delay_slot_count));
+    delay_ends_.emplace(next_pc(op, delay_slot_count), &op);
+  }
   stack_written_ = std::ranges::any_of(instructions_, [](const auto &op) {
     return op.type == return_branch_type || call_branch_instruction(op);
   });
@@ -2022,33 +2129,63 @@ std::uint32_t context_mask(const std::vector<Instruction> &instructions) {
   return mask;
 }
 
-std::vector<Instruction> connected_code(const std::vector<Instruction> &code, std::uint32_t entry) {
-  std::map<std::uint32_t, const Instruction *> addresses;
-  for (const auto &op : code) { addresses.emplace(op.address, &op); }
+bool complementary_jumps(const Instruction &first, const Instruction &second) {
+  constexpr auto complement_bit = 16;
+  return delayed(second) && !call_branch_instruction(first) && !call_branch_instruction(second) &&
+         first.type != return_branch_type && second.type != return_branch_type &&
+         first.compute.kind == ComputeKind::none && second.compute.kind == ComputeKind::none &&
+         branch_condition(first) != true_condition && branch_condition(second) != true_condition &&
+         (branch_condition(first) ^ branch_condition(second)) == complement_bit;
+}
+
+using InstructionMap = std::map<std::uint32_t, const Instruction *>;
+
+void validate_delay_slots(const InstructionMap &code, std::string_view identity) {
+  for (const auto &entry : code) {
+    const auto &op = *entry.second;
+    if (!delayed(op)) { continue; }
+    for (unsigned i = 1; i <= delay_slot_count; ++i) {
+      const auto slot = code.find(next_pc(op, i));
+      if (slot == code.end()) {
+        reject(
+            op, identity, FaultReason::undeclared_entry, "delayed transfer has an undeclared slot");
+      }
+      const auto &instruction = *slot->second;
+      if (branch(instruction) && (i != 1 || !complementary_jumps(op, instruction))) {
+        reject(instruction, identity, FaultReason::invalid_encoding, "branch in a delay slot");
+      }
+    }
+  }
+}
+
+std::vector<Instruction> connected_code(const InstructionMap &code, std::uint32_t entry) {
   std::set<std::uint32_t> visited;
   std::vector<std::uint32_t> pending{entry};
-  std::vector<Instruction> result;
+  std::set<std::uint32_t> slots;
   while (!pending.empty()) {
     const auto address = pending.back();
     pending.pop_back();
-    const auto found = addresses.find(address);
-    if (found == addresses.end() || !visited.insert(address).second) { continue; }
+    const auto found = code.find(address);
+    if (found == code.end() || !visited.insert(address).second) { continue; }
     const auto &op = *found->second;
-    result.push_back(op);
+    if (delayed(op)) {
+      slots.insert(next_pc(op));
+      slots.insert(next_pc(op, delay_slot_count));
+      if (call_branch_instruction(op)) { pending.push_back(call_resume(op)); }
+    }
     if (op.type == direct_branch_type || op.type == computed_branch_type) {
       if (!indirect_branch(op)) { pending.push_back(branch_target(op)); }
-      if ((op.word & call_branch) == 0 &&
-          ((op.word >> condition_shift) & true_condition) == true_condition) {
+      if ((!call_branch_instruction(op) || delayed(op)) && branch_condition(op) == true_condition) {
         continue;
       }
     }
-    if (op.type == return_branch_type &&
-        ((op.word >> condition_shift) & true_condition) == true_condition) {
-      continue;
-    }
-    pending.push_back((op.address + 1) & maximum_pc);
+    if (op.type == return_branch_type && branch_condition(op) == true_condition) { continue; }
+    pending.push_back(next_pc(op));
   }
-  std::ranges::sort(result, {}, &Instruction::address);
+  visited.merge(slots);
+  std::vector<Instruction> result;
+  result.reserve(visited.size());
+  for (const auto address : visited) { result.push_back(*code.at(address)); }
   return result;
 }
 
@@ -2058,7 +2195,7 @@ void collect_continuations(std::vector<Continuation> &continuations,
                            std::uint32_t entry) {
   for (const auto &op : connected) {
     if (!call_branch_instruction(op)) { continue; }
-    const auto next = (op.address + 1) & maximum_pc;
+    const auto next = call_resume(op);
     if (std::ranges::find(connected, next, &Instruction::address) != connected.end()) {
       continuations.push_back({.variant = variant.id, .address = next, .root = entry});
     }
@@ -2071,8 +2208,12 @@ std::shared_ptr<const PreparedImage> lower_image(const CodeImage &image,
   auto result = std::make_shared<PreparedImage>();
   result->identity = input_identity(image, options);
   validate_options(options, result->identity);
-  auto instructions = decode(image, result->identity);
-  for (const auto &instruction : instructions) { validate(instruction, result->identity); }
+  const auto instructions = decode(image, result->identity);
+  std::map<std::uint32_t, InstructionMap> variant_code;
+  for (const auto &instruction : instructions) {
+    validate(instruction, result->identity);
+    variant_code[instruction.variant].emplace(instruction.address, &instruction);
+  }
   result->code = image;
   result->options = options;
   llvm::LLVMContext context;
@@ -2090,10 +2231,8 @@ std::shared_ptr<const PreparedImage> lower_image(const CodeImage &image,
   std::vector<Continuation> continuations;
   for (const auto &variant : image.variants) {
     validate_memory_layout(variant, result->identity);
-    std::vector<Instruction> code;
-    std::ranges::copy_if(instructions, std::back_inserter(code), [&](const auto &instruction) {
-      return instruction.variant == variant.id;
-    });
+    const auto &code = variant_code[variant.id];
+    validate_delay_slots(code, result->identity);
     std::set<std::uint32_t> entries(variant.entries.begin(), variant.entries.end());
     for (const auto &request : variant.interrupt_vectors) { entries.insert(request.vector); }
     for (const auto entry : entries) {
@@ -2122,12 +2261,13 @@ std::shared_ptr<const PreparedImage> lower_image(const CodeImage &image,
   const NativeAbi abi(module, result->units, continuations);
   for (const auto &unit : result->units) {
     const auto variant = std::ranges::find(image.variants, unit.variant, &CodeVariant::id);
-    std::vector<Instruction> code;
-    std::ranges::copy_if(instructions, std::back_inserter(code), [&](const auto &op) {
-      return op.variant == unit.variant;
-    });
-    Lowering(
-        module, debug, options.memory_mode, abi, *variant, connected_code(code, unit.entry), unit)
+    Lowering(module,
+             debug,
+             options.memory_mode,
+             abi,
+             *variant,
+             connected_code(variant_code.at(unit.variant), unit.entry),
+             unit)
         .emit();
   }
   finalize_debug(module, debug);

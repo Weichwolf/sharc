@@ -96,6 +96,7 @@ int main() {
     fixture::register_transfers();
     fixture::control_flow();
     fixture::computed_control_flow();
+    fixture::delayed_control_flow();
     fixture::memory_access();
     fixture::dag_addressing();
     using Key = std::tuple<unsigned, bool, sharc::ExecutionMode>;
