@@ -720,11 +720,11 @@ void nested_do() {
   fixture::verify_prefixes(core, replay, trace.prefixes);
 }
 
-void enter_arithmetic_child(Timeline &trace) {
+void enter_long_child(Timeline &trace, std::uint32_t kind = 0) {
   auto &state = trace.registers;
   state.loop_address_depth = state.loop_counter_depth = state.pc_stack_pointer = 2;
   state.pc_stack[1] = base + 3;
-  state.loop_address_stack[1] = base + 7;
+  state.loop_address_stack[1] = kind | (base + 7);
   state.loop_counter_stack[1] = state.lcntr;
   trace.boundary(base + 3);
   trace.record();
@@ -802,7 +802,7 @@ void counted_arithmetic_turn(Timeline &trace, unsigned end, OverlapTail tail, bo
   trace.registers.pe[0].data[0][0] = 2U << raw_shift;
   trace.boundary(base + 2);
   trace.record();
-  enter_arithmetic_child(trace);
+  enter_long_child(trace);
   child_arithmetic_pass(trace, true);
   child_arithmetic_pass(trace, false);
   // After termination the child's Fetch1 reaches +8 while +6 executes,
@@ -881,7 +881,7 @@ void arithmetic_refill_overlap(bool ending) {
   entered(trace, {.address = end, .count = old_lcntr});
   trace.boundary(base + 2);
   trace.record();
-  enter_arithmetic_child(trace);
+  enter_long_child(trace);
   state.pe[0].astat = az;
   short_boundary(trace, {.pc = 4, .fetch = 3, .decode = 6});
   short_boundary(trace, {.pc = 5, .fetch = 4, .decode = 7});
@@ -2037,6 +2037,13 @@ constexpr unsigned nested_tail_sub = 14;
 
 enum class NestedTailReturn : std::uint8_t { none, immediate, delayed };
 
+struct NestedTailCall {
+  unsigned word{nested_tail_call};
+  NestedTailReturn form{NestedTailReturn::none};
+  bool predicated{};
+  bool separate{};
+};
+
 void nested_counted_boundary(
     Timeline &trace, Range loop, std::uint32_t pc, bool repeats, unsigned cycles = 1) {
   trace.boundary(pc == loop.end + 1 && repeats ? loop.start : pc, cycles);
@@ -2050,11 +2057,12 @@ void nested_tail_add(Timeline &trace, unsigned pc) {
   trace.registers.pe[0].data[0][pc] += 1U << raw_shift;
 }
 
-unsigned nested_tail_call_and_return(Timeline &trace, NestedTailReturn form) {
-  constexpr auto resume = nested_tail_call + 1;
-  entered_call(trace, {.target = base + nested_tail_sub, .raw_return = call_tag | (base + resume)});
+unsigned
+nested_tail_call_and_return(Timeline &trace, NestedTailCall call, unsigned resume, bool tagged) {
+  const auto tags = call_tag | (tagged ? termination_tag : 0);
+  entered_call(trace, {.target = base + nested_tail_sub, .raw_return = tags | (base + resume)});
   popped_call(trace.registers);
-  if (form == NestedTailReturn::immediate) { return 4; }
+  if (call.form == NestedTailReturn::immediate) { return 4; }
   short_boundary(trace,
                  {.pc = nested_tail_sub + 1, .fetch = resume + 1, .decode = nested_tail_sub + 3});
   nested_tail_add(trace, 0);
@@ -2063,10 +2071,31 @@ unsigned nested_tail_call_and_return(Timeline &trace, NestedTailReturn form) {
   return 2;
 }
 
-void nested_counted_child(Timeline &trace,
-                          Range parent,
-                          bool parent_repeats,
-                          NestedTailReturn form) {
+void nested_counted_pass(
+    Timeline &trace, Range parent, bool parent_repeats, NestedTailCall call, bool repeats) {
+  constexpr auto child = inner_counted_tail;
+  --trace.registers.loop_counter_stack[1];
+  if (!repeats) { leave_nested_child(trace.registers); }
+  nested_counted_boundary(trace, child, child.start + 1, repeats);
+  for (auto pc = child.start + 1; pc <= child.end; ++pc) {
+    const bool call_site = call.form != NestedTailReturn::none && pc == base + call.word;
+    const bool taken = call_site && (!call.predicated || repeats || pc <= child.start + 2);
+    unsigned cycles = 1;
+    if (taken) {
+      const auto resume = repeats && pc == child.end ? child.start : pc + 1;
+      const bool parent_exited = pc == parent.end - 3 && !parent_repeats;
+      const bool tagged = !repeats && (pc == child.start + 1 || parent_exited);
+      cycles = nested_tail_call_and_return(trace, call, resume - base, tagged);
+    } else if (!call_site && (repeats || pc == child.start + 1)) {
+      nested_tail_add(trace, pc - base);
+    }
+    if (!repeats && pc == parent.end - 4) { parent_count_sample(trace, parent_repeats); }
+    nested_counted_boundary(
+        trace, repeats ? child : parent, pc + 1, repeats || parent_repeats, cycles);
+  }
+}
+
+void nested_counted_child(Timeline &trace, Range parent, bool parent_repeats, NestedTailCall call) {
   auto &state = trace.registers;
   constexpr auto child = inner_counted_tail;
   state.loop_address_depth = state.loop_counter_depth = state.pc_stack_pointer = 2;
@@ -2076,48 +2105,38 @@ void nested_counted_child(Timeline &trace,
   trace.boundary(child.start);
   trace.record();
 
-  for (const bool repeats : {true, false}) {
-    --state.loop_counter_stack[1];
-    if (!repeats) { leave_nested_child(state); }
-    nested_counted_boundary(trace, child, child.start + 1, repeats);
-    for (auto pc = child.start + 1; pc <= child.end; ++pc) {
-      if (!repeats && pc == parent.end - 4) { parent_count_sample(trace, parent_repeats); }
-      unsigned cycles = 1;
-      if (form != NestedTailReturn::none && pc == base + nested_tail_call) {
-        cycles = nested_tail_call_and_return(trace, form);
-      } else if (repeats || pc == child.start + 1) {
-        nested_tail_add(trace, pc - base);
-      }
-      nested_counted_boundary(
-          trace, repeats ? child : parent, pc + 1, repeats || parent_repeats, cycles);
-    }
-  }
+  nested_counted_pass(trace, parent, parent_repeats, call, true);
+  nested_counted_pass(trace, parent, parent_repeats, call, false);
 }
 
-void nested_counted_not_lce(unsigned gap, NestedTailReturn form = NestedTailReturn::none) {
+void nested_counted_not_lce(unsigned gap, NestedTailCall call = {}) {
   constexpr auto child = inner_counted_tail;
   constexpr auto two_iterations = do_immediate | (std::uint64_t{2} << count_shift);
   const Range parent{.start = base + 1, .end = child.end + gap};
-  const bool call = form != NestedTailReturn::none;
-  std::vector<std::uint64_t> words(call ? nested_tail_sub + 3 : parent.end - base + 2);
+  const bool calls = call.form != NestedTailReturn::none;
+  std::vector<std::uint64_t> words(calls ? nested_tail_sub + 3 : parent.end - base + 2);
   words[0] = two_iterations | (parent.end - base);
   words[2] = two_iterations | (child.end - child.start + 1);
   for (auto pc = child.start + 1 - base; pc <= parent.end - base; ++pc) {
     words[pc] = if_not_lce(fixture::add(pc, pc, 1));
   }
-  if (call) {
-    // Address-stage predicates still see the pre-sample value on this word.
-    words[nested_tail_call] = if_not_lce(call_direct | (base + nested_tail_sub));
+  if (calls) {
+    const auto opcode = call.separate ? call_dag2 : call_direct | (base + nested_tail_sub);
+    words[call.word] = call.predicated ? if_not_lce(opcode) : opcode;
     words[nested_tail_sub] = rts | lr;
-    if (form == NestedTailReturn::delayed) {
+    if (call.form == NestedTailReturn::delayed) {
       words[nested_tail_sub] |= db;
       words[nested_tail_sub + 1] = fixture::add(0, 0, 1);
       words[nested_tail_sub + 2] = fixture::add(0, 0, 1);
     }
   }
   fixture::Program program(words);
-  if (call) { program.code.variants[0].entries.push_back(base + nested_tail_sub); }
+  if (calls) { program.code.variants[0].entries.push_back(base + nested_tail_sub); }
   auto initial = starting();
+  if (call.separate) {
+    initial.dag[0][8].index = base + nested_tail_sub;
+    program.code.variants[0].entries.push_back(base + call.word + 1);
+  }
   initial.pe[0].data[0][1] = 1U << raw_shift;
   Timeline trace{.registers = initial, .prefixes = {}};
   trace.registers.lcntr = 2;
@@ -2125,9 +2144,55 @@ void nested_counted_not_lce(unsigned gap, NestedTailReturn form = NestedTailRetu
   for (const bool repeats : {true, false}) {
     trace.boundary(child.start - 1);
     trace.record();
-    nested_counted_child(trace, parent, repeats, form);
+    nested_counted_child(trace, parent, repeats, call);
     for (auto pc = child.end + 1; pc <= parent.end; ++pc) {
       if (repeats || pc == parent.end - 3) { nested_tail_add(trace, pc - base); }
+      nested_counted_boundary(trace, parent, pc + 1, repeats);
+    }
+  }
+  verify_timeline(program, initial, trace);
+}
+
+void nested_counted_call_cases() {
+  for (const auto gap : {1U, 2U, 3U, 4U}) {
+    nested_counted_not_lce(gap);
+    const auto sample = inner_counted_tail.end - base + gap - 4;
+    const auto delayed = gap % 2 == 0;
+    const auto form = delayed ? NestedTailReturn::delayed : NestedTailReturn::immediate;
+    nested_counted_not_lce(gap, {.word = sample, .form = form, .separate = delayed});
+  }
+  // The parent can sample one clock before the endpoint's CALL.
+  nested_counted_not_lce(3, {.word = 7, .form = NestedTailReturn::delayed, .separate = true});
+  nested_counted_not_lce(4, {.word = 7, .form = NestedTailReturn::immediate, .predicated = true});
+  // These pre-sample branch predicates still see the old observation.
+  nested_counted_not_lce(4, {.form = NestedTailReturn::immediate, .predicated = true});
+  nested_counted_not_lce(4, {.form = NestedTailReturn::delayed, .predicated = true});
+}
+
+void counted_parent_call_without_child_setup() {
+  constexpr Range parent{.start = base + 1, .end = base + 12};
+  constexpr auto call = base + 8;
+  constexpr auto sub = base + nested_tail_sub;
+  constexpr auto twice = do_immediate | (std::uint64_t{2} << count_shift);
+  std::array<std::uint64_t, nested_tail_sub + 1> words{};
+  words[0] = twice | (parent.end - base);
+  words[1] = jump_direct | call;
+  words[4] = twice | 5;
+  words[call - base] = call_direct | sub;
+  words[sub - base] = rts | lr;
+  fixture::Program program(words);
+  const auto initial = starting();
+  Timeline trace{.registers = initial, .prefixes = {}};
+  trace.registers.lcntr = 2;
+  entered(trace, {.address = counted_address | parent.end, .count = 2});
+  for (const bool repeats : {true, false}) {
+    trace.boundary(call, 4);
+    trace.record();
+    entered_call(trace, {.target = sub, .raw_return = call_tag | (call + 1)});
+    popped_call(trace.registers);
+    parent_count_sample(trace, repeats);
+    nested_counted_boundary(trace, parent, call + 1, repeats, 4);
+    for (auto pc = call + 1; pc <= parent.end; ++pc) {
       nested_counted_boundary(trace, parent, pc + 1, repeats);
     }
   }
@@ -3193,7 +3258,7 @@ void counted_ancestor_refill_call_turn(Timeline &trace, RefillCall call, bool re
   if (call.child_repeats) { state.pe[0].data[0][0] = 2U << raw_shift; }
   trace.boundary(base + 2);
   trace.record();
-  enter_arithmetic_child(trace);
+  enter_long_child(trace);
   if (call.child_repeats) {
     state.pe[0].data[0][0] = 1U << raw_shift;
     state.pe[0].astat = ac;
@@ -3269,7 +3334,7 @@ void refill_call_arithmetic_callee(Timeline &trace, bool ending) {
   state.pc_stack_pointer = 3;
   state.loop_address_depth = state.loop_counter_depth = 2;
   state.loop_address_stack[1] = base + sub + 4;
-  state.loop_counter_stack[1] = old_lcntr;
+  state.loop_counter_stack[1] = state.lcntr;
   short_boundary(trace, {.pc = sub + 1, .fetch = sub + 1, .decode = sub + 3});
   short_boundary(trace, {.pc = sub + 2, .fetch = sub + 2, .decode = sub + 4});
   state.pc_stack_pointer = 2;
@@ -3285,12 +3350,16 @@ void refill_call_arithmetic_callee(Timeline &trace, bool ending) {
   state.pe[1].data[0][3] = ending ? 0 : 2U << raw_shift;
 }
 
-void arithmetic_ancestor_refill_call(bool ending) {
+enum class RefillChild : std::uint8_t { arithmetic, counted };
+
+void arithmetic_ancestor_refill_call(bool ending, RefillChild child = RefillChild::arithmetic) {
   constexpr auto sub = refill_call_sub;
   constexpr auto simd = 1U << 21;
   std::array<std::uint64_t, sub + 8> words{};
   words[0] = do_eq | 9;
-  words[2] = do_eq | 5;
+  constexpr auto once = do_immediate | (std::uint64_t{1} << count_shift);
+  const bool counted = child == RefillChild::counted;
+  words[2] = (counted ? once : do_eq) | 5;
   words[3] = fixture::add(0, 0, 0);
   words[7] = call_dag2;
   words[sub] = do_eq | 4;
@@ -3308,13 +3377,23 @@ void arithmetic_ancestor_refill_call(bool ending) {
   entered(trace, {.address = base + 9, .count = old_lcntr});
   trace.boundary(base + 2);
   trace.record();
-  enter_arithmetic_child(trace);
+  if (counted) { state.lcntr = 1; }
+  enter_long_child(trace, counted ? counted_address : 0);
   for (auto &lane : state.pe) { lane.astat = az; }
-  short_boundary(trace, {.pc = 4, .fetch = 3, .decode = 6});
-  short_boundary(trace, {.pc = 5, .fetch = 4, .decode = 7});
-  leave_nested_child(state);
-  short_boundary(trace, {.pc = 6, .fetch = 8, .decode = 3});
-  short_boundary(trace, {.pc = 7, .fetch = 9, .decode = 4});
+  if (counted) {
+    state.loop_counter_stack[1] = 0;
+    leave_nested_child(state);
+    short_boundary(trace, {.pc = 4, .fetch = 8, .decode = 6});
+    short_boundary(trace, {.pc = 5, .fetch = 9, .decode = 7});
+    short_boundary(trace, {.pc = 6, .fetch = 1, .decode = 8});
+    short_boundary(trace, {.pc = 7, .fetch = 2, .decode = 9});
+  } else {
+    short_boundary(trace, {.pc = 4, .fetch = 3, .decode = 6});
+    short_boundary(trace, {.pc = 5, .fetch = 4, .decode = 7});
+    leave_nested_child(state);
+    short_boundary(trace, {.pc = 6, .fetch = 8, .decode = 3});
+    short_boundary(trace, {.pc = 7, .fetch = 9, .decode = 4});
+  }
   entered_call(trace, {.target = base + sub, .raw_return = call_tag | (base + 8)});
   refill_call_arithmetic_callee(trace, ending);
   // The last return slot is visible to both lanes of the displaced sample.
@@ -3379,6 +3458,50 @@ void two_counted_ancestors_refill_calls() {
   verify_timeline(program, initial, trace);
 }
 
+void arithmetic_child_condition_call(bool ending) {
+  constexpr auto sub = refill_call_sub;
+  constexpr auto end = base + 9;
+  constexpr auto once = do_immediate | (std::uint64_t{1} << count_shift);
+  std::array<std::uint64_t, sub + 2> words{};
+  words[0] = once | (end - base);
+  words[2] = do_eq | 5;
+  words[5] = call_dag2;
+  words[sub] = fixture::add(0, 1, 1);
+  words[sub + 1] = rts | lr;
+  fixture::Program program(words);
+  program.code.variants[0].entries.push_back(base + sub);
+  program.code.variants[0].entries.push_back(base + 6);
+  auto initial = starting();
+  initial.dag[0][8].index = base + sub;
+  initial.pe[0].data[0][1] = ending ? 0 : 1U << raw_shift;
+  Timeline trace{.registers = initial, .prefixes = {}};
+  auto &state = trace.registers;
+  state.lcntr = 1;
+  entered(trace, {.address = counted_address | end, .count = 1});
+  trace.boundary(base + 2);
+  trace.record();
+  enter_long_child(trace);
+  short_boundary(trace, {.pc = 4, .fetch = 3, .decode = 6});
+  short_boundary(trace, {.pc = 5, .fetch = 4, .decode = 7});
+  entered_call(trace, {.target = base + sub, .raw_return = call_tag | (base + 6)});
+  state.pe[0].data[0][0] = ending ? 0 : 2U << raw_shift;
+  state.pe[0].astat = ending ? az : 0;
+  trace.boundary(base + sub + 1);
+  trace.record();
+  popped_call(state);
+  if (ending) { leave_nested_child(state); }
+  short_boundary(trace, {.pc = 6, .fetch = ending ? 8U : 5U, .decode = 3}, 4);
+  short_boundary(trace, {.pc = 7, .fetch = ending ? 9U : 6U, .decode = 4});
+  if (ending) {
+    parent_count_sample(trace, false);
+    trace.boundary(base + 8, 3);
+  } else {
+    trace.boundary(base + 3);
+  }
+  trace.record();
+  verify_timeline(program, initial, trace);
+}
+
 void arithmetic_refill_call_cases() {
   for (const auto gap : {1U, 2U, 3U, 4U}) {
     counted_ancestor_refill_call({.pc = refill_call_end - 1, .gap = gap, .delayed = gap == 1});
@@ -3388,7 +3511,11 @@ void arithmetic_refill_call_cases() {
       {.pc = refill_call_end, .gap = 1, .delayed = true, .child_repeats = true});
   arithmetic_ancestor_refill_call(false);
   arithmetic_ancestor_refill_call(true);
+  arithmetic_ancestor_refill_call(false, RefillChild::counted);
+  arithmetic_ancestor_refill_call(true, RefillChild::counted);
   two_counted_ancestors_refill_calls();
+  arithmetic_child_condition_call(false);
+  arithmetic_child_condition_call(true);
 }
 
 void arithmetic_call_reentry() {
@@ -3810,9 +3937,8 @@ void fixture::hardware_loop_control_flow() {
   counted_sample_call(CountedSampleCall::predicated);
   counted_sample_before_second_call();
   counted_not_lce_compute();
-  for (const auto gap : {1U, 2U, 3U, 4U}) { nested_counted_not_lce(gap); }
-  nested_counted_not_lce(4, NestedTailReturn::immediate);
-  nested_counted_not_lce(4, NestedTailReturn::delayed);
+  nested_counted_call_cases();
+  counted_parent_call_without_child_setup();
   counted_not_lce_call(2);
   counted_not_lce_call(3);
   counted_not_lce_call(4);

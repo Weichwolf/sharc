@@ -333,9 +333,16 @@ Fixtures exercise all four gaps to a counted parent, its `NOT LCE`
 latency and termination tag, and a displaced arithmetic parent sample
 after a separate callee runs its own DO and sets SIMD flags in the last
 return slot. Consecutive CALLs can independently sample two counted
-ancestors. Other overlapping long CALL sites and other branches in an
-overlapping refill remain unqualified. The combined timing awaits hardware
-comparison.
+ancestors.
+Immediate CALLs in shared long tails restore sampled conditions and
+defer an outstanding fetch or arithmetic test to the return refill.
+The terminating pass of a counted child can reach the parent's sample.
+A repeating endpoint CALL returns to the child header. Fixtures cover the four
+counted parent gaps, a CALL following a sampled parent, false `NOT LCE`
+predicates, a prepared edge that bypasses the child setup, and the
+arithmetic child and parent tests across separate return entries.
+Other branches in an overlapping refill remain unqualified. The combined
+timing awaits hardware comparison.
 
 Classic type 5 transfers raw data among R/S and I/M/L/B registers, including
 cross-PE data moves and raw40 register swaps, with supported single-function fixed
