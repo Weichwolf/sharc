@@ -223,6 +223,16 @@ and a callee that runs a short DO of its own. Four-word fixtures also
 cover the full-count encoding, IF NOT LCE on the resumed suffix and a
 precise fault for an ordinary RTS on the suspended buffer. The combined
 timing awaits hardware comparison.
+Immediate CALLs in two- and three-word arithmetic and FOREVER bodies
+retain either the active loop or its buffered exit across `RTS (LR)` and
+`RTS (DB, LR)`. A CALL at the two-word endpoint or the three-word header
+can defer the arithmetic sample to the fourth return fetch. That sample
+sees flags from the callee, including the last slot of a delayed return.
+A following CALL in Address carries the termination tag. Tests cover both
+sample outcomes, continuation after a tagged CALL, a taken endpoint CALL
+that replaces the final refill, and a callee that uses its own short DO.
+Single-word bodies exclude CALL. The combined timing awaits hardware
+comparison.
 Admitted immediate CALLs in the tail of a long DO preserve the sampled loop
 decision across `RTS (LR)` and `RTS (DB, LR)`. The PC stack records a separate
 tag when the loop terminates during the call's address stage. Tests cover
@@ -289,8 +299,7 @@ short child fill. Tests exercise counted bodies of one through four words,
 a short arithmetic child, a late arithmetic parent sample and snapshot
 replay with both active and already-popped frames. The overlap timing is
 derived from the documented pipeline observations.
-CALLs in short arithmetic bodies, short outer loops and branches in the
-overlapping child refill remain open.
+Short outer loops and branches in the overlapping child refill remain open.
 
 Classic type 5 transfers raw data among R/S and I/M/L/B registers, including
 cross-PE data moves and raw40 register swaps, with supported single-function fixed

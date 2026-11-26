@@ -87,6 +87,11 @@ the compact drain state of a one-pass loop. For a CALL at the first word of
 an admitted two-, three- or four-word body, the startup fetch can sample before
 the CALL saves the suffix. The compact three-word suffix keeps its sample
 pending for the second word.
+An arithmetic or FOREVER CALL records an unbounded pass or the bounded
+buffer still to drain. If the branch replaces an arithmetic condition fetch,
+the prepared return performs that sample after the frozen clocks, using the
+flags after the return slots. It restores the fetched suffix and any tag for
+a CALL in Address on the sample clock.
 A CALL occupying an admitted long-loop endpoint consumes the loop decision
 and pushes the selected successor, including the loop header on a repeat.
 When a CALL redirects before a pending long-loop sample reaches Fetch1,

@@ -1803,6 +1803,146 @@ unsigned short_call_round_trip(Timeline &trace,
   return delayed ? 2U : 4U;
 }
 
+std::array<std::uint64_t, 15> short_condition_callee(bool delayed) {
+  std::array<std::uint64_t, 15> words{};
+  words[8] = do_immediate | (std::uint64_t{1} << count_shift) | 1;
+  words[9] = fixture::add(0, 0, 1);
+  words[10] = rts | lr | (delayed ? db : 0);
+  words[12] = fixture::add(7, 7, 7);
+  return words;
+}
+
+void short_condition_return_slots(Timeline &trace, unsigned resume, std::uint32_t tags = call_tag) {
+  entered_call(trace, {.target = short_call_sub, .raw_return = tags | (base + resume)});
+  callee_short_loop(trace);
+  popped_call(trace.registers);
+  short_boundary(trace, {.pc = 11, .fetch = resume + 1, .decode = 13});
+  short_boundary(trace, {.pc = 12, .fetch = resume + 2, .decode = resume});
+  // Only the last delay slot sets EQ.
+  trace.registers.pe[0].astat = az;
+}
+
+void two_word_condition_call() {
+  auto words = short_condition_callee(true);
+  words[0] = do_eq | 2;
+  words[2] = call_dag2;
+  fixture::Program program(words);
+  program.code.variants.front().entries.push_back(short_call_sub);
+  auto initial = starting();
+  initial.dag[0][8].index = short_call_sub;
+  initial.pe[0].data[0][1] = 1U << raw_shift;
+  Timeline trace{.registers = initial, .prefixes = {}};
+  entered_arithmetic(trace, {.pc = 1, .fetch = 2, .decode = 2}, base + 2);
+  short_boundary(trace, {.pc = 2, .fetch = 2, .decode = 2}, 2);
+  short_condition_return_slots(trace, 1);
+  popped(trace.registers);
+  short_boundary(trace, {.pc = 1, .fetch = 3, .decode = 1}, 2);
+  short_boundary(trace, {.pc = 2, .fetch = 4, .decode = 2});
+  short_condition_return_slots(trace, 3);
+  // A taken CALL on the final word replaces the exit refill.
+  short_boundary(trace, {.pc = 3, .fetch = 7, .decode = 5}, 2);
+  verify_timeline(program, initial, trace);
+}
+
+void two_word_call_after_condition_sample() {
+  auto words = short_condition_callee(true);
+  words[0] = do_eq | 2;
+  words[1] = call_dag2;
+  fixture::Program program(words);
+  program.code.variants.front().entries.push_back(short_call_sub);
+  auto initial = starting();
+  initial.dag[0][8].index = short_call_sub;
+  initial.pe[0].data[0][1] = 1U << raw_shift;
+  Timeline trace{.registers = initial, .prefixes = {}};
+  entered_arithmetic(trace, {.pc = 1, .fetch = 2, .decode = 2}, base + 2);
+  short_condition_return_slots(trace, 2);
+  // The header CALL returns before the condition sample on the endpoint.
+  short_boundary(trace, {.pc = 2, .fetch = 2, .decode = 2}, 2);
+  popped(trace.registers);
+  short_boundary(trace, {.pc = 1, .fetch = 3, .decode = 1});
+  short_condition_return_slots(trace, 2, call_tag | termination_tag);
+  short_boundary(trace, {.pc = 2, .fetch = 4, .decode = 2}, 2);
+  short_boundary(trace, {.pc = 3, .fetch = 7, .decode = 5}, 3);
+  verify_timeline(program, initial, trace);
+}
+
+void three_word_condition_call(bool delayed) {
+  constexpr std::uint64_t call_eq = 0x068000000000;
+  auto words = short_condition_callee(delayed);
+  words[0] = do_eq | 3;
+  words[1] = delayed ? call_dag2 : call_direct | short_call_sub;
+  if (delayed) { words[2] = call_eq | short_call_sub; }
+  fixture::Program program(words);
+  program.code.variants.front().entries.push_back(short_call_sub);
+  auto initial = starting();
+  initial.dag[0][8].index = short_call_sub;
+  initial.pe[0].data[0][1] = 1U << raw_shift;
+  initial.pe[0].astat = delayed ? 0 : az;
+  Timeline trace{.registers = initial, .prefixes = {}};
+  entered_arithmetic(trace, {.pc = 1, .fetch = 2, .decode = 3}, base + 3);
+  if (delayed) {
+    short_condition_return_slots(trace, 2);
+    popped(trace.registers);
+  } else {
+    // A formerly true predicate is overwritten before the deferred sample.
+    (void)short_call_round_trip(trace, 2, false);
+  }
+  short_boundary(trace, {.pc = 2, .fetch = 3, .decode = 1}, delayed ? 2U : 4U);
+  if (delayed) { short_condition_return_slots(trace, 3, call_tag | termination_tag); }
+  short_boundary(trace, {.pc = 3, .fetch = 1, .decode = 2}, delayed ? 2U : 1U);
+  short_boundary(trace, {.pc = 1, .fetch = 2, .decode = 3});
+  if (delayed) {
+    short_condition_return_slots(trace, 2);
+    short_boundary(trace, {.pc = 2, .fetch = 4, .decode = 1}, 2);
+    short_condition_return_slots(trace, 3);
+    short_boundary(trace, {.pc = 3, .fetch = 5, .decode = 2}, 2);
+    short_boundary(trace, {.pc = 4, .fetch = 8, .decode = 6}, 3);
+  }
+  verify_timeline(program, initial, trace);
+}
+
+void three_word_call_in_condition_drain() {
+  constexpr std::uint64_t call_eq = 0x068000000000;
+  auto words = short_condition_callee(false);
+  words[0] = do_eq | 3;
+  words[2] = call_eq | short_call_sub;
+  fixture::Program program(words);
+  auto initial = starting();
+  initial.pe[0].data[0][1] = 1U << raw_shift;
+  initial.pe[0].astat = az;
+  Timeline trace{.registers = initial, .prefixes = {}};
+  entered_arithmetic(trace, {.pc = 1, .fetch = 2, .decode = 3}, base + 3);
+  popped(trace.registers);
+  short_boundary(trace, {.pc = 2, .fetch = 3, .decode = 1});
+  const auto cycles = short_call_round_trip(trace, 3, false, call_tag | termination_tag);
+  short_boundary(trace, {.pc = 3, .fetch = 1, .decode = 2}, cycles);
+  short_boundary(trace, {.pc = 1, .fetch = 2, .decode = 3});
+  short_boundary(trace, {.pc = 2, .fetch = 4, .decode = 1});
+  // The callee cleared EQ. The false CALL retires the buffered word.
+  short_boundary(trace, {.pc = 3, .fetch = 5, .decode = 2});
+  short_boundary(trace, {.pc = 4, .fetch = 8, .decode = 6}, 3);
+  verify_timeline(program, initial, trace);
+}
+
+void short_forever_call() {
+  constexpr auto setup = 0x0e3e00000002;
+  constexpr auto address = 0x1f000000 | (base + 2);
+  auto words = short_condition_callee(false);
+  words[0] = setup;
+  words[2] = call_direct | short_call_sub;
+  fixture::Program program(words);
+  auto initial = starting();
+  initial.pe[0].data[0][1] = 1U << raw_shift;
+  Timeline trace{.registers = initial, .prefixes = {}};
+  entered_arithmetic(trace, {.pc = 1, .fetch = 2, .decode = 2}, address);
+  for (unsigned turn = 0; turn < 3; ++turn) {
+    short_boundary(trace, {.pc = 2, .fetch = 2, .decode = 2}, turn == 0 ? 2U : 1U);
+    const auto cycles = short_call_round_trip(trace, 1, false);
+    short_boundary(trace, {.pc = 1, .fetch = 1, .decode = 1}, cycles);
+  }
+  verify_timeline(program, initial, trace);
+}
+
 enum class FourWordCall : std::uint8_t { direct, delayed, predicated, full_count, single_turn };
 
 void four_word_call_turn(Timeline &trace, unsigned site, FourWordCall form, unsigned turn) {
@@ -2759,6 +2899,12 @@ void fixture::hardware_loop_control_flow() {
   counted_not_lce_call(4);
   counted_not_lce_call(3, true);
   refused_not_lce_without_loop();
+  two_word_condition_call();
+  two_word_call_after_condition_sample();
+  three_word_condition_call(false);
+  three_word_condition_call(true);
+  three_word_call_in_condition_drain();
+  short_forever_call();
   four_word_loop_call(FourWordCall::direct);
   four_word_loop_call(FourWordCall::delayed);
   four_word_loop_call(FourWordCall::predicated);
