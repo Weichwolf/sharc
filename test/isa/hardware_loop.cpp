@@ -1803,16 +1803,40 @@ unsigned short_call_round_trip(Timeline &trace,
   return delayed ? 2U : 4U;
 }
 
-enum class FourWordCall : std::uint8_t { direct, delayed, predicated, full_count };
+enum class FourWordCall : std::uint8_t { direct, delayed, predicated, full_count, single_turn };
+
+void four_word_call_turn(Timeline &trace, unsigned site, FourWordCall form, unsigned turn) {
+  const bool delayed = form == FourWordCall::delayed;
+  const bool final = turn == 1 || form == FourWordCall::single_turn;
+  const bool take_call = form != FourWordCall::predicated || turn == 0;
+  auto header = turn == 0 ? 2U : 1U;
+  if (site == 1 && take_call) { header = short_call_round_trip(trace, 2, delayed); }
+  short_boundary(trace, {.pc = 2, .fetch = final ? 6U : 2U, .decode = 3}, header);
+  const auto third = site == 2 && take_call ? short_call_round_trip(trace, 3, delayed) : 1U;
+  short_boundary(trace, {.pc = 3, .fetch = final ? 7U : 3U, .decode = 4}, third);
+  const auto cycles = site == 3 && take_call ? short_call_round_trip(trace, 4, delayed) : 1U;
+  short_boundary(trace, {.pc = 4, .fetch = final ? 8U : 4U, .decode = final ? 5U : 1U}, cycles);
+  if (final) {
+    short_boundary(trace, {.pc = 5, .fetch = 9, .decode = 6});
+  } else {
+    // The last word is still buffered after the final counter check.
+    const bool full_count = form == FourWordCall::full_count;
+    parent_count_sample(trace, full_count);
+    short_boundary(trace, {.pc = 1, .fetch = full_count ? 1U : 5U, .decode = 2});
+  }
+}
 
 void four_word_loop_call(FourWordCall form, unsigned site = 3) {
   constexpr std::uint64_t call_eq = 0x068000000000;
   const bool delayed = form == FourWordCall::delayed;
   const bool predicated = form == FourWordCall::predicated;
   const bool full_count = form == FourWordCall::full_count;
-  const std::uint32_t count = full_count ? 0 : 2;
+  const bool single_turn = form == FourWordCall::single_turn;
+  const auto turns = single_turn ? 1U : 2U;
+  const auto count = full_count ? 0U : turns;
   std::array<std::uint64_t, 15> words{};
   words[0] = do_immediate | (std::uint64_t{count} << count_shift) | 4;
+  if (single_turn) { words[2] = if_not_lce(fixture::add(6, 6, 1)); }
   words[site] = delayed ? call_dag2 : (predicated ? call_eq : call_direct) | short_call_sub;
   words[5] = jump_direct | (base + 14);
   words[8] = do_immediate | (std::uint64_t{1} << count_shift) | 1;
@@ -1832,28 +1856,9 @@ void four_word_loop_call(FourWordCall form, unsigned site = 3) {
   state.faddr = base + 4;
   state.daddr = base + 2;
   trace.prefixes.back().registers = state;
-  --state.loop_counter_stack[0];
-  short_boundary(trace, {.pc = 2, .fetch = 2, .decode = 3}, 2);
-  for (const bool repeats : {true, false}) {
-    const bool take_call = !predicated || repeats;
-    const auto third = site == 2 && take_call ? short_call_round_trip(trace, 3, delayed) : 1U;
-    short_boundary(trace, {.pc = 3, .fetch = repeats ? 3U : 7U, .decode = 4}, third);
-    const auto cycles = site == 3 && take_call ? short_call_round_trip(trace, 4, delayed) : 1U;
-    short_boundary(
-        trace, {.pc = 4, .fetch = repeats ? 4U : 8U, .decode = repeats ? 1U : 5U}, cycles);
-    if (full_count) {
-      parent_count_sample(trace, true);
-      short_boundary(trace, {.pc = 1, .fetch = 1, .decode = 2});
-      break;
-    }
-    if (repeats) {
-      // The last word is still buffered after the final counter check.
-      parent_count_sample(trace, false);
-      short_boundary(trace, {.pc = 1, .fetch = 5, .decode = 2});
-      short_boundary(trace, {.pc = 2, .fetch = 6, .decode = 3});
-    } else {
-      short_boundary(trace, {.pc = 5, .fetch = 9, .decode = 6});
-    }
+  parent_count_sample(trace, !single_turn);
+  for (unsigned turn = 0; turn < (full_count ? 1U : turns); ++turn) {
+    four_word_call_turn(trace, site, form, turn);
   }
   verify_timeline(program, initial, trace);
 }
@@ -2211,10 +2216,10 @@ void late_address_long_loop_call() {
   verify_timeline(program, initial, trace);
 }
 
-void refused_plain_short_loop_return() {
+void refused_plain_short_loop_return(unsigned site) {
   std::array<std::uint64_t, 9> words{};
   words[0] = do_immediate | 4; // Zero encodes the full 32-bit count.
-  words[3] = call_direct | short_call_sub;
+  words[site] = call_direct | short_call_sub;
   words[8] = rts;
   fixture::Program program(words);
   // An unrelated long-loop CALL makes plain RTS valid for its deferred fetch.
@@ -2229,7 +2234,10 @@ void refused_plain_short_loop_return() {
   const auto native = sharc::Core::compile(program.code);
   sharc::Core core(program.memory());
   fixture::install(core, native, starting());
-  check(fixture::completed(core.run(4), 4, 8) && core.registers().pc == short_call_sub,
+  const auto instructions = site + 1;
+  const auto cycles = site == 1 ? 5U : 8U;
+  check(fixture::completed(core.run(instructions), instructions, cycles) &&
+            core.registers().pc == short_call_sub,
         "full-count short loop failed to reach an ordinary RTS");
   const auto before = core.registers();
   const auto fault = core.run(1);
@@ -2240,18 +2248,18 @@ void refused_plain_short_loop_return() {
         "ordinary RTS consumed a buffered short loop");
 }
 
-void refused_overlapping_short_call() {
+void refused_overlapping_short_call(unsigned site) {
   constexpr auto count_two = do_immediate | (std::uint64_t{2} << count_shift);
   constexpr auto call = call_direct | (base + 10);
   std::array<std::uint64_t, 11> words{};
   words[0] = count_two | 9;
   words[1] = count_two | 4;
-  words[3] = call;
+  words[site] = call;
   words[10] = rts | lr;
   const fixture::Program program(words);
   const auto fault = fixture::refusal(program.code, "overlapping short CALL was prepared");
-  check(fault.reason == sharc::FaultReason::unsupported_instruction && fault.address == base + 3 &&
-            fault.instruction == call,
+  check(fault.reason == sharc::FaultReason::unsupported_instruction &&
+            fault.address == base + site && fault.instruction == call,
         "overlapping short CALL fault lost instruction attribution");
 }
 
@@ -2756,6 +2764,11 @@ void fixture::hardware_loop_control_flow() {
   four_word_loop_call(FourWordCall::predicated);
   four_word_loop_call(FourWordCall::full_count);
   four_word_loop_call(FourWordCall::delayed, 2);
+  four_word_loop_call(FourWordCall::direct, 1);
+  four_word_loop_call(FourWordCall::delayed, 1);
+  four_word_loop_call(FourWordCall::predicated, 1);
+  four_word_loop_call(FourWordCall::full_count, 1);
+  four_word_loop_call(FourWordCall::single_turn, 1);
   four_word_endpoint_call(FourWordCall::direct);
   four_word_endpoint_call(FourWordCall::delayed);
   four_word_endpoint_call(FourWordCall::predicated);
@@ -2781,8 +2794,10 @@ void fixture::hardware_loop_control_flow() {
   single_iteration_three_word_call(false);
   single_iteration_three_word_call(true);
   late_address_long_loop_call();
-  refused_plain_short_loop_return();
-  refused_overlapping_short_call();
+  refused_plain_short_loop_return(1);
+  refused_plain_short_loop_return(3);
+  refused_overlapping_short_call(2);
+  refused_overlapping_short_call(3);
   arithmetic_sample_call(ArithmeticSampleCall::immediate);
   arithmetic_sample_call(ArithmeticSampleCall::delayed);
   arithmetic_sample_call(ArithmeticSampleCall::repeated);

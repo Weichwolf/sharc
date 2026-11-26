@@ -3894,10 +3894,7 @@ void validate_loop_call(LoopPlan &plan,
                         LoopShape &shape,
                         const Instruction &op,
                         std::string_view identity) {
-  const auto remaining = (shape.end - op.address) & maximum_pc;
-  const bool short_site = shape.counted() && shape.length >= 2 &&
-                          (shape.length <= 3 || (shape.length == loop_fetch_distance &&
-                                                 remaining <= loop_decode_distance));
+  const bool short_site = shape.counted() && shape.length >= 2;
   if ((shape.short_body() && !short_site) || !call_branch_instruction(op) || delayed(op)) {
     reject(op, identity, FaultReason::unsupported_instruction, "branch near the DO endpoint");
   }
@@ -3927,8 +3924,7 @@ void validate_nested_loop(const InstructionMap &code,
     reject(op, identity, FaultReason::invalid_encoding, "arithmetic DO endpoints are too close");
   }
   if (overlapping_refill(child, outer) || overlapping_short_tail(child, outer)) {
-    const auto overlap_words =
-        child.short_body() ? std::min(child.length, loop_fetch_distance - 1) : loop_decode_distance;
+    const auto overlap_words = child.short_body() ? child.length : loop_decode_distance;
     for (unsigned distance = 0; distance < overlap_words; ++distance) {
       const auto word = code.find((child.end - distance) & maximum_pc);
       if (word != code.end() && branch(*word->second)) {

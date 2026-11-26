@@ -84,7 +84,7 @@ three-word body the penultimate word already sampled the count.
 If a three-word CALL occupies that penultimate word, its continuation
 instead samples during the return refill. The continuation also preserves
 the compact drain state of a one-pass loop. For a CALL at the first word of
-an admitted two- or three-word body, the startup fetch can sample before
+an admitted two-, three- or four-word body, the startup fetch can sample before
 the CALL saves the suffix. The compact three-word suffix keeps its sample
 pending for the second word.
 A CALL occupying an admitted long-loop endpoint consumes the loop decision

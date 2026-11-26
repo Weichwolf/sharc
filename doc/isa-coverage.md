@@ -214,13 +214,15 @@ terminates the loop with a following CALL in Address, that CALL carries
 the termination tag. A false predicate takes the ordinary sample in
 place. Fixtures cover both return forms, the compact drain, consecutive
 calls and snapshot replay. This combined timing awaits hardware comparison.
-An immediate CALL on the first word of a counted two- or three-word DO
+An immediate CALL on the first word of a counted two-, three- or four-word DO
 saves the buffered suffix after any startup count sample. The CALL flush
 replaces the rest of the entry fill. A single-iteration three-word loop
 restores the compact buffer and samples during its second word. Fixtures
 cover taken and false predicates, startup termination, both return forms,
-and a callee that runs a short DO of its own. The combined timing awaits
-hardware comparison.
+and a callee that runs a short DO of its own. Four-word fixtures also
+cover the full-count encoding, IF NOT LCE on the resumed suffix and a
+precise fault for an ordinary RTS on the suspended buffer. The combined
+timing awaits hardware comparison.
 Admitted immediate CALLs in the tail of a long DO preserve the sampled loop
 decision across `RTS (LR)` and `RTS (DB, LR)`. The PC stack records a separate
 tag when the loop terminates during the call's address stage. Tests cover
@@ -287,9 +289,8 @@ short child fill. Tests exercise counted bodies of one through four words,
 a short arithmetic child, a late arithmetic parent sample and snapshot
 replay with both active and already-popped frames. The overlap timing is
 derived from the documented pipeline observations.
-The first-word CALL in a four-word counted DO, CALLs in short arithmetic
-bodies, short outer loops and branches in the overlapping child refill
-remain open.
+CALLs in short arithmetic bodies, short outer loops and branches in the
+overlapping child refill remain open.
 
 Classic type 5 transfers raw data among R/S and I/M/L/B registers, including
 cross-PE data moves and raw40 register swaps, with supported single-function fixed
