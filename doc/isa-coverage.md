@@ -199,8 +199,8 @@ Endpoint CALLs in counted two- and three-word bodies resume the remaining
 buffer at the loop header or return to the linear successor on the final
 pass. In a two-word body the return refill reaches the next counter sample
 after the frozen clocks. In a three-word body the penultimate word already
-sampled the count. A taken endpoint CALL in a single-iteration two-word
-body fails at the CALL boundary. A false predicate retires the ordinary
+sampled the count. A taken CALL in a single-iteration two-word body fails
+at the CALL boundary. A false predicate retires the ordinary
 loop tail. When a three-word body terminates with the endpoint CALL in
 Address, the saved PC carries the loop-termination tag. Fixtures cover
 direct and indirect calls, both return forms, buffered passes after a
@@ -214,6 +214,13 @@ terminates the loop with a following CALL in Address, that CALL carries
 the termination tag. A false predicate takes the ordinary sample in
 place. Fixtures cover both return forms, the compact drain, consecutive
 calls and snapshot replay. This combined timing awaits hardware comparison.
+An immediate CALL on the first word of a counted two- or three-word DO
+saves the buffered suffix after any startup count sample. The CALL flush
+replaces the rest of the entry fill. A single-iteration three-word loop
+restores the compact buffer and samples during its second word. Fixtures
+cover taken and false predicates, startup termination, both return forms,
+and a callee that runs a short DO of its own. The combined timing awaits
+hardware comparison.
 Admitted immediate CALLs in the tail of a long DO preserve the sampled loop
 decision across `RTS (LR)` and `RTS (DB, LR)`. The PC stack records a separate
 tag when the loop terminates during the call's address stage. Tests cover
@@ -280,8 +287,9 @@ short child fill. Tests exercise counted bodies of one through four words,
 a short arithmetic child, a late arithmetic parent sample and snapshot
 replay with both active and already-popped frames. The overlap timing is
 derived from the documented pipeline observations.
-Other short-loop CALL positions, short outer loops and branches in the
-overlapping child refill remain open.
+The first-word CALL in a four-word counted DO, CALLs in short arithmetic
+bodies, short outer loops and branches in the overlapping child refill
+remain open.
 
 Classic type 5 transfers raw data among R/S and I/M/L/B registers, including
 cross-PE data moves and raw40 register swaps, with supported single-function fixed

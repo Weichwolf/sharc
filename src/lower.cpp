@@ -1022,12 +1022,10 @@ private:
   void stack_status(Values &values);
   void push_pc(Values &values, llvm::Value *address);
   void call(Values &values, const Instruction &op, bool partial);
-  llvm::Value *
-  loop_call_address(const Values &values, const Instruction &op, const LoopShape &shape);
+  llvm::Value *loop_call_address(Values &values, const Instruction &op, const LoopShape &shape);
   llvm::Value *
   call_termination_tag(const Values &values, const Instruction &op, llvm::Value *terminated);
-  llvm::Value *
-  suspend_short_call(const Values &values, const Instruction &op, const LoopShape &shape);
+  llvm::Value *suspend_short_call(Values &values, const Instruction &op, const LoopShape &shape);
   void restore_short_call(Values &values,
                           const LoopShape &shape,
                           std::uint32_t pc,
@@ -1785,7 +1783,7 @@ void Lowering::call(Values &values, const Instruction &op, bool partial) {
 }
 
 llvm::Value *
-Lowering::loop_call_address(const Values &values, const Instruction &op, const LoopShape &shape) {
+Lowering::loop_call_address(Values &values, const Instruction &op, const LoopShape &shape) {
   if (shape.short_body()) { return suspend_short_call(values, op, shape); }
   const auto tail_slot = shape.counted() ? counted_tail_slot_for(shape) : loop_refill_slot;
   auto *pending = load(64, tail_slot);
@@ -1844,9 +1842,15 @@ llvm::Value *Lowering::call_termination_tag(const Values &values,
 }
 
 llvm::Value *
-Lowering::suspend_short_call(const Values &values, const Instruction &op, const LoopShape &shape) {
+Lowering::suspend_short_call(Values &values, const Instruction &op, const LoopShape &shape) {
   auto *remaining = short_word(short_remaining);
   auto *active = short_active(shape, remaining);
+  auto *descriptor = short_word(short_descriptor);
+  if (op.address == shape.start) {
+    // The initial fetch belongs to the DO fill. The CALL replaces the
+    // rest of that fill and saves the buffer after the count sample.
+    short_loop_counter(values, op.address, shape, descriptor);
+  }
   auto *zero = builder_.getInt64(0);
   auto *left = builder_.CreateSub(remaining, builder_.getInt64(1));
   llvm::Value *target = builder_.getInt32(call_resume(op));
@@ -1858,7 +1862,7 @@ Lowering::suspend_short_call(const Values &values, const Instruction &op, const 
       builder_.CreateOr(builder_.CreateShl(left, builder_.getInt64(return_short_left_shift)),
                         builder_.CreateZExt(target, builder_.getInt64Ty()));
   if (shape.length == 3 && op.address != shape.end) {
-    auto *compact = short_flag(short_word(short_descriptor), short_compact_count);
+    auto *compact = short_flag(descriptor, short_compact_count);
     buffer = builder_.CreateOr(
         buffer, builder_.CreateSelect(compact, builder_.getInt64(return_short_compact), zero));
   }
@@ -1878,7 +1882,7 @@ Lowering::suspend_short_call(const Values &values, const Instruction &op, const 
   write_short(short_addresses, builder_.CreateSelect(active, zero, short_word(short_addresses)));
   llvm::Value *tags = builder_.getInt32(pc_call_tag);
   if (shape.length == 3) {
-    auto *exit = short_flag(short_word(short_descriptor), short_call_exit);
+    auto *exit = short_flag(descriptor, short_call_exit);
     tags =
         builder_.CreateOr(tags, call_termination_tag(values, op, builder_.CreateAnd(active, exit)));
   }
@@ -2041,10 +2045,12 @@ void Lowering::restore_short_call(Values &values,
   const bool header = pc == shape.start;
   const auto call_pc = header ? shape.end : ((pc - 1) & maximum_pc);
   llvm::Value *descriptor = builder_.getInt64(shape.end);
-  if (shape.length == 3 && pc == shape.end) {
+  if (shape.length == 3) {
     auto *compact = short_flag(payload, return_short_compact);
     descriptor = builder_.CreateSelect(
         compact, builder_.getInt64(shape.end | short_compact_count), descriptor);
+  }
+  if (shape.length == 3 && pc == shape.end) {
     // E, B, B+1, E puts the steady sample after the frozen fetches.
     // A one-pass loop retains its unsampled end and compact drain state.
     auto *depth = values[pc_stack_depth_value];
@@ -2057,7 +2063,13 @@ void Lowering::restore_short_call(Values &values,
     short_loop_counter(values, call_pc, shape, descriptor, true);
   }
   write_short(short_descriptor, descriptor);
-  write_short_addresses(short_lookahead(call_pc, shape, left), builder_.getTrue());
+  auto stages = short_lookahead(call_pc, shape, left);
+  if (shape.length == 3 && call_pc == shape.start) {
+    // The compact entry still holds E for the sample at its second word.
+    auto *compact = short_flag(descriptor, short_compact_count);
+    stages.fetch = builder_.CreateSelect(compact, builder_.getInt64(shape.end), stages.fetch);
+  }
+  write_short_addresses(stages, builder_.getTrue());
   store(builder_.getInt64(0), return_loop_tail_slot);
   jump(next, values);
   builder_.SetInsertPoint(next.block);
@@ -3883,10 +3895,9 @@ void validate_loop_call(LoopPlan &plan,
                         const Instruction &op,
                         std::string_view identity) {
   const auto remaining = (shape.end - op.address) & maximum_pc;
-  const bool short_site =
-      shape.counted() && shape.length >= 2 &&
-      (remaining == 0 || (shape.length == 3 && remaining == 1) ||
-       (shape.length == loop_fetch_distance && remaining <= loop_decode_distance));
+  const bool short_site = shape.counted() && shape.length >= 2 &&
+                          (shape.length <= 3 || (shape.length == loop_fetch_distance &&
+                                                 remaining <= loop_decode_distance));
   if ((shape.short_body() && !short_site) || !call_branch_instruction(op) || delayed(op)) {
     reject(op, identity, FaultReason::unsupported_instruction, "branch near the DO endpoint");
   }

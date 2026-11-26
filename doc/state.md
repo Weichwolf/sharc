@@ -83,7 +83,10 @@ return refill samples the loop count before the header executes. In a
 three-word body the penultimate word already sampled the count.
 If a three-word CALL occupies that penultimate word, its continuation
 instead samples during the return refill. The continuation also preserves
-the compact drain state of a one-pass loop.
+the compact drain state of a one-pass loop. For a CALL at the first word of
+an admitted two- or three-word body, the startup fetch can sample before
+the CALL saves the suffix. The compact three-word suffix keeps its sample
+pending for the second word.
 A CALL occupying an admitted long-loop endpoint consumes the loop decision
 and pushes the selected successor, including the loop header on a repeat.
 When a CALL redirects before a pending long-loop sample reaches Fetch1,

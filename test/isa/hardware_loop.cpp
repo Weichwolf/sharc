@@ -1924,21 +1924,23 @@ constexpr std::array three_word_turns{
                       .second = {.pc = 3, .fetch = 7, .decode = 5},
                       .returned = {.pc = 4, .fetch = 8, .decode = 6}}};
 
+constexpr std::array two_word_turns{
+    ShortEndpointTurn{.first = {.pc = 2, .fetch = 2, .decode = 2},
+                      .returned = {.pc = 1, .fetch = 1, .decode = 1}},
+    ShortEndpointTurn{.first = {.pc = 2, .fetch = 2, .decode = 2},
+                      .returned = {.pc = 1, .fetch = 3, .decode = 1}},
+    ShortEndpointTurn{.first = {.pc = 2, .fetch = 4, .decode = 2},
+                      .returned = {.pc = 1, .fetch = 5, .decode = 3}},
+    ShortEndpointTurn{.first = {.pc = 2, .fetch = 6, .decode = 4},
+                      .returned = {.pc = 3, .fetch = 7, .decode = 5}}};
+
 enum class ShortEndpointPredicate : std::uint8_t { unconditional, not_lce };
 
 void counted_short_endpoint_call(
     unsigned width,
     bool delayed,
     ShortEndpointPredicate predicate = ShortEndpointPredicate::unconditional) {
-  constexpr std::array two_word{ShortEndpointTurn{.first = {.pc = 2, .fetch = 2, .decode = 2},
-                                                  .returned = {.pc = 1, .fetch = 1, .decode = 1}},
-                                ShortEndpointTurn{.first = {.pc = 2, .fetch = 2, .decode = 2},
-                                                  .returned = {.pc = 1, .fetch = 3, .decode = 1}},
-                                ShortEndpointTurn{.first = {.pc = 2, .fetch = 4, .decode = 2},
-                                                  .returned = {.pc = 1, .fetch = 5, .decode = 3}},
-                                ShortEndpointTurn{.first = {.pc = 2, .fetch = 6, .decode = 4},
-                                                  .returned = {.pc = 3, .fetch = 7, .decode = 5}}};
-  const auto &turns = width == 2 ? two_word : three_word_turns;
+  const auto &turns = width == 2 ? two_word_turns : three_word_turns;
   std::array<std::uint64_t, 15> words{};
   words[0] = do_immediate | (std::uint64_t{4} << count_shift) | width;
   words[width] = delayed ? call_dag2 : call_direct | short_call_sub;
@@ -1979,6 +1981,72 @@ void counted_short_endpoint_call(
     // In a two-word body the fourth return fetch reaches E after the freeze.
     if (width == 2 && i < 2) { parent_count_sample(trace, i == 0); }
     short_boundary(trace, turn.returned, cycles);
+  }
+  verify_timeline(program, initial, trace);
+}
+
+enum class ShortHeaderForm : std::uint8_t { direct, delayed_return, first_only };
+
+struct ShortHeaderCall {
+  unsigned width;
+  ShortHeaderForm form;
+  unsigned count{4};
+};
+
+void short_header_turns(Timeline &trace, ShortHeaderCall call) {
+  const auto &turns = call.width == 2 ? two_word_turns : three_word_turns;
+  // The fill has already fetched the end when the startup CALL transfers.
+  parent_count_sample(trace, call.count != 2);
+  for (std::size_t i = turns.size() - call.count; i < turns.size(); ++i) {
+    const auto &turn = turns[i];
+    const bool taken = call.form != ShortHeaderForm::first_only || i == 0;
+    const auto cycles =
+        taken ? short_call_round_trip(trace, 2, call.form == ShortHeaderForm::delayed_return) : 1U;
+    short_boundary(trace, turn.first, cycles);
+    if (i < 2) { parent_count_sample(trace, i == 0); }
+    if (call.width == 3) { short_boundary(trace, turn.second); }
+    short_boundary(trace, turn.returned);
+  }
+}
+
+void short_compact_header_turn(Timeline &trace) {
+  const auto cycles = short_call_round_trip(trace, 2, false);
+  short_boundary(trace, {.pc = 2, .fetch = 3, .decode = 3}, cycles);
+  parent_count_sample(trace, false);
+  short_boundary(trace, {.pc = 3, .fetch = 4, .decode = 3});
+  trace.boundary(base + 4, 4);
+  trace.record();
+}
+
+void counted_short_header_call(ShortHeaderCall call) {
+  constexpr std::uint64_t call_eq = 0x068000000000;
+  const bool delayed = call.form == ShortHeaderForm::delayed_return;
+  const bool predicated = call.form == ShortHeaderForm::first_only;
+  std::array<std::uint64_t, 15> words{};
+  words[0] = do_immediate | (std::uint64_t{call.count} << count_shift) | call.width;
+  words[1] = delayed ? call_dag2 : (predicated ? call_eq : call_direct) | short_call_sub;
+  words[call.width + 1] = jump_direct | (base + 14);
+  words[8] = do_immediate | (std::uint64_t{1} << count_shift) | 1;
+  words[9] = fixture::add(0, 0, 1);
+  words[10] = rts | lr | (delayed ? db : 0);
+  words[11] = fixture::immediate(2, 7);
+  fixture::Program program(words);
+  program.code.variants.front().entries.push_back(short_call_sub);
+  auto initial = starting();
+  initial.dag[0][8].index = short_call_sub;
+  initial.pe[0].data[0][1] = 1U << raw_shift;
+  initial.pe[0].astat = predicated ? az : 0;
+  Timeline trace{.registers = initial, .prefixes = {}};
+  trace.registers.lcntr = call.count;
+  const auto address = short_counted_types[call.width - 1] | (base + call.width);
+  entered(trace, {.address = address, .count = call.count});
+  trace.registers.faddr = base + 2;
+  trace.registers.daddr = base + call.width;
+  trace.prefixes.back().registers = trace.registers;
+  if (call.count == 1) {
+    short_compact_header_turn(trace);
+  } else {
+    short_header_turns(trace, call);
   }
   verify_timeline(program, initial, trace);
 }
@@ -2056,12 +2124,12 @@ void compact_three_word_penultimate_call(bool chain) {
   verify_timeline(program, initial, trace);
 }
 
-void single_iteration_two_word_call() {
+void single_iteration_two_word_call(unsigned site) {
   constexpr std::uint64_t call_eq = 0x068000000000;
   constexpr auto call = call_eq | short_call_sub;
   std::array<std::uint64_t, 9> words{};
   words[0] = do_immediate | (std::uint64_t{1} << count_shift) | 2;
-  words[2] = call;
+  words[site] = call;
   words[8] = rts | lr;
   fixture::Program program(words);
   auto initial = starting();
@@ -2073,7 +2141,7 @@ void single_iteration_two_word_call() {
   trace.prefixes.back().registers = trace.registers;
   parent_count_sample(trace, false);
   short_boundary(trace, {.pc = 2, .fetch = 4, .decode = 2}, 2);
-  const auto before = trace.registers;
+  const auto before = trace.prefixes[site - 1].registers;
   trace.boundary(base + 3, 3);
   trace.record();
   verify_timeline(program, initial, trace);
@@ -2082,13 +2150,13 @@ void single_iteration_two_word_call() {
   const auto native = sharc::Core::compile(program.code);
   sharc::Core core(program.memory());
   fixture::install(core, native, initial);
-  check(fixture::completed(core.run(2), 2, before.emuclk),
+  check(fixture::completed(core.run(site), site, before.emuclk),
         "one-iteration short DO failed to enter");
   auto at_call = before;
   at_call.pe[0].astat = az;
   const auto fault = core.run(1);
   check(fault.has_fault && fault.fault.reason == sharc::FaultReason::unsupported_feature &&
-            fault.fault.address == base + 2 && fault.fault.instruction == call &&
+            fault.fault.address == base + site && fault.fault.instruction == call &&
             fault.progress == sharc::Progress{} && core.registers() == at_call,
         "taken CALL in one-iteration two-word DO failed to preserve the boundary");
 }
@@ -2697,13 +2765,19 @@ void fixture::hardware_loop_control_flow() {
   counted_short_endpoint_call(3, true);
   counted_short_endpoint_call(2, true, ShortEndpointPredicate::not_lce);
   counted_short_endpoint_call(3, false, ShortEndpointPredicate::not_lce);
+  counted_short_header_call({.width = 2, .form = ShortHeaderForm::direct});
+  counted_short_header_call({.width = 2, .form = ShortHeaderForm::delayed_return, .count = 2});
+  counted_short_header_call({.width = 3, .form = ShortHeaderForm::first_only});
+  counted_short_header_call({.width = 3, .form = ShortHeaderForm::delayed_return});
+  counted_short_header_call({.width = 3, .form = ShortHeaderForm::direct, .count = 1});
   three_word_penultimate_call(ThreeWordCall::direct);
   three_word_penultimate_call(ThreeWordCall::delayed);
   three_word_penultimate_call(ThreeWordCall::predicated);
   three_word_penultimate_call(ThreeWordCall::delayed, true);
   compact_three_word_penultimate_call(false);
   compact_three_word_penultimate_call(true);
-  single_iteration_two_word_call();
+  single_iteration_two_word_call(1);
+  single_iteration_two_word_call(2);
   single_iteration_three_word_call(false);
   single_iteration_three_word_call(true);
   late_address_long_loop_call();
