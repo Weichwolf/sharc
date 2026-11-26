@@ -48,16 +48,79 @@ stopped is observed by the guarded native return. Restore replaces that
 state, including clearing a later fault. It does not replace consumer memory or
 bindings. `set_registers` preserves hidden continuation when PC is unchanged;
 replacing PC starts a fresh declared entry and clears its pipeline history.
-Snapshots retain the preceding-compute interlock and two recent physical DAG
-register-load tags, including their remaining dependency distance. The current execution implementation has no pending instruction,
-branch, mode-register write or code transfer; their hidden continuation must be
-added to snapshots together with the corresponding execution implementation.
-Interrupted/delayed execution snapshots are not qualified yet.
+Snapshots retain the preceding-compute interlock, two recent physical DAG
+register-load tags and a taken classic delayed transfer's destination and slot
+phase. Cross-Core replay preserves the destination even when a slot changes a
+contributing DAG register. Pending interrupts, mode-register writes and
+declared code transfers still need execution and snapshot qualification.
+
+For admitted DO forms, snapshots retain the PC-stack ownership of each
+hardware loop frame and its fetch decision. They also retain the pending
+arithmetic refill and short loop words still buffered after an early stack pop.
+A pending counted tail and an arithmetic refill have distinct storage, so
+the outer counter may terminate while the inner arithmetic tail is draining.
+For a short child, the snapshot also preserves how far Fetch1 has advanced
+past its endpoint while buffered child words remain.
+A short outer DO keeps its remaining body words and descriptor while the
+inner DO owns the short fetch buffer. The child's drain can see addresses
+from the next outer pass. The child endpoint restores the outer suffix
+after the inner frame has popped, even when the outer stack frame popped
+earlier. Exact bounds and snapshots retain both buffers during the handoff.
+If a long DO also encloses both short loops, it sees the fetch stream
+after applying the middle loop's redirects. The handoff carries fetch
+progress forward relative to the middle endpoint and preserves any outer
+decision already reached during the inner drain.
+A counted DO loads LCNTR once. The current count then evolves on the loop
+counter stack while LCNTR continues to hold the setup value.
+A qualified CALL saves a suspended terminating tail with its PC-stack entry.
+For a delayed `RTS (LR)`, the tail becomes active after the two return slots.
+An overlapping short CALL also saves the ancestor fetch position and any
+suspended short parent with that PC-stack entry. The callee uses its own
+buffers and observations. The prepared return restores the caller's state
+and processes the surviving fetches, including after a terminal child CALL.
+When a prepared DO tail uses IF NOT LCE, the counted tail also carries
+the clocks elapsed after its terminal fetch. This observation survives a
+stack pop, a return refill and a cross-Core snapshot. A short CALL saves
+the expiration observation with the remaining buffered words. The
+ordinary short body clears it when its last buffered word retires.
+Overlapping counted tails have independent observations, including two long
+tails. Preparation assigns distinct storage to overlapping long tails. The
+saved CALL payload identifies the storage to restore after a return. A parent
+sample reached during a short drain or long arithmetic refill records the
+clocks from that fetch to the next retirement boundary.
+A short counted parent and child also keep separate observations. When the
+child's final clock reaches the parent's sample, the restored outer suffix
+starts with the fresh observation. Later CALL reentry restores the observation
+to the slot of the short loop that owns the continuation.
+Admitted CALLs in counted two-, three- and four-word loops keep the
+buffered instruction count with the PC-stack entry. The callee can use its
+own loop buffer. The saved buffer is restored at the prepared return
+address. On a repeating endpoint CALL in two- and four-word bodies the
+return refill samples the loop count before the header executes. In a
+three-word body the penultimate word already sampled the count.
+If a three-word CALL occupies that penultimate word, its continuation
+instead samples during the return refill. The continuation also preserves
+the compact drain state of a one-pass loop. For a CALL at the first word of
+an admitted two-, three- or four-word body, the startup fetch can sample before
+the CALL saves the suffix. The compact three-word suffix keeps its sample
+pending for the second word.
+An arithmetic or FOREVER CALL records an unbounded pass or the bounded
+buffer still to drain. If the branch replaces an arithmetic condition fetch,
+the prepared return performs that sample after the frozen clocks, using the
+flags after the return slots. It restores the fetched suffix and any tag for
+a CALL in Address on the sample clock.
+A CALL occupying an admitted long-loop endpoint consumes the loop decision
+and pushes the selected successor, including the loop header on a repeat.
+When a CALL redirects before a pending long-loop sample reaches Fetch1,
+the snapshot retains that event until the return refill. A delayed return
+preserves it across both slots and applies it at the redirect.
+An admitted `JUMP (LA)` removes the loop frame at the jump. A counted tail
+that has already popped identifies the completed frame until an abort or the
+original endpoint retires. With DB, the two slots execute after the stack effect.
 
 Peripheral interrupt routing (PICR), SRU, DMA and peripheral timers remain consumer
 state. TAP emulation controls and physical instruction-cache contents are not
-implemented. Delayed register visibility, instruction pipeline observations,
-loop reentry, interrupt eligibility/shadows, timer evolution and reset values
-remain open. Straight-line ISA and non-delayed direct jumps update PC, FADDR,
-DADDR and EMUCLK;
-this does not qualify delayed transfers or arbitrary pipeline observations.
+implemented. Instruction pipeline observations beyond the admitted classic
+transfers and loop reentry, interrupt eligibility/shadows, timer evolution and
+reset values remain open. Straight-line ISA and admitted direct and indirect
+transfers update PC, FADDR, DADDR and EMUCLK at owner boundaries.

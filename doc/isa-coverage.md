@@ -15,7 +15,7 @@ is claimed.
 | FastFP32 numerical mode (opt-in) | Independent approximation expectations, rounding/flags, unchanged raw moves/integer behavior, separate translations | Unimplemented |
 | Parallel operations | Old operands, memory aliases, register exchanges and ordered partial effects | Partial: raw register moves/swaps with supported fixed ALU writeback |
 | Address generation and memory | Both DAGs, modulo/reverse addressing, PM/DM and physical view aliases | Partial: normal-word pre-indexing, immediate modify/reverse and DAG register-load dependencies |
-| Sequencer and control | Delayed flow, DO/loop endpoints, LR, stacks, reset and interrupts | Partial: non-delayed direct/indirect flow, calls/returns and branch stalls |
+| Sequencer and control | Delayed flow, DO/loop endpoints, LR, stacks, reset and interrupts | Partial: classic direct/indirect transfers, two delay slots, classic hardware DO, counted nesting and admitted loop reentry |
 | Chip-profile boundaries | ADSP-21489 memory/vector parameters and explicit I/O ownership | Unimplemented |
 | JIT coherence and hosts | Self-modifying aliases, natural loops, precise exits, x86-64 and ARM64 | Unimplemented |
 
@@ -110,7 +110,7 @@ Reference 2.4, 4-19–4-21 and 4-115–4-116). The preceding-compute history is 
 state, stored at exits and included in snapshots. Cycle bounds may cross the
 deadline to finish the current instruction; cycle credit cannot wrap under zero.
 External-flag and loop conditions refuse preparation. VISA, floating computation,
-multiplier, remaining shifter and memory forms, delayed jumps, hardware loops, timer, reset and
+multiplier, remaining shifter and memory forms, timer, reset and
 interrupt entry remain unimplemented. `interrupt_ready` reports false.
 
 Non-delayed direct CALL and plain conditional RTS keep static call targets and
@@ -123,8 +123,8 @@ cold path to another declared entry; owner dispatch uses a loop, not host recurs
 A completed return respects the current bound before requiring a new entry.
 Empty/overflowed stacks and returns with a loop/interrupt continuation tag fail before
 retiring that instruction, retaining any preceding completed prefix. These are
-qualification gaps, not architectural stack-exception implementations. Delayed,
-loop-reentry, interrupt and parallel-compute returns remain unsupported.
+qualification gaps, not architectural stack-exception implementations.
+Loop-reentry, interrupt and parallel-compute returns remain unsupported.
 
 Classic type 9 adds non-delayed DAG2-indirect and signed six-bit PC-relative
 jumps and calls, optionally with supported single-function fixed ALU computation.
@@ -146,9 +146,222 @@ all I8–I15/M8–M15 selector fields, independent DAG quarters, displacement ex
 and wrap, EQ lane combinations with/without ELSE, complete call/return prefixes,
 cycle bounds, cross-Core snapshots, interlocks and refusal before parallel effects.
 `test/core/native.cpp` also exercises a cached, consumer-linked indirect call.
-System-register transfers, other parallel compute classes, delayed flow and
+System-register transfers, other parallel compute classes and
 architectural stack exceptions remain open. This is
 ISA evidence; the K4 benchmark below exercises nested direct/indirect calls.
+
+Classic delayed jumps, calls and plain RTS latch the destination and commit
+the stack effect at the transfer. A taken CALL records PC+3. Both declared
+slots execute before the redirect, with one refill cycle charged at the
+second slot. Slots inherit pipeline dependencies from the branch and can
+fault at their own PC. A false transfer follows the ordinary sequential
+path. Preparation admits adjacent complementary delayed jumps without
+parallel computation and rejects other branches in slots. The ISA tests in
+`test/isa/delay.cpp` cover instruction and cycle prefixes, cross-Core replay,
+absolute, relative and DAG2 calls, 24-bit PC wrap, stack refusal and a slot
+memory fault. RTI remains open.
+
+Long classic DO bodies of at least five words support immediate and admitted
+register counts, LCNTR, arithmetic termination and FOREVER. Counted loops
+update the current counter when the end word reaches Fetch1. On the final
+turn the stack can pop several words ahead of the end. Arithmetic loops
+test both lanes in SIMD and account for the trailing pipeline refill.
+Counted nesting and complete-turn LLVM grants for eligible counted,
+arithmetic and FOREVER bodies are exercised through the public interface. Tests cover zero
+count wrap, retained stack cells, exact instruction and cycle prefixes,
+cross-Core replay and fault attribution.
+
+Counted classic DO bodies of one through four words retain buffered
+instructions after the loop and PC stacks pop. The short-loop fixtures cover
+startup and drain cycles, the count thresholds for fetch redirection, retained
+stack cells, fetch and decode addresses, and snapshot replay after an early
+pop. Eligible steady turns execute in the same bounded LLVM loop as long
+counted bodies.
+
+Short condition-terminated DO has separate sample points for one-, two- and
+three-word bodies. It preserves the remaining pass or iterations after the stack
+pop and charges the two-clock arithmetic refill at the final retirement. The
+four-word arithmetic loop uses the regular five-stage fetch schedule. Authored
+tests cover old ASTAT sampling, a flag changing on either word of a two-word
+loop, SIMD lane agreement, FOREVER, exact bounds and cross-Core replay.
+Short arithmetic fetch and decode observations derive from the documented
+sample points and five-stage pipeline. They have no hardware trace comparison.
+An immediate CALL on any of the last three words of an admitted counted
+four-word DO suspends the remaining buffered words. The callee can run its
+own DO. On a repeating endpoint CALL, the saved PC is the loop header and
+the replacement end fetch samples the count at the return boundary. On
+the final endpoint CALL, the saved PC is the word after the loop. `RTS (LR)`
+restores a suspended buffer after both slots of a delayed return. The
+installed-image tests cover a popped loop frame, a live frame, the
+zero-encoded full count, false CALL predicates and snapshot replay. The
+combined CALL and refill timing awaits hardware comparison.
+Endpoint CALLs in counted two- and three-word bodies resume the remaining
+buffer at the loop header or return to the linear successor on the final
+pass. In a two-word body the return refill reaches the next counter sample
+after the frozen clocks. In a three-word body the penultimate word already
+sampled the count. A taken CALL in a single-iteration two-word body fails
+at the CALL boundary. A false predicate retires the ordinary
+loop tail. When a three-word body terminates with the endpoint CALL in
+Address, the saved PC carries the loop-termination tag. Fixtures cover
+direct and indirect calls, both return forms, buffered passes after a
+stack pop and snapshot replay. These combined pipeline observations await
+hardware comparison.
+An immediate CALL on the penultimate word of a counted three-word DO
+suspends the pending end sample. The return refill samples before the
+endpoint executes, after both slots of a delayed RTS. The compact
+single-iteration buffer keeps its drain clocks. When the replayed sample
+terminates the loop with a following CALL in Address, that CALL carries
+the termination tag. A false predicate takes the ordinary sample in
+place. Fixtures cover both return forms, the compact drain, consecutive
+calls and snapshot replay. This combined timing awaits hardware comparison.
+An immediate CALL on the first word of a counted two-, three- or four-word DO
+saves the buffered suffix after any startup count sample. The CALL flush
+replaces the rest of the entry fill. A single-iteration three-word loop
+restores the compact buffer and samples during its second word. Fixtures
+cover taken and false predicates, startup termination, both return forms,
+and a callee that runs a short DO of its own. Four-word fixtures also
+cover the full-count encoding, IF NOT LCE on the resumed suffix and a
+precise fault for an ordinary RTS on the suspended buffer. The combined
+timing awaits hardware comparison.
+Immediate CALLs in two- and three-word arithmetic and FOREVER bodies
+retain either the active loop or its buffered exit across `RTS (LR)` and
+`RTS (DB, LR)`. A CALL at the two-word endpoint or the three-word header
+can defer the arithmetic sample to the fourth return fetch. That sample
+sees flags from the callee, including the last slot of a delayed return.
+A following CALL in Address carries the termination tag. Tests cover both
+sample outcomes, continuation after a tagged CALL, a taken endpoint CALL
+that replaces the final refill, and a callee that uses its own short DO.
+Single-word bodies exclude CALL. The combined timing awaits hardware
+comparison.
+Admitted immediate CALLs in the tail of a long DO preserve the sampled loop
+decision across `RTS (LR)` and `RTS (DB, LR)`. The PC stack records a separate
+tag when the loop terminates during the call's address stage. Tests cover
+continued and terminating counted turns, a DAG2 call into a separate prepared
+entry, delayed return slots, suspension of an arithmetic refill while the callee
+runs its own DO, and a precise fault for an ordinary RTS on a suspended tail.
+An interlock that holds the CALL in Decode delays its address stage past
+the counter sample. The saved PC has no termination tag in that case.
+Installed-image fixtures exercise this timing in short and long bodies.
+Qualified classic IF NOT LCE uses the end-fetch decision in long counted
+DO tails and in buffered one- through four-word bodies. At a counted
+header reached from its DO, the predicate observes the newly loaded
+count with a one-cycle compute or two-cycle branch interlock.
+A backedge to the same header follows the normal sample history.
+The tests exercise immediate, register and LCNTR setup, SIMD compute,
+both header CALL predicate outcomes, and snapshot replay.
+The startup timing is derived from the programming reference's
+conditional-branch stalls and loop timing tables.
+Buffered passes retain sampled decisions after the loop stacks pop and
+across CALL and RTS (LR). A held startup fetch ages through its entry
+bubble. The tests exercise the separate branch and Execute latencies,
+a DAG2 interlock and complete-turn grants for nonterminating counted passes.
+An admitted long counted parent tracks the sample clock during a short
+child's drain or a long arithmetic child's refill. A counted child preserves
+its own observation while the parent samples. Installed-image fixtures cover
+simultaneous pops, all four endpoint gaps for long counted children and
+arithmetic children of one to three words, parent samples preceding child
+setup, and parent outcomes at successive refill clocks. The long counted
+child is also exercised across immediate and delayed `RTS (LR)`.
+Three- and four-word counted outer loops keep their own expiry observation
+while a short child runs or drains. A counted child has an independent
+observation. Tests exercise both outcomes in the overlapping buffers,
+a parent sample on the last clock of a child refill, and preservation of
+the parent's sampled expiry across both return forms after the child drains.
+Explicit loop-resource changes, other overlapping configurations, predicates
+in the middle of long bodies and unlooped predicates remain unqualified.
+Combined condition timing awaits hardware comparison.
+An immediate CALL at the endpoint stores the next loop header or the word
+after the loop as its return address. On a terminating arithmetic turn the
+taken call replaces the loop refill. A false predicate keeps the normal
+loop backedge or exit refill. Installed-image fixtures cover both backedge
+and exit returns through the connected and separate prepared entries.
+The endpoint CALL timing is derived from the branch and loop pipeline
+tables. Comparison with a hardware trace remains open.
+An immediate CALL at the instruction whose retirement would sample the
+end fetch or arithmetic condition defers that sample to the return refill.
+The ordinary RTS form admits a return to the first, still-unsampled end
+fetch. A deferred arithmetic condition uses the callee flags, including
+the final `RTS (DB, LR)` slot. A false CALL samples on the ordinary loop
+path. Installed-image tests cover counter timing, direct and separate
+DAG2 callee entries, SIMD lane disagreement, both return slots and
+snapshot replay. The sample executes at the prepared return address
+before admitting another guest instruction. The combined timing follows
+the documented pipeline and awaits hardware comparison.
+An in-loop JUMP can reach the last four words before the ordinary end fetch.
+The target refill samples a long counted endpoint once or selects the
+speculative arithmetic backedge and tests its condition. Delayed jumps
+advance that fetch stream at each slot boundary, preserving the sampled
+state and fetch address in snapshots. The arithmetic test sees the first
+slot's flags if it coincides with the second slot, and the second slot's
+flags if it occurs in the refill bubble. Installed-image programs cover
+absolute, PC-relative and declared DAG2 targets, both count outcomes, a
+delayed one-level abort into a parent tail and an arithmetic child whose
+branch refill reaches a counted parent's end. In the fourth- and
+fifth-last words of the source loop, plain JUMP needs a static in-loop
+target.
+This timing is derived from the documented pipeline and awaits hardware
+comparison.
+Classic JUMP (LA) handles qualified long-loop exits through absolute,
+PC-relative and DAG2 targets, with either immediate transfer or two delay
+slots. A false predicate leaves the hardware loop's outstanding decision
+active. A taken exit uses the active frame or the already-popped counted
+tail, preserving the parent frame. Authored tests cover precise refusal for
+targets inside the current loop, exits across two levels and exits to the
+endpoint of an arithmetic parent.
+When an admitted long arithmetic child finishes within four words of the
+parent endpoint, the parent's Fetch1 event follows the child's actual drain
+and refill clocks. A parent arithmetic sample in the final refill clock sees
+the flags written by the child's last instruction. The checked path and the
+LLVM grant for full child turns share the transition logic. Installed-image
+tests cover countdown timing at all four gaps, snapshot replay, an arithmetic
+parent and a child refill overlapping an already-popped counted parent with
+a pending CALL. These combined pipeline timings are derived from the manual.
+For short children within long loops, Fetch1 can reach a parent endpoint
+while buffered child words still execute, including during a compact entry
+or exit bubble. The parent keeps any earlier fetch decision across the
+short child fill. Tests exercise counted bodies of one through four words,
+a short arithmetic child, a late arithmetic parent sample and snapshot
+replay with both active and already-popped frames. The overlap timing is
+derived from the documented pipeline observations.
+Counted three- and four-word outer loops and three-word `DO FOREVER`
+can nest a short DO with a distinct earlier endpoint. The outer buffer
+survives the child, including when the outer counted frame has already
+popped. Tests cover one- and two-word counted children, a one-word
+arithmetic child, both child positions in a four-word parent, and a
+counted child that admits complete native turns. Fetch and decode
+observations across the handoff are derived from the short-loop timing.
+When both short buffers are nested in a long DO, their fetch stream still
+reaches the long endpoint at the correct point in the drain. Tests exercise
+all four counted outer endpoint gaps, another middle pass, a compact
+middle loop, and a long arithmetic condition sampled across the handoff.
+The authored expectations use the documented fetch and decode timing.
+An immediate CALL in an overlapping short child saves the outside fetch
+position, sampled conditions and any suspended short parent. `RTS (LR)`
+and `RTS (DB, LR)` restore that context. The return can finish a displaced
+ancestor sample or resume a short parent after a terminal child CALL.
+Fixtures exercise an already sampled ancestor, an unsampled ancestor,
+callee-owned nested short loops and the last return slot's arithmetic
+flags.
+An immediate CALL on either of the final two words of a long arithmetic
+child suspends the enclosing tail and the child's pending refill.
+`RTS (LR)` and `RTS (DB, LR)` restore the tail. On a returning backedge
+the child continues at its header. On a terminating pass the return
+refill reaches enclosing end fetches displaced by the CALL. A taken
+endpoint CALL replaces the child's own final two refill clocks.
+Fixtures exercise all four gaps to a counted parent, its `NOT LCE`
+latency and termination tag, and a displaced arithmetic parent sample
+after a separate callee runs its own DO and sets SIMD flags in the last
+return slot. Consecutive CALLs can independently sample two counted
+ancestors.
+Immediate CALLs in shared long tails restore sampled conditions and
+defer an outstanding fetch or arithmetic test to the return refill.
+The terminating pass of a counted child can reach the parent's sample.
+A repeating endpoint CALL returns to the child header. Fixtures cover the four
+counted parent gaps, a CALL following a sampled parent, false `NOT LCE`
+predicates, a prepared edge that bypasses the child setup, and the
+arithmetic child and parent tests across separate return entries.
+Other branches in an overlapping refill remain unqualified. The combined
+timing awaits hardware comparison.
 
 Classic type 5 transfers raw data among R/S and I/M/L/B registers, including
 cross-PE data moves and raw40 register swaps, with supported single-function fixed

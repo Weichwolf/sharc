@@ -30,7 +30,57 @@ inline constexpr std::size_t interrupt_latch_slot = stack_depth_slot + 1;
 inline constexpr std::size_t dag_index_slot = interrupt_latch_slot + 1;
 inline constexpr std::size_t dag_fields = 4;
 inline constexpr std::size_t mode_slot = dag_index_slot + (32 * dag_fields);
-inline constexpr std::size_t register_pointer_count = mode_slot + 1;
+inline constexpr std::size_t delayed_target_slot = mode_slot + 1;
+inline constexpr std::size_t loop_address_slot = delayed_target_slot + 1;
+inline constexpr std::size_t loop_counter_slot = loop_address_slot + 1;
+inline constexpr std::size_t loop_address_depth_slot = loop_counter_slot + 1;
+inline constexpr std::size_t loop_counter_depth_slot = loop_address_depth_slot + 1;
+inline constexpr std::size_t lcntr_slot = loop_counter_depth_slot + 1;
+inline constexpr std::size_t loop_frames_slot = lcntr_slot + 1;
+inline constexpr std::size_t loop_refill_slot = loop_frames_slot + 1;
+inline constexpr std::size_t short_loop_slot = loop_refill_slot + 1;
+inline constexpr std::size_t loop_call_slot = short_loop_slot + 1;
+inline constexpr std::size_t return_loop_tail_slot = loop_call_slot + 1;
+inline constexpr unsigned loop_stack_capacity = 6;
+inline constexpr std::size_t counted_tail_slot = return_loop_tail_slot + 1;
+inline constexpr std::size_t short_counted_tail_slot = counted_tail_slot + loop_stack_capacity;
+inline constexpr std::size_t short_parent_tail_slot = short_counted_tail_slot + 1;
+inline constexpr std::size_t suspended_call_state_slot = short_parent_tail_slot + 1;
+inline constexpr std::size_t register_pointer_count = suspended_call_state_slot + 1;
+// Three short-buffer words, the arithmetic refill, and all counted tails.
+inline constexpr unsigned suspended_call_state_words = 4 + loop_stack_capacity + 2;
+inline constexpr std::uint32_t loop_pc_index_mask = 31;
+inline constexpr std::uint32_t loop_frame_live = 1U << 5;
+inline constexpr std::uint32_t loop_repeat_scheduled = 1U << 6;
+inline constexpr unsigned loop_fetch_distance = 4;
+inline constexpr unsigned loop_decode_distance = 2;
+inline constexpr unsigned loop_refill_end_shift = 24;
+inline constexpr std::uint64_t loop_refill_live = 1ULL << 48;
+inline constexpr std::uint64_t counted_loop_tail = 1ULL << 49;
+inline constexpr std::uint64_t loop_call_live = 1ULL << 63;
+inline constexpr std::uint32_t pc_call_tag = 1U << 24;
+inline constexpr std::uint32_t pc_sequencer_tag = 1U << 25;
+
+enum ShortLoopWord : std::uint8_t {
+  short_remaining,
+  short_descriptor,
+  short_addresses,
+  short_fetch_progress,
+  short_parent_remaining,
+  short_parent_descriptor,
+  short_state_words
+};
+
+inline constexpr std::uint64_t short_startup = 1ULL << 24;
+inline constexpr std::uint64_t short_compact_count = 1ULL << 25;
+inline constexpr std::uint64_t short_call_exit = 1ULL << 26;
+inline constexpr std::uint64_t short_unbounded = ~std::uint64_t{0};
+inline constexpr unsigned short_decode_shift = 24;
+inline constexpr std::uint64_t short_addresses_live = 1ULL << 48;
+inline constexpr std::uint32_t before_first_delay_slot = 1U << 25;
+inline constexpr std::uint32_t before_second_delay_slot = 1U << 24;
+inline constexpr std::uint32_t delayed_fetch_live = 1U << 26;
+inline constexpr unsigned delayed_fetch_shift = 32;
 inline constexpr std::uint32_t dag1_high_mode = 1U << 3;
 inline constexpr std::uint32_t dag1_low_mode = 1U << 4;
 inline constexpr std::uint32_t dag2_high_mode = 1U << 5;
@@ -75,7 +125,11 @@ enum class NativeExit : std::uint8_t {
   unsupported_memory,
   access_fault,
   code_alias,
-  returned
+  returned,
+  unsupported_loop_stack,
+  unsupported_loop_reentry,
+  invalid_loop_abort,
+  invalid_short_loop_call
 };
 using NativeEntry = void (*)(void **, std::uint64_t *);
 using RegisterPointers = std::vector<void *>;

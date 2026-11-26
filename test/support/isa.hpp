@@ -23,6 +23,8 @@ inline constexpr std::array numeric_modes{sharc::ExecutionMode::strict,
 inline constexpr std::uint32_t code_address = 0x100;
 void control_flow();
 void computed_control_flow();
+void delayed_control_flow();
+void hardware_loop_control_flow();
 void register_transfers();
 void rotations();
 void memory_access();
@@ -87,11 +89,17 @@ inline void verify_branch_fields(std::uint64_t opcode, std::span<const unsigned>
               fault.address == code_address,
           "reserved branch lost fault reason, instruction or location");
   }
-  for (const auto bit : {24U, 26U, 38U}) {
+  for (const auto bit : {24U, 26U}) {
     const auto word = opcode | (std::uint64_t{1} << bit);
     (void)refusal(image(sharc::InstructionSet::isa, word),
                   "unimplemented branch modifier was accepted");
   }
+  constexpr auto loop_abort = 1ULL << 38;
+  const auto word = opcode | loop_abort;
+  const auto fault = refusal(image(sharc::InstructionSet::isa, word), "LA outside DO was accepted");
+  check(fault.reason == sharc::FaultReason::unsupported_instruction && fault.instruction == word &&
+            fault.address == code_address,
+        "LA outside DO lost fault reason, instruction or location");
 }
 
 inline sharc::RegionLayout

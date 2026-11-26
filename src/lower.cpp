@@ -10,7 +10,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
-#include <iterator>
 #include <limits>
 #include <llvm/ADT/SmallVector.h>
 #include <llvm/BinaryFormat/Dwarf.h>
@@ -62,6 +61,7 @@ constexpr unsigned shadow_register_first = 0x50;
 constexpr unsigned system_register_first = 0x60;
 constexpr unsigned ureg_mask = 127, byte_mask = 255;
 constexpr unsigned history_older_mask = 0xff00;
+constexpr unsigned history_loop_setup = 1U << 16;
 constexpr unsigned rotate_opcode = 0x08;
 constexpr unsigned conditional_compute_type = 2;
 constexpr unsigned immediate_shift_type = 6;
@@ -71,6 +71,8 @@ constexpr unsigned nop_type = 21;
 constexpr unsigned direct_branch_type = 8;
 constexpr unsigned computed_branch_type = 9;
 constexpr unsigned return_branch_type = 11;
+constexpr unsigned counted_loop_type = 12;
+constexpr unsigned conditional_loop_type = 13;
 constexpr unsigned memory_move_type = 15;
 constexpr unsigned index_modify_type = 19;
 constexpr std::uint64_t forced_long = std::uint64_t{1} << 39;
@@ -80,12 +82,20 @@ constexpr std::uint64_t abort_branch = std::uint64_t{1} << 38;
 constexpr std::uint64_t delayed_branch = std::uint64_t{1} << 26;
 constexpr std::uint64_t else_compute = std::uint64_t{1} << 25;
 constexpr std::uint64_t clear_interrupt_branch = std::uint64_t{1} << 24;
+constexpr std::uint64_t loop_reentry = std::uint64_t{1} << 24;
 // Programming Reference 2.4, 4-19: three pipeline bubbles on a taken jump.
 constexpr unsigned branch_penalty = 3;
+constexpr unsigned delay_slot_count = 2;
 constexpr std::uint32_t true_condition = 31;
 constexpr unsigned condition_shift = 33;
 constexpr unsigned immediate_register_shift = 32;
 constexpr unsigned raw_extension_bits = 8;
+constexpr unsigned loop_opcode_shift = 40;
+constexpr unsigned immediate_count_shift = 24;
+constexpr unsigned loop_count_register_opcode = 0x0d;
+constexpr unsigned loop_counter_expired = 15;
+constexpr unsigned loop_type_shift = 29;
+constexpr unsigned long_counted_loop_kind = 7;
 constexpr std::int64_t fixed_minimum = std::numeric_limits<std::int32_t>::min();
 constexpr std::int64_t fixed_maximum = std::numeric_limits<std::int32_t>::max();
 constexpr auto unsigned_limit = std::uint64_t{1} << 32;
@@ -195,8 +205,182 @@ bool call_branch_instruction(const Instruction &op) {
          (op.word & call_branch) != 0;
 }
 
+bool jump_instruction(const Instruction &op) {
+  return (op.type == direct_branch_type || op.type == computed_branch_type) &&
+         !call_branch_instruction(op);
+}
+
+bool loop_abort(const Instruction &op) {
+  return (op.type == direct_branch_type || op.type == computed_branch_type) &&
+         (op.word & abort_branch) != 0;
+}
+
 bool indirect_branch(const Instruction &op) {
   return op.type == computed_branch_type && (op.word & relative_branch) == 0;
+}
+
+unsigned branch_condition(const Instruction &op) {
+  return static_cast<unsigned>((op.word >> condition_shift) & true_condition);
+}
+
+bool observes_not_lce(const Instruction &op) {
+  return branch_condition(op) == loop_counter_expired &&
+         (branch(op) || op.type == conditional_compute_type || op.type == immediate_shift_type ||
+          op.type == register_move_type);
+}
+
+bool delayed(const Instruction &op) {
+  return branch(op) && (op.word & delayed_branch) != 0;
+}
+
+std::uint32_t next_pc(const Instruction &op, unsigned words = 1) {
+  return (op.address + words) & maximum_pc;
+}
+
+std::uint32_t call_resume(const Instruction &op) {
+  return next_pc(op, delayed(op) ? delay_slot_count + 1 : 1);
+}
+
+bool loop_setup(const Instruction &op) {
+  return op.type == counted_loop_type || op.type == conditional_loop_type;
+}
+
+struct LoopShape {
+  std::uint32_t start{}, end{};
+  unsigned length{}, term{};
+  bool has_reentry{};
+  bool has_tail_abort{};
+  bool suspends_enclosing_tail{};
+
+  [[nodiscard]] bool counted() const { return term == loop_counter_expired; }
+
+  [[nodiscard]] bool arithmetic() const { return !counted() && term != true_condition; }
+
+  [[nodiscard]] bool short_body() const {
+    return length < loop_fetch_distance || (counted() && length == loop_fetch_distance);
+  }
+
+  [[nodiscard]] std::uint32_t condition_pc() const {
+    if (length == 1 || length == 2) { return end; }
+    return (end - loop_decode_distance) & maximum_pc;
+  }
+
+  [[nodiscard]] unsigned short_condition_tail() const { return length == 1 ? 3U : length; }
+
+  [[nodiscard]] bool contains(std::uint32_t pc) const {
+    return ((pc - start) & maximum_pc) < length;
+  }
+
+  [[nodiscard]] unsigned short_threshold() const {
+    constexpr std::array thresholds{4U, 2U, 2U, 1U};
+    return thresholds[length - 1];
+  }
+
+  [[nodiscard]] std::uint32_t address_word() const {
+    const auto counted_type = length < loop_fetch_distance ? length * 2U : long_counted_loop_kind;
+    const auto type = counted() ? counted_type : static_cast<unsigned>(length == 1);
+    return end | (term << immediate_count_shift) | (type << loop_type_shift);
+  }
+};
+
+using LoopMap = std::map<std::uint32_t, LoopShape>;
+
+constexpr std::uint64_t return_loop_fetch = 1ULL << 50;
+constexpr std::uint64_t return_loop_condition = 1ULL << 51;
+constexpr unsigned counted_tail_index_shift = 52;
+constexpr std::uint64_t counted_tail_index_mask = 7ULL << counted_tail_index_shift;
+constexpr std::uint64_t return_enclosing_tail = 1ULL << 55;
+// A four-word loop can have at most 2^34-1 words left after a CALL.
+constexpr unsigned return_short_left_shift = 24;
+constexpr std::uint64_t return_short_left_mask = (unsigned_limit * loop_fetch_distance) - 1;
+constexpr std::uint64_t return_short_loop = 1ULL << 58;
+constexpr std::uint64_t return_short_compact = 1ULL << 59;
+constexpr std::uint64_t return_short_lce = 1ULL << 60;
+constexpr std::uint64_t return_short_done = 1ULL << 61;
+constexpr std::uint64_t return_loop_ready = 1ULL << 62;
+// The counted tail shares its word with two bits of termination history.
+constexpr unsigned lce_age_shift = 56;
+constexpr unsigned lce_compute_age = 2;
+constexpr unsigned lce_branch_age = 3;
+constexpr auto lce_age_mask = std::uint64_t{lce_branch_age} << lce_age_shift;
+constexpr auto lce_before_credit = 1ULL << 61;
+constexpr auto lce_clock_mask = lce_age_mask | lce_before_credit;
+
+std::uint64_t loop_return_payload(std::uint32_t call_pc, const LoopShape &shape) {
+  if (shape.short_body()) { return return_short_loop | ((call_pc + 1) & maximum_pc); }
+  if (shape.suspends_enclosing_tail) {
+    return return_enclosing_tail | ((call_pc + 1) & maximum_pc);
+  }
+  const auto address = (std::uint64_t{shape.end} << loop_refill_end_shift) | shape.start;
+  if (call_pc == ((shape.end - loop_fetch_distance) & maximum_pc)) {
+    return address | return_loop_fetch;
+  }
+  if (shape.arithmetic() && call_pc == shape.condition_pc()) {
+    return address | return_loop_condition;
+  }
+  return 0;
+}
+
+const LoopShape *loop_return_at(std::uint32_t pc, const LoopMap &calls) {
+  const auto call_pc = (pc - 1) & maximum_pc;
+  const auto site = calls.find(call_pc);
+  if (site != calls.end() && loop_return_payload(call_pc, site->second) != 0) {
+    return &site->second;
+  }
+  // A taken short endpoint CALL returns to the live buffer's header.
+  for (unsigned distance = 1; distance < loop_fetch_distance; ++distance) {
+    const auto end = (pc + distance) & maximum_pc;
+    const auto endpoint = calls.find(end);
+    if (endpoint != calls.end() && endpoint->second.short_body() && endpoint->second.start == pc &&
+        endpoint->second.end == end) {
+      return &endpoint->second;
+    }
+  }
+  return nullptr;
+}
+
+std::set<std::uint32_t> call_continuations(std::span<const Instruction> code,
+                                           const LoopMap &reentry_calls) {
+  std::set<std::uint32_t> continuations;
+  for (const auto &op : code) {
+    if (!call_branch_instruction(op)) { continue; }
+    continuations.insert(call_resume(op));
+    const auto site = reentry_calls.find(op.address);
+    if (site != reentry_calls.end() && site->second.end == op.address) {
+      continuations.insert(site->second.start);
+    }
+  }
+  return continuations;
+}
+
+struct LoopPlan {
+  LoopMap shapes;
+  LoopMap short_nested;
+  LoopMap reentry_calls;
+  LoopMap aborts;
+  std::map<std::uint32_t, std::vector<std::uint32_t>> jump_ends;
+  LoopMap not_lce;
+  std::set<std::uint32_t> lce_endpoints;
+  std::set<std::uint32_t> short_parent_tails;
+  std::set<std::size_t> lce_slots;
+  std::map<std::uint32_t, std::size_t> long_tail_indices;
+  std::size_t long_tail_count{};
+};
+
+LoopShape loop_shape(const Instruction &op) {
+  const auto length = static_cast<std::uint32_t>(op.word) & maximum_pc;
+  return {.start = next_pc(op),
+          .end = next_pc(op, length),
+          .length = length,
+          .term = op.type == counted_loop_type ? loop_counter_expired : branch_condition(op)};
+}
+
+bool register_count(const Instruction &op) {
+  return (op.word >> loop_opcode_shift) == loop_count_register_opcode;
+}
+
+unsigned count_register(const Instruction &op) {
+  return static_cast<unsigned>(op.word >> immediate_register_shift) & ureg_mask;
 }
 
 unsigned branch_index(const Instruction &op) {
@@ -212,11 +396,50 @@ unsigned branch_modifier(const Instruction &op) {
 void validate_condition(const Instruction &instruction, std::string_view identity) {
   const auto cond = (instruction.word >> condition_shift) & true_condition;
   const auto base = cond & 15;
-  if (cond != true_condition && (base == 15 || (base >= 9 && base <= 12))) {
+  if (base >= 9 && base <= 12) {
     reject(instruction,
            identity,
            FaultReason::unsupported_instruction,
-           "external or loop condition is not lowered");
+           "external condition is not lowered");
+  }
+}
+
+unsigned source_register(const Instruction &op) {
+  if (op.type == register_move_type) { return register_move(op).source; }
+  if (register_count(op)) { return count_register(op); }
+  return 0;
+}
+
+void validate_loop(const Instruction &op, std::string_view identity) {
+  const auto shape = loop_shape(op);
+  constexpr auto negative_offset = 1U << 23;
+  if (shape.length == 0 || shape.length >= negative_offset) {
+    reject(op, identity, FaultReason::invalid_encoding, "DO endpoint must follow the setup");
+  }
+  if (register_count(op)) {
+    constexpr auto reserved = (1ULL << 39) | (std::uint64_t{byte_mask} << immediate_count_shift);
+    if ((op.word & reserved) != 0) {
+      reject(op, identity, FaultReason::invalid_encoding, "reserved register-count bits");
+    }
+    const auto reg = count_register(op);
+    if (!data_register(reg) && !dag_register(reg)) {
+      reject(
+          op, identity, FaultReason::unsupported_instruction, "DO count register is unqualified");
+    }
+  }
+  if (op.type == conditional_loop_type) {
+    constexpr auto allowed = (0x0eULL << loop_opcode_shift) |
+                             (std::uint64_t{true_condition} << condition_shift) | maximum_pc;
+    if ((op.word & ~allowed) != 0) {
+      reject(op, identity, FaultReason::invalid_encoding, "reserved termination bits");
+    }
+    if (!shape.counted()) { validate_condition(op, identity); }
+  }
+}
+
+void validate_loop_abort_modifier(const Instruction &op, std::string_view identity) {
+  if (loop_abort(op) && (op.word & (call_branch | clear_interrupt_branch)) != 0) {
+    reject(op, identity, FaultReason::invalid_encoding, "LA requires a jump without CI");
   }
 }
 
@@ -228,11 +451,12 @@ void validate_branch(const Instruction &instruction, std::string_view identity) 
   if ((instruction.word & ~allowed) != 0) {
     reject(instruction, identity, FaultReason::invalid_encoding, "reserved direct-branch bits");
   }
-  if ((instruction.word & (modifiers & ~call_branch)) != 0) {
+  validate_loop_abort_modifier(instruction, identity);
+  if ((instruction.word & clear_interrupt_branch) != 0) {
     reject(instruction,
            identity,
            FaultReason::unsupported_instruction,
-           "delayed, loop-abort or interrupt-clear branch is not lowered");
+           "interrupt-clear branch is not lowered");
   }
   validate_condition(instruction, identity);
 }
@@ -255,8 +479,8 @@ void validate_computed_branch(const Instruction &instruction, std::string_view i
   if ((instruction.word & reserved) != 0) {
     reject(instruction, identity, FaultReason::invalid_encoding, "reserved computed-branch bit");
   }
-  if ((instruction.word & (abort_branch | delayed_branch | clear_interrupt_branch)) != 0 ||
-      !supported_compute(instruction.compute)) {
+  validate_loop_abort_modifier(instruction, identity);
+  if ((instruction.word & clear_interrupt_branch) != 0 || !supported_compute(instruction.compute)) {
     reject(instruction,
            identity,
            FaultReason::unsupported_instruction,
@@ -293,7 +517,8 @@ void validate_return(const Instruction &instruction, std::string_view identity) 
   if ((instruction.word & ~allowed) != 0) {
     reject(instruction, identity, FaultReason::invalid_encoding, "reserved return bits");
   }
-  if ((instruction.word >> opcode_shift) != 0x0a || (instruction.word & modifiers) != 0 ||
+  if ((instruction.word >> opcode_shift) != 0x0a ||
+      (instruction.word & (modifiers & ~(delayed_branch | loop_reentry))) != 0 ||
       instruction.compute.kind != ComputeKind::none) {
     reject(instruction,
            identity,
@@ -380,6 +605,10 @@ void validate(const Instruction &instruction, std::string_view identity) {
   }
   if (instruction.type == return_branch_type) {
     validate_return(instruction, identity);
+    return;
+  }
+  if (loop_setup(instruction)) {
+    validate_loop(instruction, identity);
     return;
   }
   if (instruction.type == memory_move_type) {
@@ -477,6 +706,46 @@ struct BlockCost {
   std::uint64_t instructions{1}, cycles{1};
 };
 
+struct LoopFrame {
+  llvm::Value *index{}, *metadata{}, *matches{};
+};
+
+struct OverlappingLoopFetch {
+  std::uint32_t child_end;
+  LoopShape parent;
+};
+
+enum class RefillSample : std::uint8_t { instruction, whole_turn, call_return };
+
+struct JumpFetch {
+  unsigned clock;
+  unsigned clocks_retired;
+  llvm::Value *status{};
+};
+
+struct JumpRefill {
+  std::vector<LoopShape> shapes;
+  std::set<std::uint32_t> targets;
+};
+
+bool overlapping_tail(const LoopShape &child, const LoopShape &parent) {
+  const auto gap = (parent.end - child.end) & maximum_pc;
+  return gap != 0 && gap <= loop_fetch_distance && parent.contains((child.start - 1) & maximum_pc);
+}
+
+bool overlapping_refill(const LoopShape &child, const LoopShape &parent) {
+  return child.arithmetic() && !child.short_body() && overlapping_tail(child, parent);
+}
+
+bool late_arithmetic_call(const LoopShape &shape, std::uint32_t pc) {
+  return shape.arithmetic() && !shape.short_body() &&
+         ((shape.end - pc) & maximum_pc) < loop_decode_distance;
+}
+
+bool overlapping_short_tail(const LoopShape &child, const LoopShape &parent) {
+  return child.short_body() && overlapping_tail(child, parent);
+}
+
 void debug_scope(llvm::DIBuilder &debug, llvm::Function &function, const std::string &filename) {
   auto *file = debug.createFile(filename, "");
   function.setSubprogram(
@@ -515,12 +784,24 @@ public:
            const NativeAbi &abi,
            const CodeVariant &variant,
            std::vector<Instruction> instructions,
-           const NativeUnit &unit)
+           const NativeUnit &unit,
+           const LoopPlan &loops)
       : module_(module),
         memory_mode_(memory_mode),
         abi_(abi),
         unit_(unit),
         variant_(variant),
+        loop_shapes_(loops.shapes),
+        reentry_calls_(loops.reentry_calls),
+        aborts_(loops.aborts),
+        jump_ends_(loops.jump_ends),
+        short_nested_(loops.short_nested),
+        not_lce_(loops.not_lce),
+        lce_endpoints_(loops.lce_endpoints),
+        short_parent_tails_(loops.short_parent_tails),
+        lce_slots_(loops.lce_slots),
+        long_tail_indices_(loops.long_tail_indices),
+        long_tail_count_(loops.long_tail_count),
         instructions_(std::move(instructions)),
         entry_address_(unit.entry),
         context_(unit.context),
@@ -567,6 +848,24 @@ private:
 
   llvm::Value *stack_cell(llvm::Value *index) {
     return builder_.CreateInBoundsGEP(builder_.getInt32Ty(), pointer(stack_slot), index);
+  }
+
+  llvm::Value *loop_cell(std::size_t slot, llvm::Value *index, unsigned bits = 32) {
+    return builder_.CreateInBoundsGEP(
+        llvm::IntegerType::get(module_.getContext(), bits), pointer(slot), index);
+  }
+
+  llvm::Value *short_cell(ShortLoopWord slot) {
+    return builder_.CreateInBoundsGEP(
+        builder_.getInt64Ty(), pointer(short_loop_slot), builder_.getInt64(slot));
+  }
+
+  llvm::Value *short_word(ShortLoopWord slot) {
+    return builder_.CreateLoad(builder_.getInt64Ty(), short_cell(slot));
+  }
+
+  void write_short(ShortLoopWord slot, llvm::Value *word) {
+    builder_.CreateStore(word, short_cell(slot));
   }
 
   std::size_t data_slot(unsigned lane, unsigned reg) const {
@@ -620,6 +919,7 @@ private:
   }
 
   llvm::Value *condition(const Values &values, unsigned code);
+  llvm::Value *condition(const Values &values, const Instruction &op);
   Arithmetic arithmetic(const Values &values, const Compute &compute, unsigned opcode);
   FixedResult word_step(llvm::Value *input, bool decrement);
   Arithmetic rotation(const Values &values, const Compute &compute);
@@ -641,18 +941,188 @@ private:
                       NativeExit reason,
                       bool partial);
   void finish(Values values, std::uint32_t next, bool partial);
+  void readmit(const Values &values, std::uint32_t next);
   void credit(Values &values, llvm::Value *count, llvm::Value *cycles, bool partial);
+  void advance_lce(llvm::Value *cycles, std::size_t slot);
+  llvm::Value *lce_age(llvm::Value *tail);
   void complete(Values values,
                 const Instruction &op,
                 bool partial,
                 llvm::Value *lanes,
-                PipelineEffects pipeline);
+                PipelineEffects pipeline,
+                llvm::Value *old_status);
+  void
+  delayed_slot(const Values &values, const Instruction &op, bool partial, llvm::Value *old_status);
+  void redirect(Values values, const Instruction &op, llvm::Value *target, bool partial);
+  void plan_jump_refills();
+  [[nodiscard]] bool prepared_jump_target(const Instruction &op, std::uint32_t target) const;
+  llvm::Value *jump_fetch(Values &values,
+                          llvm::Value *target,
+                          const Instruction &op,
+                          llvm::Value *fetch,
+                          JumpFetch position);
+  llvm::Value *pack_delayed_target(llvm::Value *target, std::uint32_t phase, llvm::Value *fetch);
+  [[nodiscard]] bool delay_boundary(std::uint32_t pc) const;
+  [[nodiscard]] bool sequencer_boundary(std::uint32_t pc) const;
+  void plan_hardware_loops(const LoopMap &shapes);
+  void plan_short_body(const LoopShape &shape);
+  void plan_overlapping_loop_fetches(const LoopMap &shapes);
+  void plan_hardware_grants(const LoopMap &shapes);
+  void admit_hardware_turns(const Values &values, const LoopShape &shape);
+  void emit_hardware_turns(const Node &body,
+                           const LoopFrame &frame,
+                           llvm::Value *count,
+                           const LoopShape &shape);
+  void loop_push(Values &values, const Instruction &op, bool partial);
+  void suspend_short_parent(Values &values,
+                            const Instruction &op,
+                            const LoopShape &parent,
+                            unsigned words,
+                            llvm::Value *active);
+  void resume_short_parent(Values &values,
+                           const LoopShape &child,
+                           const LoopShape &parent,
+                           llvm::Value *done = nullptr);
+  void loop_pop(Values &values, const LoopFrame &frame);
+  void
+  guard_loop_abort(const Values &values, const Instruction &op, llvm::Value *lanes, bool partial);
+  void retire_loop_abort(Values &values, const LoopShape &shape);
+  llvm::Value *jump_target(const Values &values, const Instruction &op);
+  [[nodiscard]] std::size_t counted_tail_slot_for(const LoopShape &shape) const;
+  [[nodiscard]] std::uint64_t counted_tail_word(const LoopShape &shape) const;
+  llvm::Value *counted_tail_matches(const LoopShape &shape);
+  void save_counted_tail(const LoopShape &shape, llvm::Value *age, bool returning);
+  void clear_counted_tail(const LoopShape &shape, llvm::Value *enabled = nullptr);
+  llvm::Value *
+  abort_target_in_parent(llvm::Value *target, const Values &values, llvm::Value *already_exited);
+  void loop_status(Values &values, llvm::Value *depth);
+  [[nodiscard]] LoopFrame active_loop(const Values &values, const LoopShape &shape);
+  llvm::Value *repeat_scheduled(const LoopFrame &frame);
+  void clear_loop_repeat(const LoopFrame &frame);
+  void loop_fetch(Values &values,
+                  const LoopShape &shape,
+                  llvm::Value *enabled,
+                  bool returning = false,
+                  llvm::Value *age = nullptr);
+  void
+  loop_test(Values &values, llvm::Value *old_status, const LoopShape &shape, llvm::Value *enabled);
+  [[nodiscard]] llvm::Value *refill_at(llvm::Value *refill, std::uint32_t child_end);
+  void overlapping_loop_fetches(Values &values,
+                                std::uint32_t pc,
+                                llvm::Value *refill,
+                                RefillSample sample = RefillSample::instruction);
+  void loop_samples(Values &values,
+                    llvm::Value *old_status,
+                    std::uint32_t pc,
+                    llvm::Value *refill,
+                    RefillSample sample = RefillSample::instruction);
+  void loop_refill(Values &values, const Instruction &op);
+  void check_loop_end(const Values &values, const Instruction &op, bool partial);
+
+  struct ShortLookahead {
+    llvm::Value *fetch{}, *decode{}, *decode_lag{};
+  };
+
+  struct ShortRetirement {
+    llvm::Value *left{}, *old_status{};
+  };
+
+  struct ShortFetchWindow {
+    llvm::Value *before{}, *after{}, *old_status{}, *decode_lag{};
+  };
+
+  void write_short_addresses(ShortLookahead addresses, llvm::Value *live);
+  ShortLookahead project_short_parent(ShortLookahead stages,
+                                      const LoopShape &child,
+                                      const LoopShape &parent,
+                                      llvm::Value *resumes);
+  llvm::Value *short_flag(llvm::Value *descriptor, std::uint64_t mask);
+  llvm::Value *short_active(const LoopShape &shape, llvm::Value *left);
+  void setup_short_loop(const LoopShape &shape, llvm::Value *count);
+  void short_loop_retirement(Values values,
+                             const Instruction &op,
+                             const LoopShape &shape,
+                             llvm::Value *old_status,
+                             bool partial);
+  void short_loop_counter(Values &values,
+                          std::uint32_t pc,
+                          const LoopShape &shape,
+                          llvm::Value *descriptor,
+                          bool after_credit = false);
+  llvm::Value *
+  short_exit_descriptor(llvm::Value *descriptor, const Values &values, llvm::Value *previous_depth);
+  llvm::Value *short_words_after(llvm::Value *remaining, const LoopShape &shape);
+  llvm::Value *short_loop_test(Values &values, const LoopShape &shape, ShortRetirement retirement);
+  llvm::Value *short_loop_refill(const LoopShape &shape, llvm::Value *done);
+  llvm::Value *
+  short_stage(const LoopShape &shape, std::uint32_t pc, llvm::Value *left, unsigned lag);
+  ShortLookahead short_lookahead(std::uint32_t pc,
+                                 const LoopShape &shape,
+                                 llvm::Value *left,
+                                 bool saved_parent = false);
+  void short_loop_observation(Values &values,
+                              const Instruction &op,
+                              const LoopShape &shape,
+                              ShortRetirement retirement);
+  void observe_short_fetches(Values &values,
+                             const LoopShape &shape,
+                             ShortLookahead stages,
+                             ShortRetirement retirement,
+                             bool after_credit);
+  ShortLookahead overlapping_short_fetches(Values &values,
+                                           const LoopShape &shape,
+                                           ShortLookahead stages,
+                                           llvm::Value *old_status,
+                                           bool after_credit);
+  llvm::Value *short_fetch_crossed(ShortFetchWindow window, unsigned offset);
+  ShortLookahead redirect_short_parent(ShortLookahead stages,
+                                       const LoopShape &child,
+                                       const LoopShape &parent,
+                                       ShortFetchWindow window,
+                                       llvm::Value *selected);
+  void retire_short_observation(std::uint32_t pc);
+  void loop_backedge(const Values &values, const LoopShape &shape, bool partial);
+  void
+  loop_retirement(Values &values, const Instruction &op, llvm::Value *old_status, bool partial);
   llvm::Value *branch_lanes(const Values &values, const Instruction &op, bool partial);
   llvm::Value *branch_taken(llvm::Value *lanes);
-  void stack_guard(const Values &values, const Instruction &op, llvm::Value *allowed, bool partial);
+  void stack_guard(const Values &values,
+                   const Instruction &op,
+                   llvm::Value *allowed,
+                   bool partial,
+                   NativeExit reason = NativeExit::unsupported_stack);
   void stack_status(Values &values);
+  void push_pc(Values &values, llvm::Value *address);
   void call(Values &values, const Instruction &op, bool partial);
+  llvm::Value *loop_call_address(Values &values, const Instruction &op, const LoopShape &shape);
+  llvm::Value *parent_exit_before_call(const LoopShape &shape, std::uint32_t pc);
+  llvm::Value *enclosing_call_live(const Values &values, const LoopShape &shape, std::uint32_t pc);
+  llvm::Value *
+  call_termination_tag(const Values &values, const Instruction &op, llvm::Value *terminated);
+  llvm::Value *suspend_short_call(Values &values, const Instruction &op, const LoopShape &shape);
+  [[nodiscard]] bool overlapping_short_call(const LoopShape &shape) const;
+  void transfer_call_state(llvm::Value *depth, bool saving);
+  void suspend_call_state(const Values &values, llvm::Value *live);
+  void restore_short_call(Values &values,
+                          const LoopShape &shape,
+                          std::uint32_t pc,
+                          llvm::Value *payload);
+  llvm::Value *resume_short_count(Values &values,
+                                  const LoopShape &shape,
+                                  std::uint32_t pc,
+                                  llvm::Value *payload);
   llvm::Value *pop(Values &values, const Instruction &op, bool partial);
+  llvm::Value *check_loop_return(const Values &values,
+                                 const Instruction &op,
+                                 llvm::Value *popped_depth,
+                                 bool partial);
+  void restore_loop_tail(llvm::Value *tail);
+  void resume_loop_tail(const Values &values, llvm::Value *target);
+  void finish_loop_return(Values &values, const Instruction &op);
+  void finish_enclosing_tail(Values &values,
+                             const LoopShape &shape,
+                             std::uint32_t pc,
+                             llvm::Value *payload);
   void return_to_caller(Values values, llvm::Value *target, bool partial);
   std::vector<BlockCost> block_costs() const;
   void emit_exit();
@@ -662,6 +1132,7 @@ private:
   void write_register(Values &values, unsigned reg, llvm::Value *raw, llvm::Value *selected);
   void register_instruction(Values &values, const Instruction &op, const Values &before);
   llvm::Value *pipeline_stall(const Values &values, const Instruction &op);
+  llvm::Value *loop_count_loaded(const Values &values);
   llvm::Value *loaded_tag(const Values &values, const Instruction &op);
   void retire_pipeline(Values &values, PipelineEffects effects);
   void plan_memory();
@@ -678,12 +1149,33 @@ private:
   const NativeAbi &abi_;
   const NativeUnit &unit_;
   const CodeVariant &variant_;
+  const LoopMap &loop_shapes_;
+  const LoopMap &reentry_calls_;
+  const LoopMap &aborts_;
+  const std::map<std::uint32_t, std::vector<std::uint32_t>> &jump_ends_;
+  const LoopMap &short_nested_;
+  const LoopMap &not_lce_;
+  const std::set<std::uint32_t> &lce_endpoints_;
+  const std::set<std::uint32_t> &short_parent_tails_;
+  const std::set<std::size_t> &lce_slots_;
+  const std::map<std::uint32_t, std::size_t> &long_tail_indices_;
+  std::size_t long_tail_count_;
   std::vector<Instruction> instructions_;
   std::uint32_t entry_address_;
   std::uint32_t context_;
   llvm::IRBuilder<> builder_;
   llvm::Function *function_{};
   std::map<std::uint32_t, std::size_t> addresses_;
+  std::set<std::uint32_t> delay_slots_;
+  std::map<std::uint32_t, const Instruction *> delay_starts_, delay_ends_;
+  std::map<std::uint32_t, LoopShape> loop_fetches_, loop_tests_, hardware_ends_;
+  std::map<std::uint32_t, std::vector<OverlappingLoopFetch>> overlapping_fetches_;
+  std::map<std::uint32_t, std::vector<LoopShape>> short_parents_;
+  std::set<std::uint32_t> shifted_fetches_;
+  std::map<std::uint32_t, JumpRefill> jump_refills_;
+  std::map<std::uint32_t, LoopShape> hardware_grants_, short_bodies_;
+  std::set<std::uint32_t> short_successors_;
+  std::set<std::uint32_t> loop_setups_;
   std::vector<Node> admission_, fast_entry_, fast_, partial_;
   std::map<std::uint32_t, MemoryPlan> memory_plan_;
   llvm::Value *memory_admitted_{};
@@ -692,6 +1184,10 @@ private:
   std::array<llvm::Value *, 64> dag_{};
   std::set<unsigned> dag_written_;
   bool dag_status_written_{};
+  bool has_plain_loop_returns_{};
+  bool has_loop_sample_returns_{};
+  bool has_short_loop_returns_{};
+  bool has_enclosing_tail_returns_{};
   std::vector<BlockCost> costs_;
   std::map<std::size_t, std::size_t> loop_headers_;
   std::map<std::size_t, BlockCost> loop_ends_;
@@ -730,6 +1226,24 @@ llvm::Value *Lowering::condition(const Values &values, unsigned code) {
     result = builder_.CreateInsertElement(result, builder_.getFalse(), builder_.getInt32(1));
   }
   return result;
+}
+
+llvm::Value *Lowering::condition(const Values &values, const Instruction &op) {
+  const auto site = not_lce_.find(op.address);
+  if (site == not_lce_.end()) { return condition(values, branch_condition(op)); }
+  auto *age = lce_age(load(64, counted_tail_slot_for(site->second)));
+  age = builder_.CreateAdd(age, pipeline_stall(values, op));
+  const auto limit = branch(op) ? lce_branch_age : lce_compute_age;
+  llvm::Value *expired = builder_.CreateAnd(counted_tail_matches(site->second),
+                                            builder_.CreateICmpUGE(age, builder_.getInt64(limit)));
+  if (op.address == site->second.start) {
+    // The DO just copied LCNTR to CURLCNTR. Its interlock makes the loaded
+    // count visible before the first predicate. A backedge uses fetch history.
+    auto *single = builder_.CreateICmpEQ(load(32, lcntr_slot), builder_.getInt32(1));
+    expired = builder_.CreateSelect(loop_count_loaded(values), single, expired);
+  }
+  auto *enabled = builder_.CreateNot(expired);
+  return pair(enabled, (context_ & simd_mode) != 0 ? enabled : builder_.getFalse(), 1);
 }
 
 Arithmetic Lowering::arithmetic(const Values &values, const Compute &compute, unsigned opcode) {
@@ -933,8 +1447,7 @@ void Lowering::write_register(Values &values,
 
 void Lowering::register_instruction(Values &values, const Instruction &op, const Values &before) {
   const auto move = register_move(op);
-  auto *selected =
-      condition(before, static_cast<unsigned>((op.word >> condition_shift) & true_condition));
+  auto *selected = condition(before, op);
   if (!move.swap) {
     write_register(values, move.destination, read_register(before, move.source), selected);
     return;
@@ -954,19 +1467,25 @@ void Lowering::register_instruction(Values &values, const Instruction &op, const
 }
 
 llvm::Value *Lowering::loaded_tag(const Values &values, const Instruction &op) {
+  if (loop_setup(op) && not_lce_.contains(next_pc(op))) {
+    return builder_.getInt32(history_loop_setup);
+  }
   const auto reg = loaded_register(op);
   if (!dag_register(reg)) { return builder_.getInt32(0); }
   const auto index = reg & 15;
   const auto bank = (context_ & dag_bank_mode(index)) != 0 ? 1U : 0U;
   const auto tag = 1 + index + (bank * 16) + (reg >= 0x20 && reg < 0x30 ? 32U : 0U);
   auto *selected =
-      condition(values,
-                op.type == immediate_move_type
-                    ? true_condition
-                    : static_cast<unsigned>((op.word >> condition_shift) & true_condition));
+      op.type == immediate_move_type ? condition(values, true_condition) : condition(values, op);
   return builder_.CreateSelect(builder_.CreateExtractElement(selected, builder_.getInt32(0)),
                                builder_.getInt32(tag),
                                builder_.getInt32(0));
+}
+
+llvm::Value *Lowering::loop_count_loaded(const Values &values) {
+  auto *setup =
+      builder_.CreateAnd(values[dag_history_value], builder_.getInt32(history_loop_setup));
+  return builder_.CreateICmpNE(setup, builder_.getInt32(0));
 }
 
 llvm::Value *Lowering::pipeline_stall(const Values &values, const Instruction &op) {
@@ -979,7 +1498,11 @@ llvm::Value *Lowering::pipeline_stall(const Values &values, const Instruction &o
     dependencies.push_back(16 + branch_modifier(op));
   }
   auto *previous = builder_.CreateAnd(values[dag_history_value], builder_.getInt32(byte_mask));
-  auto *earlier = builder_.CreateLShr(values[dag_history_value], builder_.getInt32(8));
+  auto *older = values[dag_history_value];
+  if (!not_lce_.empty()) {
+    older = builder_.CreateAnd(older, builder_.getInt32(history_older_mask));
+  }
+  auto *earlier = builder_.CreateLShr(older, builder_.getInt32(8));
   llvm::Value *recent_match = builder_.getFalse();
   llvm::Value *earlier_match = builder_.getFalse();
   for (const auto dependency : dependencies) {
@@ -992,10 +1515,16 @@ llvm::Value *Lowering::pipeline_stall(const Values &values, const Instruction &o
   stall = builder_.CreateSelect(recent_match,
                                 builder_.getInt64(2),
                                 builder_.CreateSelect(earlier_match, builder_.getInt64(1), stall));
-  if (branch(op) && ((op.word >> condition_shift) & true_condition) != true_condition) {
+  if (branch(op) && branch_condition(op) != true_condition && !observes_not_lce(op)) {
     // Concurrent Decode/Address hazards overlap, rather than adding sequential stalls.
     auto *compute = builder_.CreateZExt(values[hazard_value], builder_.getInt64Ty());
     stall = builder_.CreateSelect(builder_.CreateICmpUGT(compute, stall), compute, stall);
+  }
+  const auto lce = not_lce_.find(op.address);
+  if (lce != not_lce_.end() && op.address == lce->second.start) {
+    auto *interlock = builder_.CreateSelect(
+        loop_count_loaded(values), builder_.getInt64(branch(op) ? 2 : 1), builder_.getInt64(0));
+    stall = builder_.CreateBinaryIntrinsic(llvm::Intrinsic::umax, stall, interlock);
   }
   return stall;
 }
@@ -1035,6 +1564,11 @@ Arithmetic Lowering::rotation(const Values &values, const Compute &compute) {
 }
 
 void Lowering::instruction(Values &values, const Instruction &op, bool partial) {
+  if (loop_setup(op)) {
+    loop_push(values, op, partial);
+    values[hazard_value] = builder_.getFalse();
+    return;
+  }
   if (op.type == memory_move_type) {
     memory_instruction(values, op, partial);
     values[hazard_value] = builder_.getFalse();
@@ -1060,8 +1594,7 @@ void Lowering::instruction(Values &values, const Instruction &op, bool partial) 
     if (op.type == register_move_type) { register_instruction(values, op, before); }
     return;
   }
-  auto *selected =
-      condition(values, static_cast<unsigned>((op.word >> condition_shift) & true_condition));
+  auto *selected = condition(values, op);
   if (op.type == computed_branch_type) {
     if ((op.word & else_compute) != 0) {
       selected =
@@ -1289,7 +1822,8 @@ void Lowering::memory_instruction(Values &values, const Instruction &op, bool pa
 void Lowering::stack_guard(const Values &values,
                            const Instruction &op,
                            llvm::Value *allowed,
-                           bool partial) {
+                           bool partial,
+                           NativeExit reason) {
   auto *admitted = llvm::BasicBlock::Create(module_.getContext(), "stack.admitted", function_);
   auto *refused = llvm::BasicBlock::Create(module_.getContext(), "cold.stack", function_);
   builder_.CreateCondBr(
@@ -1303,7 +1837,15 @@ void Lowering::stack_guard(const Values &values,
     auto *completed = builder_.CreateSub(values[credit_value], builder_.getInt64(1));
     credit(prefix, completed, builder_.CreateAdd(completed, values[extra_cycles_value]), false);
   }
-  exit(prefix, builder_.getInt32(op.address), NativeExit::unsupported_stack);
+  if (reason == NativeExit::unsupported_loop_stack ||
+      reason == NativeExit::unsupported_loop_reentry || reason == NativeExit::invalid_loop_abort ||
+      reason == NativeExit::invalid_short_loop_call) {
+    auto *word = builder_.CreateGEP(builder_.getInt64Ty(),
+                                    function_->getArg(unit_controls),
+                                    builder_.getInt64(fault_instruction));
+    builder_.CreateStore(builder_.getInt64(op.word), word);
+  }
+  exit(prefix, builder_.getInt32(op.address), reason);
   builder_.SetInsertPoint(admitted);
 }
 
@@ -1328,19 +1870,11 @@ void Lowering::stack_status(Values &values) {
       builder_.CreateInsertElement(values[sticky_value], status, builder_.getInt32(0));
 }
 
-void Lowering::call(Values &values, const Instruction &op, bool partial) {
-  constexpr std::uint32_t call_tag = 1U << 24;
+void Lowering::push_pc(Values &values, llvm::Value *address) {
   constexpr unsigned almost_full = Registers::pc_stack_capacity - 1;
   constexpr std::uint32_t stack_overflow_interrupt = 1U << 3;
   auto *depth = values[pc_stack_depth_value];
-  if (op.compute.kind == ComputeKind::none) {
-    stack_guard(values,
-                op,
-                builder_.CreateICmpULT(depth, builder_.getInt32(Registers::pc_stack_capacity)),
-                partial);
-  }
-  builder_.CreateStore(builder_.getInt32(((op.address + 1) & maximum_pc) | call_tag),
-                       stack_cell(depth));
+  builder_.CreateStore(address, stack_cell(depth));
   depth = builder_.CreateAdd(depth, builder_.getInt32(1));
   values[pc_stack_depth_value] = depth;
   values[interrupt_latch_value] = builder_.CreateOr(
@@ -1351,9 +1885,233 @@ void Lowering::call(Values &values, const Instruction &op, bool partial) {
   stack_status(values);
 }
 
+void Lowering::call(Values &values, const Instruction &op, bool partial) {
+  if (op.compute.kind == ComputeKind::none) {
+    stack_guard(values,
+                op,
+                builder_.CreateICmpULT(values[pc_stack_depth_value],
+                                       builder_.getInt32(Registers::pc_stack_capacity)),
+                partial);
+  }
+  const auto site = reentry_calls_.find(op.address);
+  auto *address = site == reentry_calls_.end() ? builder_.getInt32(call_resume(op) | pc_call_tag)
+                                               : loop_call_address(values, op, site->second);
+  push_pc(values, address);
+}
+
+llvm::Value *
+Lowering::loop_call_address(Values &values, const Instruction &op, const LoopShape &shape) {
+  if (shape.short_body()) { return suspend_short_call(values, op, shape); }
+  const auto tail_slot = shape.counted() ? counted_tail_slot_for(shape) : loop_refill_slot;
+  auto *pending = load(64, tail_slot);
+  const auto signature = (std::uint64_t{shape.end} << loop_refill_end_shift) | shape.start |
+                         (shape.counted() ? counted_loop_tail : loop_refill_live);
+  auto *terminating = shape.counted()
+                          ? counted_tail_matches(shape)
+                          : builder_.CreateICmpEQ(pending, builder_.getInt64(signature));
+  const auto frame = active_loop(values, shape);
+  llvm::Value *in_loop = builder_.CreateOr(terminating, frame.matches);
+  const bool endpoint = op.address == shape.end;
+  // CALL at E replaces the remainder of the loop's pipeline refill.
+  auto *saved = endpoint ? static_cast<llvm::Value *>(builder_.getInt64(0))
+                         : builder_.CreateSelect(terminating, pending, builder_.getInt64(0));
+  // The call redirects Fetch1 before the unsampled word arrives. The
+  // return refill reaches that fetch after the three frozen fetch clocks.
+  const auto sample_payload = loop_return_payload(op.address, shape);
+  llvm::Value *exited = builder_.getFalse();
+  // PCSTK bit 25 is set when the sample exits while CALL is in Address.
+  const auto sample =
+      shape.counted() ? (shape.end - loop_fetch_distance) & maximum_pc : shape.condition_pc();
+  if (shape.term != true_condition && op.address == ((sample + 1) & maximum_pc)) {
+    exited = terminating;
+  }
+  if (shape.suspends_enclosing_tail) {
+    exited = builder_.CreateOr(exited, parent_exit_before_call(shape, op.address));
+    in_loop = builder_.CreateOr(in_loop, enclosing_call_live(values, shape, op.address));
+    suspend_call_state(values, in_loop);
+    saved = builder_.getInt64(sample_payload);
+  } else {
+    store(builder_.CreateSelect(terminating, builder_.getInt64(0), pending), tail_slot);
+    if (sample_payload != 0) {
+      auto *unsampled = frame.matches;
+      if ((sample_payload & return_loop_fetch) != 0) {
+        unsampled = builder_.CreateAnd(unsampled, builder_.CreateNot(repeat_scheduled(frame)));
+      }
+      saved = builder_.CreateSelect(unsampled, builder_.getInt64(sample_payload), saved);
+    }
+  }
+  auto *call_state = builder_.CreateSelect(
+      in_loop, builder_.CreateOr(saved, builder_.getInt64(loop_call_live)), builder_.getInt64(0));
+  builder_.CreateStore(call_state, loop_cell(loop_call_slot, values[pc_stack_depth_value], 64));
+  auto *address = builder_.CreateOr(builder_.getInt32(call_resume(op) | pc_call_tag),
+                                    call_termination_tag(values, op, exited));
+  if (endpoint) {
+    auto *repeat = builder_.CreateAnd(frame.matches, repeat_scheduled(frame));
+    auto *backedge = llvm::BasicBlock::Create(module_.getContext(), "call.loop.repeat", function_);
+    auto *ready = llvm::BasicBlock::Create(module_.getContext(), "call.loop.resume", function_);
+    builder_.CreateCondBr(repeat, backedge, ready);
+    builder_.SetInsertPoint(backedge);
+    clear_loop_repeat(frame);
+    builder_.CreateBr(ready);
+    builder_.SetInsertPoint(ready);
+    return builder_.CreateSelect(repeat, builder_.getInt32(shape.start | pc_call_tag), address);
+  }
+  return address;
+}
+
+llvm::Value *Lowering::parent_exit_before_call(const LoopShape &shape, std::uint32_t pc) {
+  const auto previous = (pc - 1) & maximum_pc;
+  llvm::Value *exited = builder_.getFalse();
+  const auto nominal = loop_fetches_.find(previous);
+  if (nominal != loop_fetches_.end() && overlapping_tail(shape, nominal->second)) {
+    exited = counted_tail_matches(nominal->second);
+  }
+  // An arithmetic child's refill can move the sample to its penultimate word.
+  const auto shifted = overlapping_fetches_.find(previous);
+  if (shifted != overlapping_fetches_.end()) {
+    const auto &samples = shifted->second;
+    const auto parent = std::ranges::find(samples, shape.end, &OverlappingLoopFetch::child_end);
+    if (parent != samples.end()) {
+      auto *refill = refill_at(load(64, loop_refill_slot), shape.end);
+      exited = builder_.CreateOr(exited,
+                                 builder_.CreateAnd(refill, counted_tail_matches(parent->parent)));
+    }
+  }
+  return exited;
+}
+
+llvm::Value *
+Lowering::enclosing_call_live(const Values &values, const LoopShape &shape, std::uint32_t pc) {
+  // A prepared control edge can reach this CALL without executing the child DO.
+  llvm::Value *live = builder_.getFalse();
+  for (unsigned gap = 1; gap <= loop_fetch_distance; ++gap) {
+    const auto parent = loop_shapes_.find((shape.end + gap) & maximum_pc);
+    if (parent == loop_shapes_.end() || !overlapping_tail(shape, parent->second) ||
+        ((parent->first - pc) & maximum_pc) > loop_fetch_distance) {
+      continue;
+    }
+    live = builder_.CreateOr(live, active_loop(values, parent->second).matches);
+    live = builder_.CreateOr(live, counted_tail_matches(parent->second));
+  }
+  return live;
+}
+
+llvm::Value *Lowering::call_termination_tag(const Values &values,
+                                            const Instruction &op,
+                                            llvm::Value *terminated) {
+  // An interlock holds the CALL in Decode while the previous word retires.
+  auto *same_clock = builder_.CreateICmpEQ(pipeline_stall(values, op), builder_.getInt64(0));
+  return builder_.CreateSelect(builder_.CreateAnd(terminated, same_clock),
+                               builder_.getInt32(pc_sequencer_tag),
+                               builder_.getInt32(0));
+}
+
+llvm::Value *
+Lowering::suspend_short_call(Values &values, const Instruction &op, const LoopShape &shape) {
+  auto *remaining = short_word(short_remaining);
+  auto *active = short_active(shape, remaining);
+  auto *descriptor = short_word(short_descriptor);
+  if (shape.counted() && op.address == shape.start) {
+    // The initial fetch belongs to the DO fill. The CALL replaces the
+    // rest of that fill and saves the buffer after the count sample.
+    short_loop_counter(values, op.address, shape, descriptor);
+  }
+  auto *zero = builder_.getInt64(0);
+  auto *left = short_words_after(remaining, shape);
+  auto *packed = left;
+  if (!shape.counted()) {
+    // A present short payload with zero words encodes an unbounded pass.
+    packed = builder_.CreateSelect(
+        builder_.CreateICmpEQ(left, builder_.getInt64(short_unbounded)), zero, left);
+  }
+  llvm::Value *target = builder_.getInt32(call_resume(op));
+  if (op.address == shape.end) {
+    auto *repeat = builder_.CreateAnd(active, builder_.CreateICmpNE(left, zero));
+    target = builder_.CreateSelect(repeat, builder_.getInt32(shape.start), target);
+  }
+  auto *buffer =
+      builder_.CreateOr(builder_.CreateShl(packed, builder_.getInt64(return_short_left_shift)),
+                        builder_.CreateZExt(target, builder_.getInt64Ty()));
+  if (shape.counted() && shape.length == 3 && op.address != shape.end) {
+    auto *compact = short_flag(descriptor, short_compact_count);
+    buffer = builder_.CreateOr(
+        buffer, builder_.CreateSelect(compact, builder_.getInt64(return_short_compact), zero));
+  }
+  if (lce_endpoints_.contains(shape.end)) {
+    auto *expired = counted_tail_matches(shape);
+    buffer = builder_.CreateOr(
+        buffer, builder_.CreateSelect(expired, builder_.getInt64(return_short_lce), zero));
+    clear_counted_tail(shape, active);
+  }
+  auto *done = builder_.CreateICmpEQ(left, zero);
+  auto *payload = builder_.CreateOr(buffer, builder_.getInt64(loop_call_live | return_short_loop));
+  llvm::Value *terminal = builder_.getInt64(loop_call_live);
+  if (overlapping_short_call(shape)) {
+    // Even a final endpoint CALL has to finish the enclosing fetch stream on return.
+    terminal = builder_.CreateOr(payload, builder_.getInt64(return_short_done));
+    suspend_call_state(values, active);
+  }
+  auto *saved = builder_.CreateSelect(done, terminal, payload);
+  auto *slot = loop_cell(loop_call_slot, values[pc_stack_depth_value], 64);
+  builder_.CreateStore(builder_.CreateSelect(active, saved, zero), slot);
+  write_short(short_remaining, builder_.CreateSelect(active, zero, remaining));
+  write_short(short_addresses, builder_.CreateSelect(active, zero, short_word(short_addresses)));
+  llvm::Value *tags = builder_.getInt32(pc_call_tag);
+  if (shape.arithmetic() || (shape.counted() && shape.length == 3) ||
+      overlapping_short_call(shape)) {
+    auto *exit = short_flag(descriptor, short_call_exit);
+    tags =
+        builder_.CreateOr(tags, call_termination_tag(values, op, builder_.CreateAnd(active, exit)));
+  }
+  return builder_.CreateOr(target, tags);
+}
+
+bool Lowering::overlapping_short_call(const LoopShape &shape) const {
+  return short_nested_.contains(shape.end) || short_parents_.contains(shape.end);
+}
+
+void Lowering::suspend_call_state(const Values &values, llvm::Value *live) {
+  auto *save = llvm::BasicBlock::Create(module_.getContext(), "loop.call.save", function_);
+  auto *next = llvm::BasicBlock::Create(module_.getContext(), "loop.call.ready", function_);
+  builder_.CreateCondBr(live, save, next);
+  builder_.SetInsertPoint(save);
+  transfer_call_state(values[pc_stack_depth_value], true);
+  builder_.CreateBr(next);
+  builder_.SetInsertPoint(next);
+}
+
+void Lowering::transfer_call_state(llvm::Value *depth, bool saving) {
+  auto *first = builder_.CreateMul(depth, builder_.getInt32(suspended_call_state_words));
+  unsigned word = 0;
+  const auto transfer = [&](llvm::Value *cell, bool has_age = false) {
+    auto *index = builder_.CreateAdd(first, builder_.getInt32(word++));
+    auto *saved = loop_cell(suspended_call_state_slot, index, 64);
+    auto *source = saving ? cell : saved;
+    auto *target = saving ? saved : cell;
+    llvm::Value *value = builder_.CreateLoad(builder_.getInt64Ty(), source);
+    if (!saving && has_age) {
+      auto *mature =
+          builder_.CreateOr(builder_.CreateAnd(value, builder_.getInt64(~lce_clock_mask)),
+                            builder_.getInt64(lce_age_mask));
+      value = builder_.CreateSelect(short_flag(value, lce_clock_mask), mature, value);
+    }
+    builder_.CreateStore(value, target);
+    builder_.CreateStore(builder_.getInt64(0), source);
+  };
+  transfer(short_cell(short_fetch_progress));
+  transfer(short_cell(short_parent_remaining));
+  transfer(short_cell(short_parent_descriptor));
+  transfer(pointer(loop_refill_slot));
+  for (std::size_t i = 0; i < long_tail_count_; ++i) {
+    const auto slot = counted_tail_slot + i;
+    transfer(pointer(slot), lce_slots_.contains(slot));
+  }
+  for (const auto slot : {short_counted_tail_slot, short_parent_tail_slot}) {
+    if (lce_slots_.contains(slot)) { transfer(pointer(slot), true); }
+  }
+}
+
 llvm::Value *Lowering::pop(Values &values, const Instruction &op, bool partial) {
-  // PCSTK bit 25 records loop termination or interrupt continuation (A-10).
-  constexpr std::uint32_t sequencer_tag = 1U << 25;
   auto *depth = values[pc_stack_depth_value];
   stack_guard(values,
               op,
@@ -1363,27 +2121,281 @@ llvm::Value *Lowering::pop(Values &values, const Instruction &op, bool partial) 
               partial);
   auto *popped_depth = builder_.CreateSub(depth, builder_.getInt32(1));
   auto *top = builder_.CreateLoad(builder_.getInt32Ty(), stack_cell(popped_depth));
-  stack_guard(values,
-              op,
-              builder_.CreateICmpEQ(builder_.CreateAnd(top, builder_.getInt32(sequencer_tag)),
-                                    builder_.getInt32(0)),
-              partial);
+  auto *tagged = builder_.CreateICmpNE(builder_.CreateAnd(top, builder_.getInt32(pc_sequencer_tag)),
+                                       builder_.getInt32(0));
+  auto *allowed = builder_.CreateNot(tagged);
+  const bool reentry = (op.word & loop_reentry) != 0;
+  if (reentry) {
+    auto *call = builder_.CreateICmpNE(builder_.CreateAnd(top, builder_.getInt32(pc_call_tag)),
+                                       builder_.getInt32(0));
+    allowed = builder_.CreateOr(allowed, call);
+  }
+  auto *payload =
+      reentry_calls_.empty() ? nullptr : check_loop_return(values, op, popped_depth, partial);
+  stack_guard(values, op, allowed, partial);
+  if (payload != nullptr && (reentry || has_plain_loop_returns_)) {
+    store(builder_.CreateAnd(payload, builder_.getInt64(~loop_call_live)), return_loop_tail_slot);
+    builder_.CreateStore(builder_.getInt64(0), loop_cell(loop_call_slot, popped_depth, 64));
+  }
   values[pc_stack_depth_value] = popped_depth;
   stack_status(values);
   return builder_.CreateAnd(top, builder_.getInt32(maximum_pc));
 }
 
+llvm::Value *Lowering::check_loop_return(const Values &values,
+                                         const Instruction &op,
+                                         llvm::Value *popped_depth,
+                                         bool partial) {
+  auto *slot = loop_cell(loop_call_slot, popped_depth, 64);
+  auto *pending = builder_.CreateLoad(builder_.getInt64Ty(), slot);
+  if ((op.word & loop_reentry) == 0) {
+    llvm::Value *ordinary = builder_.CreateICmpEQ(pending, builder_.getInt64(0));
+    if (has_plain_loop_returns_) {
+      // A CALL before the end word reached Fetch1 has no sampled count
+      // to freeze. Its ordinary RTS reaches the first sample naturally.
+      auto *fetch =
+          builder_.CreateAnd(pending, builder_.getInt64(return_loop_fetch | return_short_loop));
+      ordinary = builder_.CreateOr(
+          ordinary, builder_.CreateICmpEQ(fetch, builder_.getInt64(return_loop_fetch)));
+    }
+    stack_guard(values, op, ordinary, partial, NativeExit::unsupported_loop_reentry);
+  }
+  return pending;
+}
+
+void Lowering::restore_loop_tail(llvm::Value *tail) {
+  auto *refill = short_flag(tail, loop_refill_live);
+  store(builder_.CreateSelect(refill, tail, load(64, loop_refill_slot)), loop_refill_slot);
+  auto *counted = short_flag(tail, counted_loop_tail);
+  for (std::size_t index = 0; index < long_tail_count_; ++index) {
+    const auto slot = counted_tail_slot + index;
+    auto *present = counted;
+    if (long_tail_count_ > 1) {
+      auto *saved = builder_.CreateAnd(tail, builder_.getInt64(counted_tail_index_mask));
+      auto *selected = builder_.CreateICmpEQ(
+          saved, builder_.getInt64(std::uint64_t{index} << counted_tail_index_shift));
+      present = builder_.CreateAnd(counted, selected);
+    }
+    auto *restored = tail;
+    if (lce_slots_.contains(slot)) {
+      auto *mature =
+          builder_.CreateOr(builder_.CreateAnd(tail, builder_.getInt64(~lce_before_credit)),
+                            builder_.getInt64(lce_age_mask));
+      restored = builder_.CreateSelect(short_flag(tail, lce_clock_mask), mature, tail);
+    }
+    store(builder_.CreateSelect(present, restored, load(64, slot)), slot);
+  }
+}
+
+void Lowering::resume_loop_tail(const Values &values, llvm::Value *target) {
+  auto *payload = load(64, return_loop_tail_slot);
+  auto *zero = builder_.getInt64(0);
+  llvm::Value *short_ready = builder_.getFalse();
+  llvm::Value *long_payload = payload;
+  if (has_short_loop_returns_) {
+    auto *kind = builder_.CreateAnd(payload, builder_.getInt64(return_short_loop));
+    auto *is_short = builder_.CreateICmpNE(kind, zero);
+    auto *address = builder_.CreateAnd(builder_.CreateTrunc(payload, builder_.getInt32Ty()),
+                                       builder_.getInt32(maximum_pc));
+    short_ready = builder_.CreateAnd(is_short, builder_.CreateICmpEQ(target, address));
+    long_payload = builder_.CreateSelect(is_short, zero, payload);
+  }
+  restore_loop_tail(long_payload);
+  llvm::Value *valid = short_ready;
+  if (has_enclosing_tail_returns_) {
+    auto *saved = short_flag(long_payload, return_enclosing_tail);
+    auto *restore = llvm::BasicBlock::Create(module_.getContext(), "loop.call.restore", function_);
+    auto *next = llvm::BasicBlock::Create(module_.getContext(), "loop.call.continue", function_);
+    builder_.CreateCondBr(saved, restore, next);
+    builder_.SetInsertPoint(restore);
+    transfer_call_state(values[pc_stack_depth_value], false);
+    builder_.CreateBr(next);
+    builder_.SetInsertPoint(next);
+    auto *address = builder_.CreateTrunc(long_payload, builder_.getInt32Ty());
+    valid =
+        builder_.CreateOr(valid, builder_.CreateAnd(saved, builder_.CreateICmpEQ(target, address)));
+  }
+  if (has_loop_sample_returns_) {
+    auto *kind = builder_.CreateAnd(long_payload,
+                                    builder_.getInt64(return_loop_fetch | return_loop_condition));
+    auto *is_fetch = builder_.CreateICmpEQ(kind, builder_.getInt64(return_loop_fetch));
+    auto *distance = builder_.CreateSelect(is_fetch,
+                                           builder_.getInt32(loop_fetch_distance - 1),
+                                           builder_.getInt32(loop_decode_distance - 1));
+    auto *end = builder_.CreateTrunc(
+        builder_.CreateLShr(long_payload, builder_.getInt64(loop_refill_end_shift)),
+        builder_.getInt32Ty());
+    auto *resume =
+        builder_.CreateAnd(builder_.CreateSub(end, distance), builder_.getInt32(maximum_pc));
+    valid = builder_.CreateOr(valid,
+                              builder_.CreateAnd(builder_.CreateICmpNE(kind, zero),
+                                                 builder_.CreateICmpEQ(target, resume)));
+  }
+  auto *ready = builder_.CreateSelect(
+      valid, builder_.CreateOr(payload, builder_.getInt64(return_loop_ready)), zero);
+  store(ready, return_loop_tail_slot);
+}
+
+void Lowering::finish_loop_return(Values &values, const Instruction &op) {
+  const auto *shape = loop_return_at(op.address, reentry_calls_);
+  if (shape == nullptr) { return; }
+  auto *payload = load(64, return_loop_tail_slot);
+  if (shape->short_body()) {
+    restore_short_call(values, *shape, op.address, payload);
+    return;
+  }
+  if (shape->suspends_enclosing_tail) {
+    finish_enclosing_tail(values, *shape, op.address, payload);
+    return;
+  }
+  const auto sample = loop_return_payload((op.address - 1) & maximum_pc, *shape);
+  auto *ready = builder_.CreateICmpEQ(payload, builder_.getInt64(sample | return_loop_ready));
+  store(builder_.CreateSelect(ready, builder_.getInt64(0), payload), return_loop_tail_slot);
+  if ((sample & return_loop_fetch) != 0) {
+    loop_fetch(values, *shape, ready, true);
+  } else {
+    loop_test(values, values[status_value], *shape, ready);
+  }
+}
+
+void Lowering::finish_enclosing_tail(Values &values,
+                                     const LoopShape &shape,
+                                     std::uint32_t pc,
+                                     llvm::Value *payload) {
+  auto *ready = builder_.CreateICmpEQ(
+      payload, builder_.getInt64(pc | return_enclosing_tail | return_loop_ready));
+  auto *fetch = llvm::BasicBlock::Create(module_.getContext(), "loop.return.fetch", function_);
+  auto next = node("loop.return.continue");
+  next.incoming(values, builder_.GetInsertBlock());
+  builder_.CreateCondBr(ready, fetch, next.block);
+  builder_.SetInsertPoint(fetch);
+  store(builder_.getInt64(0), return_loop_tail_slot);
+  const auto call_pc = (pc - 1) & maximum_pc;
+  auto *refill = load(64, loop_refill_slot);
+  if (call_pc == shape.end && shape.counted()) { clear_counted_tail(shape); }
+  if (call_pc == shape.end && shape.arithmetic()) {
+    // The taken endpoint CALL replaces the child's exit refill. Keep its
+    // identity for the enclosing samples reached by the return fill.
+    store(builder_.CreateSelect(refill_at(refill, shape.end), builder_.getInt64(0), refill),
+          loop_refill_slot);
+  }
+  loop_samples(values, values[status_value], call_pc, refill, RefillSample::call_return);
+  jump(next, values);
+  builder_.SetInsertPoint(next.block);
+  values = next.values();
+}
+
+void Lowering::restore_short_call(Values &values,
+                                  const LoopShape &shape,
+                                  std::uint32_t pc,
+                                  llvm::Value *payload) {
+  constexpr auto flags = return_short_loop | return_loop_ready;
+  auto *signature = builder_.CreateAnd(payload, builder_.getInt64(maximum_pc | flags));
+  auto *ready = builder_.CreateICmpEQ(signature, builder_.getInt64(pc | flags));
+  auto *restore = llvm::BasicBlock::Create(module_.getContext(), "short.return", function_);
+  auto next = node("short.return.continue");
+  next.incoming(values, builder_.GetInsertBlock());
+  builder_.CreateCondBr(ready, restore, next.block);
+  builder_.SetInsertPoint(restore);
+  auto *left =
+      builder_.CreateAnd(builder_.CreateLShr(payload, builder_.getInt64(return_short_left_shift)),
+                         builder_.getInt64(return_short_left_mask));
+  const bool overlap = overlapping_short_call(shape);
+  if (overlap) {
+    transfer_call_state(values[pc_stack_depth_value], false);
+  } else {
+    write_short(short_fetch_progress, builder_.getInt64(0));
+  }
+  auto *done = short_flag(payload, return_short_done);
+  if (lce_endpoints_.contains(shape.end)) {
+    auto *expired = short_flag(payload, return_short_lce);
+    auto *tail = builder_.getInt64(counted_tail_word(shape) | lce_age_mask);
+    const auto slot = counted_tail_slot_for(shape);
+    store(builder_.CreateSelect(expired, tail, load(64, slot)), slot);
+  }
+  const auto call_pc = pc == shape.start ? shape.end : ((pc - 1) & maximum_pc);
+  llvm::Value *descriptor = builder_.getInt64(shape.end);
+  if (shape.counted()) {
+    descriptor = resume_short_count(values, shape, pc, payload);
+  } else {
+    auto *unbounded = builder_.CreateAnd(builder_.CreateNot(done),
+                                         builder_.CreateICmpEQ(left, builder_.getInt64(0)));
+    left = builder_.CreateSelect(unbounded, builder_.getInt64(short_unbounded), left);
+    if (shape.arithmetic() && call_pc == shape.condition_pc()) {
+      // The fourth return fetch reaches the condition word after the freeze.
+      auto *depth = values[pc_stack_depth_value];
+      left = short_loop_test(values, shape, {.left = left, .old_status = values[status_value]});
+      if (reentry_calls_.contains(pc)) {
+        descriptor = short_exit_descriptor(descriptor, values, depth);
+      }
+    }
+  }
+  write_short(short_remaining, left);
+  write_short(short_descriptor, descriptor);
+  auto stages = short_lookahead(call_pc, shape, left);
+  if (shape.counted() && shape.length == 3 && call_pc == shape.start) {
+    // The compact entry still holds E for the sample at its second word.
+    auto *compact = short_flag(descriptor, short_compact_count);
+    stages.fetch = builder_.CreateSelect(compact, builder_.getInt64(shape.end), stages.fetch);
+  }
+  if (overlap) {
+    auto *depth = values[pc_stack_depth_value];
+    stages.decode = builder_.CreateSelect(
+        done, builder_.getInt64((pc + loop_decode_distance) & maximum_pc), stages.decode);
+    const auto lag = shape.length == loop_fetch_distance ? 3U : loop_decode_distance;
+    stages.decode_lag = builder_.CreateSelect(
+        done, builder_.getInt64(loop_decode_distance), builder_.getInt64(lag));
+    observe_short_fetches(
+        values, shape, stages, {.left = left, .old_status = values[status_value]}, true);
+    if (const auto parent = short_nested_.find(shape.end); parent != short_nested_.end()) {
+      resume_short_parent(values, shape, parent->second, done);
+    }
+    if (reentry_calls_.contains(pc)) {
+      write_short(short_descriptor,
+                  short_exit_descriptor(short_word(short_descriptor), values, depth));
+    }
+  } else {
+    write_short_addresses(stages, builder_.getTrue());
+  }
+  store(builder_.getInt64(0), return_loop_tail_slot);
+  jump(next, values);
+  builder_.SetInsertPoint(next.block);
+  values = next.values();
+}
+
+llvm::Value *Lowering::resume_short_count(Values &values,
+                                          const LoopShape &shape,
+                                          std::uint32_t pc,
+                                          llvm::Value *payload) {
+  llvm::Value *descriptor = builder_.getInt64(shape.end);
+  if (shape.length == 3) {
+    auto *compact = short_flag(payload, return_short_compact);
+    descriptor = builder_.CreateSelect(
+        compact, builder_.getInt64(shape.end | short_compact_count), descriptor);
+    // E, B, B+1, E puts the steady sample after the frozen fetches.
+    // A one-pass loop retains its unsampled end and compact drain state.
+    if (pc == shape.end) {
+      auto *depth = values[pc_stack_depth_value];
+      short_loop_counter(values, (pc - 1) & maximum_pc, shape, descriptor, true);
+      if (reentry_calls_.contains(pc)) {
+        descriptor = short_exit_descriptor(descriptor, values, depth);
+      }
+    }
+  } else if (pc == shape.start) {
+    // The repeating two- and four-word endpoints sample on the fourth fetch.
+    short_loop_counter(values, shape.end, shape, descriptor, true);
+  }
+  return descriptor;
+}
+
 void Lowering::return_to_caller(Values values, llvm::Value *target, bool partial) {
   auto *unknown = llvm::BasicBlock::Create(module_.getContext(), "cold.return", function_);
   auto *dispatch = builder_.CreateSwitch(target, unknown);
-  std::set<std::uint32_t> returns;
-  for (const auto &op : instructions_) {
-    if (call_branch_instruction(op)) { returns.insert((op.address + 1) & maximum_pc); }
-  }
-  for (const auto address : returns) {
+  for (const auto address : call_continuations(instructions_, reentry_calls_)) {
     const auto found = addresses_.find(address);
     if (found == addresses_.end()) { continue; }
-    auto &destination = partial ? partial_[found->second] : admission_[found->second];
+    const bool admission = !partial || loop_return_at(address, reentry_calls_) != nullptr;
+    auto &destination = admission ? admission_[found->second] : partial_[found->second];
     destination.incoming(values, builder_.GetInsertBlock());
     dispatch->addCase(builder_.getInt32(address), destination.block);
   }
@@ -1392,6 +2404,7 @@ void Lowering::return_to_caller(Values values, llvm::Value *target, bool partial
 }
 
 void Lowering::credit(Values &values, llvm::Value *count, llvm::Value *cycles, bool partial) {
+  for (const auto slot : lce_slots_) { advance_lce(cycles, slot); }
   values[instruction_remaining_value] =
       builder_.CreateSub(values[instruction_remaining_value], count);
   auto *available = values[cycle_remaining_value];
@@ -1405,6 +2418,28 @@ void Lowering::credit(Values &values, llvm::Value *count, llvm::Value *cycles, b
   values[extra_cycles_value] = builder_.getInt64(0);
 }
 
+llvm::Value *Lowering::lce_age(llvm::Value *tail) {
+  auto *masked = builder_.CreateAnd(tail, builder_.getInt64(lce_age_mask));
+  return builder_.CreateLShr(masked, builder_.getInt64(lce_age_shift));
+}
+
+void Lowering::advance_lce(llvm::Value *cycles, std::size_t slot) {
+  auto *tail = load(64, slot);
+  auto *age = lce_age(tail);
+  auto *limit = builder_.getInt64(lce_branch_age);
+  auto *elapsed = builder_.CreateBinaryIntrinsic(llvm::Intrinsic::umin, cycles, limit);
+  auto *advanced = builder_.CreateBinaryIntrinsic(
+      llvm::Intrinsic::umin, builder_.CreateAdd(age, elapsed), limit);
+  // The sampling instruction records just the clocks from its own fetch to
+  // retirement. Its earlier stalls must not age a newly sampled termination.
+  auto *next = builder_.CreateSelect(short_flag(tail, lce_before_credit), age, advanced);
+  auto *clocked = builder_.CreateOr(builder_.CreateAnd(tail, builder_.getInt64(~lce_clock_mask)),
+                                    builder_.CreateShl(next, builder_.getInt64(lce_age_shift)));
+  auto *live = builder_.CreateAnd(short_flag(tail, lce_clock_mask),
+                                  builder_.CreateICmpNE(cycles, builder_.getInt64(0)));
+  store(builder_.CreateSelect(live, clocked, tail), slot);
+}
+
 llvm::Value *Lowering::branch_taken(llvm::Value *lanes) {
   auto *taken = builder_.CreateExtractElement(lanes, builder_.getInt32(0));
   if ((context_ & simd_mode) != 0) {
@@ -1415,29 +2450,46 @@ llvm::Value *Lowering::branch_taken(llvm::Value *lanes) {
 
 llvm::Value *Lowering::branch_lanes(const Values &values, const Instruction &op, bool partial) {
   if (!branch(op)) { return nullptr; }
-  auto *lanes =
-      condition(values, static_cast<unsigned>((op.word >> condition_shift) & true_condition));
+  auto *lanes = condition(values, op);
   if (call_branch_instruction(op) && op.compute.kind != ComputeKind::none) {
     auto *room = builder_.CreateICmpULT(values[pc_stack_depth_value],
                                         builder_.getInt32(Registers::pc_stack_capacity));
     stack_guard(
         values, op, builder_.CreateOr(builder_.CreateNot(branch_taken(lanes)), room), partial);
   }
+  const auto site = reentry_calls_.find(op.address);
+  if (site != reentry_calls_.end() && site->second.counted() && site->second.length == 2) {
+    auto *one_turn = short_flag(short_word(short_descriptor), short_compact_count);
+    auto *active = short_active(site->second, short_word(short_remaining));
+    auto *invalid = builder_.CreateAnd(branch_taken(lanes), builder_.CreateAnd(active, one_turn));
+    stack_guard(
+        values, op, builder_.CreateNot(invalid), partial, NativeExit::invalid_short_loop_call);
+  }
+  if (loop_abort(op)) { guard_loop_abort(values, op, lanes, partial); }
   return lanes;
+}
+
+llvm::Value *Lowering::jump_target(const Values &values, const Instruction &op) {
+  if (!indirect_branch(op)) { return builder_.getInt32(branch_target(op)); }
+  auto *address = builder_.CreateAdd(values[index_value + branch_index(op)],
+                                     values[modifier_value + branch_modifier(op)]);
+  return builder_.CreateAnd(address, builder_.getInt32(maximum_pc));
 }
 
 void Lowering::complete(Values values,
                         const Instruction &op,
                         bool partial,
                         llvm::Value *lanes,
-                        PipelineEffects pipeline) {
+                        PipelineEffects pipeline,
+                        llvm::Value *old_status) {
   if (!partial && loop_ends_.contains(addresses_.at(op.address))) {
     complete_loop(values, op);
     return;
   }
   auto *count = partial ? builder_.getInt64(1) : values[credit_value];
-  const auto next = (op.address + 1) & maximum_pc;
+  const auto next = next_pc(op);
   if (!branch(op)) {
+    retire_short_observation(op.address);
     credit(values, count, builder_.CreateAdd(count, values[extra_cycles_value]), partial);
     finish(values, next, partial);
     return;
@@ -1451,35 +2503,1375 @@ void Lowering::complete(Values values,
   builder_.SetInsertPoint(branch);
   auto branch_values = values;
   if (call_branch_instruction(op)) { call(branch_values, op, partial); }
+  if (loop_abort(op)) { retire_loop_abort(branch_values, aborts_.at(op.address)); }
   auto *target = op.type == return_branch_type ? pop(branch_values, op, partial) : nullptr;
+  retire_short_observation(op.address);
+  if (indirect_branch(op)) { target = jump_target(values, op); }
   retire_pipeline(branch_values, pipeline);
-  branch_values[hazard_value] = builder_.getFalse();
-  branch_values[dag_history_value] = builder_.getInt32(0);
-  credit(
-      branch_values, count, builder_.CreateAdd(cycles, builder_.getInt64(branch_penalty)), partial);
-  if (target != nullptr) {
-    return_to_caller(branch_values, target, partial);
-  } else if (indirect_branch(op)) {
-    auto *address = builder_.CreateAdd(values[index_value + branch_index(op)],
-                                       values[modifier_value + branch_modifier(op)]);
-    exit(branch_values,
-         builder_.CreateAnd(address, builder_.getInt32(maximum_pc)),
-         NativeExit::indirect);
+  if (delayed(op)) {
+    if (target == nullptr) { target = builder_.getInt32(branch_target(op)); }
+    branch_values[hazard_value] = builder_.getInt1(op.compute.kind != ComputeKind::none);
+    credit(branch_values, count, cycles, partial);
+    auto *fetch =
+        jump_refills_.contains(op.address)
+            ? jump_fetch(branch_values, target, op, target, {.clock = 0, .clocks_retired = 1})
+            : nullptr;
+    store(pack_delayed_target(target, before_first_delay_slot, fetch), delayed_target_slot);
+    finish(branch_values, next, partial);
   } else {
-    finish(branch_values, branch_target(op), partial);
+    branch_values[hazard_value] = builder_.getFalse();
+    branch_values[dag_history_value] = builder_.getInt32(0);
+    credit(branch_values,
+           count,
+           builder_.CreateAdd(cycles, builder_.getInt64(branch_penalty)),
+           partial);
+    redirect(branch_values, op, target, partial);
   }
   builder_.SetInsertPoint(fallthrough);
+  retire_short_observation(op.address);
   retire_pipeline(values, pipeline);
   values[hazard_value] = builder_.getInt1(op.compute.kind != ComputeKind::none);
-  credit(values, count, cycles, partial);
+  if (loop_abort(op) || loop_fetches_.contains(op.address) || hardware_ends_.contains(op.address) ||
+      reentry_calls_.contains(op.address)) {
+    loop_retirement(values, op, old_status, partial);
+  }
+  credit(values, count, builder_.CreateAdd(count, values[extra_cycles_value]), partial);
   finish(values, next, partial);
+}
+
+void Lowering::redirect(Values values, const Instruction &op, llvm::Value *target, bool partial) {
+  if (!delayed(op) && jump_refills_.contains(op.address)) {
+    auto *entry = target != nullptr ? target : builder_.getInt32(branch_target(op));
+    auto *fetch = entry;
+    for (unsigned clock = 0; clock < loop_fetch_distance; ++clock) {
+      fetch = jump_fetch(
+          values,
+          entry,
+          op,
+          fetch,
+          {.clock = clock, .clocks_retired = loop_fetch_distance, .status = values[status_value]});
+    }
+  }
+  if (op.type == return_branch_type) {
+    if (!reentry_calls_.empty() && ((op.word & loop_reentry) != 0 || has_plain_loop_returns_)) {
+      resume_loop_tail(values, target);
+    }
+    return_to_caller(values, target, partial);
+  } else if (indirect_branch(op)) {
+    exit(values, target, NativeExit::indirect);
+  } else {
+    finish(values, branch_target(op), partial);
+  }
+}
+
+llvm::Value *
+Lowering::pack_delayed_target(llvm::Value *target, std::uint32_t phase, llvm::Value *fetch) {
+  auto *word = builder_.CreateZExt(builder_.CreateOr(target, builder_.getInt32(phase)),
+                                   builder_.getInt64Ty());
+  if (fetch == nullptr) { return word; }
+  auto *cursor = builder_.CreateShl(builder_.CreateZExt(fetch, builder_.getInt64Ty()),
+                                    builder_.getInt64(delayed_fetch_shift));
+  return builder_.CreateOr(builder_.CreateOr(word, builder_.getInt64(delayed_fetch_live)), cursor);
+}
+
+void Lowering::delayed_slot(const Values &values,
+                            const Instruction &op,
+                            bool partial,
+                            llvm::Value *old_status) {
+  if (!delay_slots_.contains(op.address)) { return; }
+  auto *pending = load(64, delayed_target_slot);
+  auto *slot = llvm::BasicBlock::Create(module_.getContext(), "delay.slot", function_);
+  auto *ordinary = llvm::BasicBlock::Create(module_.getContext(), "delay.none", function_);
+  builder_.CreateCondBr(builder_.CreateICmpNE(pending, builder_.getInt64(0)), slot, ordinary);
+  builder_.SetInsertPoint(slot);
+  auto retired = values;
+  if (branch(op)) {
+    // An adjacent complementary delayed JUMP is suppressed on the taken path.
+    retired[hazard_value] = builder_.getFalse();
+    retire_pipeline(retired, {.stall = builder_.getInt64(0), .tag = builder_.getInt32(0)});
+  }
+  auto *address = builder_.CreateTrunc(pending, builder_.getInt32Ty());
+  auto *target = builder_.CreateAnd(address, builder_.getInt32(maximum_pc));
+  auto *fetch = builder_.CreateTrunc(
+      builder_.CreateLShr(pending, builder_.getInt64(delayed_fetch_shift)), builder_.getInt32Ty());
+  const auto origin = delay_ends_.find(op.address);
+  llvm::BasicBlock *last = nullptr;
+  if (origin != delay_ends_.end()) {
+    last = llvm::BasicBlock::Create(module_.getContext(), "delay.last", function_);
+    auto *first = llvm::BasicBlock::Create(module_.getContext(), "delay.first", function_);
+    auto *phase = builder_.CreateAnd(address, builder_.getInt32(before_second_delay_slot));
+    builder_.CreateCondBr(builder_.CreateICmpNE(phase, builder_.getInt32(0)), last, first);
+    builder_.SetInsertPoint(first);
+  }
+  auto first_values = retired;
+  credit(first_values,
+         builder_.getInt64(1),
+         builder_.CreateAdd(builder_.getInt64(1), retired[extra_cycles_value]),
+         partial);
+  const auto first_origin = delay_starts_.find(op.address);
+  llvm::Value *first_fetch = nullptr;
+  if (first_origin != delay_starts_.end() &&
+      jump_refills_.contains(first_origin->second->address)) {
+    first_fetch = jump_fetch(
+        first_values, target, *first_origin->second, fetch, {.clock = 1, .clocks_retired = 2});
+  }
+  store(pack_delayed_target(target, before_second_delay_slot, first_fetch), delayed_target_slot);
+  finish(first_values, next_pc(op), partial);
+  if (last != nullptr) {
+    builder_.SetInsertPoint(last);
+    store(builder_.getInt64(0), delayed_target_slot);
+    retired[hazard_value] = builder_.getFalse();
+    // One refill cycle follows the second slot. It also ages the DAG dependency.
+    retire_pipeline(retired, {.stall = builder_.getInt64(0), .tag = builder_.getInt32(0)});
+    credit(retired,
+           builder_.getInt64(1),
+           builder_.CreateAdd(builder_.getInt64(2), retired[extra_cycles_value]),
+           partial);
+    if (jump_refills_.contains(origin->second->address)) {
+      auto *next_fetch = jump_fetch(retired,
+                                    target,
+                                    *origin->second,
+                                    fetch,
+                                    {.clock = 2, .clocks_retired = 4, .status = old_status});
+      (void)jump_fetch(retired,
+                       target,
+                       *origin->second,
+                       next_fetch,
+                       {.clock = 3, .clocks_retired = 4, .status = retired[status_value]});
+    }
+    redirect(retired, *origin->second, target, partial);
+  }
+  builder_.SetInsertPoint(ordinary);
+}
+
+bool Lowering::delay_boundary(std::uint32_t pc) const {
+  return delay_slots_.contains(pc) || delay_ends_.contains((pc + delay_slot_count) & maximum_pc);
+}
+
+bool Lowering::sequencer_boundary(std::uint32_t pc) const {
+  return delay_boundary(pc) || loop_setups_.contains(pc) || loop_fetches_.contains(pc) ||
+         loop_tests_.contains(pc) || hardware_ends_.contains(pc) || hardware_grants_.contains(pc) ||
+         short_bodies_.contains(pc) || short_successors_.contains(pc) || aborts_.contains(pc) ||
+         overlapping_fetches_.contains(pc) || jump_refills_.contains(pc) || not_lce_.contains(pc);
+}
+
+void Lowering::plan_hardware_loops(const LoopMap &shapes) {
+  for (const auto &op : instructions_) {
+    if (loop_setup(op)) { loop_setups_.insert(op.address); }
+  }
+  const auto sample_site = [this](std::uint32_t pc) {
+    // An explicitly prepared return entry may exclude the preceding CALL.
+    return addresses_.contains(pc) || addresses_.contains((pc + 1) & maximum_pc);
+  };
+  for (const auto &[end, shape] : shapes) {
+    if (shape.short_body()) {
+      plan_short_body(shape);
+      continue;
+    }
+    if (addresses_.contains(end)) { hardware_ends_.emplace(end, shape); }
+    const auto fetch = (end - loop_fetch_distance) & maximum_pc;
+    if (sample_site(fetch)) { loop_fetches_.emplace(fetch, shape); }
+    const auto test = shape.condition_pc();
+    if (shape.arithmetic() && sample_site(test)) { loop_tests_.emplace(test, shape); }
+  }
+  plan_overlapping_loop_fetches(shapes);
+  plan_jump_refills();
+}
+
+bool Lowering::prepared_jump_target(const Instruction &op, std::uint32_t target) const {
+  if (!indirect_branch(op)) { return target == branch_target(op); }
+  return std::ranges::contains(variant_.entries, target) ||
+         std::ranges::any_of(variant_.interrupt_vectors,
+                             [target](const auto &v) { return v.vector == target; });
+}
+
+void Lowering::plan_jump_refills() {
+  if (jump_ends_.empty()) { return; }
+  for (const auto &op : instructions_) {
+    const auto site = jump_ends_.find(op.address);
+    if (site == jump_ends_.end()) { continue; }
+    JumpRefill refill;
+    for (const auto end : site->second) {
+      bool reaches_end = false;
+      for (unsigned distance = 0; distance < loop_fetch_distance; ++distance) {
+        const auto target = (end - distance) & maximum_pc;
+        if (!prepared_jump_target(op, target)) { continue; }
+        refill.targets.insert(target);
+        reaches_end = true;
+      }
+      if (reaches_end) { refill.shapes.push_back(loop_shapes_.at(end)); }
+    }
+    if (!refill.shapes.empty()) { jump_refills_.emplace(op.address, std::move(refill)); }
+  }
+}
+
+void Lowering::plan_short_body(const LoopShape &shape) {
+  for (unsigned i = 0; i < shape.length; ++i) {
+    const auto pc = (shape.start + i) & maximum_pc;
+    if (!addresses_.contains(pc)) { continue; }
+    const auto [site, inserted] = short_bodies_.try_emplace(pc, shape);
+    if (!inserted && shape.length < site->second.length) { site->second = shape; }
+  }
+  if (shape.length == loop_fetch_distance) {
+    short_successors_.insert((shape.end + 1) & maximum_pc);
+  }
+}
+
+void Lowering::plan_overlapping_loop_fetches(const LoopMap &shapes) {
+  for (const auto &[end, child] : shapes) {
+    if (!child.arithmetic() && !child.short_body()) { continue; }
+    // A given child appends the candidate fetches in refill clock order.
+    // Events for other children are gated by the active refill identity.
+    for (unsigned gap = 1; gap <= loop_fetch_distance; ++gap) {
+      const auto parent = shapes.find((end + gap) & maximum_pc);
+      if (parent == shapes.end()) { continue; }
+      if (!parent->second.short_body() && overlapping_short_tail(child, parent->second)) {
+        short_parents_[end].push_back(parent->second);
+      }
+      if (!overlapping_refill(child, parent->second)) { continue; }
+      const auto pc = (end - (gap == 1 ? 1U : 0U)) & maximum_pc;
+      if (!addresses_.contains(pc) && !addresses_.contains((pc + 1) & maximum_pc)) { continue; }
+      overlapping_fetches_[pc].push_back({.child_end = end, .parent = parent->second});
+      shifted_fetches_.insert(parent->first);
+    }
+  }
+}
+
+void Lowering::loop_push(Values &values, const Instruction &op, bool partial) {
+  auto *depth = builder_.CreateZExt(load(8, loop_address_depth_slot), builder_.getInt32Ty());
+  auto *counter_depth =
+      builder_.CreateZExt(load(8, loop_counter_depth_slot), builder_.getInt32Ty());
+  auto *pc_depth = values[pc_stack_depth_value];
+  const auto shape = loop_shape(op);
+  auto *room = builder_.CreateAnd(
+      builder_.CreateICmpULT(depth, builder_.getInt32(loop_stack_capacity)),
+      builder_.CreateICmpULT(pc_depth, builder_.getInt32(Registers::pc_stack_capacity)));
+  const auto parent = short_nested_.find(shape.end);
+  llvm::Value *parent_active = nullptr;
+  if (shape.short_body()) {
+    auto *left = short_word(short_remaining);
+    auto *available = builder_.CreateICmpEQ(left, builder_.getInt64(0));
+    if (parent != short_nested_.end()) {
+      parent_active = short_active(parent->second, left);
+      auto *free = builder_.CreateICmpEQ(short_word(short_parent_remaining), builder_.getInt64(0));
+      available = builder_.CreateOr(available, builder_.CreateAnd(parent_active, free));
+    }
+    room = builder_.CreateAnd(room, available);
+  }
+  stack_guard(values,
+              op,
+              builder_.CreateAnd(room, builder_.CreateICmpEQ(depth, counter_depth)),
+              partial,
+              NativeExit::unsupported_loop_stack);
+  if (parent_active != nullptr) {
+    suspend_short_parent(values, op, parent->second, shape.length + 1, parent_active);
+    depth = builder_.CreateZExt(load(8, loop_address_depth_slot), builder_.getInt32Ty());
+    pc_depth = values[pc_stack_depth_value];
+  }
+  auto *count = load(32, lcntr_slot);
+  if (op.type == counted_loop_type) {
+    if (register_count(op)) {
+      auto *raw = builder_.CreateExtractElement(read_register(values, count_register(op)),
+                                                builder_.getInt32(0));
+      count = builder_.CreateTrunc(builder_.CreateLShr(raw, builder_.getInt64(raw_extension_bits)),
+                                   builder_.getInt32Ty());
+    } else {
+      count = builder_.getInt32(static_cast<std::uint16_t>(op.word >> immediate_count_shift));
+    }
+    store(count, lcntr_slot);
+  }
+  if (shape.short_body()) { setup_short_loop(shape, count); }
+  builder_.CreateStore(builder_.getInt32(shape.address_word()),
+                       loop_cell(loop_address_slot, depth));
+  builder_.CreateStore(count, loop_cell(loop_counter_slot, depth));
+  auto *metadata = builder_.CreateOr(pc_depth, builder_.getInt32(loop_frame_live));
+  builder_.CreateStore(metadata, loop_cell(loop_frames_slot, depth));
+  auto *next_depth = builder_.CreateAdd(depth, builder_.getInt32(1));
+  auto *raw_depth = builder_.CreateTrunc(next_depth, builder_.getInt8Ty());
+  store(raw_depth, loop_address_depth_slot);
+  store(raw_depth, loop_counter_depth_slot);
+  push_pc(values, builder_.getInt32(shape.start));
+  loop_status(values, next_depth);
+}
+
+void Lowering::suspend_short_parent(Values &values,
+                                    const Instruction &op,
+                                    const LoopShape &parent,
+                                    unsigned words,
+                                    llvm::Value *active) {
+  auto next = node("short.child.enter");
+  auto *suspend = llvm::BasicBlock::Create(module_.getContext(), "short.parent.suspend", function_);
+  next.incoming(values, builder_.GetInsertBlock());
+  builder_.CreateCondBr(active, suspend, next.block);
+  builder_.SetInsertPoint(suspend);
+  auto *descriptor = short_word(short_descriptor);
+  auto *left = short_word(short_remaining);
+  if (parent.counted()) {
+    short_loop_counter(values, op.address, parent, descriptor);
+    left = builder_.CreateSub(left, builder_.getInt64(words));
+  }
+  if (parent.length == loop_fetch_distance) {
+    auto *startup = short_flag(descriptor, short_startup);
+    values[extra_cycles_value] = builder_.CreateAdd(
+        values[extra_cycles_value], builder_.CreateZExt(startup, builder_.getInt64Ty()));
+    auto *history = values[dag_history_value];
+    auto *older = builder_.CreateAnd(builder_.CreateShl(history, builder_.getInt32(8)),
+                                     builder_.getInt32(history_older_mask));
+    values[dag_history_value] = builder_.CreateSelect(startup, older, history);
+  }
+  write_short(short_parent_remaining, left);
+  write_short(short_parent_descriptor,
+              builder_.CreateAnd(descriptor, builder_.getInt64(~short_startup)));
+  jump(next, values);
+  builder_.SetInsertPoint(next.block);
+  values = next.values();
+}
+
+void Lowering::resume_short_parent(Values &values,
+                                   const LoopShape &child,
+                                   const LoopShape &parent,
+                                   llvm::Value *done) {
+  auto *left = short_word(short_parent_remaining);
+  auto *resume = llvm::BasicBlock::Create(module_.getContext(), "short.parent.resume", function_);
+  auto next = node("short.child.leave");
+  next.incoming(values, builder_.GetInsertBlock());
+  auto *ready = builder_.CreateICmpNE(left, builder_.getInt64(0));
+  if (done != nullptr) { ready = builder_.CreateAnd(ready, done); }
+  builder_.CreateCondBr(ready, resume, next.block);
+  builder_.SetInsertPoint(resume);
+  auto *descriptor = short_word(short_parent_descriptor);
+  if (parent.counted()) { short_loop_counter(values, child.end, parent, descriptor, true); }
+  write_short(short_remaining, left);
+  write_short(short_descriptor, descriptor);
+  write_short(short_parent_remaining, builder_.getInt64(0));
+  llvm::Value *progress = builder_.getInt64(0);
+  if (short_parents_.contains(child.end)) {
+    const auto gap = (parent.end - child.end) & maximum_pc;
+    progress = builder_.CreateBinaryIntrinsic(
+        llvm::Intrinsic::usub_sat, short_word(short_fetch_progress), builder_.getInt64(gap));
+  }
+  write_short(short_fetch_progress, progress);
+  jump(next, values);
+  builder_.SetInsertPoint(next.block);
+  values = next.values();
+}
+
+llvm::Value *Lowering::short_flag(llvm::Value *descriptor, std::uint64_t mask) {
+  return builder_.CreateICmpNE(builder_.CreateAnd(descriptor, builder_.getInt64(mask)),
+                               builder_.getInt64(0));
+}
+
+llvm::Value *Lowering::short_active(const LoopShape &shape, llvm::Value *left) {
+  auto *end = builder_.CreateAnd(short_word(short_descriptor), builder_.getInt64(maximum_pc));
+  return builder_.CreateAnd(builder_.CreateICmpNE(left, builder_.getInt64(0)),
+                            builder_.CreateICmpEQ(end, builder_.getInt64(shape.end)));
+}
+
+void Lowering::write_short_addresses(ShortLookahead addresses, llvm::Value *live) {
+  auto *packed = builder_.CreateOr(
+      builder_.CreateAnd(addresses.fetch, builder_.getInt64(maximum_pc)),
+      builder_.CreateShl(builder_.CreateAnd(addresses.decode, builder_.getInt64(maximum_pc)),
+                         builder_.getInt64(short_decode_shift)));
+  write_short(
+      short_addresses,
+      builder_.CreateSelect(live,
+                            builder_.CreateOr(packed, builder_.getInt64(short_addresses_live)),
+                            builder_.getInt64(0)));
+}
+
+void Lowering::setup_short_loop(const LoopShape &shape, llvm::Value *count) {
+  // The startup states hold or substitute prefetched words for the short bodies.
+  constexpr std::array fetch_offsets{0U, 1U, 1U, 3U};
+  constexpr std::array decode_offsets{0U, 1U, 2U, 1U};
+  const auto index = shape.length - 1;
+  llvm::Value *remaining = builder_.getInt64(short_unbounded);
+  llvm::Value *descriptor = builder_.getInt64(shape.end | short_startup);
+  if (shape.counted()) {
+    auto *zero = builder_.CreateICmpEQ(count, builder_.getInt32(0));
+    auto *iterations = builder_.CreateSelect(
+        zero, builder_.getInt64(unsigned_limit), builder_.CreateZExt(count, builder_.getInt64Ty()));
+    remaining = builder_.CreateMul(iterations, builder_.getInt64(shape.length));
+    auto *compact = builder_.CreateAnd(
+        builder_.CreateNot(zero),
+        builder_.CreateICmpULT(count, builder_.getInt32(shape.short_threshold())));
+    descriptor = builder_.CreateOr(descriptor,
+                                   builder_.CreateSelect(compact,
+                                                         builder_.getInt64(short_compact_count),
+                                                         builder_.getInt64(0)));
+  }
+  write_short(short_remaining, remaining);
+  write_short(short_descriptor, descriptor);
+  write_short(short_fetch_progress, builder_.getInt64(0));
+  write_short_addresses({.fetch = builder_.getInt64(shape.start + fetch_offsets[index]),
+                         .decode = builder_.getInt64(shape.start + decode_offsets[index])},
+                        builder_.getTrue());
+}
+
+void Lowering::short_loop_counter(Values &values,
+                                  std::uint32_t pc,
+                                  const LoopShape &shape,
+                                  llvm::Value *descriptor,
+                                  bool after_credit) {
+  const auto frame = active_loop(values, shape);
+  auto *startup = short_flag(descriptor, short_startup);
+  auto *compact = short_flag(descriptor, short_compact_count);
+  const auto second = (shape.start + 1) & maximum_pc;
+  if (shape.length == 3) { startup = builder_.CreateAnd(startup, builder_.CreateNot(compact)); }
+  // Once started, Fetch1 encounters the end when E executes (lengths 1/2/4),
+  // or when the second word executes (length 3). The startup can count a
+  // held end word before the ordinary rolling window is established.
+  const bool steady_fetch = pc == (shape.length == 3 ? second : shape.end);
+  auto *attempts = builder_.CreateAdd(builder_.getInt32(steady_fetch ? 1 : 0),
+                                      builder_.CreateZExt(startup, builder_.getInt32Ty()));
+  auto *consider = llvm::BasicBlock::Create(module_.getContext(), "short.fetch.end", function_);
+  auto next = node("short.fetch.continue");
+  next.incoming(values, builder_.GetInsertBlock());
+  builder_.CreateCondBr(
+      builder_.CreateAnd(frame.matches, builder_.CreateICmpNE(attempts, builder_.getInt32(0))),
+      consider,
+      next.block);
+  builder_.SetInsertPoint(consider);
+  auto *cell = loop_cell(loop_counter_slot, frame.index);
+  auto *current = builder_.CreateLoad(builder_.getInt32Ty(), cell);
+  auto *threshold = builder_.CreateSelect(
+      compact, builder_.getInt32(1), builder_.getInt32(shape.short_threshold()));
+  auto *terminate = builder_.CreateICmpULT(builder_.CreateSub(current, threshold), attempts);
+  auto *updated = builder_.CreateSelect(terminate,
+                                        builder_.CreateSub(threshold, builder_.getInt32(1)),
+                                        builder_.CreateSub(current, attempts));
+  builder_.CreateStore(updated, cell);
+  auto *pop = llvm::BasicBlock::Create(module_.getContext(), "short.fetch.pop", function_);
+  next.incoming(values, builder_.GetInsertBlock());
+  builder_.CreateCondBr(terminate, pop, next.block);
+  builder_.SetInsertPoint(pop);
+  loop_pop(values, frame);
+  if (lce_endpoints_.contains(shape.end)) {
+    llvm::Value *age = builder_.getInt64(1);
+    if (shape.length != 3 && !after_credit) {
+      // A held startup fetch ages through its entry bubble.
+      age = builder_.CreateAdd(age, builder_.CreateZExt(startup, builder_.getInt64Ty()));
+    }
+    save_counted_tail(shape, age, after_credit);
+  }
+  jump(next, values);
+  builder_.SetInsertPoint(next.block);
+  values = next.values();
+}
+
+llvm::Value *Lowering::short_exit_descriptor(llvm::Value *descriptor,
+                                             const Values &values,
+                                             llvm::Value *previous_depth) {
+  // A following CALL can be in Address when the sample pops the loop.
+  auto *popped = builder_.CreateICmpNE(previous_depth, values[pc_stack_depth_value]);
+  return builder_.CreateOr(
+      descriptor,
+      builder_.CreateSelect(popped, builder_.getInt64(short_call_exit), builder_.getInt64(0)));
+}
+
+llvm::Value *Lowering::short_words_after(llvm::Value *remaining, const LoopShape &shape) {
+  auto *left = builder_.CreateSub(remaining, builder_.getInt64(1));
+  if (shape.counted()) { return left; }
+  auto *unbounded = builder_.CreateICmpEQ(remaining, builder_.getInt64(short_unbounded));
+  return builder_.CreateSelect(unbounded, remaining, left);
+}
+
+llvm::Value *
+Lowering::short_loop_test(Values &values, const LoopShape &shape, ShortRetirement retirement) {
+  const auto [left, old_status] = retirement;
+  auto *unbounded = builder_.CreateICmpEQ(left, builder_.getInt64(short_unbounded));
+  auto before = values;
+  before[status_value] = old_status;
+  auto *satisfied = branch_taken(condition(before, shape.term));
+  if (shape.length == 1) {
+    // The single-word loop samples on the startup bubble as well.
+    auto *startup = short_flag(short_word(short_descriptor), short_startup);
+    satisfied = builder_.CreateOr(
+        satisfied, builder_.CreateAnd(startup, branch_taken(condition(values, shape.term))));
+  }
+  const auto frame = active_loop(values, shape);
+  auto *done = builder_.CreateAnd(builder_.CreateAnd(frame.matches, unbounded), satisfied);
+  auto *pop = llvm::BasicBlock::Create(module_.getContext(), "short.condition.pop", function_);
+  auto next = node("short.condition.continue");
+  next.incoming(values, builder_.GetInsertBlock());
+  builder_.CreateCondBr(done, pop, next.block);
+  builder_.SetInsertPoint(pop);
+  loop_pop(values, frame);
+  jump(next, values);
+  builder_.SetInsertPoint(next.block);
+  values = next.values();
+  // The sample commits the rest of this pass and the documented extra passes.
+  const auto current_suffix = (shape.end - shape.condition_pc()) & maximum_pc;
+  return builder_.CreateSelect(
+      done, builder_.getInt64(current_suffix + shape.short_condition_tail()), left);
+}
+
+llvm::Value *
+Lowering::short_stage(const LoopShape &shape, std::uint32_t pc, llvm::Value *left, unsigned lag) {
+  const auto position = (pc - shape.start + 1) & maximum_pc;
+  const auto body_pc = shape.start + ((position + lag) % shape.length);
+  auto *following = builder_.CreateSub(builder_.getInt64(shape.end + 1 + lag), left);
+  return builder_.CreateSelect(
+      builder_.CreateICmpUGT(left, builder_.getInt64(lag)), builder_.getInt64(body_pc), following);
+}
+
+Lowering::ShortLookahead Lowering::short_lookahead(std::uint32_t pc,
+                                                   const LoopShape &shape,
+                                                   llvm::Value *left,
+                                                   bool saved_parent) {
+  if (!shape.counted()) {
+    auto *repeat = builder_.getInt64(short_unbounded);
+    auto *fetch = short_stage(shape, pc, repeat, loop_fetch_distance);
+    auto *decode = short_stage(shape, pc, repeat, loop_decode_distance);
+    auto *redirect = builder_.CreateICmpULE(left, builder_.getInt64(loop_decode_distance));
+    fetch =
+        builder_.CreateSelect(redirect, short_stage(shape, pc, left, loop_decode_distance), fetch);
+    return {.fetch = fetch, .decode = decode};
+  }
+  auto *descriptor = short_word(saved_parent ? short_parent_descriptor : short_descriptor);
+  auto *fetch = short_stage(shape, pc, left, loop_fetch_distance);
+  auto *decode =
+      short_stage(shape, pc, left, shape.length == loop_fetch_distance ? 1U : loop_decode_distance);
+  auto *startup = short_flag(descriptor, short_startup);
+  auto *compact = short_flag(descriptor, short_compact_count);
+  if (shape.length == 1) {
+    auto *last = builder_.CreateICmpEQ(left, builder_.getInt64(1));
+    auto *compact_fetch = builder_.CreateSelect(
+        last, builder_.getInt64(shape.end + 1), builder_.getInt64(shape.start));
+    fetch = builder_.CreateSelect(compact, compact_fetch, fetch);
+    // A suppressed decode still names the held short-loop instruction.
+    decode = builder_.CreateSelect(compact, builder_.getInt64(shape.start), decode);
+  } else if (shape.length == 2) {
+    auto *compact_fill = builder_.CreateAnd(startup, compact);
+    decode = builder_.CreateSelect(compact_fill, builder_.getInt64(shape.end), decode);
+    fetch = builder_.CreateSelect(compact_fill, builder_.getInt64(shape.end + 2), fetch);
+  } else if (shape.length == 3) {
+    auto *compact_fetch = builder_.CreateSelect(
+        startup, builder_.getInt64(shape.end), builder_.getInt64(shape.end + 1));
+    fetch = builder_.CreateSelect(compact, compact_fetch, fetch);
+    decode = builder_.CreateSelect(compact, builder_.getInt64(shape.end), decode);
+  }
+  return {.fetch = fetch, .decode = decode};
+}
+
+void Lowering::short_loop_observation(Values &values,
+                                      const Instruction &op,
+                                      const LoopShape &shape,
+                                      ShortRetirement retirement) {
+  observe_short_fetches(
+      values, shape, short_lookahead(op.address, shape, retirement.left), retirement, false);
+}
+
+void Lowering::observe_short_fetches(Values &values,
+                                     const LoopShape &shape,
+                                     ShortLookahead stages,
+                                     ShortRetirement retirement,
+                                     bool after_credit) {
+  const auto [left, old_status] = retirement;
+  auto *live = builder_.CreateICmpNE(left, builder_.getInt64(0));
+  const bool has_ancestors = short_parents_.contains(shape.end);
+  if (has_ancestors) {
+    stages.fetch = builder_.CreateSelect(
+        live, stages.fetch, builder_.getInt64(shape.end + 1 + loop_fetch_distance));
+  }
+  const auto parent = short_nested_.find(shape.end);
+  if (parent != short_nested_.end()) {
+    auto *saved = builder_.CreateICmpNE(short_word(short_parent_remaining), builder_.getInt64(0));
+    auto *resumes = builder_.CreateAnd(builder_.CreateNot(live), saved);
+    stages = project_short_parent(stages, shape, parent->second, resumes);
+    live = builder_.CreateOr(live, resumes);
+  }
+  if (has_ancestors) {
+    stages = overlapping_short_fetches(values, shape, stages, old_status, after_credit);
+  }
+  if (shape.length == loop_fetch_distance) { live = builder_.getTrue(); }
+  write_short_addresses(stages, live);
+}
+
+Lowering::ShortLookahead Lowering::project_short_parent(ShortLookahead stages,
+                                                        const LoopShape &child,
+                                                        const LoopShape &parent,
+                                                        llvm::Value *resumes) {
+  const auto gap = (parent.end - child.end) & maximum_pc;
+  auto *left = short_word(short_parent_remaining);
+  auto *distance =
+      builder_.CreateAnd(builder_.CreateSub(stages.fetch, builder_.getInt64(child.end)),
+                         builder_.getInt64(maximum_pc));
+  auto *wrap = builder_.CreateAnd(builder_.CreateICmpUGT(left, builder_.getInt64(gap)),
+                                  builder_.CreateICmpUGT(distance, builder_.getInt64(gap)));
+  wrap = builder_.CreateAnd(
+      wrap, builder_.CreateICmpULE(distance, builder_.getInt64(loop_fetch_distance + 1)));
+  const auto address_at = [&](llvm::Value *step) {
+    auto *offset = builder_.CreateAdd(step, builder_.getInt64(parent.length - gap));
+    auto *body = builder_.CreateAdd(builder_.getInt64(parent.start),
+                                    builder_.CreateURem(offset, builder_.getInt64(parent.length)));
+    auto *outside =
+        builder_.CreateSub(builder_.CreateAdd(builder_.getInt64(parent.end + 1), step), left);
+    return builder_.CreateSelect(builder_.CreateICmpULT(step, left), body, outside);
+  };
+  auto *index = builder_.CreateSub(distance, builder_.getInt64(1));
+  auto *decode = builder_.CreateAnd(
+      wrap, builder_.CreateICmpUGT(distance, builder_.getInt64(gap + loop_decode_distance)));
+  auto *fetch = builder_.CreateSelect(wrap, address_at(index), stages.fetch);
+  auto *decoded = builder_.CreateSelect(
+      decode,
+      address_at(builder_.CreateSub(index, builder_.getInt64(loop_decode_distance))),
+      stages.decode);
+  // At the handoff the restored buffer owns both visible addresses.
+  const auto restored = short_lookahead(child.end, parent, left, true);
+  const auto lag = parent.length == loop_fetch_distance ? 3U : loop_decode_distance;
+  return {.fetch = builder_.CreateSelect(resumes, restored.fetch, fetch),
+          .decode = builder_.CreateSelect(resumes, restored.decode, decoded),
+          .decode_lag = builder_.CreateSelect(
+              resumes, builder_.getInt64(lag), builder_.getInt64(loop_decode_distance))};
+}
+
+llvm::Value *Lowering::short_fetch_crossed(ShortFetchWindow window, unsigned offset) {
+  auto *limit = builder_.getInt64(offset);
+  return builder_.CreateAnd(builder_.CreateICmpULE(window.before, limit),
+                            builder_.CreateICmpUGT(window.after, limit));
+}
+
+Lowering::ShortLookahead Lowering::redirect_short_parent(ShortLookahead stages,
+                                                         const LoopShape &child,
+                                                         const LoopShape &parent,
+                                                         ShortFetchWindow window,
+                                                         llvm::Value *selected) {
+  const auto gap = (parent.end - child.end) & maximum_pc;
+  auto *delta = builder_.CreateSub(window.after, builder_.getInt64(gap));
+  auto *fetch = builder_.CreateAdd(builder_.getInt64(parent.start - 1), delta);
+  if (parent.arithmetic()) {
+    auto *terminating = refill_at(load(64, loop_refill_slot), parent.end);
+    auto *following =
+        builder_.CreateAdd(builder_.getInt64(parent.end - loop_decode_distance), delta);
+    fetch = builder_.CreateSelect(terminating, following, fetch);
+  }
+  auto *decoder_redirected =
+      builder_.CreateAnd(selected, builder_.CreateICmpUGT(delta, window.decode_lag));
+  auto *decode = builder_.CreateSub(builder_.CreateAdd(builder_.getInt64(parent.start - 1), delta),
+                                    window.decode_lag);
+  return {.fetch = builder_.CreateSelect(selected, fetch, stages.fetch),
+          .decode = builder_.CreateSelect(decoder_redirected, decode, stages.decode)};
+}
+
+Lowering::ShortLookahead Lowering::overlapping_short_fetches(Values &values,
+                                                             const LoopShape &shape,
+                                                             ShortLookahead stages,
+                                                             llvm::Value *old_status,
+                                                             bool after_credit) {
+  auto *distance =
+      builder_.CreateAnd(builder_.CreateSub(stages.fetch, builder_.getInt64(shape.end)),
+                         builder_.getInt64(maximum_pc));
+  auto *linear = builder_.CreateICmpULE(distance, builder_.getInt64(loop_fetch_distance + 1));
+  auto *lag = stages.decode_lag;
+  if (lag == nullptr) {
+    lag = builder_.getInt64(shape.length == loop_fetch_distance ? 3U : loop_decode_distance);
+  }
+  const ShortFetchWindow window{.before = short_word(short_fetch_progress),
+                                .after =
+                                    builder_.CreateSelect(linear, distance, builder_.getInt64(0)),
+                                .old_status = old_status,
+                                .decode_lag = lag};
+  write_short(short_fetch_progress, window.after);
+  llvm::Value *redirected = builder_.getFalse();
+  for (const auto &parent : short_parents_.at(shape.end)) {
+    const auto gap = (parent.end - shape.end) & maximum_pc;
+    auto *reachable = builder_.CreateNot(redirected);
+    llvm::Value *age = nullptr;
+    if (lce_endpoints_.contains(parent.end)) {
+      // The remaining linear fetches are clocks after this sample, including
+      // clocks inside a held or draining short instruction.
+      auto *after_sample = builder_.CreateSub(window.after, builder_.getInt64(gap));
+      age = builder_.CreateBinaryIntrinsic(
+          llvm::Intrinsic::umin, after_sample, builder_.getInt64(lce_branch_age));
+    }
+    loop_fetch(values,
+               parent,
+               builder_.CreateAnd(reachable, short_fetch_crossed(window, gap)),
+               after_credit,
+               age);
+    const auto frame = active_loop(values, parent);
+    auto *repeat = builder_.CreateAnd(frame.matches, repeat_scheduled(frame));
+    llvm::Value *selection = repeat;
+    if (parent.arithmetic()) {
+      const auto sample = gap + loop_decode_distance;
+      auto *at_execute = builder_.CreateICmpEQ(window.before, builder_.getInt64(sample));
+      auto *status = builder_.CreateSelect(at_execute, window.old_status, values[status_value]);
+      auto *sampled = builder_.CreateAnd(builder_.CreateAnd(reachable, repeat),
+                                         short_fetch_crossed(window, sample));
+      loop_test(values, status, parent, sampled);
+      selection = builder_.CreateOr(repeat, refill_at(load(64, loop_refill_slot), parent.end));
+    }
+    auto *selected =
+        builder_.CreateAnd(builder_.CreateAnd(reachable, selection),
+                           builder_.CreateICmpUGT(window.after, builder_.getInt64(gap)));
+    stages = redirect_short_parent(stages, shape, parent, window, selected);
+    redirected = builder_.CreateOr(redirected, selected);
+  }
+  return stages;
+}
+
+llvm::Value *Lowering::short_loop_refill(const LoopShape &shape, llvm::Value *done) {
+  auto *descriptor = short_word(short_descriptor);
+  llvm::Value *refill = builder_.getInt64(0);
+  if (shape.counted()) {
+    auto *compact = short_flag(descriptor, short_compact_count);
+    refill = builder_.CreateSelect(builder_.CreateAnd(compact, done),
+                                   builder_.getInt64(shape.length == 2 ? 2 : 3),
+                                   builder_.getInt64(0));
+  } else if (shape.arithmetic()) {
+    refill =
+        builder_.CreateSelect(done, builder_.getInt64(loop_decode_distance), builder_.getInt64(0));
+  }
+  if (shape.length == 3) { return refill; }
+  auto *startup = short_flag(descriptor, short_startup);
+  return builder_.CreateAdd(refill, builder_.CreateZExt(startup, builder_.getInt64Ty()));
+}
+
+void Lowering::short_loop_retirement(Values values,
+                                     const Instruction &op,
+                                     const LoopShape &shape,
+                                     llvm::Value *old_status,
+                                     bool partial) {
+  auto *remaining = short_word(short_remaining);
+  auto *descriptor = short_word(short_descriptor);
+  auto *active = short_active(shape, remaining);
+  auto *advance = llvm::BasicBlock::Create(module_.getContext(), "short.retire", function_);
+  auto *ordinary = llvm::BasicBlock::Create(module_.getContext(), "short.inactive", function_);
+  builder_.CreateCondBr(active, advance, ordinary);
+  builder_.SetInsertPoint(advance);
+  auto *depth = values[pc_stack_depth_value];
+  auto *next_descriptor =
+      builder_.CreateAnd(descriptor, builder_.getInt64(~(short_startup | short_call_exit)));
+  auto *left = short_words_after(remaining, shape);
+  const bool arithmetic_sample = shape.arithmetic() && op.address == shape.condition_pc();
+  if (shape.counted()) {
+    short_loop_counter(values, op.address, shape, descriptor);
+  } else if (arithmetic_sample) {
+    left = short_loop_test(values, shape, {.left = left, .old_status = old_status});
+  }
+  const bool counted_tag = shape.counted() && shape.length == 3 && next_pc(op) == shape.end;
+  const auto following = op.address == shape.end ? shape.start : next_pc(op);
+  if ((counted_tag || arithmetic_sample) && reentry_calls_.contains(following)) {
+    next_descriptor = short_exit_descriptor(next_descriptor, values, depth);
+  }
+  auto *done = builder_.CreateICmpEQ(left, builder_.getInt64(0));
+  auto *refill = short_loop_refill(shape, done);
+  auto *stalled = builder_.CreateICmpNE(refill, builder_.getInt64(0));
+  values[hazard_value] = builder_.CreateAnd(values[hazard_value], builder_.CreateNot(stalled));
+  auto *older =
+      builder_.CreateAnd(builder_.CreateShl(values[dag_history_value], builder_.getInt32(8)),
+                         builder_.getInt32(history_older_mask));
+  values[dag_history_value] = builder_.CreateSelect(
+      stalled,
+      builder_.CreateSelect(
+          builder_.CreateICmpEQ(refill, builder_.getInt64(1)), older, builder_.getInt32(0)),
+      values[dag_history_value]);
+  auto *cycles = builder_.CreateAdd(builder_.CreateAdd(builder_.getInt64(1), refill),
+                                    values[extra_cycles_value]);
+  auto *before_fetch = values[pc_stack_depth_value];
+  short_loop_observation(values, op, shape, {.left = left, .old_status = old_status});
+  const bool overlapping = short_parents_.contains(shape.end);
+  if (overlapping && reentry_calls_.contains(following)) {
+    next_descriptor = short_exit_descriptor(next_descriptor, values, before_fetch);
+  }
+  credit(values, builder_.getInt64(1), cycles, partial);
+  write_short(short_remaining, left);
+  write_short(short_descriptor, next_descriptor);
+  if (op.address == shape.end) {
+    if (lce_endpoints_.contains(shape.end)) { clear_counted_tail(shape, done); }
+    auto *repeat = llvm::BasicBlock::Create(module_.getContext(), "short.repeat", function_);
+    auto *finished = llvm::BasicBlock::Create(module_.getContext(), "short.finished", function_);
+    builder_.CreateCondBr(done, finished, repeat);
+    builder_.SetInsertPoint(repeat);
+    finish(values, shape.start, partial);
+    builder_.SetInsertPoint(finished);
+    if (const auto parent = short_nested_.find(shape.end); parent != short_nested_.end()) {
+      resume_short_parent(values, shape, parent->second);
+      if (reentry_calls_.contains(next_pc(op))) {
+        write_short(short_descriptor,
+                    short_exit_descriptor(short_word(short_descriptor), values, before_fetch));
+      }
+    }
+  }
+  finish(values, next_pc(op), partial);
+  builder_.SetInsertPoint(ordinary);
+}
+
+void Lowering::loop_status(Values &values, llvm::Value *depth) {
+  constexpr auto empty_mask = 1U << 26;
+  auto *sticky = builder_.CreateExtractElement(values[sticky_value], builder_.getInt32(0));
+  sticky = builder_.CreateAnd(sticky, builder_.getInt32(~empty_mask));
+  sticky =
+      builder_.CreateOr(sticky,
+                        builder_.CreateSelect(builder_.CreateICmpEQ(depth, builder_.getInt32(0)),
+                                              builder_.getInt32(empty_mask),
+                                              builder_.getInt32(0)));
+  values[sticky_value] =
+      builder_.CreateInsertElement(values[sticky_value], sticky, builder_.getInt32(0));
+}
+
+LoopFrame Lowering::active_loop(const Values &values, const LoopShape &shape) {
+  auto *depth = builder_.CreateZExt(load(8, loop_address_depth_slot), builder_.getInt32Ty());
+  auto *occupied =
+      builder_.CreateAnd(builder_.CreateICmpNE(depth, builder_.getInt32(0)),
+                         builder_.CreateICmpULE(depth, builder_.getInt32(loop_stack_capacity)));
+  auto *index = builder_.CreateSelect(
+      occupied, builder_.CreateSub(depth, builder_.getInt32(1)), builder_.getInt32(0));
+  auto *metadata = builder_.CreateLoad(builder_.getInt32Ty(), loop_cell(loop_frames_slot, index));
+  auto *address = builder_.CreateLoad(builder_.getInt32Ty(), loop_cell(loop_address_slot, index));
+  auto *pc_index = builder_.CreateAnd(metadata, builder_.getInt32(loop_pc_index_mask));
+  auto *pc = builder_.CreateLoad(builder_.getInt32Ty(), stack_cell(pc_index));
+  auto *live = builder_.CreateICmpNE(
+      builder_.CreateAnd(metadata, builder_.getInt32(loop_frame_live)), builder_.getInt32(0));
+  auto *pc_depth = builder_.CreateAdd(pc_index, builder_.getInt32(1));
+  auto *matches =
+      builder_.CreateAnd(builder_.CreateICmpEQ(address, builder_.getInt32(shape.address_word())),
+                         builder_.CreateICmpEQ(pc, builder_.getInt32(shape.start)));
+  matches =
+      builder_.CreateAnd(matches, builder_.CreateICmpEQ(pc_depth, values[pc_stack_depth_value]));
+  return {.index = index,
+          .metadata = metadata,
+          .matches = builder_.CreateAnd(matches, builder_.CreateAnd(occupied, live))};
+}
+
+void Lowering::loop_pop(Values &values, const LoopFrame &frame) {
+  auto *depth = builder_.CreateTrunc(frame.index, builder_.getInt8Ty());
+  store(depth, loop_address_depth_slot);
+  store(depth, loop_counter_depth_slot);
+  builder_.CreateStore(builder_.getInt32(0), loop_cell(loop_frames_slot, frame.index));
+  values[pc_stack_depth_value] =
+      builder_.CreateSub(values[pc_stack_depth_value], builder_.getInt32(1));
+  stack_status(values);
+  loop_status(values, frame.index);
+}
+
+std::size_t Lowering::counted_tail_slot_for(const LoopShape &shape) const {
+  if (shape.short_body()) {
+    return short_parent_tails_.contains(shape.end) ? short_parent_tail_slot
+                                                   : short_counted_tail_slot;
+  }
+  const auto index = long_tail_indices_.find(shape.end);
+  return counted_tail_slot + (index == long_tail_indices_.end() ? 0 : index->second);
+}
+
+std::uint64_t Lowering::counted_tail_word(const LoopShape &shape) const {
+  const auto index = shape.short_body() ? 0 : counted_tail_slot_for(shape) - counted_tail_slot;
+  return counted_loop_tail | (std::uint64_t{index} << counted_tail_index_shift) |
+         (std::uint64_t{shape.end} << loop_refill_end_shift) | shape.start;
+}
+
+llvm::Value *Lowering::counted_tail_matches(const LoopShape &shape) {
+  if (!shape.counted()) { return builder_.getFalse(); }
+  auto *saved = load(64, counted_tail_slot_for(shape));
+  if (lce_endpoints_.contains(shape.end)) {
+    saved = builder_.CreateAnd(saved, builder_.getInt64(~lce_clock_mask));
+  }
+  return builder_.CreateICmpEQ(saved, builder_.getInt64(counted_tail_word(shape)));
+}
+
+void Lowering::save_counted_tail(const LoopShape &shape, llvm::Value *age, bool returning) {
+  const bool tracked = lce_endpoints_.contains(shape.end);
+  const auto marker = tracked && !returning ? lce_before_credit : 0;
+  llvm::Value *tail = builder_.getInt64(counted_tail_word(shape) | marker);
+  if (tracked) {
+    tail = builder_.CreateOr(tail, builder_.CreateShl(age, builder_.getInt64(lce_age_shift)));
+  }
+  store(tail, counted_tail_slot_for(shape));
+}
+
+void Lowering::clear_counted_tail(const LoopShape &shape, llvm::Value *enabled) {
+  auto *clear = counted_tail_matches(shape);
+  if (enabled != nullptr) { clear = builder_.CreateAnd(clear, enabled); }
+  const auto slot = counted_tail_slot_for(shape);
+  store(builder_.CreateSelect(clear, builder_.getInt64(0), load(64, slot)), slot);
+}
+
+llvm::Value *Lowering::abort_target_in_parent(llvm::Value *target,
+                                              const Values &values,
+                                              llvm::Value *already_exited) {
+  auto *remove = builder_.CreateZExt(builder_.CreateNot(already_exited), builder_.getInt32Ty());
+  auto *depth = builder_.CreateSub(
+      builder_.CreateZExt(load(8, loop_address_depth_slot), builder_.getInt32Ty()), remove);
+  auto *occupied =
+      builder_.CreateAnd(builder_.CreateICmpNE(depth, builder_.getInt32(0)),
+                         builder_.CreateICmpULE(depth, builder_.getInt32(loop_stack_capacity)));
+  auto *index = builder_.CreateSelect(
+      occupied, builder_.CreateSub(depth, builder_.getInt32(1)), builder_.getInt32(0));
+  auto *metadata = builder_.CreateLoad(builder_.getInt32Ty(), loop_cell(loop_frames_slot, index));
+  auto *parent_pc_slot = builder_.CreateAnd(metadata, builder_.getInt32(loop_pc_index_mask));
+  auto *parent_pc_depth = builder_.CreateAdd(parent_pc_slot, builder_.getInt32(1));
+  auto *remaining_pc_depth = builder_.CreateSub(values[pc_stack_depth_value], remove);
+  // A hardware loop in a caller is suspended behind a CALL stack slot.
+  auto *same_scope = builder_.CreateICmpEQ(parent_pc_depth, remaining_pc_depth);
+  auto *live = builder_.CreateICmpNE(
+      builder_.CreateAnd(metadata, builder_.getInt32(loop_frame_live)), builder_.getInt32(0));
+  auto *parent = builder_.CreateAnd(occupied, builder_.CreateAnd(same_scope, live));
+  auto *start = builder_.CreateLoad(builder_.getInt32Ty(), stack_cell(parent_pc_slot));
+  auto *end = builder_.CreateLoad(builder_.getInt32Ty(), loop_cell(loop_address_slot, index));
+  auto *mask = builder_.getInt32(maximum_pc);
+  auto *offset = builder_.CreateAnd(builder_.CreateSub(target, start), mask);
+  auto *last = builder_.CreateAnd(builder_.CreateSub(end, start), mask);
+  auto *term =
+      builder_.CreateAnd(builder_.CreateLShr(end, builder_.getInt32(immediate_count_shift)),
+                         builder_.getInt32(true_condition));
+  auto *arithmetic =
+      builder_.CreateAnd(builder_.CreateICmpNE(term, builder_.getInt32(loop_counter_expired)),
+                         builder_.CreateICmpNE(term, builder_.getInt32(true_condition)));
+  // A nested LA cannot skip to the endpoint of an arithmetic parent.
+  auto *within = builder_.CreateOr(
+      builder_.CreateICmpULT(offset, last),
+      builder_.CreateAnd(builder_.CreateNot(arithmetic), builder_.CreateICmpEQ(offset, last)));
+  return builder_.CreateOr(builder_.CreateNot(parent), within);
+}
+
+void Lowering::guard_loop_abort(const Values &values,
+                                const Instruction &op,
+                                llvm::Value *lanes,
+                                bool partial) {
+  const auto &shape = aborts_.at(op.address);
+  const auto frame = active_loop(values, shape);
+  auto *already_exited = counted_tail_matches(shape);
+  auto *target = jump_target(values, op);
+  auto *offset = builder_.CreateAnd(builder_.CreateSub(target, builder_.getInt32(shape.start)),
+                                    builder_.getInt32(maximum_pc));
+  auto *outside = builder_.CreateICmpUGE(offset, builder_.getInt32(shape.length));
+  auto *one_level =
+      builder_.CreateAnd(outside, abort_target_in_parent(target, values, already_exited));
+  auto *stack_matches =
+      builder_.CreateICmpEQ(load(8, loop_address_depth_slot), load(8, loop_counter_depth_slot));
+  auto *owned = builder_.CreateAnd(stack_matches, builder_.CreateOr(frame.matches, already_exited));
+  auto *allowed = builder_.CreateOr(builder_.CreateNot(branch_taken(lanes)),
+                                    builder_.CreateAnd(owned, one_level));
+  stack_guard(values, op, allowed, partial, NativeExit::invalid_loop_abort);
+}
+
+void Lowering::retire_loop_abort(Values &values, const LoopShape &shape) {
+  const auto frame = active_loop(values, shape);
+  auto *pop = llvm::BasicBlock::Create(module_.getContext(), "loop.abort.pop", function_);
+  auto next = node("loop.abort.continue");
+  next.incoming(values, builder_.GetInsertBlock());
+  builder_.CreateCondBr(frame.matches, pop, next.block);
+  builder_.SetInsertPoint(pop);
+  loop_pop(values, frame);
+  jump(next, values);
+  builder_.SetInsertPoint(next.block);
+  values = next.values();
+  if (shape.counted()) {
+    // If the count already popped this loop, consume its tail without
+    // popping the parent or applying the discarded loop's redirect.
+    clear_counted_tail(shape);
+  }
+}
+
+void Lowering::loop_fetch(Values &values,
+                          const LoopShape &shape,
+                          llvm::Value *enabled,
+                          bool returning,
+                          llvm::Value *age) {
+  const auto frame = active_loop(values, shape);
+  auto *pending = builder_.CreateAnd(frame.metadata, builder_.getInt32(loop_repeat_scheduled));
+  auto *consider = llvm::BasicBlock::Create(module_.getContext(), "loop.fetch.end", function_);
+  auto continuation = node("loop.fetch.continue");
+  continuation.incoming(values, builder_.GetInsertBlock());
+  builder_.CreateCondBr(
+      builder_.CreateAnd(
+          enabled,
+          builder_.CreateAnd(frame.matches, builder_.CreateICmpEQ(pending, builder_.getInt32(0)))),
+      consider,
+      continuation.block);
+  builder_.SetInsertPoint(consider);
+  if (shape.counted()) {
+    auto *cell = loop_cell(loop_counter_slot, frame.index);
+    auto *count = builder_.CreateLoad(builder_.getInt32Ty(), cell);
+    auto *remaining = builder_.CreateSub(count, builder_.getInt32(1));
+    builder_.CreateStore(remaining, cell);
+    auto *repeat = llvm::BasicBlock::Create(module_.getContext(), "loop.fetch.repeat", function_);
+    auto *terminate = llvm::BasicBlock::Create(module_.getContext(), "loop.fetch.exit", function_);
+    builder_.CreateCondBr(
+        builder_.CreateICmpEQ(remaining, builder_.getInt32(0)), terminate, repeat);
+    builder_.SetInsertPoint(terminate);
+    auto popped = values;
+    loop_pop(popped, frame);
+    if (shape.has_reentry || shape.has_tail_abort || lce_endpoints_.contains(shape.end)) {
+      save_counted_tail(shape, age != nullptr ? age : builder_.getInt64(1), returning);
+    }
+    jump(continuation, popped);
+    builder_.SetInsertPoint(repeat);
+  }
+  auto *scheduled = builder_.CreateOr(frame.metadata, builder_.getInt32(loop_repeat_scheduled));
+  builder_.CreateStore(scheduled, loop_cell(loop_frames_slot, frame.index));
+  jump(continuation, values);
+  builder_.SetInsertPoint(continuation.block);
+  values = continuation.values();
+}
+
+void Lowering::loop_test(Values &values,
+                         llvm::Value *old_status,
+                         const LoopShape &shape,
+                         llvm::Value *enabled) {
+  const auto frame = active_loop(values, shape);
+  auto before = values;
+  before[status_value] = old_status;
+  auto *done = branch_taken(condition(before, shape.term));
+  auto *leave = llvm::BasicBlock::Create(module_.getContext(), "loop.condition.exit", function_);
+  auto next = node("loop.condition.continue");
+  next.incoming(values, builder_.GetInsertBlock());
+  builder_.CreateCondBr(
+      builder_.CreateAnd(enabled, builder_.CreateAnd(frame.matches, done)), leave, next.block);
+  builder_.SetInsertPoint(leave);
+  auto popped = values;
+  loop_pop(popped, frame);
+  const auto refill =
+      loop_refill_live | (std::uint64_t{shape.end} << loop_refill_end_shift) | shape.start;
+  store(builder_.getInt64(refill), loop_refill_slot);
+  jump(next, popped);
+  builder_.SetInsertPoint(next.block);
+  values = next.values();
+}
+
+llvm::Value *Lowering::jump_fetch(Values &values,
+                                  llvm::Value *target,
+                                  const Instruction &op,
+                                  llvm::Value *fetch,
+                                  JumpFetch position) {
+  const auto &refill = jump_refills_.at(op.address);
+  llvm::Value *declared = builder_.getTrue();
+  if (indirect_branch(op)) {
+    declared = builder_.getFalse();
+    for (const auto entry : refill.targets) {
+      declared =
+          builder_.CreateOr(declared, builder_.CreateICmpEQ(target, builder_.getInt32(entry)));
+    }
+  }
+  auto *mask = builder_.getInt32(maximum_pc);
+  auto *next = builder_.CreateAnd(builder_.CreateAdd(fetch, builder_.getInt32(1)), mask);
+  const auto age = std::min(position.clocks_retired - position.clock, lce_branch_age);
+  for (const auto &shape : refill.shapes) {
+    // All positions use the address present at the start of this clock. A
+    // backedge or a cancelled speculative backedge changes the next fetch.
+    auto *at_end =
+        builder_.CreateAnd(declared, builder_.CreateICmpEQ(fetch, builder_.getInt32(shape.end)));
+    loop_fetch(values, shape, at_end, true, builder_.getInt64(age));
+    const auto frame = active_loop(values, shape);
+    auto *scheduled = builder_.CreateAnd(frame.matches, repeat_scheduled(frame));
+    next = builder_.CreateSelect(
+        builder_.CreateAnd(at_end, scheduled), builder_.getInt32(shape.start), next);
+    if (!shape.arithmetic() || position.clock < loop_decode_distance) { continue; }
+    const auto offset = position.clock - loop_decode_distance;
+    const auto reached_end = (shape.end - offset) & maximum_pc;
+    auto *tests =
+        builder_.CreateAnd(declared, builder_.CreateICmpEQ(target, builder_.getInt32(reached_end)));
+    tests = builder_.CreateAnd(
+        tests, builder_.CreateICmpEQ(fetch, builder_.getInt32((shape.start + 1) & maximum_pc)));
+    tests = builder_.CreateAnd(tests, scheduled);
+    loop_test(values, position.status, shape, tests);
+    auto *exited = builder_.CreateAnd(tests, refill_at(load(64, loop_refill_slot), shape.end));
+    next = builder_.CreateSelect(exited, builder_.getInt32((shape.end + 1) & maximum_pc), next);
+  }
+  return next;
+}
+
+void Lowering::loop_refill(Values &values, const Instruction &op) {
+  auto *pending = load(64, loop_refill_slot);
+  auto *end =
+      builder_.CreateAnd(builder_.CreateLShr(pending, builder_.getInt64(loop_refill_end_shift)),
+                         builder_.getInt64(maximum_pc));
+  auto *active = builder_.CreateICmpNE(
+      builder_.CreateAnd(pending, builder_.getInt64(loop_refill_live)), builder_.getInt64(0));
+  auto *at_end = builder_.CreateICmpEQ(end, builder_.getInt64(op.address));
+  auto *here = builder_.CreateAnd(active, at_end);
+  store(builder_.CreateSelect(at_end, builder_.getInt64(0), pending), loop_refill_slot);
+  values[extra_cycles_value] = builder_.CreateAdd(
+      values[extra_cycles_value],
+      builder_.CreateSelect(here, builder_.getInt64(loop_decode_distance), builder_.getInt64(0)));
+  values[hazard_value] = builder_.CreateAnd(values[hazard_value], builder_.CreateNot(here));
+  values[dag_history_value] =
+      builder_.CreateSelect(here, builder_.getInt32(0), values[dag_history_value]);
+}
+
+void Lowering::check_loop_end(const Values &values, const Instruction &op, bool partial) {
+  const auto shape = hardware_ends_.find(op.address);
+  if (shape == hardware_ends_.end()) { return; }
+  const auto frame = active_loop(values, shape->second);
+  auto *known = builder_.CreateOr(builder_.CreateNot(frame.matches), repeat_scheduled(frame));
+  stack_guard(values, op, known, partial, NativeExit::unsupported_loop_stack);
+}
+
+llvm::Value *Lowering::repeat_scheduled(const LoopFrame &frame) {
+  auto *pending = builder_.CreateAnd(frame.metadata, builder_.getInt32(loop_repeat_scheduled));
+  return builder_.CreateICmpNE(pending, builder_.getInt32(0));
+}
+
+void Lowering::clear_loop_repeat(const LoopFrame &frame) {
+  auto *metadata = builder_.CreateAnd(frame.metadata, builder_.getInt32(~loop_repeat_scheduled));
+  builder_.CreateStore(metadata, loop_cell(loop_frames_slot, frame.index));
+}
+
+void Lowering::loop_backedge(const Values &values, const LoopShape &shape, bool partial) {
+  const auto frame = active_loop(values, shape);
+  auto *repeat = llvm::BasicBlock::Create(module_.getContext(), "loop.repeat", function_);
+  auto *next = llvm::BasicBlock::Create(module_.getContext(), "loop.next", function_);
+  builder_.CreateCondBr(builder_.CreateAnd(frame.matches, repeat_scheduled(frame)), repeat, next);
+  builder_.SetInsertPoint(repeat);
+  clear_loop_repeat(frame);
+  auto turn = values;
+  credit(turn,
+         builder_.getInt64(1),
+         builder_.CreateAdd(builder_.getInt64(1), values[extra_cycles_value]),
+         partial);
+  finish(turn, shape.start, partial);
+  builder_.SetInsertPoint(next);
+}
+
+void Lowering::retire_short_observation(std::uint32_t pc) {
+  if (!short_successors_.contains(pc)) { return; }
+  auto *live = builder_.CreateICmpNE(short_word(short_remaining), builder_.getInt64(0));
+  write_short(short_addresses,
+              builder_.CreateSelect(live, short_word(short_addresses), builder_.getInt64(0)));
+}
+
+llvm::Value *Lowering::refill_at(llvm::Value *refill, std::uint32_t child_end) {
+  constexpr auto mask = loop_refill_live | (std::uint64_t{maximum_pc} << loop_refill_end_shift);
+  const auto signature = loop_refill_live | (std::uint64_t{child_end} << loop_refill_end_shift);
+  return builder_.CreateICmpEQ(builder_.CreateAnd(refill, builder_.getInt64(mask)),
+                               builder_.getInt64(signature));
+}
+
+void Lowering::overlapping_loop_fetches(Values &values,
+                                        std::uint32_t pc,
+                                        llvm::Value *refill,
+                                        RefillSample sample) {
+  const auto overlaps = overlapping_fetches_.find(pc);
+  if (overlaps == overlapping_fetches_.end()) { return; }
+  llvm::Value *redirected = builder_.getFalse();
+  for (const auto &[child_end, parent] : overlaps->second) {
+    auto *enabled =
+        builder_.CreateAnd(builder_.CreateNot(redirected), refill_at(refill, child_end));
+    const auto gap = (parent.end - child_end) & maximum_pc;
+    // Gaps 2 through 4 sample during the endpoint or the two refill clocks.
+    // Gap 1 samples one word earlier. A whole-turn grant already retired it.
+    const auto early_age = sample == RefillSample::whole_turn ? lce_branch_age : 1U;
+    const auto age = gap == 1 ? early_age : loop_fetch_distance + 1 - gap;
+    loop_fetch(
+        values, parent, enabled, sample == RefillSample::call_return, builder_.getInt64(age));
+    const auto frame = active_loop(values, parent);
+    auto *repeat =
+        builder_.CreateAnd(enabled, builder_.CreateAnd(frame.matches, repeat_scheduled(frame)));
+    redirected = builder_.CreateOr(redirected, repeat);
+    if (parent.arithmetic() && gap == loop_decode_distance) {
+      // Fetch1 reaches the parent's second word on the last child refill
+      // clock. Decode sees this decision before any more guest work retires.
+      loop_test(values, values[status_value], parent, repeat);
+    }
+  }
+}
+
+void Lowering::loop_retirement(Values &values,
+                               const Instruction &op,
+                               llvm::Value *old_status,
+                               bool partial) {
+  const auto body = short_bodies_.find(op.address);
+  if (body != short_bodies_.end()) {
+    short_loop_retirement(values, op, body->second, old_status, partial);
+  }
+  const auto end = hardware_ends_.find(op.address);
+  const auto fetch = loop_fetches_.find(op.address);
+  const bool shifted = fetch != loop_fetches_.end() && shifted_fetches_.contains(fetch->second.end);
+  auto *refill = shifted || overlapping_fetches_.contains(op.address) ? load(64, loop_refill_slot)
+                                                                      : builder_.getInt64(0);
+  if (end != hardware_ends_.end()) {
+    if (end->second.arithmetic()) { loop_refill(values, op); }
+    if (end->second.counted() && (end->second.has_reentry || end->second.has_tail_abort ||
+                                  lce_endpoints_.contains(op.address))) {
+      clear_counted_tail(end->second);
+    }
+  }
+  loop_samples(values, old_status, op.address, refill);
+  if (end != hardware_ends_.end()) { loop_backedge(values, end->second, partial); }
+}
+
+void Lowering::loop_samples(Values &values,
+                            llvm::Value *old_status,
+                            std::uint32_t pc,
+                            llvm::Value *refill,
+                            RefillSample sample) {
+  const auto fetch = loop_fetches_.find(pc);
+  if (fetch != loop_fetches_.end()) {
+    llvm::Value *enabled = builder_.getTrue();
+    if (shifted_fetches_.contains(fetch->second.end)) {
+      enabled = builder_.CreateNot(
+          builder_.CreateOr(refill_at(refill, pc), refill_at(refill, (pc + 1) & maximum_pc)));
+    }
+    loop_fetch(values, fetch->second, enabled, sample == RefillSample::call_return);
+  }
+  const auto test = loop_tests_.find(pc);
+  if (test != loop_tests_.end()) {
+    auto *enabled = builder_.CreateNot(refill_at(refill, pc));
+    loop_test(values, old_status, test->second, enabled);
+  }
+  overlapping_loop_fetches(values, pc, refill, sample);
+}
+
+void Lowering::plan_hardware_grants(const LoopMap &shapes) {
+  for (const auto &[end, shape] : shapes) {
+    const auto start = addresses_.find(shape.start);
+    const auto last = addresses_.find(end);
+    if (start == addresses_.end() || last == addresses_.end() || last->second < start->second ||
+        last->second - start->second + 1 != shape.length) {
+      continue;
+    }
+    const auto body = std::span(instructions_).subspan(start->second, shape.length);
+    if (!std::ranges::all_of(body, [this, &shape](const Instruction &op) {
+          const auto fetch = loop_fetches_.find(op.address);
+          const auto test = loop_tests_.find(op.address);
+          return !branch(op) && !loop_setup(op) && !delay_boundary(op.address) &&
+                 (test == loop_tests_.end() || test->second.end == shape.end ||
+                  overlapping_refill(shape, test->second) ||
+                  overlapping_short_tail(shape, test->second)) &&
+                 (op.address == shape.end || !hardware_ends_.contains(op.address)) &&
+                 (fetch == loop_fetches_.end() || fetch->second.end == shape.end ||
+                  overlapping_refill(shape, fetch->second) ||
+                  overlapping_short_tail(shape, fetch->second) ||
+                  (shape.counted() && fetch->second.counted() &&
+                   overlapping_tail(shape, fetch->second))) &&
+                 op.type != index_modify_type && !dag_register(loaded_register(op));
+        })) {
+      continue;
+    }
+    hardware_grants_.emplace(shape.start, shape);
+  }
+}
+
+void Lowering::admit_hardware_turns(const Values &values, const LoopShape &shape) {
+  const auto frame = active_loop(values, shape);
+  auto *length = builder_.getInt64(shape.length);
+  auto *instructions = builder_.CreateUDiv(values[instruction_remaining_value], length);
+  auto *available_cycles = values[cycle_remaining_value];
+  if (shape.arithmetic() && !shape.short_body()) {
+    // At most one terminating turn in this grant owes a two-cycle refill.
+    available_cycles = builder_.CreateBinaryIntrinsic(
+        llvm::Intrinsic::usub_sat, available_cycles, builder_.getInt64(loop_decode_distance));
+  }
+  auto *cycles = builder_.CreateUDiv(available_cycles, length);
+  auto *turns = builder_.CreateBinaryIntrinsic(llvm::Intrinsic::umin, instructions, cycles);
+  llvm::Value *count = nullptr;
+  llvm::Value *steady = builder_.getTrue();
+  if (shape.short_body()) {
+    steady = builder_.CreateNot(short_flag(short_word(short_descriptor), short_startup));
+  }
+  if (shape.counted()) {
+    count = builder_.CreateLoad(builder_.getInt32Ty(), loop_cell(loop_counter_slot, frame.index));
+    // A raw zero represents 2^32 turns. The final turn always takes the exact path.
+    llvm::Value *before_last = nullptr;
+    if (shape.short_body()) {
+      // Leave the fetch that pops the frame and starts draining buffered words to the exact path.
+      before_last = builder_.CreateBinaryIntrinsic(
+          llvm::Intrinsic::usub_sat, count, builder_.getInt32(shape.short_threshold()));
+    } else {
+      before_last = builder_.CreateSub(count, builder_.getInt32(1));
+    }
+    turns = builder_.CreateBinaryIntrinsic(
+        llvm::Intrinsic::umin, turns, builder_.CreateZExt(before_last, builder_.getInt64Ty()));
+  }
+  auto *pending = builder_.CreateAnd(frame.metadata, builder_.getInt32(loop_repeat_scheduled));
+  auto *clean = builder_.CreateAnd(
+      builder_.CreateAnd(steady, builder_.CreateICmpEQ(pending, builder_.getInt32(0))),
+      builder_.CreateICmpEQ(values[dag_history_value], builder_.getInt32(0)));
+  auto *admitted = builder_.CreateAnd(
+      builder_.CreateAnd(frame.matches, clean),
+      builder_.CreateAnd(memory_admitted_, builder_.CreateICmpNE(turns, builder_.getInt64(0))));
+  auto body = node("hardware.loop.body");
+  auto *fallback = llvm::BasicBlock::Create(module_.getContext(), "hardware.loop.exact", function_);
+  auto initial = values;
+  initial[loop_grant_value] = turns;
+  initial[loop_remaining_value] = turns;
+  body.incoming(initial, builder_.GetInsertBlock());
+  builder_.CreateCondBr(admitted, body.block, fallback);
+  emit_hardware_turns(body, frame, count, shape);
+  builder_.SetInsertPoint(fallback);
+}
+
+void Lowering::emit_hardware_turns(const Node &body,
+                                   const LoopFrame &frame,
+                                   llvm::Value *count,
+                                   const LoopShape &shape) {
+  const auto start = addresses_.at(shape.start);
+  builder_.SetInsertPoint(body.block);
+  auto values = body.values();
+  values[dag_history_value] = builder_.getInt32(0);
+  values[extra_cycles_value] = builder_.getInt64(0);
+  const auto words = std::span(instructions_).subspan(start, shape.length);
+  llvm::Value *done = builder_.getFalse();
+  for (const auto &op : words) {
+    builder_.SetCurrentDebugLocation(
+        llvm::DILocation::get(module_.getContext(), op.address + 1, 0, function_->getSubprogram()));
+    if (shape.arithmetic() && op.address == shape.condition_pc()) {
+      done = branch_taken(condition(values, shape.term));
+    }
+    instruction(values, op, false);
+  }
+  auto *left = builder_.CreateSub(values[loop_remaining_value], builder_.getInt64(1));
+  values[loop_remaining_value] = left;
+  auto *account =
+      llvm::BasicBlock::Create(module_.getContext(), "hardware.loop.account", function_);
+  body.incoming(values, builder_.GetInsertBlock());
+  auto *again = builder_.CreateAnd(builder_.CreateNot(done),
+                                   builder_.CreateICmpNE(left, builder_.getInt64(0)));
+  builder_.CreateCondBr(again, body.block, account);
+  builder_.SetInsertPoint(account);
+  auto *turns = builder_.CreateSub(values[loop_grant_value], left);
+  auto *retired = builder_.CreateMul(turns, builder_.getInt64(shape.length));
+  if (count != nullptr) {
+    auto *updated = builder_.CreateSub(count, builder_.CreateTrunc(turns, builder_.getInt32Ty()));
+    builder_.CreateStore(updated, loop_cell(loop_counter_slot, frame.index));
+  }
+  if (shape.short_body() && shape.counted()) {
+    // At a steady header, a whole turn leaves FADDR and DADDR at the same body addresses.
+    write_short(short_remaining, builder_.CreateSub(short_word(short_remaining), retired));
+  }
+  if (!shape.arithmetic()) {
+    credit(values, retired, retired, false);
+    jump(partial_[start], values);
+    return;
+  }
+  auto *finished =
+      llvm::BasicBlock::Create(module_.getContext(), "hardware.loop.finished", function_);
+  auto *prefix = llvm::BasicBlock::Create(module_.getContext(), "hardware.loop.prefix", function_);
+  builder_.CreateCondBr(done, finished, prefix);
+  builder_.SetInsertPoint(prefix);
+  auto tail = values;
+  credit(tail, retired, retired, false);
+  jump(partial_[start], tail);
+  builder_.SetInsertPoint(finished);
+  loop_pop(values, frame);
+  if (shape.short_body()) {
+    auto *buffered = builder_.getInt64(shape.short_condition_tail());
+    write_short(short_remaining, buffered);
+    short_loop_observation(
+        values, words.back(), shape, {.left = buffered, .old_status = values[status_value]});
+    credit(values, retired, retired, false);
+    jump(partial_[start], values);
+    return;
+  }
+  values[hazard_value] = builder_.getFalse();
+  auto *refill = builder_.getInt64(
+      loop_refill_live | (std::uint64_t{shape.end} << loop_refill_end_shift) | shape.start);
+  overlapping_loop_fetches(values, (shape.end - 1) & maximum_pc, refill, RefillSample::whole_turn);
+  overlapping_loop_fetches(values, shape.end, refill);
+  credit(
+      values, retired, builder_.CreateAdd(retired, builder_.getInt64(loop_decode_distance)), false);
+  readmit(values, (shape.end + 1) & maximum_pc);
 }
 
 void Lowering::finish(Values values, std::uint32_t next, bool partial) {
   const auto target = addresses_.find(next);
   if (target != addresses_.end()) {
     const auto i = target->second;
-    if (partial && loop_headers_.contains(i)) {
+    if (hardware_grants_.contains(next)) {
+      jump(admission_[i], values);
+    } else if (sequencer_boundary(next)) {
+      jump(partial_[i], values);
+    } else if (partial && loop_headers_.contains(i)) {
       partial_[i].incoming(values, builder_.GetInsertBlock());
       admission_[i].incoming(values, builder_.GetInsertBlock());
       builder_.CreateCondBr(values[tail_value], partial_[i].block, admission_[i].block);
@@ -1498,6 +3890,15 @@ void Lowering::finish(Values values, std::uint32_t next, bool partial) {
   exit(values, builder_.getInt32(next), NativeExit::bound);
   builder_.SetInsertPoint(missing);
   exit(values, builder_.getInt32(next), NativeExit::undeclared);
+}
+
+void Lowering::readmit(const Values &values, std::uint32_t next) {
+  const auto successor = addresses_.find(next);
+  if (successor == addresses_.end()) {
+    finish(values, next, false);
+  } else {
+    jump(admission_[successor->second], values);
+  }
 }
 
 void Lowering::emit_exit() {
@@ -1541,6 +3942,7 @@ void Lowering::emit_exit() {
 
 std::vector<BlockCost> Lowering::block_costs() const {
   std::set<std::uint32_t> leaders(variant_.entries.begin(), variant_.entries.end());
+  leaders.insert(delay_slots_.begin(), delay_slots_.end());
   for (const auto &vector : variant_.interrupt_vectors) { leaders.insert(vector.vector); }
   std::vector<BlockCost> result(instructions_.size());
   for (const auto &op : instructions_) {
@@ -1552,6 +3954,10 @@ std::vector<BlockCost> Lowering::block_costs() const {
   for (std::size_t i = instructions_.size(); i != 0; --i) {
     const auto index = i - 1;
     const auto &op = instructions_[index];
+    if (sequencer_boundary(op.address)) {
+      leaders.insert(op.address);
+      continue;
+    }
     if (branch(op)) {
       result[index].cycles += branch_penalty;
       if (((op.word >> condition_shift) & true_condition) != true_condition) {
@@ -1578,14 +3984,8 @@ void Lowering::load_indices() {
   for (const auto &op : instructions_) {
     const auto destination = loaded_register(op);
     if (dag_register(destination)) { dag_written_.insert(dag_number(destination)); }
-    if (op.type == register_move_type) {
-      const auto move = register_move(op);
-      for (const auto reg : {move.source, move.destination}) {
-        if (dag_register(reg)) { load_dag(dag_number(reg)); }
-      }
-    }
-    if (op.type == immediate_move_type && dag_register(destination)) {
-      load_dag(dag_number(destination));
+    for (const auto reg : {source_register(op), destination}) {
+      if (dag_register(reg)) { load_dag(dag_number(reg)); }
     }
     if (indirect_branch(op)) {
       load_dag(branch_index(op));
@@ -1606,7 +4006,10 @@ void Lowering::load_indices() {
 void Lowering::plan_loops() {
   for (std::size_t end = 0; end < instructions_.size(); ++end) {
     const auto &op = instructions_[end];
-    if (op.type != direct_branch_type || (op.word & call_branch) != 0) { continue; }
+    if (op.type != direct_branch_type || (op.word & call_branch) != 0 ||
+        sequencer_boundary(op.address)) {
+      continue;
+    }
     const auto header = addresses_.find(branch_target(op));
     if (header == addresses_.end() || header->second > end) { continue; }
     const auto start = header->second;
@@ -1632,8 +4035,7 @@ void Lowering::complete_loop(Values values, const Instruction &op) {
   const auto end = addresses_.at(op.address);
   const auto start = addresses_.at(branch_target(op));
   const auto cost = loop_ends_.at(end);
-  auto *lanes =
-      condition(values, static_cast<unsigned>((op.word >> condition_shift) & true_condition));
+  auto *lanes = condition(values, op);
   auto *taken = builder_.CreateExtractElement(lanes, builder_.getInt32(0));
   if ((context_ & simd_mode) != 0) {
     taken = builder_.CreateAnd(taken, builder_.CreateExtractElement(lanes, builder_.getInt32(1)));
@@ -1662,13 +4064,7 @@ void Lowering::complete_loop(Values values, const Instruction &op) {
   prefix[tail_value] = builder_.getTrue();
   jump(partial_[start], prefix);
   builder_.SetInsertPoint(finished);
-  const auto next = (op.address + 1) & maximum_pc;
-  const auto successor = addresses_.find(next);
-  if (successor == addresses_.end()) {
-    finish(values, next, false);
-  } else {
-    jump(admission_[successor->second], values);
-  }
+  readmit(values, next_pc(op));
 }
 
 std::pair<llvm::Value *, llvm::Value *> Lowering::plan_pointer(const MemoryMove &move,
@@ -1743,12 +4139,13 @@ std::vector<std::optional<BlockCost>> Lowering::unit_costs() const {
     if (visited[i] != 0) { return visited[i] == 2 ? result[i] : std::nullopt; }
     visited[i] = 1;
     const auto &op = instructions_[i];
+    if (sequencer_boundary(op.address)) { return std::nullopt; }
     const bool is_branch = branch(op);
     const auto next = grant_successors(op);
     BlockCost suffix{.instructions = 0, .cycles = 0};
     for (const auto address : next) {
       const auto found = addresses_.find(address);
-      if (found == addresses_.end()) { continue; }
+      if (found == addresses_.end() || sequencer_boundary(address)) { continue; }
       const auto cost = visit(found->second);
       if (!cost.has_value()) {
         visited[i] = 2;
@@ -1804,6 +4201,12 @@ void Lowering::emit_instruction(std::size_t i,
       llvm::DILocation::get(module_.getContext(), op.address + 1, 0, function_->getSubprogram()));
   builder_.SetInsertPoint(admission_[i].block);
   auto values = admission_[i].values();
+  finish_loop_return(values, op);
+  if (const auto hardware = hardware_grants_.find(op.address); hardware != hardware_grants_.end()) {
+    const auto source = builder_.getCurrentDebugLocation();
+    admit_hardware_turns(values, hardware->second);
+    builder_.SetCurrentDebugLocation(source);
+  }
   llvm::Value *admitted = builder_.getFalse();
   const auto loop = loop_headers_.find(i);
   if (loop != loop_headers_.end()) {
@@ -1831,10 +4234,10 @@ void Lowering::emit_instruction(std::size_t i,
   auto hot = values;
   // A fixed-cost loop grant proves that no incoming DAG load is pending.
   if (loop != loop_headers_.end()) { hot[dag_history_value] = builder_.getInt32(0); }
-  fast_entry_[i].incoming(hot, admission_[i].block);
+  fast_entry_[i].incoming(hot, builder_.GetInsertBlock());
   auto tail = values;
   tail[tail_value] = builder_.getInt1(loop != loop_headers_.end() || grant.has_value());
-  partial_[i].incoming(tail, admission_[i].block);
+  partial_[i].incoming(tail, builder_.GetInsertBlock());
   builder_.CreateCondBr(
       admitted,
       fast_entry_[i].block,
@@ -1851,14 +4254,20 @@ void Lowering::emit_instruction(std::size_t i,
   auto pipeline =
       PipelineEffects{.stall = pipeline_stall(values, op), .tag = loaded_tag(values, op)};
   auto *old_status = values[status_value];
+  if (branch(op)) { delayed_slot(values, op, false, old_status); }
+  check_loop_end(values, op, false);
   instruction(values, op, false);
   // Admitted memory accesses have no resumable exit inside this block.
   if (dead_status) { values[status_value] = old_status; }
-  if (!branch(op)) { retire_pipeline(values, pipeline); }
+  if (!branch(op)) {
+    retire_pipeline(values, pipeline);
+    delayed_slot(values, op, false, old_status);
+    loop_retirement(values, op, old_status, false);
+  }
   if (costs_[i].instructions > 1) {
     jump(fast_[i + 1], values);
   } else {
-    complete(values, op, false, lanes, pipeline);
+    complete(values, op, false, lanes, pipeline, old_status);
   }
   builder_.SetInsertPoint(partial_[i].block);
   values = partial_[i].values();
@@ -1873,10 +4282,17 @@ void Lowering::emit_instruction(std::size_t i,
   builder_.SetInsertPoint(bound);
   exit(values, builder_.getInt32(op.address), NativeExit::bound);
   builder_.SetInsertPoint(execute);
+  if (branch(op)) { delayed_slot(values, op, true, values[status_value]); }
+  check_loop_end(values, op, true);
   lanes = branch_lanes(values, op, true);
   pipeline = {.stall = pipeline_stall(values, op), .tag = loaded_tag(values, op)};
+  old_status = values[status_value];
   instruction(values, op, true);
-  if (!branch(op)) { retire_pipeline(values, pipeline); }
+  if (!branch(op)) {
+    retire_pipeline(values, pipeline);
+    delayed_slot(values, op, true, old_status);
+    loop_retirement(values, op, old_status, true);
+  }
   if (costs_[i].instructions > 1) {
     credit(values,
            builder_.getInt64(1),
@@ -1884,14 +4300,29 @@ void Lowering::emit_instruction(std::size_t i,
            true);
     jump(partial_[i + 1], values);
   } else {
-    complete(values, op, true, lanes, pipeline);
+    complete(values, op, true, lanes, pipeline, old_status);
   }
 }
 
 void Lowering::emit() {
-  stack_written_ = std::ranges::any_of(instructions_, [](const auto &op) {
-    return op.type == return_branch_type || call_branch_instruction(op);
+  has_plain_loop_returns_ = std::ranges::any_of(reentry_calls_, [](const auto &site) {
+    return (loop_return_payload(site.first, site.second) & return_loop_fetch) != 0;
   });
+  has_loop_sample_returns_ =
+      has_plain_loop_returns_ || std::ranges::any_of(reentry_calls_, [](const auto &site) {
+        return (loop_return_payload(site.first, site.second) & return_loop_condition) != 0;
+      });
+  has_short_loop_returns_ = std::ranges::any_of(
+      reentry_calls_, [](const auto &site) { return site.second.short_body(); });
+  has_enclosing_tail_returns_ = std::ranges::any_of(
+      reentry_calls_, [](const auto &site) { return site.second.suspends_enclosing_tail; });
+  for (const auto &op : instructions_) {
+    if (!delayed(op)) { continue; }
+    delay_starts_.emplace(next_pc(op), &op);
+    delay_slots_.insert(next_pc(op));
+    delay_slots_.insert(next_pc(op, delay_slot_count));
+    delay_ends_.emplace(next_pc(op, delay_slot_count), &op);
+  }
   dag_status_written_ = std::ranges::any_of(instructions_, [](const auto &op) {
     return op.type == index_modify_type && (index_modify(op).source & 7) == 7;
   });
@@ -1909,6 +4340,14 @@ void Lowering::emit() {
     fast_.push_back(node("body." + std::to_string(i)));
     partial_.push_back(node("cold.prefix." + std::to_string(i)));
   }
+  plan_hardware_loops(loop_shapes_);
+  plan_hardware_grants(loop_shapes_);
+  stack_written_ = !short_bodies_.empty() || !loop_setups_.empty() || !hardware_ends_.empty() ||
+                   !loop_fetches_.empty() || !loop_tests_.empty() || !jump_refills_.empty() ||
+                   std::ranges::any_of(instructions_, [this](const auto &op) {
+                     return op.type == return_branch_type || call_branch_instruction(op) ||
+                            loop_return_at(op.address, reentry_calls_) != nullptr;
+                   });
   costs_ = block_costs();
   plan_loops();
   builder_.SetInsertPoint(entry);
@@ -1975,10 +4414,7 @@ void Lowering::emit() {
 
 std::uint32_t register_context(const Instruction &instruction) {
   std::uint32_t mask = simd_mode;
-  const auto source =
-      instruction.type == register_move_type ? register_move(instruction).source : 0U;
-  const auto destination = loaded_register(instruction);
-  for (const auto reg : {source, destination}) {
+  for (const auto reg : {source_register(instruction), loaded_register(instruction)}) {
     if (dag_register(reg)) { mask |= dag_bank_mode(reg & 15); }
     if (data_register(reg)) { mask |= ((reg & 15) < 8 ? low_bank_mode : high_bank_mode); }
   }
@@ -1998,7 +4434,8 @@ std::uint32_t instruction_context(const Instruction &instruction) {
     if (!move.write && move.index == 1) { mask |= broadcast1_mode; }
     if (!move.write && move.index == 9) { mask |= broadcast9_mode; }
   }
-  if (instruction.type == register_move_type || instruction.type == immediate_move_type) {
+  if (instruction.type == register_move_type || instruction.type == immediate_move_type ||
+      register_count(instruction)) {
     mask |= register_context(instruction);
   }
   if (branch(instruction)) { mask |= simd_mode | saturation_mode; }
@@ -2016,49 +4453,323 @@ std::uint32_t instruction_context(const Instruction &instruction) {
   return mask;
 }
 
-std::uint32_t context_mask(const std::vector<Instruction> &instructions) {
+std::uint32_t context_mask(const std::vector<Instruction> &instructions, const LoopPlan &plan) {
   std::uint32_t mask{};
-  for (const auto &instruction : instructions) { mask |= instruction_context(instruction); }
+  for (const auto &instruction : instructions) {
+    mask |= instruction_context(instruction);
+    const auto condition = plan.shapes.find(next_pc(instruction, loop_decode_distance));
+    const auto endpoint = plan.shapes.find(instruction.address);
+    const bool short_sample = endpoint != plan.shapes.end() && endpoint->second.short_body() &&
+                              endpoint->second.arithmetic() &&
+                              endpoint->second.condition_pc() == instruction.address;
+    if ((condition != plan.shapes.end() && condition->second.arithmetic()) || short_sample ||
+        (loop_setup(instruction) && loop_shape(instruction).arithmetic())) {
+      mask |= simd_mode | saturation_mode;
+    }
+    const auto *resumed = loop_return_at(instruction.address, plan.reentry_calls);
+    if (resumed == nullptr) { continue; }
+    if (resumed->suspends_enclosing_tail) {
+      const auto sample = plan.shapes.find(next_pc(instruction, loop_decode_distance - 1));
+      if (sample != plan.shapes.end() && sample->second.arithmetic()) {
+        mask |= simd_mode | saturation_mode;
+      }
+    }
+    if (!resumed->arithmetic()) { continue; }
+    const auto sample = resumed->condition_pc();
+    const auto resume = sample == resumed->end ? resumed->start : ((sample + 1) & maximum_pc);
+    if (instruction.address == resume) { mask |= simd_mode | saturation_mode; }
+  }
   return mask;
 }
 
-std::vector<Instruction> connected_code(const std::vector<Instruction> &code, std::uint32_t entry) {
-  std::map<std::uint32_t, const Instruction *> addresses;
-  for (const auto &op : code) { addresses.emplace(op.address, &op); }
+bool complementary_jumps(const Instruction &first, const Instruction &second) {
+  constexpr auto complement_bit = 16;
+  return delayed(second) && !call_branch_instruction(first) && !call_branch_instruction(second) &&
+         first.type != return_branch_type && second.type != return_branch_type &&
+         first.compute.kind == ComputeKind::none && second.compute.kind == ComputeKind::none &&
+         branch_condition(first) != true_condition && branch_condition(second) != true_condition &&
+         (branch_condition(first) ^ branch_condition(second)) == complement_bit;
+}
+
+using InstructionMap = std::map<std::uint32_t, const Instruction *>;
+
+void validate_delay_slots(const InstructionMap &code, std::string_view identity) {
+  for (const auto &entry : code) {
+    const auto &op = *entry.second;
+    if (!delayed(op)) { continue; }
+    for (unsigned i = 1; i <= delay_slot_count; ++i) {
+      const auto slot = code.find(next_pc(op, i));
+      if (slot == code.end()) {
+        reject(
+            op, identity, FaultReason::undeclared_entry, "delayed transfer has an undeclared slot");
+      }
+      const auto &instruction = *slot->second;
+      if (loop_setup(instruction)) {
+        reject(instruction, identity, FaultReason::unsupported_instruction, "DO in a delay slot");
+      }
+      if (branch(instruction) && (i != 1 || !complementary_jumps(op, instruction))) {
+        reject(instruction, identity, FaultReason::invalid_encoding, "branch in a delay slot");
+      }
+    }
+  }
+}
+
+void validate_loop_call(LoopPlan &plan,
+                        LoopShape &shape,
+                        const Instruction &op,
+                        std::string_view identity) {
+  const bool short_site = shape.length >= 2;
+  if ((shape.short_body() && !short_site) || !call_branch_instruction(op) || delayed(op)) {
+    reject(op, identity, FaultReason::unsupported_instruction, "branch near the DO endpoint");
+  }
+  shape.has_reentry = true;
+  const auto [site, inserted] = plan.reentry_calls.try_emplace(op.address, shape);
+  if (!inserted && shape.length < site->second.length) { site->second = shape; }
+}
+
+void plan_enclosing_call_returns(LoopPlan &plan) {
+  // The same instruction can be in several tails. Qualify it after choosing
+  // the innermost owner, independent of the order of the DO instructions.
+  for (auto &[pc, shape] : plan.reentry_calls) {
+    if (shape.short_body()) { continue; }
+    for (unsigned gap = 1; gap <= loop_fetch_distance; ++gap) {
+      const auto parent = plan.shapes.find((shape.end + gap) & maximum_pc);
+      if (parent == plan.shapes.end() || !overlapping_tail(shape, parent->second)) { continue; }
+      if (((parent->first - pc) & maximum_pc) <= loop_fetch_distance ||
+          late_arithmetic_call(shape, pc)) {
+        shape.suspends_enclosing_tail = true;
+        break;
+      }
+    }
+  }
+}
+
+void validate_nested_loop(const InstructionMap &code,
+                          LoopPlan &plan,
+                          const LoopShape &outer,
+                          const Instruction &op,
+                          unsigned remaining,
+                          std::string_view identity) {
+  const auto child = loop_shape(op);
+  if (child.length >= remaining) {
+    reject(op, identity, FaultReason::invalid_encoding, "nested DO crosses or shares its endpoint");
+  }
+  const auto gap = remaining - child.length;
+  if (outer.arithmetic() && gap < loop_decode_distance) {
+    reject(op, identity, FaultReason::invalid_encoding, "arithmetic DO endpoints are too close");
+  }
+  if (outer.short_body()) { plan.short_nested.emplace(child.end, outer); }
+  if (overlapping_refill(child, outer) || overlapping_short_tail(child, outer)) {
+    const auto overlap_words = child.short_body() ? child.length : loop_decode_distance;
+    for (unsigned distance = 0; distance < overlap_words; ++distance) {
+      const auto word = code.find((child.end - distance) & maximum_pc);
+      if (word != code.end() && branch(*word->second)) {
+        if ((child.short_body() || late_arithmetic_call(child, word->first)) &&
+            call_branch_instruction(*word->second) && !delayed(*word->second)) {
+          continue;
+        }
+        reject(*word->second,
+               identity,
+               FaultReason::unsupported_instruction,
+               "branch across overlapping loop refill is unqualified");
+      }
+    }
+  }
+}
+
+void validate_loop_body(const InstructionMap &code,
+                        const Instruction &setup,
+                        LoopPlan &plan,
+                        std::string_view identity) {
+  auto shape = loop_shape(setup);
+  for (unsigned offset = 1; offset <= shape.length; ++offset) {
+    const auto assigned = code.find(next_pc(setup, offset));
+    if (assigned == code.end()) {
+      reject(setup, identity, FaultReason::undeclared_entry, "DO body has an undeclared word");
+    }
+    const auto &op = *assigned->second;
+    const auto remaining = shape.length - offset;
+    if (!shape.short_body() && jump_instruction(op) &&
+        (indirect_branch(op) ||
+         ((shape.end - branch_target(op)) & maximum_pc) < loop_fetch_distance)) {
+      plan.jump_ends[op.address].push_back(shape.end);
+    }
+    if (loop_abort(op)) {
+      const auto owner = plan.aborts.find(op.address);
+      if (owner == plan.aborts.end() || shape.length < owner->second.length) {
+        plan.aborts.insert_or_assign(op.address, shape);
+      }
+    } else if (branch(op) && remaining <= loop_fetch_distance) {
+      const bool in_loop_jump = jump_instruction(op) && !indirect_branch(op) &&
+                                shape.contains(branch_target(op)) && !shape.short_body() &&
+                                remaining > loop_decode_distance;
+      if (!in_loop_jump) { validate_loop_call(plan, shape, op, identity); }
+    }
+    if (loop_setup(op)) { validate_nested_loop(code, plan, shape, op, remaining, identity); }
+  }
+  if (!plan.shapes.emplace(shape.end, shape).second) {
+    reject(setup,
+           identity,
+           FaultReason::invalid_encoding,
+           "multiple DO instructions share an endpoint");
+  }
+}
+
+void validate_loop_aborts(const InstructionMap &code, LoopPlan &plan, std::string_view identity) {
+  for (const auto &[pc, op] : code) {
+    if (!loop_abort(*op)) { continue; }
+    const auto site = plan.aborts.find(pc);
+    if (site == plan.aborts.end()) {
+      reject(*op, identity, FaultReason::unsupported_instruction, "LA has no declared DO body");
+    }
+    const auto &shape = site->second;
+    const auto remaining = (shape.end - pc) & maximum_pc;
+    if (shape.short_body() || remaining < loop_decode_distance) {
+      reject(*op,
+             identity,
+             FaultReason::unsupported_instruction,
+             "LA at this DO endpoint is unqualified");
+    }
+    if (!indirect_branch(*op) && shape.contains(branch_target(*op))) {
+      reject(*op, identity, FaultReason::invalid_encoding, "LA target is inside its loop");
+    }
+    if (remaining < loop_fetch_distance) { plan.shapes.at(shape.end).has_tail_abort = true; }
+  }
+}
+
+void validate_not_lce(const InstructionMap &code, LoopPlan &plan, std::string_view identity) {
+  for (const auto &[pc, op] : code) {
+    if (!observes_not_lce(*op)) { continue; }
+    const LoopShape *owner = nullptr;
+    for (const auto &[end, shape] : plan.shapes) {
+      if (shape.contains(pc) && (owner == nullptr || shape.length < owner->length)) {
+        owner = &shape;
+      }
+    }
+    if (owner == nullptr || !owner->counted() ||
+        (pc != owner->start && ((owner->end - pc) & maximum_pc) > loop_fetch_distance)) {
+      reject(*op,
+             identity,
+             FaultReason::unsupported_instruction,
+             "NOT LCE outside an admitted counted DO header or tail");
+    }
+    const auto unqualified_overlap = [&plan](const LoopShape &parent, const LoopShape &child) {
+      const auto nested = plan.short_nested.find(child.end);
+      return overlapping_tail(child, parent) &&
+             ((!child.arithmetic() && !child.counted()) ||
+              (parent.short_body() &&
+               (nested == plan.short_nested.end() || nested->second.end != parent.end)));
+    };
+    const bool overlap = std::ranges::any_of(plan.shapes, [&](const auto &entry) {
+      return unqualified_overlap(*owner, entry.second) || unqualified_overlap(entry.second, *owner);
+    });
+    if (overlap) {
+      reject(
+          *op, identity, FaultReason::unsupported_instruction, "NOT LCE at an overlapping DO tail");
+    }
+    plan.not_lce.emplace(pc, *owner);
+    plan.lce_endpoints.insert(owner->end);
+  }
+}
+
+void plan_short_counted_tails(LoopPlan &plan) {
+  for (const auto &[end, parent] : plan.short_nested) {
+    if (plan.lce_endpoints.contains(parent.end)) { plan.short_parent_tails.insert(parent.end); }
+  }
+  for (const auto end : plan.lce_endpoints) {
+    if (!plan.shapes.at(end).short_body()) { continue; }
+    const auto slot =
+        plan.short_parent_tails.contains(end) ? short_parent_tail_slot : short_counted_tail_slot;
+    plan.lce_slots.insert(slot);
+  }
+}
+
+void plan_counted_tails(LoopPlan &plan) {
+  plan_short_counted_tails(plan);
+  std::vector<const LoopShape *> ordered;
+  for (const auto &[end, shape] : plan.shapes) {
+    if (!shape.counted() || shape.short_body()) { continue; }
+    if (shape.has_reentry || shape.has_tail_abort || plan.lce_endpoints.contains(end)) {
+      ordered.push_back(&shape);
+    }
+  }
+  // A long counted tail can coexist with an ancestor's tail while both drain.
+  // Only endpoints within four words can overlap, including across PC wrap.
+  std::ranges::sort(ordered, std::ranges::greater{}, &LoopShape::length);
+  for (const auto *shape : ordered) {
+    std::array<bool, loop_stack_capacity> used{};
+    for (unsigned gap = 1; gap <= loop_fetch_distance; ++gap) {
+      const auto parent = plan.long_tail_indices.find((shape->end + gap) & maximum_pc);
+      if (parent != plan.long_tail_indices.end() &&
+          overlapping_tail(*shape, plan.shapes.at(parent->first))) {
+        used[parent->second] = true;
+      }
+    }
+    const auto index = static_cast<std::size_t>(std::ranges::find(used, false) - used.begin());
+    plan.long_tail_indices.emplace(shape->end, index);
+    plan.long_tail_count = std::max(plan.long_tail_count, index + 1);
+    if (plan.lce_endpoints.contains(shape->end)) {
+      plan.lce_slots.insert(counted_tail_slot + index);
+    }
+  }
+}
+
+LoopPlan validate_loop_bodies(const InstructionMap &code, std::string_view identity) {
+  LoopPlan plan;
+  for (const auto &entry : code) {
+    const auto &op = *entry.second;
+    if (!loop_setup(op)) { continue; }
+    validate_loop_body(code, op, plan, identity);
+  }
+  plan_enclosing_call_returns(plan);
+  validate_loop_aborts(code, plan, identity);
+  validate_not_lce(code, plan, identity);
+  plan_counted_tails(plan);
+  return plan;
+}
+
+bool has_sequential_successor(const Instruction &op) {
+  return !branch(op) || branch_condition(op) != true_condition ||
+         (call_branch_instruction(op) && !delayed(op));
+}
+
+std::vector<Instruction>
+connected_code(const InstructionMap &code, const LoopMap &shapes, std::uint32_t entry) {
   std::set<std::uint32_t> visited;
   std::vector<std::uint32_t> pending{entry};
-  std::vector<Instruction> result;
+  std::set<std::uint32_t> slots;
   while (!pending.empty()) {
     const auto address = pending.back();
     pending.pop_back();
-    const auto found = addresses.find(address);
-    if (found == addresses.end() || !visited.insert(address).second) { continue; }
+    const auto found = code.find(address);
+    if (found == code.end() || !visited.insert(address).second) { continue; }
     const auto &op = *found->second;
-    result.push_back(op);
-    if (op.type == direct_branch_type || op.type == computed_branch_type) {
-      if (!indirect_branch(op)) { pending.push_back(branch_target(op)); }
-      if ((op.word & call_branch) == 0 &&
-          ((op.word >> condition_shift) & true_condition) == true_condition) {
-        continue;
-      }
+    const auto loop = shapes.find(address);
+    if (loop != shapes.end()) { pending.push_back(loop->second.start); }
+    if (delayed(op)) {
+      slots.insert(next_pc(op));
+      slots.insert(next_pc(op, delay_slot_count));
+      if (call_branch_instruction(op)) { pending.push_back(call_resume(op)); }
     }
-    if (op.type == return_branch_type &&
-        ((op.word >> condition_shift) & true_condition) == true_condition) {
-      continue;
+    if ((op.type == direct_branch_type || op.type == computed_branch_type) &&
+        !indirect_branch(op)) {
+      pending.push_back(branch_target(op));
     }
-    pending.push_back((op.address + 1) & maximum_pc);
+    if (has_sequential_successor(op)) { pending.push_back(next_pc(op)); }
   }
-  std::ranges::sort(result, {}, &Instruction::address);
+  visited.merge(slots);
+  std::vector<Instruction> result;
+  result.reserve(visited.size());
+  for (const auto address : visited) { result.push_back(*code.at(address)); }
   return result;
 }
 
 void collect_continuations(std::vector<Continuation> &continuations,
                            const std::vector<Instruction> &connected,
                            const CodeVariant &variant,
+                           const LoopMap &reentry_calls,
                            std::uint32_t entry) {
-  for (const auto &op : connected) {
-    if (!call_branch_instruction(op)) { continue; }
-    const auto next = (op.address + 1) & maximum_pc;
+  for (const auto next : call_continuations(connected, reentry_calls)) {
     if (std::ranges::find(connected, next, &Instruction::address) != connected.end()) {
       continuations.push_back({.variant = variant.id, .address = next, .root = entry});
     }
@@ -2071,8 +4782,12 @@ std::shared_ptr<const PreparedImage> lower_image(const CodeImage &image,
   auto result = std::make_shared<PreparedImage>();
   result->identity = input_identity(image, options);
   validate_options(options, result->identity);
-  auto instructions = decode(image, result->identity);
-  for (const auto &instruction : instructions) { validate(instruction, result->identity); }
+  const auto instructions = decode(image, result->identity);
+  std::map<std::uint32_t, InstructionMap> variant_code;
+  for (const auto &instruction : instructions) {
+    validate(instruction, result->identity);
+    variant_code[instruction.variant].emplace(instruction.address, &instruction);
+  }
   result->code = image;
   result->options = options;
   llvm::LLVMContext context;
@@ -2088,18 +4803,20 @@ std::shared_ptr<const PreparedImage> lower_image(const CodeImage &image,
                           "",
                           llvm::DICompileUnit::LineTablesOnly);
   std::vector<Continuation> continuations;
+  std::map<std::uint32_t, LoopPlan> variant_loops;
   for (const auto &variant : image.variants) {
     validate_memory_layout(variant, result->identity);
-    std::vector<Instruction> code;
-    std::ranges::copy_if(instructions, std::back_inserter(code), [&](const auto &instruction) {
-      return instruction.variant == variant.id;
-    });
+    const auto &code = variant_code[variant.id];
+    validate_delay_slots(code, result->identity);
+    const auto &plan =
+        variant_loops.emplace(variant.id, validate_loop_bodies(code, result->identity))
+            .first->second;
     std::set<std::uint32_t> entries(variant.entries.begin(), variant.entries.end());
     for (const auto &request : variant.interrupt_vectors) { entries.insert(request.vector); }
     for (const auto entry : entries) {
-      const auto connected = connected_code(code, entry);
-      collect_continuations(continuations, connected, variant, entry);
-      const auto mask = context_mask(connected);
+      const auto connected = connected_code(code, plan.shapes, entry);
+      collect_continuations(continuations, connected, variant, plan.reentry_calls, entry);
+      const auto mask = context_mask(connected, plan);
       std::vector<std::uint32_t> contexts{0};
       for (std::uint32_t bit = 1; bit != 0; bit <<= 1) {
         if ((mask & bit) == 0) { continue; }
@@ -2122,12 +4839,15 @@ std::shared_ptr<const PreparedImage> lower_image(const CodeImage &image,
   const NativeAbi abi(module, result->units, continuations);
   for (const auto &unit : result->units) {
     const auto variant = std::ranges::find(image.variants, unit.variant, &CodeVariant::id);
-    std::vector<Instruction> code;
-    std::ranges::copy_if(instructions, std::back_inserter(code), [&](const auto &op) {
-      return op.variant == unit.variant;
-    });
-    Lowering(
-        module, debug, options.memory_mode, abi, *variant, connected_code(code, unit.entry), unit)
+    const auto &plan = variant_loops.at(unit.variant);
+    Lowering(module,
+             debug,
+             options.memory_mode,
+             abi,
+             *variant,
+             connected_code(variant_code.at(unit.variant), plan.shapes, unit.entry),
+             unit,
+             plan)
         .emit();
   }
   finalize_debug(module, debug);

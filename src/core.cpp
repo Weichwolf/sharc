@@ -132,6 +132,86 @@ struct Resume {
   std::string identity;
   std::uint32_t variant{}, address{}, entry{};
 };
+
+struct LoopPipeline {
+  std::array<std::uint32_t, detail::loop_stack_capacity> frames{};
+  std::uint64_t refill{};
+  std::array<std::uint64_t, detail::loop_stack_capacity> counted_tails{};
+  std::uint64_t short_counted_tail{};
+  std::uint64_t short_parent_tail{};
+  std::array<std::uint64_t, detail::short_state_words> short_loop{};
+  std::array<std::uint64_t, Registers::pc_stack_capacity> calls{};
+  std::array<std::uint64_t, Registers::pc_stack_capacity * detail::suspended_call_state_words>
+      suspended_calls{};
+  std::uint64_t return_tail{};
+
+  [[nodiscard]] bool active() const {
+    return short_loop[detail::short_remaining] != 0 ||
+           short_loop[detail::short_parent_remaining] != 0 || refill != 0 ||
+           short_counted_tail != 0 || short_parent_tail != 0 || return_tail != 0 ||
+           std::ranges::any_of(counted_tails, [](auto tail) { return tail != 0; }) ||
+           std::ranges::any_of(frames, [](auto frame) { return frame != 0; }) ||
+           std::ranges::any_of(calls, [](auto call) { return call != 0; });
+  }
+
+  void observe(Registers &registers) const {
+    if (observe_short(registers)) { return; }
+    const auto pc = registers.pc;
+    const bool refilling = observe_refill(registers, pc);
+    for (auto depth = registers.loop_address_depth; depth != 0; --depth) {
+      const auto frame = frames[depth - 1];
+      if ((frame & detail::loop_repeat_scheduled) == 0) { continue; }
+      const auto pc_slot = frame & detail::loop_pc_index_mask;
+      if (pc_slot + 1 != registers.pc_stack_pointer) { continue; }
+      const auto end = registers.loop_address_stack[depth - 1] & detail::maximum_pc;
+      const auto distance = (end - pc) & detail::maximum_pc;
+      if (distance >= detail::loop_fetch_distance) { continue; }
+      const auto start = registers.pc_stack[pc_slot];
+      if (refilling) {
+        // The child owns Decode, but Fetch1 may already have reached
+        // the parent ending immediately after the child.
+        const auto child_end = static_cast<std::uint32_t>(refill >> detail::loop_refill_end_shift) &
+                               detail::maximum_pc;
+        if (pc == child_end && distance == 1) { registers.faddr = start; }
+        return;
+      }
+      registers.faddr = (start + detail::loop_fetch_distance - distance - 1) & detail::maximum_pc;
+      if (distance < detail::loop_decode_distance) {
+        registers.daddr =
+            (start + detail::loop_decode_distance - distance - 1) & detail::maximum_pc;
+      }
+      return;
+    }
+  }
+
+private:
+  bool observe_short(Registers &registers) const {
+    const auto addresses = short_loop[detail::short_addresses];
+    if ((addresses & detail::short_addresses_live) == 0) { return false; }
+    const auto end =
+        static_cast<std::uint32_t>(short_loop[detail::short_descriptor]) & detail::maximum_pc;
+    if (short_loop[detail::short_remaining] == 0 &&
+        registers.pc != ((end + 1) & detail::maximum_pc)) {
+      return false;
+    }
+    registers.faddr = static_cast<std::uint32_t>(addresses) & detail::maximum_pc;
+    registers.daddr =
+        static_cast<std::uint32_t>(addresses >> detail::short_decode_shift) & detail::maximum_pc;
+    return true;
+  }
+
+  bool observe_refill(Registers &registers, std::uint32_t pc) const {
+    if ((refill & detail::loop_refill_live) == 0) { return false; }
+    const auto start = static_cast<std::uint32_t>(refill) & detail::maximum_pc;
+    const auto end =
+        static_cast<std::uint32_t>(refill >> detail::loop_refill_end_shift) & detail::maximum_pc;
+    const auto distance = (end - pc) & detail::maximum_pc;
+    if (distance >= detail::loop_decode_distance) { return false; }
+    registers.faddr = (end + detail::loop_decode_distance - distance) & detail::maximum_pc;
+    registers.daddr = (start + detail::loop_decode_distance - distance - 1) & detail::maximum_pc;
+    return true;
+  }
+};
 } // namespace
 
 struct Core::Impl {
@@ -151,9 +231,26 @@ struct Core::Impl {
     pointers[detail::daddr_slot] = &state.registers.daddr;
     pointers[detail::clock_slot] = &state.registers.emuclk;
     pointers[detail::pipeline_slot] = &pipeline_history;
+    pointers[detail::delayed_target_slot] = &delayed_target;
     pointers[detail::mode_slot] = &state.registers.mode1;
     pointers[detail::stack_slot] = state.registers.pc_stack.data();
     pointers[detail::stack_depth_slot] = &state.registers.pc_stack_pointer;
+    pointers[detail::loop_address_slot] = state.registers.loop_address_stack.data();
+    pointers[detail::loop_counter_slot] = state.registers.loop_counter_stack.data();
+    pointers[detail::loop_address_depth_slot] = &state.registers.loop_address_depth;
+    pointers[detail::loop_counter_depth_slot] = &state.registers.loop_counter_depth;
+    pointers[detail::lcntr_slot] = &state.registers.lcntr;
+    pointers[detail::loop_frames_slot] = loops.frames.data();
+    pointers[detail::loop_refill_slot] = &loops.refill;
+    pointers[detail::short_loop_slot] = loops.short_loop.data();
+    pointers[detail::loop_call_slot] = loops.calls.data();
+    pointers[detail::return_loop_tail_slot] = &loops.return_tail;
+    for (std::size_t index = 0; index < loops.counted_tails.size(); ++index) {
+      pointers[detail::counted_tail_slot + index] = &loops.counted_tails[index];
+    }
+    pointers[detail::short_counted_tail_slot] = &loops.short_counted_tail;
+    pointers[detail::short_parent_tail_slot] = &loops.short_parent_tail;
+    pointers[detail::suspended_call_state_slot] = loops.suspended_calls.data();
     pointers[detail::interrupt_latch_slot] = &state.registers.irptl;
     for (unsigned bank = 0; bank < 2; ++bank) {
       for (unsigned index = 0; index < 16; ++index) {
@@ -213,6 +310,31 @@ struct Core::Impl {
         result = fail(FaultReason::unsupported_feature,
                       "PC stack underflow, overflow or tagged continuation is not implemented");
         break;
+      case detail::NativeExit::unsupported_loop_stack:
+        result = fail(FaultReason::unsupported_feature, "invalid or exhausted hardware loop stack");
+        result.fault.instruction = control[detail::fault_instruction];
+        result.fault.instruction_bits = detail::full_instruction_bits;
+        state.fault = result.fault;
+        break;
+      case detail::NativeExit::unsupported_loop_reentry:
+        result = fail(FaultReason::unsupported_feature, "loop continuation requires RTS (LR)");
+        result.fault.instruction = control[detail::fault_instruction];
+        result.fault.instruction_bits = detail::full_instruction_bits;
+        state.fault = result.fault;
+        break;
+      case detail::NativeExit::invalid_loop_abort:
+        result = fail(FaultReason::unsupported_feature,
+                      "JUMP (LA) requires a valid exit from the innermost loop");
+        result.fault.instruction = control[detail::fault_instruction];
+        result.fault.instruction_bits = detail::full_instruction_bits;
+        state.fault = result.fault;
+        break;
+      case detail::NativeExit::invalid_short_loop_call:
+        result = fail(FaultReason::unsupported_feature, "CALL in a two-word, single-iteration DO");
+        result.fault.instruction = control[detail::fault_instruction];
+        result.fault.instruction_bits = detail::full_instruction_bits;
+        state.fault = result.fault;
+        break;
       case detail::NativeExit::undeclared:
         result = fail(FaultReason::undeclared_entry, "execution reached an undeclared instruction");
         break;
@@ -229,6 +351,7 @@ struct Core::Impl {
 
   [[nodiscard]] bool entry_allowed() const {
     if (continuing()) { return true; }
+    if (delayed_target != 0 || loops.active()) { return false; }
     const auto &variants = installed->image->code.variants;
     const auto code = std::ranges::find(variants, variant, &CodeVariant::id);
     return code != variants.end() &&
@@ -250,6 +373,7 @@ struct Core::Impl {
   }
 
   RunResult execute(std::uint64_t instructions, std::uint64_t cycles);
+  void observe_pipeline(Progress retired);
   RunResult host_failure(Progress progress);
   bool enter(std::size_t index, detail::ControlWords &control);
 
@@ -262,6 +386,8 @@ struct Core::Impl {
   detail::NativeCall native_call;
   std::vector<detail::HostView> views;
   std::uint32_t pipeline_history{};
+  std::uint64_t delayed_target{}; // Latched PC, next slot and optional loop fetch address.
+  LoopPipeline loops;
   std::shared_ptr<const NativeImage::Impl> installed;
   std::uint32_t variant{};
   std::optional<Resume> resume;
@@ -274,6 +400,8 @@ struct Snapshot::Impl {
   bool yield_requested{};
   std::optional<Resume> resume;
   std::uint32_t pipeline_history{};
+  std::uint64_t delayed_target{};
+  LoopPipeline loops;
 };
 
 Core::Core(Memory memory, ExecutionMode mode)
@@ -490,6 +618,8 @@ void Core::set_registers(const Registers &registers) {
   if (registers.pc != impl_->state.registers.pc) {
     impl_->resume.reset();
     impl_->pipeline_history = 0;
+    impl_->delayed_target = 0;
+    impl_->loops = {};
   }
   impl_->state.registers = registers;
 }
@@ -506,7 +636,9 @@ Snapshot Core::save() const {
                      .state = impl_->state,
                      .yield_requested = impl_->yield_requested,
                      .resume = impl_->resume,
-                     .pipeline_history = impl_->pipeline_history});
+                     .pipeline_history = impl_->pipeline_history,
+                     .delayed_target = impl_->delayed_target,
+                     .loops = impl_->loops});
   return snapshot;
 }
 
@@ -519,6 +651,8 @@ void Core::restore(const Snapshot &snapshot) {
   impl_->yield_requested = snapshot.impl_->yield_requested;
   impl_->resume = snapshot.impl_->resume;
   impl_->pipeline_history = snapshot.impl_->pipeline_history;
+  impl_->delayed_target = snapshot.impl_->delayed_target;
+  impl_->loops = snapshot.impl_->loops;
 }
 
 bool Core::Impl::enter(std::size_t index, detail::ControlWords &control) {
@@ -529,6 +663,24 @@ bool Core::Impl::enter(std::size_t index, detail::ControlWords &control) {
     return true;
   }
   return native_call.invoke(installed->entries[index], pointers.data(), control.data());
+}
+
+void Core::Impl::observe_pipeline(Progress retired) {
+  if (retired.instructions == 0) { return; }
+  auto &registers = state.registers;
+  if (delayed_target == 0) {
+    if (registers.loop_address_depth != 0 || loops.refill != 0 ||
+        loops.short_loop[detail::short_addresses] != 0) {
+      loops.observe(registers);
+    }
+    return;
+  }
+  const auto target = static_cast<std::uint32_t>(delayed_target) & detail::maximum_pc;
+  const bool first = (delayed_target & detail::before_first_delay_slot) != 0;
+  registers.faddr = (delayed_target & detail::delayed_fetch_live) != 0
+                        ? static_cast<std::uint32_t>(delayed_target >> detail::delayed_fetch_shift)
+                        : (target + (first ? 1U : 2U)) & detail::maximum_pc;
+  registers.daddr = first ? (registers.pc + 2) & detail::maximum_pc : target;
 }
 
 RunResult Core::Impl::execute(std::uint64_t instructions, std::uint64_t cycles) {
@@ -573,6 +725,7 @@ RunResult Core::Impl::execute(std::uint64_t instructions, std::uint64_t cycles) 
     if (!enter(*index, control)) { return host_failure(progress); }
     const Progress retired{.instructions = control[detail::retired_instructions],
                            .base_cycles = control[detail::retired_cycles]};
+    observe_pipeline(retired);
     progress.instructions += retired.instructions;
     progress.base_cycles += retired.base_cycles;
     state.progress.instructions += retired.instructions;
