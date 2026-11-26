@@ -61,6 +61,8 @@ A counted DO loads LCNTR once. The current count then evolves on the loop
 counter stack while LCNTR continues to hold the setup value.
 A qualified CALL saves a suspended terminating tail with its PC-stack entry.
 For a delayed `RTS (LR)`, the tail becomes active after the two return slots.
+A CALL occupying an admitted long-loop endpoint consumes the loop decision
+and pushes the selected successor, including the loop header on a repeat.
 An admitted `JUMP (LA)` removes the loop frame at the jump. A counted tail
 that has already popped identifies the completed frame until an abort or the
 original endpoint retires. With DB, the two slots execute after the stack effect.

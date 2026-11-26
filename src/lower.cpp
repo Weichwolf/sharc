@@ -272,6 +272,20 @@ struct LoopShape {
 
 using LoopMap = std::map<std::uint32_t, LoopShape>;
 
+std::set<std::uint32_t> call_continuations(std::span<const Instruction> code,
+                                           const LoopMap &reentry_calls) {
+  std::set<std::uint32_t> continuations;
+  for (const auto &op : code) {
+    if (!call_branch_instruction(op)) { continue; }
+    continuations.insert(call_resume(op));
+    const auto site = reentry_calls.find(op.address);
+    if (site != reentry_calls.end() && site->second.end == op.address) {
+      continuations.insert(site->second.start);
+    }
+  }
+  return continuations;
+}
+
 struct LoopPlan {
   LoopMap shapes;
   LoopMap reentry_calls;
@@ -836,6 +850,8 @@ private:
   abort_target_in_parent(llvm::Value *target, const Values &values, llvm::Value *already_exited);
   void loop_status(Values &values, llvm::Value *depth);
   [[nodiscard]] LoopFrame active_loop(const Values &values, const LoopShape &shape);
+  llvm::Value *repeat_scheduled(const LoopFrame &frame);
+  void clear_loop_repeat(const LoopFrame &frame);
   void loop_fetch(Values &values, const LoopShape &shape);
   void loop_test(Values &values, const LoopShape &shape, llvm::Value *old_status);
   void loop_refill(Values &values, const Instruction &op);
@@ -1619,12 +1635,26 @@ Lowering::loop_call_address(const Values &values, const Instruction &op, const L
   auto *terminating = builder_.CreateICmpEQ(pending, builder_.getInt64(signature));
   const auto frame = active_loop(values, shape);
   auto *in_loop = builder_.CreateOr(terminating, frame.matches);
-  auto *saved = builder_.CreateSelect(terminating, pending, builder_.getInt64(0));
+  const bool endpoint = op.address == shape.end;
+  // CALL at E replaces the remainder of the loop's pipeline refill.
+  auto *saved = endpoint ? static_cast<llvm::Value *>(builder_.getInt64(0))
+                         : builder_.CreateSelect(terminating, pending, builder_.getInt64(0));
   auto *call_state = builder_.CreateSelect(
       in_loop, builder_.CreateOr(saved, builder_.getInt64(loop_call_live)), builder_.getInt64(0));
   builder_.CreateStore(call_state, loop_cell(loop_call_slot, values[pc_stack_depth_value], 64));
   store(builder_.CreateSelect(terminating, builder_.getInt64(0), pending), loop_refill_slot);
-  auto *address = builder_.getInt32(call_resume(op) | pc_call_tag);
+  llvm::Value *address = builder_.getInt32(call_resume(op) | pc_call_tag);
+  if (endpoint) {
+    auto *repeat = builder_.CreateAnd(frame.matches, repeat_scheduled(frame));
+    auto *backedge = llvm::BasicBlock::Create(module_.getContext(), "call.loop.repeat", function_);
+    auto *ready = llvm::BasicBlock::Create(module_.getContext(), "call.loop.resume", function_);
+    builder_.CreateCondBr(repeat, backedge, ready);
+    builder_.SetInsertPoint(backedge);
+    clear_loop_repeat(frame);
+    builder_.CreateBr(ready);
+    builder_.SetInsertPoint(ready);
+    return builder_.CreateSelect(repeat, builder_.getInt32(shape.start | pc_call_tag), address);
+  }
   // PCSTK bit 25 is set when the sample exits while CALL is in Address.
   const auto sample =
       shape.counted() ? (shape.end - loop_fetch_distance) & maximum_pc : shape.condition_pc();
@@ -1683,11 +1713,7 @@ void Lowering::restore_loop_call(const Instruction &op,
 void Lowering::return_to_caller(Values values, llvm::Value *target, bool partial) {
   auto *unknown = llvm::BasicBlock::Create(module_.getContext(), "cold.return", function_);
   auto *dispatch = builder_.CreateSwitch(target, unknown);
-  std::set<std::uint32_t> returns;
-  for (const auto &op : instructions_) {
-    if (call_branch_instruction(op)) { returns.insert(call_resume(op)); }
-  }
-  for (const auto address : returns) {
+  for (const auto address : call_continuations(instructions_, reentry_calls_)) {
     const auto found = addresses_.find(address);
     if (found == addresses_.end()) { continue; }
     auto &destination = partial ? partial_[found->second] : admission_[found->second];
@@ -1794,8 +1820,10 @@ void Lowering::complete(Values values,
   retire_short_observation(op.address);
   retire_pipeline(values, pipeline);
   values[hazard_value] = builder_.getInt1(op.compute.kind != ComputeKind::none);
-  if (loop_abort(op)) { loop_retirement(values, op, old_status, partial); }
-  credit(values, count, cycles, partial);
+  if (loop_abort(op) || hardware_ends_.contains(op.address)) {
+    loop_retirement(values, op, old_status, partial);
+  }
+  credit(values, count, builder_.CreateAdd(count, values[extra_cycles_value]), partial);
   finish(values, next, partial);
 }
 
@@ -2394,24 +2422,27 @@ void Lowering::check_loop_end(const Values &values, const Instruction &op, bool 
   const auto shape = hardware_ends_.find(op.address);
   if (shape == hardware_ends_.end()) { return; }
   const auto frame = active_loop(values, shape->second);
-  auto *pending = builder_.CreateAnd(frame.metadata, builder_.getInt32(loop_repeat_scheduled));
-  auto *known = builder_.CreateOr(builder_.CreateNot(frame.matches),
-                                  builder_.CreateICmpNE(pending, builder_.getInt32(0)));
+  auto *known = builder_.CreateOr(builder_.CreateNot(frame.matches), repeat_scheduled(frame));
   stack_guard(values, op, known, partial, NativeExit::unsupported_loop_stack);
+}
+
+llvm::Value *Lowering::repeat_scheduled(const LoopFrame &frame) {
+  auto *pending = builder_.CreateAnd(frame.metadata, builder_.getInt32(loop_repeat_scheduled));
+  return builder_.CreateICmpNE(pending, builder_.getInt32(0));
+}
+
+void Lowering::clear_loop_repeat(const LoopFrame &frame) {
+  auto *metadata = builder_.CreateAnd(frame.metadata, builder_.getInt32(~loop_repeat_scheduled));
+  builder_.CreateStore(metadata, loop_cell(loop_frames_slot, frame.index));
 }
 
 void Lowering::loop_backedge(const Values &values, const LoopShape &shape, bool partial) {
   const auto frame = active_loop(values, shape);
-  auto *pending = builder_.CreateAnd(frame.metadata, builder_.getInt32(loop_repeat_scheduled));
   auto *repeat = llvm::BasicBlock::Create(module_.getContext(), "loop.repeat", function_);
   auto *next = llvm::BasicBlock::Create(module_.getContext(), "loop.next", function_);
-  builder_.CreateCondBr(
-      builder_.CreateAnd(frame.matches, builder_.CreateICmpNE(pending, builder_.getInt32(0))),
-      repeat,
-      next);
+  builder_.CreateCondBr(builder_.CreateAnd(frame.matches, repeat_scheduled(frame)), repeat, next);
   builder_.SetInsertPoint(repeat);
-  auto *metadata = builder_.CreateAnd(frame.metadata, builder_.getInt32(~loop_repeat_scheduled));
-  builder_.CreateStore(metadata, loop_cell(loop_frames_slot, frame.index));
+  clear_loop_repeat(frame);
   auto turn = values;
   credit(turn,
          builder_.getInt64(1),
@@ -3211,7 +3242,7 @@ void validate_loop_call(LoopPlan &plan,
                         unsigned remaining,
                         std::string_view identity) {
   const bool sample = shape.arithmetic() && op.address == shape.condition_pc();
-  if (shape.short_body() || remaining == 0 || remaining == loop_fetch_distance || sample ||
+  if (shape.short_body() || remaining == loop_fetch_distance || sample ||
       !call_branch_instruction(op) || delayed(op)) {
     reject(op, identity, FaultReason::unsupported_instruction, "branch near the DO endpoint");
   }
@@ -3349,10 +3380,9 @@ connected_code(const InstructionMap &code, const LoopMap &shapes, std::uint32_t 
 void collect_continuations(std::vector<Continuation> &continuations,
                            const std::vector<Instruction> &connected,
                            const CodeVariant &variant,
+                           const LoopMap &reentry_calls,
                            std::uint32_t entry) {
-  for (const auto &op : connected) {
-    if (!call_branch_instruction(op)) { continue; }
-    const auto next = call_resume(op);
+  for (const auto next : call_continuations(connected, reentry_calls)) {
     if (std::ranges::find(connected, next, &Instruction::address) != connected.end()) {
       continuations.push_back({.variant = variant.id, .address = next, .root = entry});
     }
@@ -3398,7 +3428,7 @@ std::shared_ptr<const PreparedImage> lower_image(const CodeImage &image,
     for (const auto &request : variant.interrupt_vectors) { entries.insert(request.vector); }
     for (const auto entry : entries) {
       const auto connected = connected_code(code, plan.shapes, entry);
-      collect_continuations(continuations, connected, variant, entry);
+      collect_continuations(continuations, connected, variant, plan.reentry_calls, entry);
       const auto mask = context_mask(connected, plan.shapes);
       std::vector<std::uint32_t> contexts{0};
       for (std::uint32_t bit = 1; bit != 0; bit <<= 1) {

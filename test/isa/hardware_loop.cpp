@@ -773,7 +773,8 @@ void counted_call_turn(Timeline &trace, unsigned call_word, bool delayed_return,
     }
     // The third-to-last CALL is in Address in the final counter sample cycle.
     const auto tags = call_tag | (!repeats && pc == 2 ? termination_tag : 0);
-    const auto return_pc = pc + 1;
+    // Tables 4-13 and 4-14 show the instruction behind the endpoint CALL.
+    const auto return_pc = pc == 5 && repeats ? 1U : pc + 1;
     entered_call(trace, {.target = base + subroutine, .raw_return = tags | (base + return_pc)});
     state.pe[0].data[0][0] += 1U << raw_shift;
     trace.boundary(base + return_word);
@@ -793,14 +794,23 @@ void counted_call_turn(Timeline &trace, unsigned call_word, bool delayed_return,
 void counted_call_reentry() {
   constexpr auto setup = do_immediate | (std::uint64_t{2} << count_shift) | 5;
   constexpr auto sub = base + 8;
-  for (const bool delayed_return : {false, true}) {
-    const auto call_word = delayed_return ? 2U : 4U;
+
+  struct CallSite {
+    unsigned word;
+    bool dag2{};
+  };
+
+  constexpr std::array sites{CallSite{.word = 4},
+                             CallSite{.word = 2, .dag2 = true},
+                             CallSite{.word = 5},
+                             CallSite{.word = 5, .dag2 = true}};
+  for (const auto &[call_word, dag2] : sites) {
     std::array<std::uint64_t, 14> words{};
     words[0] = setup;
-    words[call_word] = delayed_return ? call_dag2 : call_direct | sub;
+    words[call_word] = dag2 ? call_dag2 : call_direct | sub;
     words[6] = jump_direct | (base + 13);
     words[8] = fixture::add(0, 0, 1);
-    words[9] = rts | lr | (delayed_return ? db : 0);
+    words[9] = rts | lr | (dag2 ? db : 0);
     words[10] = fixture::add(2, 2, 1);
     words[11] = fixture::add(2, 2, 1);
     fixture::Program program(words);
@@ -811,10 +821,55 @@ void counted_call_reentry() {
     Timeline trace{.registers = initial, .prefixes = {}};
     trace.registers.lcntr = 2;
     entered(trace, {.address = counted_address | (base + 5), .count = 2});
-    counted_call_turn(trace, call_word, delayed_return, true);
-    counted_call_turn(trace, call_word, delayed_return, false);
+    counted_call_turn(trace, call_word, dag2, true);
+    counted_call_turn(trace, call_word, dag2, false);
     verify_timeline(program, initial, trace);
   }
+}
+
+void conditional_endpoint_call(bool call_if_nonzero) {
+  constexpr auto start = base + 1;
+  constexpr auto end = base + 5;
+  constexpr auto sub = base + 8;
+  constexpr std::uint64_t call_eq = 0x068000000000;
+  constexpr std::uint64_t call_ne = 0x06a000000000;
+  constexpr auto minus_one = std::numeric_limits<std::uint32_t>::max();
+  std::array<std::uint64_t, 12> words{};
+  words[0] = do_eq | 5;
+  words[1] = fixture::add(0, 0, 1);
+  words[5] = (call_if_nonzero ? call_ne : call_eq) | sub;
+  words[6] = jump_direct | (base + 11);
+  words[9] = rts | lr;
+  fixture::Program program(words);
+  auto initial = starting();
+  initial.pe[0].data[0][0] = 2U << raw_shift;
+  initial.pe[0].data[0][1] = std::uint64_t{minus_one} << raw_shift;
+  Timeline trace{.registers = initial, .prefixes = {}};
+  auto &state = trace.registers;
+  entered(trace, {.address = end, .count = old_lcntr});
+  for (const bool repeats : {true, false}) {
+    auto &lane = state.pe[0];
+    lane.data[0][0] = repeats ? 1U << raw_shift : 0;
+    lane.astat = repeats ? ac : ac | az;
+    short_boundary(trace, {.pc = 2, .fetch = 1, .decode = 4});
+    short_boundary(trace, {.pc = 3, .fetch = 2, .decode = 5});
+    if (!repeats) { popped(state); }
+    short_boundary(trace, {.pc = 4, .fetch = repeats ? 3U : 6U, .decode = 1});
+    short_boundary(trace, {.pc = 5, .fetch = repeats ? 4U : 7U, .decode = 2});
+    const auto target = repeats ? start : end + 1;
+    if (repeats == call_if_nonzero) {
+      entered_call(trace, {.target = sub, .raw_return = call_tag | target});
+      trace.boundary(sub + 1);
+      trace.record();
+      popped_call(state);
+      trace.boundary(target, 4);
+    } else {
+      // A false CALL leaves the ordinary loop backedge or two-clock refill.
+      trace.boundary(target, repeats ? 1U : 3U);
+    }
+    trace.record();
+  }
+  verify_timeline(program, initial, trace);
 }
 
 void arithmetic_call_reentry() {
@@ -1147,6 +1202,8 @@ void fixture::hardware_loop_control_flow() {
   nested_do();
   nested_short_do();
   counted_call_reentry();
+  conditional_endpoint_call(false);
+  conditional_endpoint_call(true);
   arithmetic_call_reentry();
   predicated_loop_abort();
   arithmetic_loop_abort();

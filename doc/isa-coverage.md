@@ -192,6 +192,13 @@ tag when the loop terminates during the call's address stage. Tests cover
 continued and terminating counted turns, a DAG2 call into a separate prepared
 entry, delayed return slots, suspension of an arithmetic refill while the callee
 runs its own DO, and a precise fault for an ordinary RTS on a suspended tail.
+An immediate CALL at the endpoint stores the next loop header or the word
+after the loop as its return address. On a terminating arithmetic turn the
+taken call replaces the loop refill. A false predicate keeps the normal
+loop backedge or exit refill. Installed-image fixtures cover both backedge
+and exit returns through the connected and separate prepared entries.
+The endpoint CALL timing is derived from the branch and loop pipeline
+tables. Comparison with a hardware trace remains open.
 Classic JUMP (LA) handles qualified long-loop exits through absolute,
 PC-relative and DAG2 targets, with either immediate transfer or two delay
 slots. A false predicate leaves the hardware loop's outstanding decision
@@ -199,7 +206,7 @@ active. A taken exit uses the active frame or the already-popped counted
 tail, preserving the parent frame. Authored tests cover precise refusal for
 targets inside the current loop, exits across two levels and exits to the
 endpoint of an arithmetic parent.
-Remaining endpoint placements, short-loop calls and overlapping loop
+Calls coinciding with a loop sample, short-loop calls and overlapping loop
 lookahead are open.
 
 Classic type 5 transfers raw data among R/S and I/M/L/B registers, including
