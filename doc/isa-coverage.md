@@ -206,8 +206,16 @@ active. A taken exit uses the active frame or the already-popped counted
 tail, preserving the parent frame. Authored tests cover precise refusal for
 targets inside the current loop, exits across two levels and exits to the
 endpoint of an arithmetic parent.
-Calls coinciding with a loop sample, short-loop calls and overlapping loop
-lookahead are open.
+When an admitted long arithmetic child finishes within four words of the
+parent endpoint, the parent's Fetch1 event follows the child's actual drain
+and refill clocks. A parent arithmetic sample in the final refill clock sees
+the flags written by the child's last instruction. The checked path and the
+LLVM grant for full child turns share the transition logic. Installed-image
+tests cover countdown timing at all four gaps, snapshot replay, an arithmetic
+parent and a child refill overlapping an already-popped counted parent with
+a pending CALL. These combined pipeline timings are derived from the manual.
+Calls coinciding with a loop sample, short-loop calls, overlapping short
+loops and branches in the overlapping child refill remain open.
 
 Classic type 5 transfers raw data among R/S and I/M/L/B registers, including
 cross-PE data moves and raw40 register swaps, with supported single-function fixed

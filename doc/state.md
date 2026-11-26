@@ -57,6 +57,8 @@ declared code transfers still need execution and snapshot qualification.
 For admitted DO forms, snapshots retain the PC-stack ownership of each
 hardware loop frame and its fetch decision. They also retain the pending
 arithmetic refill and short loop words still buffered after an early stack pop.
+A pending counted tail and an arithmetic refill have distinct storage, so
+the outer counter may terminate while the inner arithmetic tail is draining.
 A counted DO loads LCNTR once. The current count then evolves on the loop
 counter stack while LCNTR continues to hold the setup value.
 A qualified CALL saves a suspended terminating tail with its PC-stack entry.

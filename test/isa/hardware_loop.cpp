@@ -78,6 +78,22 @@ void popped(sharc::Registers &registers) {
   registers.pe[0].stky |= empty;
 }
 
+struct CallTransfer {
+  std::uint32_t target, raw_return;
+};
+
+void entered_call(Timeline &trace, CallTransfer call) {
+  auto &state = trace.registers;
+  state.pc_stack[state.pc_stack_pointer++] = call.raw_return;
+  state.pe[0].stky &= ~pc_empty;
+  trace.boundary(call.target, 4);
+  trace.record();
+}
+
+void popped_call(sharc::Registers &state) {
+  if (--state.pc_stack_pointer == 0) { state.pe[0].stky |= pc_empty; }
+}
+
 struct Range {
   std::uint32_t start, end;
 };
@@ -677,6 +693,157 @@ void nested_do() {
   fixture::verify_prefixes(core, replay, trace.prefixes);
 }
 
+void enter_arithmetic_child(Timeline &trace) {
+  auto &state = trace.registers;
+  state.loop_address_depth = state.loop_counter_depth = state.pc_stack_pointer = 2;
+  state.pc_stack[1] = base + 3;
+  state.loop_address_stack[1] = base + 7;
+  state.loop_counter_stack[1] = state.lcntr;
+  trace.boundary(base + 3);
+  trace.record();
+}
+
+void leave_arithmetic_child(sharc::Registers &state) {
+  state.loop_address_depth = state.loop_counter_depth = state.pc_stack_pointer = 1;
+}
+
+void child_arithmetic_pass(Timeline &trace, bool repeats) {
+  auto &state = trace.registers;
+  state.pe[0].data[0][0] = repeats ? 1U << raw_shift : 0;
+  state.pe[0].astat = repeats ? ac : ac | az;
+  short_boundary(trace, {.pc = 4, .fetch = 3, .decode = 6});
+  short_boundary(trace, {.pc = 5, .fetch = 4, .decode = 7});
+  if (repeats) {
+    short_boundary(trace, {.pc = 6, .fetch = 5, .decode = 3});
+    short_boundary(trace, {.pc = 7, .fetch = 6, .decode = 4});
+    trace.boundary(base + 3);
+    trace.record();
+  } else {
+    leave_arithmetic_child(state);
+    short_boundary(trace, {.pc = 6, .fetch = 8, .decode = 3});
+  }
+}
+
+void parent_count_sample(Timeline &trace, bool repeats) {
+  --trace.registers.loop_counter_stack[0];
+  if (!repeats) { popped(trace.registers); }
+}
+
+void parent_count_tail(Timeline &trace, unsigned end, bool repeats) {
+  for (unsigned pc = 8; pc <= end; ++pc) {
+    trace.boundary(base + pc, pc == 8 ? 3U : 1U);
+    if (repeats) {
+      constexpr std::array fetch{4U, 3U, 2U, 1U};
+      const auto distance = end - pc;
+      trace.registers.faddr = base + fetch[distance];
+      if (distance < 2) { trace.registers.daddr = base + 2 - distance; }
+    }
+    trace.record();
+  }
+}
+
+constexpr auto overlap_subroutine = base + 11;
+
+void finish_overlapping_outer(Timeline &trace, std::uint32_t next, bool calls) {
+  if (calls) {
+    entered_call(trace, {.target = overlap_subroutine, .raw_return = call_tag | next});
+    trace.boundary(overlap_subroutine + 1);
+    trace.record();
+    popped_call(trace.registers);
+  }
+  trace.boundary(next, calls ? 4U : 1U);
+  trace.record();
+}
+
+void counted_arithmetic_overlap() {
+  constexpr unsigned child_end = 7;
+  constexpr auto minus_one = std::numeric_limits<std::uint32_t>::max();
+  constexpr auto counted_two = do_immediate | (std::uint64_t{2} << count_shift);
+
+  struct OverlapCase {
+    unsigned gap;
+    bool calls{};
+  };
+
+  constexpr std::array cases{OverlapCase{.gap = 1},
+                             OverlapCase{.gap = 2},
+                             OverlapCase{.gap = 3},
+                             OverlapCase{.gap = 4},
+                             OverlapCase{.gap = 1, .calls = true}};
+  for (const auto &[gap, calls] : cases) {
+    const auto end = child_end + gap;
+    std::array<std::uint64_t, 13> words{};
+    words[0] = counted_two | end;
+    words[1] = fixture::immediate(0, 2);
+    words[2] = do_eq | 5;
+    words[3] = fixture::add(0, 0, 1);
+    if (calls) {
+      words[end] = call_direct | overlap_subroutine;
+      words[overlap_subroutine - base + 1] = rts | lr;
+    }
+    fixture::Program program(words);
+    auto initial = starting();
+    initial.pe[0].data[0][1] = std::uint64_t{minus_one} << raw_shift;
+    Timeline trace{.registers = initial, .prefixes = {}};
+    auto &state = trace.registers;
+    state.lcntr = 2;
+    entered(trace, {.address = counted_address | (base + end), .count = 2});
+    for (const bool repeats : {true, false}) {
+      state.pe[0].data[0][0] = 2U << raw_shift;
+      trace.boundary(base + 2);
+      trace.record();
+      enter_arithmetic_child(trace);
+      child_arithmetic_pass(trace, true);
+      child_arithmetic_pass(trace, false);
+      // After termination the child's Fetch1 reaches +8 while +6
+      // executes, +9 while +7 executes, then +10/+11 on the two bubbles.
+      if (gap == 1) { parent_count_sample(trace, repeats); }
+      short_boundary(trace, {.pc = 7, .fetch = gap == 1 && repeats ? 1U : 9U, .decode = 4});
+      if (gap != 1) { parent_count_sample(trace, repeats); }
+      parent_count_tail(trace, end, repeats);
+      finish_overlapping_outer(trace, base + (repeats ? 1U : end + 1), calls);
+    }
+    verify_timeline(program, initial, trace);
+  }
+}
+
+void arithmetic_refill_overlap(bool ending) {
+  constexpr auto end = base + 9;
+  std::array<std::uint64_t, 11> words{};
+  words[0] = do_eq | 9;
+  words[2] = do_eq | 5;
+  words[3] = fixture::add(0, 0, 0);
+  words[6] = fixture::add(2, 1, 1);
+  words[7] = ending ? fixture::add(3, 4, 4) : fixture::add(3, 1, 1);
+  fixture::Program program(words);
+  auto initial = starting();
+  initial.pe[0].data[0][1] = 1U << raw_shift;
+  Timeline trace{.registers = initial, .prefixes = {}};
+  auto &state = trace.registers;
+  entered(trace, {.address = end, .count = old_lcntr});
+  trace.boundary(base + 2);
+  trace.record();
+  enter_arithmetic_child(trace);
+  state.pe[0].astat = az;
+  short_boundary(trace, {.pc = 4, .fetch = 3, .decode = 6});
+  short_boundary(trace, {.pc = 5, .fetch = 4, .decode = 7});
+  leave_arithmetic_child(state);
+  short_boundary(trace, {.pc = 6, .fetch = 8, .decode = 3});
+  state.pe[0].astat = 0;
+  state.pe[0].data[0][2] = 2U << raw_shift;
+  short_boundary(trace, {.pc = 7, .fetch = 9, .decode = 4});
+  // The parent's condition is tested during refill with the flags from
+  // the last child instruction, which are not available on entry to +7.
+  state.pe[0].astat = ending ? az : 0;
+  state.pe[0].data[0][3] = ending ? 0 : 2U << raw_shift;
+  if (ending) { popped(state); }
+  short_boundary(trace, {.pc = 8, .fetch = ending ? 10U : 3U, .decode = 1}, 3);
+  short_boundary(trace, {.pc = 9, .fetch = ending ? 11U : 4U, .decode = 2});
+  trace.boundary(ending ? end + 1 : base + 1, ending ? 3U : 1U);
+  trace.record();
+  verify_timeline(program, initial, trace);
+}
+
 void nested_short_do() {
   constexpr Range outer{.start = base + 1, .end = base + 7};
   constexpr auto inner_word = base + 2;
@@ -730,22 +897,6 @@ void nested_short_do() {
     tail(trace, outer, repeats);
   }
   fixture::verify_prefixes(core, replay, trace.prefixes);
-}
-
-struct CallTransfer {
-  std::uint32_t target, raw_return;
-};
-
-void entered_call(Timeline &trace, CallTransfer call) {
-  auto &state = trace.registers;
-  state.pc_stack[state.pc_stack_pointer++] = call.raw_return;
-  state.pe[0].stky &= ~pc_empty;
-  trace.boundary(call.target, 4);
-  trace.record();
-}
-
-void popped_call(sharc::Registers &state) {
-  if (--state.pc_stack_pointer == 0) { state.pe[0].stky |= pc_empty; }
 }
 
 void counted_call_boundary(Timeline &trace, unsigned pc, bool repeats, unsigned cycles) {
@@ -1200,6 +1351,9 @@ void fixture::hardware_loop_control_flow() {
   arithmetic_do();
   forever_do();
   nested_do();
+  counted_arithmetic_overlap();
+  arithmetic_refill_overlap(false);
+  arithmetic_refill_overlap(true);
   nested_short_do();
   counted_call_reentry();
   conditional_endpoint_call(false);
