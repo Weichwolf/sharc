@@ -11,8 +11,8 @@ report the additional base cost on those same bindings.
 The [IR optimisation-level experiment](results/linux-optimization-levels.md)
 compares O1/O2/O3/Os with native code generation and the reference held fixed.
 
-The [immediate ROT measurements](results/linux-immediate-rotate.md) compare K4
-using its immediate count with the earlier register-count program.
+The [immediate ROT experiment](results/linux-immediate-rotate.md) used a
+different guest encoding from the register-count K4 baseline.
 
 Configure a Release build with Clang 19, then run:
 
@@ -67,9 +67,9 @@ and transition count. Neither expected-result calculation shares production code
 `k4.asm` is 79 source lines and 61 authored classic ISA instructions. `k4.cpp`
 encodes them without an assembler, places main/handlers/common at PM addresses
 `0x100/0x200/0x300`, and supplies eight table words at DM `0x90000`. The common
-routine uses the immediate ROT count -1. Historical results through the
-complete-view measurements used the register-count form with R6 initialized to
--1. Both forms retain the same instruction/cycle counts and algorithm output.
+routine rotates by the register count in R6, initialized to -1. This is the
+encoding used in the complete-view measurements and the baseline for lowering
+comparisons.
 Main dispatches indirectly, each handler calls the common
 routine directly, and RTS unwinds both architectural PC-stack frames. The
 caller's return site is a prepared continuation, not a public entry.
