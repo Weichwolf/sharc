@@ -1355,21 +1355,21 @@ void callee_short_loop(Timeline &trace) {
   trace.record();
 }
 
-unsigned short_call_round_trip(Timeline &trace, bool delayed) {
-  entered_call(trace, {.target = short_call_sub, .raw_return = call_tag | (base + 4)});
+unsigned short_call_round_trip(Timeline &trace, unsigned resume, bool delayed) {
+  entered_call(trace, {.target = short_call_sub, .raw_return = call_tag | (base + resume)});
   callee_short_loop(trace);
   popped_call(trace.registers);
   if (delayed) {
-    short_boundary(trace, {.pc = 11, .fetch = 5, .decode = 13});
+    short_boundary(trace, {.pc = 11, .fetch = resume + 1, .decode = 13});
     trace.registers.pe[0].data[0][2] = 7U << raw_shift;
-    short_boundary(trace, {.pc = 12, .fetch = 6, .decode = 4});
+    short_boundary(trace, {.pc = 12, .fetch = resume + 2, .decode = resume});
   }
   return delayed ? 2U : 4U;
 }
 
 enum class FourWordCall : std::uint8_t { direct, delayed, predicated, full_count };
 
-void four_word_loop_call(FourWordCall form) {
+void four_word_loop_call(FourWordCall form, unsigned site = 3) {
   constexpr std::uint64_t call_eq = 0x068000000000;
   const bool delayed = form == FourWordCall::delayed;
   const bool predicated = form == FourWordCall::predicated;
@@ -1377,7 +1377,7 @@ void four_word_loop_call(FourWordCall form) {
   const std::uint32_t count = full_count ? 0 : 2;
   std::array<std::uint64_t, 15> words{};
   words[0] = do_immediate | (std::uint64_t{count} << count_shift) | 4;
-  words[3] = delayed ? call_dag2 : (predicated ? call_eq : call_direct) | short_call_sub;
+  words[site] = delayed ? call_dag2 : (predicated ? call_eq : call_direct) | short_call_sub;
   words[5] = jump_direct | (base + 14);
   words[8] = do_immediate | (std::uint64_t{1} << count_shift) | 1;
   words[9] = fixture::add(0, 0, 1);
@@ -1399,8 +1399,10 @@ void four_word_loop_call(FourWordCall form) {
   --state.loop_counter_stack[0];
   short_boundary(trace, {.pc = 2, .fetch = 2, .decode = 3}, 2);
   for (const bool repeats : {true, false}) {
-    short_boundary(trace, {.pc = 3, .fetch = repeats ? 3U : 7U, .decode = 4});
-    const auto cycles = !predicated || repeats ? short_call_round_trip(trace, delayed) : 1U;
+    const bool take_call = !predicated || repeats;
+    const auto third = site == 2 && take_call ? short_call_round_trip(trace, 3, delayed) : 1U;
+    short_boundary(trace, {.pc = 3, .fetch = repeats ? 3U : 7U, .decode = 4}, third);
+    const auto cycles = site == 3 && take_call ? short_call_round_trip(trace, 4, delayed) : 1U;
     short_boundary(
         trace, {.pc = 4, .fetch = repeats ? 4U : 8U, .decode = repeats ? 1U : 5U}, cycles);
     if (full_count) {
@@ -1417,6 +1419,55 @@ void four_word_loop_call(FourWordCall form) {
       short_boundary(trace, {.pc = 5, .fetch = 9, .decode = 6});
     }
   }
+  verify_timeline(program, initial, trace);
+}
+
+void four_word_endpoint_turn(Timeline &trace, FourWordCall form, unsigned turn) {
+  const bool final = turn == 2;
+  const bool takes_call = form != FourWordCall::predicated || turn == 0;
+  short_boundary(trace, {.pc = 2, .fetch = final ? 6U : 2U, .decode = 3}, turn == 0 ? 2U : 1U);
+  short_boundary(trace, {.pc = 3, .fetch = final ? 7U : 3U, .decode = 4});
+  short_boundary(trace, {.pc = 4, .fetch = final ? 8U : 4U, .decode = final ? 5U : 1U});
+  const auto resume = final ? 5U : 1U;
+  const auto cycles =
+      takes_call ? short_call_round_trip(trace, resume, form == FourWordCall::delayed) : 1U;
+  if (final) {
+    short_boundary(trace, {.pc = 5, .fetch = 9, .decode = takes_call ? 7U : 6U}, cycles);
+    return;
+  }
+  // The count stays unchanged in the callee and both delayed slots.
+  // The repeat's end reaches Fetch1 only as the return admits the header.
+  parent_count_sample(trace, turn == 0);
+  short_boundary(trace, {.pc = 1, .fetch = turn == 0 ? 1U : 5U, .decode = 2}, cycles);
+}
+
+void four_word_endpoint_call(FourWordCall form) {
+  constexpr std::uint64_t call_eq = 0x068000000000;
+  const bool delayed = form == FourWordCall::delayed;
+  const bool predicated = form == FourWordCall::predicated;
+  std::array<std::uint64_t, 15> words{};
+  words[0] = do_immediate | (std::uint64_t{3} << count_shift) | 4;
+  words[4] = delayed ? call_dag2 : (predicated ? call_eq : call_direct) | short_call_sub;
+  words[5] = jump_direct | (base + 14);
+  words[8] = do_immediate | (std::uint64_t{1} << count_shift) | 1;
+  words[9] = fixture::add(0, 0, 1);
+  words[10] = rts | lr | (delayed ? db : 0);
+  words[11] = fixture::immediate(2, 7);
+  fixture::Program program(words);
+  program.code.variants.front().entries.push_back(short_call_sub);
+  auto initial = starting();
+  initial.dag[0][8].index = short_call_sub;
+  initial.pe[0].data[0][1] = 1U << raw_shift;
+  initial.pe[0].astat = predicated ? az : 0;
+  Timeline trace{.registers = initial, .prefixes = {}};
+  auto &state = trace.registers;
+  state.lcntr = 3;
+  entered(trace, {.address = counted_address | (base + 4), .count = 3});
+  state.faddr = base + 4;
+  state.daddr = base + 2;
+  trace.prefixes.back().registers = state;
+  --state.loop_counter_stack[0];
+  for (unsigned turn = 0; turn < 3; ++turn) { four_word_endpoint_turn(trace, form, turn); }
   verify_timeline(program, initial, trace);
 }
 
@@ -1447,6 +1498,21 @@ void refused_plain_short_loop_return() {
             fault.fault.detail.contains("RTS (LR)") && fault.progress == sharc::Progress{} &&
             core.registers() == before,
         "ordinary RTS consumed a buffered short loop");
+}
+
+void refused_overlapping_short_call() {
+  constexpr auto count_two = do_immediate | (std::uint64_t{2} << count_shift);
+  constexpr auto call = call_direct | (base + 10);
+  std::array<std::uint64_t, 11> words{};
+  words[0] = count_two | 9;
+  words[1] = count_two | 4;
+  words[3] = call;
+  words[10] = rts | lr;
+  const fixture::Program program(words);
+  const auto fault = fixture::refusal(program.code, "overlapping short CALL was prepared");
+  check(fault.reason == sharc::FaultReason::unsupported_instruction && fault.address == base + 3 &&
+            fault.instruction == call,
+        "overlapping short CALL fault lost instruction attribution");
 }
 
 enum class ArithmeticSampleCall : std::uint8_t {
@@ -1939,7 +2005,12 @@ void fixture::hardware_loop_control_flow() {
   four_word_loop_call(FourWordCall::delayed);
   four_word_loop_call(FourWordCall::predicated);
   four_word_loop_call(FourWordCall::full_count);
+  four_word_loop_call(FourWordCall::delayed, 2);
+  four_word_endpoint_call(FourWordCall::direct);
+  four_word_endpoint_call(FourWordCall::delayed);
+  four_word_endpoint_call(FourWordCall::predicated);
   refused_plain_short_loop_return();
+  refused_overlapping_short_call();
   arithmetic_sample_call(ArithmeticSampleCall::immediate);
   arithmetic_sample_call(ArithmeticSampleCall::delayed);
   arithmetic_sample_call(ArithmeticSampleCall::repeated);

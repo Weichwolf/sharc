@@ -186,12 +186,15 @@ tests cover old ASTAT sampling, a flag changing on either word of a two-word
 loop, SIMD lane agreement, FOREVER, exact bounds and cross-Core replay.
 Short arithmetic fetch and decode observations derive from the documented
 sample points and five-stage pipeline. They have no hardware trace comparison.
-An immediate CALL on the penultimate word of a counted four-word DO
-suspends the remaining buffered words. The callee can run its own DO.
-`RTS (LR)` restores the suspended buffer, after both slots for a delayed
-return. The installed-image tests cover a popped loop frame, a live
-frame, the zero-encoded full count, a false CALL predicate and snapshot
-replay. The combined CALL and refill timing awaits hardware comparison.
+An immediate CALL on any of the last three words of an admitted counted
+four-word DO suspends the remaining buffered words. The callee can run its
+own DO. On a repeating endpoint CALL, the saved PC is the loop header and
+the replacement end fetch samples the count at the return boundary. On
+the final endpoint CALL, the saved PC is the word after the loop. `RTS (LR)`
+restores a suspended buffer after both slots of a delayed return. The
+installed-image tests cover a popped loop frame, a live frame, the
+zero-encoded full count, false CALL predicates and snapshot replay. The
+combined CALL and refill timing awaits hardware comparison.
 Admitted immediate CALLs in the tail of a long DO preserve the sampled loop
 decision across `RTS (LR)` and `RTS (DB, LR)`. The PC stack records a separate
 tag when the loop terminates during the call's address stage. Tests cover
