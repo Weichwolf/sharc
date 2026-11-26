@@ -66,8 +66,9 @@ bound while the core sleeps. A snapshot preserves the sleeping boundary.
 Table B-2. Its bit in IRPTL/IMASK/IMASKP or LIRPTL follows Tables A-12 and A-13.
 The consumer chooses a pending source and supplies its declared vector PC.
 `interrupt_ready` checks the installed route, the global and individual masks,
-the active service priority, the first ISR instruction and a pending delayed
-transfer. A successful `interrupt` clears the source latch, marks the source
+the active service priority, the first ISR instruction, the startup shadow of a
+counted DO with one, two or four words, and a pending delayed transfer. A
+successful `interrupt` clears the source latch, marks the source
 active and pushes the tagged return PC. It charges the four nominal vector
 refill cycles without retiring a guest instruction. A sleeping core wakes
 through the vector and resumes after IDLE on RTI.

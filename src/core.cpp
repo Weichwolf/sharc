@@ -153,6 +153,22 @@ struct LoopPipeline {
            std::ranges::any_of(calls, [](auto call) { return call != 0; });
   }
 
+  [[nodiscard]] bool blocks_interrupt_at_setup(const Registers &registers) const noexcept {
+    const auto descriptor = short_loop[detail::short_descriptor];
+    const auto depth = registers.loop_address_depth;
+    if ((descriptor & detail::short_startup) == 0 || depth == 0) { return false; }
+    const auto address = registers.loop_address_stack[depth - 1];
+    constexpr unsigned termination_shift = 24;
+    constexpr unsigned termination_mask = 31;
+    constexpr unsigned counter_expired = 15;
+    constexpr unsigned type_shift = 29;
+    constexpr unsigned three_word_counted_type = 6;
+    // A counted DO with one, two or four body words blocks the following cycle.
+    return (address & detail::maximum_pc) == (descriptor & detail::maximum_pc) &&
+           ((address >> termination_shift) & termination_mask) == counter_expired &&
+           (address >> type_shift) != three_word_counted_type;
+  }
+
   void observe(Registers &registers) const {
     if (observe_short(registers)) { return; }
     const auto pc = registers.pc;
@@ -669,7 +685,8 @@ bool Core::interrupt_ready(const InterruptRequest &request) const noexcept {
   const auto &registers = state.registers;
   if (impl_->executing || !impl_->installed || state.has_fault ||
       state.instruction_set != InstructionSet::isa || (registers.mode2 & timer_enable) != 0 ||
-      impl_->delayed_target != 0 || request.source < first_maskable || request.source == reserved ||
+      impl_->delayed_target != 0 || impl_->loops.blocks_interrupt_at_setup(registers) ||
+      request.source < first_maskable || request.source == reserved ||
       request.source >= detail::interrupt_source_count ||
       (registers.mode1 & interrupt_enable) == 0 ||
       registers.pc_stack_pointer >= Registers::pc_stack_capacity ||

@@ -268,6 +268,35 @@ void irq_stack_limits() {
             core.registers().status_depth == registers.status_depth,
         "RTI near the stack limits failed to restore the prior depths");
 }
+
+void irq_shadow_after_do() {
+  constexpr std::uint64_t counted_seven_times = 0x0c0007000000;
+  const std::array handler{rti};
+  for (const unsigned length : {1U, 2U, 3U, 4U}) {
+    std::array<std::uint64_t, 6> main{};
+    main[0] = counted_seven_times | length;
+    fixture::Program program(main);
+    program.add_span(irq2.vector, handler);
+    program.code.variants.front().interrupt_vectors = {irq2};
+    const auto native = sharc::Core::compile(program.code);
+    sharc::Core core(program.memory());
+    (void)core.install(native, fixture::Program::variant_id);
+    core.reset(base);
+    auto registers = core.registers();
+    registers.mode1 = interrupt_enable;
+    registers.imask |= irq2_mask;
+    core.set_registers(registers);
+    check(core.interrupt_ready(irq2) && fixture::completed(core.run_until(1), 1, 1) &&
+              core.interrupt_ready(irq2) == (length == 3),
+          "counted DO startup applied the wrong interrupt shadow");
+    const auto setup = core.save();
+    check(!core.run(1).has_fault && core.interrupt_ready(irq2),
+          "counted DO startup shadow outlived the first body boundary");
+    core.restore(setup);
+    check(core.interrupt_ready(irq2) == (length == 3),
+          "snapshot lost its short loop startup shadow");
+  }
+}
 } // namespace
 
 int main() {
@@ -277,5 +306,6 @@ int main() {
       irq_in_counted_loop(mode);
     }
     irq_stack_limits();
+    irq_shadow_after_do();
   });
 }
