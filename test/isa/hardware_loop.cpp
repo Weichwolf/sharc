@@ -19,9 +19,14 @@ constexpr std::uint64_t do_r9 = 0x0d0900000000;
 constexpr std::uint64_t do_i8 = 0x0d1800000000;
 constexpr std::uint64_t do_lce = 0x0e1e00000000;
 constexpr std::uint64_t do_eq = 0x0e0000000000;
+constexpr std::uint64_t call_direct = 0x06be00000000, call_dag2 = 0x08be00000000;
+constexpr std::uint64_t jump_direct = 0x063e00000000, rts = 0x0a3e00000000;
+constexpr std::uint64_t lr = 1ULL << 24, db = 1ULL << 26;
+constexpr std::uint32_t call_tag = 1U << 24, termination_tag = 1U << 25;
+constexpr std::uint32_t pc_empty = 1U << 22, loop_empty = 1U << 26;
 constexpr std::uint32_t counted_address = 0xef000000;
 constexpr std::uint32_t single_word_counted_address = 0x4f000000;
-constexpr std::uint32_t empty = (1U << 22) | (1U << 26);
+constexpr std::uint32_t empty = pc_empty | loop_empty;
 constexpr std::uint32_t loop_overflow = 1U << 25;
 constexpr std::uint32_t old_lcntr = 0x13579bdf;
 constexpr unsigned raw_shift = 8;
@@ -325,9 +330,9 @@ void entered_arithmetic(Timeline &trace, ShortAddress address, std::uint32_t loo
   trace.prefixes.back().registers = trace.registers;
 }
 
-void verify_short_arithmetic(fixture::Program &program,
-                             const sharc::Registers &initial,
-                             const Timeline &trace) {
+void verify_timeline(fixture::Program &program,
+                     const sharc::Registers &initial,
+                     const Timeline &trace) {
   for (const auto mode : fixture::numeric_modes) {
     const auto native = fixture::compile(program.code, mode);
     sharc::Core core(program.memory(), mode);
@@ -373,8 +378,24 @@ void single_word_arithmetic() {
     short_boundary(trace, {.pc = 1, .fetch = 3, .decode = 1});
     lane.data[0][0] = std::uint64_t{first_buffered - 2} << raw_shift;
     short_boundary(trace, {.pc = 2, .fetch = 6, .decode = 4}, 3);
-    verify_short_arithmetic(program, initial, trace);
+    verify_timeline(program, initial, trace);
   }
+}
+
+void single_word_simd_condition() {
+  constexpr std::array words{do_eq | 1, std::uint64_t{0}, std::uint64_t{0}};
+  constexpr auto simd = 1U << 21;
+  constexpr auto arithmetic_type = 1U << 29;
+  fixture::Program program(words);
+  auto initial = starting();
+  initial.mode1 = simd;
+  initial.pe[0].astat = az;
+  Timeline trace{.registers = initial, .prefixes = {}};
+  entered_arithmetic(trace, {.pc = 1, .fetch = 1, .decode = 1}, arithmetic_type | (base + 1));
+  short_boundary(trace, {.pc = 1, .fetch = 1, .decode = 1}, 2);
+  short_boundary(trace, {.pc = 1, .fetch = 1, .decode = 1});
+  short_boundary(trace, {.pc = 1, .fetch = 1, .decode = 1});
+  verify_timeline(program, initial, trace);
 }
 
 void two_word_arithmetic() {
@@ -413,7 +434,7 @@ void two_word_arithmetic() {
     short_boundary(trace, {.pc = 2, .fetch = 4, .decode = 2});
     if (first_sets_zero) { lane.astat = 0; }
     short_boundary(trace, {.pc = 3, .fetch = 7, .decode = 5}, 3);
-    verify_short_arithmetic(program, initial, trace);
+    verify_timeline(program, initial, trace);
   }
 }
 
@@ -453,7 +474,7 @@ void three_word_arithmetic() {
       for (auto &lane : state.pe) { lane.astat = az; }
       short_boundary(trace, {.pc = 4, .fetch = 8, .decode = 6}, 3);
     }
-    verify_short_arithmetic(program, initial, trace);
+    verify_timeline(program, initial, trace);
   }
 }
 
@@ -478,7 +499,7 @@ void four_word_arithmetic() {
   short_boundary(trace, {.pc = 3, .fetch = 5, .decode = 1});
   short_boundary(trace, {.pc = 4, .fetch = 6, .decode = 2});
   short_boundary(trace, {.pc = 5, .fetch = 9, .decode = 7}, 3);
-  verify_short_arithmetic(program, initial, trace);
+  verify_timeline(program, initial, trace);
 }
 
 void short_forever_do() {
@@ -495,7 +516,7 @@ void short_forever_do() {
     short_boundary(trace, {.pc = 2, .fetch = 2, .decode = 2}, turn == 1 ? 2U : 1U);
     short_boundary(trace, {.pc = 1, .fetch = 1, .decode = 1});
   }
-  verify_short_arithmetic(program, initial, trace);
+  verify_timeline(program, initial, trace);
 }
 
 Timeline arithmetic_prefix(sharc::Registers registers, bool both_zero) {
@@ -710,6 +731,155 @@ void nested_short_do() {
   fixture::verify_prefixes(core, replay, trace.prefixes);
 }
 
+struct CallTransfer {
+  std::uint32_t target, raw_return;
+};
+
+void entered_call(Timeline &trace, CallTransfer call) {
+  auto &state = trace.registers;
+  state.pc_stack[state.pc_stack_pointer++] = call.raw_return;
+  state.pe[0].stky &= ~pc_empty;
+  trace.boundary(call.target, 4);
+  trace.record();
+}
+
+void popped_call(sharc::Registers &state) {
+  if (--state.pc_stack_pointer == 0) { state.pe[0].stky |= pc_empty; }
+}
+
+void counted_call_boundary(Timeline &trace, unsigned pc, bool repeats, unsigned cycles) {
+  if (repeats && pc >= 2 && pc <= 5) {
+    constexpr std::array decode{4U, 5U, 1U, 2U};
+    short_boundary(trace, {.pc = pc, .fetch = pc - 1, .decode = decode[pc - 2]}, cycles);
+  } else {
+    trace.boundary(base + pc, cycles);
+    trace.record();
+  }
+}
+
+void counted_call_turn(Timeline &trace, unsigned call_word, bool delayed_return, bool repeats) {
+  constexpr unsigned subroutine = 8;
+  constexpr auto return_word = subroutine + 1;
+  auto &state = trace.registers;
+  --state.loop_counter_stack[0];
+  if (!repeats) { popped(state); }
+  counted_call_boundary(trace, 2, repeats, 1);
+  for (unsigned pc = 2; pc <= 5; ++pc) {
+    if (pc != call_word) {
+      const auto next = pc == 5 && repeats ? 1U : pc + 1;
+      counted_call_boundary(trace, next, repeats, 1);
+      continue;
+    }
+    // The third-to-last CALL is in Address in the final counter sample cycle.
+    const auto tags = call_tag | (!repeats && pc == 2 ? termination_tag : 0);
+    const auto return_pc = pc + 1;
+    entered_call(trace, {.target = base + subroutine, .raw_return = tags | (base + return_pc)});
+    state.pe[0].data[0][0] += 1U << raw_shift;
+    trace.boundary(base + return_word);
+    trace.record();
+    popped_call(state);
+    if (delayed_return) {
+      short_boundary(trace,
+                     {.pc = return_word + 1, .fetch = return_pc + 1, .decode = return_word + 3});
+      state.pe[0].data[0][2] += 1U << raw_shift;
+      short_boundary(trace, {.pc = return_word + 2, .fetch = return_pc + 2, .decode = return_pc});
+      state.pe[0].data[0][2] += 1U << raw_shift;
+    }
+    counted_call_boundary(trace, return_pc, repeats, delayed_return ? 2U : 4U);
+  }
+}
+
+void counted_call_reentry() {
+  constexpr auto setup = do_immediate | (std::uint64_t{2} << count_shift) | 5;
+  constexpr auto sub = base + 8;
+  for (const bool delayed_return : {false, true}) {
+    const auto call_word = delayed_return ? 2U : 4U;
+    std::array<std::uint64_t, 14> words{};
+    words[0] = setup;
+    words[call_word] = delayed_return ? call_dag2 : call_direct | sub;
+    words[6] = jump_direct | (base + 13);
+    words[8] = fixture::add(0, 0, 1);
+    words[9] = rts | lr | (delayed_return ? db : 0);
+    words[10] = fixture::add(2, 2, 1);
+    words[11] = fixture::add(2, 2, 1);
+    fixture::Program program(words);
+    program.code.variants[0].entries.push_back(sub);
+    auto initial = starting();
+    initial.dag[0][8].index = sub;
+    initial.pe[0].data[0][1] = 1U << raw_shift;
+    Timeline trace{.registers = initial, .prefixes = {}};
+    trace.registers.lcntr = 2;
+    entered(trace, {.address = counted_address | (base + 5), .count = 2});
+    counted_call_turn(trace, call_word, delayed_return, true);
+    counted_call_turn(trace, call_word, delayed_return, false);
+    verify_timeline(program, initial, trace);
+  }
+}
+
+void arithmetic_call_reentry() {
+  constexpr auto sub = base + 8;
+  constexpr auto ret = base + 13;
+  constexpr auto end = base + 6;
+  constexpr auto inner_end = base + 12;
+  std::array<std::uint64_t, 16> words{};
+  words[0] = do_eq | 6;
+  words[5] = call_direct | sub;
+  words[7] = jump_direct | (base + 15);
+  words[8] = do_eq | 4;
+  words[13] = rts | lr;
+  fixture::Program program(words);
+  auto initial = starting();
+  initial.pe[0].astat = az;
+  Timeline trace{.registers = initial, .prefixes = {}};
+  auto &state = trace.registers;
+  entered(trace, {.address = end, .count = old_lcntr});
+  short_boundary(trace, {.pc = 2, .fetch = 6, .decode = 4});
+  short_boundary(trace, {.pc = 3, .fetch = 1, .decode = 5});
+  short_boundary(trace, {.pc = 4, .fetch = 2, .decode = 6});
+  popped(state);
+  short_boundary(trace, {.pc = 5, .fetch = 7, .decode = 1});
+  entered_call(trace, {.target = sub, .raw_return = call_tag | termination_tag | end});
+
+  // A second arithmetic DO can use its own refill while the caller's
+  // terminating tail is suspended by the call.
+  state.pc_stack[1] = sub + 1;
+  state.pc_stack_pointer = 2;
+  state.loop_address_depth = state.loop_counter_depth = 1;
+  state.loop_address_stack[0] = inner_end;
+  state.loop_counter_stack[0] = old_lcntr;
+  state.pe[0].stky &= ~loop_empty;
+  short_boundary(trace, {.pc = 9, .fetch = 9, .decode = 11});
+  short_boundary(trace, {.pc = 10, .fetch = 10, .decode = 12});
+  state.pc_stack_pointer = 1;
+  state.loop_address_depth = state.loop_counter_depth = 0;
+  state.pe[0].stky |= loop_empty;
+  short_boundary(trace, {.pc = 11, .fetch = 13, .decode = 9});
+  short_boundary(trace, {.pc = 12, .fetch = 14, .decode = 10});
+  trace.boundary(ret, 3);
+  trace.record();
+  const auto before_return = trace.prefixes.back();
+  const auto return_step = trace.prefixes.size();
+  popped_call(state);
+  short_boundary(trace, {.pc = 6, .fetch = 8, .decode = 2}, 4);
+  short_boundary(trace, {.pc = 7, .fetch = 11, .decode = 9}, 3);
+  verify_timeline(program, initial, trace);
+
+  words[13] = rts;
+  fixture::Program plain(words);
+  const auto native = sharc::Core::compile(plain.code);
+  sharc::Core core(plain.memory());
+  fixture::install(core, native, initial);
+  check(fixture::completed(core.run(return_step), return_step, before_return.cycles) &&
+            core.registers() == before_return.registers,
+        "call lost its loop continuation before an ordinary RTS");
+  const auto fault = core.run(1);
+  check(fault.has_fault && fault.fault.reason == sharc::FaultReason::unsupported_feature &&
+            fault.fault.address == ret && fault.fault.instruction == rts &&
+            fault.fault.detail.contains("RTS (LR)") && fault.progress == sharc::Progress{} &&
+            core.registers() == before_return.registers,
+        "an ordinary RTS consumed a suspended hardware loop");
+}
+
 void refused_do() {
   constexpr auto setup = do_immediate | (std::uint64_t{1} << count_shift) | 5;
   const std::array words{setup,
@@ -769,6 +939,7 @@ void fixture::hardware_loop_control_flow() {
   single_word_loops();
   multiword_short_loops();
   single_word_arithmetic();
+  single_word_simd_condition();
   two_word_arithmetic();
   three_word_arithmetic();
   four_word_arithmetic();
@@ -777,6 +948,8 @@ void fixture::hardware_loop_control_flow() {
   forever_do();
   nested_do();
   nested_short_do();
+  counted_call_reentry();
+  arithmetic_call_reentry();
   refused_do();
   skipped_fetch_boundary();
 }

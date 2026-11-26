@@ -39,7 +39,9 @@ inline constexpr std::size_t lcntr_slot = loop_counter_depth_slot + 1;
 inline constexpr std::size_t loop_frames_slot = lcntr_slot + 1;
 inline constexpr std::size_t loop_refill_slot = loop_frames_slot + 1;
 inline constexpr std::size_t short_loop_slot = loop_refill_slot + 1;
-inline constexpr std::size_t register_pointer_count = short_loop_slot + 1;
+inline constexpr std::size_t loop_call_slot = short_loop_slot + 1;
+inline constexpr std::size_t delayed_loop_tail_slot = loop_call_slot + 1;
+inline constexpr std::size_t register_pointer_count = delayed_loop_tail_slot + 1;
 inline constexpr unsigned loop_stack_capacity = 6;
 inline constexpr std::uint32_t loop_pc_index_mask = 31;
 inline constexpr std::uint32_t loop_frame_live = 1U << 5;
@@ -48,6 +50,10 @@ inline constexpr unsigned loop_fetch_distance = 4;
 inline constexpr unsigned loop_decode_distance = 2;
 inline constexpr unsigned loop_refill_end_shift = 24;
 inline constexpr std::uint64_t loop_refill_live = 1ULL << 48;
+inline constexpr std::uint64_t counted_loop_tail = 1ULL << 49;
+inline constexpr std::uint64_t loop_call_live = 1ULL << 63;
+inline constexpr std::uint32_t pc_call_tag = 1U << 24;
+inline constexpr std::uint32_t pc_sequencer_tag = 1U << 25;
 
 enum ShortLoopWord : std::uint8_t {
   short_remaining,
@@ -108,7 +114,8 @@ enum class NativeExit : std::uint8_t {
   access_fault,
   code_alias,
   returned,
-  unsupported_loop_stack
+  unsupported_loop_stack,
+  unsupported_loop_reentry
 };
 using NativeEntry = void (*)(void **, std::uint64_t *);
 using RegisterPointers = std::vector<void *>;

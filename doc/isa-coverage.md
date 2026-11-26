@@ -15,7 +15,7 @@ is claimed.
 | FastFP32 numerical mode (opt-in) | Independent approximation expectations, rounding/flags, unchanged raw moves/integer behavior, separate translations | Unimplemented |
 | Parallel operations | Old operands, memory aliases, register exchanges and ordered partial effects | Partial: raw register moves/swaps with supported fixed ALU writeback |
 | Address generation and memory | Both DAGs, modulo/reverse addressing, PM/DM and physical view aliases | Partial: normal-word pre-indexing, immediate modify/reverse and DAG register-load dependencies |
-| Sequencer and control | Delayed flow, DO/loop endpoints, LR, stacks, reset and interrupts | Partial: classic direct/indirect transfers, two delay slots, classic hardware DO and counted nesting |
+| Sequencer and control | Delayed flow, DO/loop endpoints, LR, stacks, reset and interrupts | Partial: classic direct/indirect transfers, two delay slots, classic hardware DO, counted nesting and admitted loop reentry |
 | Chip-profile boundaries | ADSP-21489 memory/vector parameters and explicit I/O ownership | Unimplemented |
 | JIT coherence and hosts | Self-modifying aliases, natural loops, precise exits, x86-64 and ARM64 | Unimplemented |
 
@@ -159,7 +159,7 @@ path. Preparation admits adjacent complementary delayed jumps without
 parallel computation and rejects other branches in slots. The ISA tests in
 `test/isa/delay.cpp` cover instruction and cycle prefixes, cross-Core replay,
 absolute, relative and DAG2 calls, 24-bit PC wrap, stack refusal and a slot
-memory fault. RTI and loop reentry remain open.
+memory fault. RTI remains open.
 
 Long classic DO bodies of at least five words support immediate and admitted
 register counts, LCNTR, arithmetic termination and FOREVER. Counted loops
@@ -186,7 +186,14 @@ tests cover old ASTAT sampling, a flag changing on either word of a two-word
 loop, SIMD lane agreement, FOREVER, exact bounds and cross-Core replay.
 Short arithmetic fetch and decode observations derive from the documented
 sample points and five-stage pipeline. They have no hardware trace comparison.
-Overlapping loop lookahead, branches near the endpoint and LR remain open.
+Admitted immediate CALLs in the tail of a long DO preserve the sampled loop
+decision across `RTS (LR)` and `RTS (DB, LR)`. The PC stack records a separate
+tag when the loop terminates during the call's address stage. Tests cover
+continued and terminating counted turns, a DAG2 call into a separate prepared
+entry, delayed return slots, suspension of an arithmetic refill while the callee
+runs its own DO, and a precise fault for an ordinary RTS on a suspended tail.
+Remaining endpoint placements, short-loop calls, loop abort and overlapping
+loop lookahead are open.
 
 Classic type 5 transfers raw data among R/S and I/M/L/B registers, including
 cross-PE data moves and raw40 register swaps, with supported single-function fixed

@@ -59,10 +59,12 @@ hardware loop frame and its fetch decision. They also retain the pending
 arithmetic refill and short loop words still buffered after an early stack pop.
 A counted DO loads LCNTR once. The current count then evolves on the loop
 counter stack while LCNTR continues to hold the setup value.
+A qualified CALL saves a suspended terminating tail with its PC-stack entry.
+For a delayed `RTS (LR)`, the tail becomes active after the two return slots.
 
 Peripheral interrupt routing (PICR), SRU, DMA and peripheral timers remain consumer
 state. TAP emulation controls and physical instruction-cache contents are not
 implemented. Instruction pipeline observations beyond the admitted classic
-transfers, loop reentry, interrupt eligibility/shadows, timer evolution and
+transfers and loop reentry, interrupt eligibility/shadows, timer evolution and
 reset values remain open. Straight-line ISA and admitted direct and indirect
 transfers update PC, FADDR, DADDR and EMUCLK at owner boundaries.

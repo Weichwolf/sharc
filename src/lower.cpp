@@ -81,6 +81,7 @@ constexpr std::uint64_t abort_branch = std::uint64_t{1} << 38;
 constexpr std::uint64_t delayed_branch = std::uint64_t{1} << 26;
 constexpr std::uint64_t else_compute = std::uint64_t{1} << 25;
 constexpr std::uint64_t clear_interrupt_branch = std::uint64_t{1} << 24;
+constexpr std::uint64_t loop_reentry = std::uint64_t{1} << 24;
 // Programming Reference 2.4, 4-19: three pipeline bubbles on a taken jump.
 constexpr unsigned branch_penalty = 3;
 constexpr unsigned delay_slot_count = 2;
@@ -230,6 +231,7 @@ bool loop_setup(const Instruction &op) {
 struct LoopShape {
   std::uint32_t start{}, end{};
   unsigned length{}, term{};
+  bool has_reentry{};
 
   [[nodiscard]] bool counted() const { return term == loop_counter_expired; }
 
@@ -259,6 +261,11 @@ struct LoopShape {
 };
 
 using LoopMap = std::map<std::uint32_t, LoopShape>;
+
+struct LoopPlan {
+  LoopMap shapes;
+  LoopMap reentry_calls;
+};
 
 LoopShape loop_shape(const Instruction &op) {
   const auto length = static_cast<std::uint32_t>(op.word) & maximum_pc;
@@ -404,7 +411,7 @@ void validate_return(const Instruction &instruction, std::string_view identity) 
     reject(instruction, identity, FaultReason::invalid_encoding, "reserved return bits");
   }
   if ((instruction.word >> opcode_shift) != 0x0a ||
-      (instruction.word & (modifiers & ~delayed_branch)) != 0 ||
+      (instruction.word & (modifiers & ~(delayed_branch | loop_reentry))) != 0 ||
       instruction.compute.kind != ComputeKind::none) {
     reject(instruction,
            identity,
@@ -634,12 +641,14 @@ public:
            const NativeAbi &abi,
            const CodeVariant &variant,
            std::vector<Instruction> instructions,
-           const NativeUnit &unit)
+           const NativeUnit &unit,
+           const LoopMap &reentry_calls)
       : module_(module),
         memory_mode_(memory_mode),
         abi_(abi),
         unit_(unit),
         variant_(variant),
+        reentry_calls_(reentry_calls),
         instructions_(std::move(instructions)),
         entry_address_(unit.entry),
         context_(unit.context),
@@ -688,8 +697,9 @@ private:
     return builder_.CreateInBoundsGEP(builder_.getInt32Ty(), pointer(stack_slot), index);
   }
 
-  llvm::Value *loop_cell(std::size_t slot, llvm::Value *index) {
-    return builder_.CreateInBoundsGEP(builder_.getInt32Ty(), pointer(slot), index);
+  llvm::Value *loop_cell(std::size_t slot, llvm::Value *index, unsigned bits = 32) {
+    return builder_.CreateInBoundsGEP(
+        llvm::IntegerType::get(module_.getContext(), bits), pointer(slot), index);
   }
 
   llvm::Value *short_cell(ShortLoopWord slot) {
@@ -842,7 +852,13 @@ private:
   void stack_status(Values &values);
   void push_pc(Values &values, llvm::Value *address);
   void call(Values &values, const Instruction &op, bool partial);
+  llvm::Value *
+  loop_call_address(const Values &values, const Instruction &op, const LoopShape &shape);
   llvm::Value *pop(Values &values, const Instruction &op, bool partial);
+  void restore_loop_call(const Instruction &op,
+                         llvm::Value *popped_depth,
+                         bool partial,
+                         const Values &values);
   void return_to_caller(Values values, llvm::Value *target, bool partial);
   std::vector<BlockCost> block_costs() const;
   void emit_exit();
@@ -868,6 +884,7 @@ private:
   const NativeAbi &abi_;
   const NativeUnit &unit_;
   const CodeVariant &variant_;
+  const LoopMap &reentry_calls_;
   std::vector<Instruction> instructions_;
   std::uint32_t entry_address_;
   std::uint32_t context_;
@@ -1505,7 +1522,8 @@ void Lowering::stack_guard(const Values &values,
     auto *completed = builder_.CreateSub(values[credit_value], builder_.getInt64(1));
     credit(prefix, completed, builder_.CreateAdd(completed, values[extra_cycles_value]), false);
   }
-  if (reason == NativeExit::unsupported_loop_stack) {
+  if (reason == NativeExit::unsupported_loop_stack ||
+      reason == NativeExit::unsupported_loop_reentry) {
     auto *word = builder_.CreateGEP(builder_.getInt64Ty(),
                                     function_->getArg(unit_controls),
                                     builder_.getInt64(fault_instruction));
@@ -1552,7 +1570,6 @@ void Lowering::push_pc(Values &values, llvm::Value *address) {
 }
 
 void Lowering::call(Values &values, const Instruction &op, bool partial) {
-  constexpr std::uint32_t call_tag = 1U << 24;
   if (op.compute.kind == ComputeKind::none) {
     stack_guard(values,
                 op,
@@ -1560,12 +1577,37 @@ void Lowering::call(Values &values, const Instruction &op, bool partial) {
                                        builder_.getInt32(Registers::pc_stack_capacity)),
                 partial);
   }
-  push_pc(values, builder_.getInt32(call_resume(op) | call_tag));
+  const auto site = reentry_calls_.find(op.address);
+  auto *address = site == reentry_calls_.end() ? builder_.getInt32(call_resume(op) | pc_call_tag)
+                                               : loop_call_address(values, op, site->second);
+  push_pc(values, address);
+}
+
+llvm::Value *
+Lowering::loop_call_address(const Values &values, const Instruction &op, const LoopShape &shape) {
+  auto *pending = load(64, loop_refill_slot);
+  const auto signature = (std::uint64_t{shape.end} << loop_refill_end_shift) | shape.start |
+                         (shape.counted() ? counted_loop_tail : loop_refill_live);
+  auto *terminating = builder_.CreateICmpEQ(pending, builder_.getInt64(signature));
+  const auto frame = active_loop(values, shape);
+  auto *in_loop = builder_.CreateOr(terminating, frame.matches);
+  auto *saved = builder_.CreateSelect(terminating, pending, builder_.getInt64(0));
+  auto *call_state = builder_.CreateSelect(
+      in_loop, builder_.CreateOr(saved, builder_.getInt64(loop_call_live)), builder_.getInt64(0));
+  builder_.CreateStore(call_state, loop_cell(loop_call_slot, values[pc_stack_depth_value], 64));
+  store(builder_.CreateSelect(terminating, builder_.getInt64(0), pending), loop_refill_slot);
+  auto *address = builder_.getInt32(call_resume(op) | pc_call_tag);
+  // PCSTK bit 25 is set when the sample exits while CALL is in Address.
+  const auto sample =
+      shape.counted() ? (shape.end - loop_fetch_distance) & maximum_pc : shape.condition_pc();
+  if (shape.term == true_condition || op.address != ((sample + 1) & maximum_pc)) { return address; }
+  return builder_.CreateOr(address,
+                           builder_.CreateSelect(terminating,
+                                                 builder_.getInt32(pc_sequencer_tag),
+                                                 builder_.getInt32(0)));
 }
 
 llvm::Value *Lowering::pop(Values &values, const Instruction &op, bool partial) {
-  // PCSTK bit 25 records loop termination or interrupt continuation (A-10).
-  constexpr std::uint32_t sequencer_tag = 1U << 25;
   auto *depth = values[pc_stack_depth_value];
   stack_guard(values,
               op,
@@ -1575,14 +1617,39 @@ llvm::Value *Lowering::pop(Values &values, const Instruction &op, bool partial) 
               partial);
   auto *popped_depth = builder_.CreateSub(depth, builder_.getInt32(1));
   auto *top = builder_.CreateLoad(builder_.getInt32Ty(), stack_cell(popped_depth));
-  stack_guard(values,
-              op,
-              builder_.CreateICmpEQ(builder_.CreateAnd(top, builder_.getInt32(sequencer_tag)),
-                                    builder_.getInt32(0)),
-              partial);
+  auto *tagged = builder_.CreateICmpNE(builder_.CreateAnd(top, builder_.getInt32(pc_sequencer_tag)),
+                                       builder_.getInt32(0));
+  auto *allowed = builder_.CreateNot(tagged);
+  const bool reentry = (op.word & loop_reentry) != 0;
+  if (reentry) {
+    auto *call = builder_.CreateICmpNE(builder_.CreateAnd(top, builder_.getInt32(pc_call_tag)),
+                                       builder_.getInt32(0));
+    allowed = builder_.CreateOr(allowed, call);
+  }
+  if (!reentry && !reentry_calls_.empty()) { restore_loop_call(op, popped_depth, partial, values); }
+  stack_guard(values, op, allowed, partial);
+  if (reentry && !reentry_calls_.empty()) { restore_loop_call(op, popped_depth, partial, values); }
   values[pc_stack_depth_value] = popped_depth;
   stack_status(values);
   return builder_.CreateAnd(top, builder_.getInt32(maximum_pc));
+}
+
+void Lowering::restore_loop_call(const Instruction &op,
+                                 llvm::Value *popped_depth,
+                                 bool partial,
+                                 const Values &values) {
+  auto *slot = loop_cell(loop_call_slot, popped_depth, 64);
+  auto *pending = builder_.CreateLoad(builder_.getInt64Ty(), slot);
+  auto *owned = builder_.CreateICmpNE(pending, builder_.getInt64(0));
+  if ((op.word & loop_reentry) == 0) {
+    stack_guard(
+        values, op, builder_.CreateNot(owned), partial, NativeExit::unsupported_loop_reentry);
+    return;
+  }
+  auto *buffered = builder_.CreateAnd(pending, builder_.getInt64(~loop_call_live));
+  const auto destination = delayed(op) ? delayed_loop_tail_slot : loop_refill_slot;
+  store(builder_.CreateSelect(owned, buffered, load(64, destination)), destination);
+  builder_.CreateStore(builder_.getInt64(0), slot);
 }
 
 void Lowering::return_to_caller(Values values, llvm::Value *target, bool partial) {
@@ -1699,6 +1766,12 @@ void Lowering::complete(Values values,
 
 void Lowering::redirect(Values values, const Instruction &op, llvm::Value *target, bool partial) {
   if (op.type == return_branch_type) {
+    if ((op.word & loop_reentry) != 0 && delayed(op) && !reentry_calls_.empty()) {
+      auto *tail = load(64, delayed_loop_tail_slot);
+      auto *buffered = builder_.CreateICmpNE(tail, builder_.getInt64(0));
+      store(builder_.CreateSelect(buffered, tail, load(64, loop_refill_slot)), loop_refill_slot);
+      store(builder_.getInt64(0), delayed_loop_tail_slot);
+    }
     return_to_caller(values, target, partial);
   } else if (indirect_branch(op)) {
     exit(values, target, NativeExit::indirect);
@@ -2143,6 +2216,11 @@ void Lowering::loop_fetch(Values &values, const LoopShape &shape) {
     builder_.SetInsertPoint(terminate);
     auto popped = values;
     loop_pop(popped, frame);
+    if (shape.has_reentry) {
+      const auto tail =
+          counted_loop_tail | (std::uint64_t{shape.end} << loop_refill_end_shift) | shape.start;
+      store(builder_.getInt64(tail), loop_refill_slot);
+    }
     jump(continuation, popped);
     builder_.SetInsertPoint(repeat);
   }
@@ -2180,9 +2258,9 @@ void Lowering::loop_refill(Values &values, const Instruction &op) {
                          builder_.getInt64(maximum_pc));
   auto *active = builder_.CreateICmpNE(
       builder_.CreateAnd(pending, builder_.getInt64(loop_refill_live)), builder_.getInt64(0));
-  auto *here =
-      builder_.CreateAnd(active, builder_.CreateICmpEQ(end, builder_.getInt64(op.address)));
-  store(builder_.CreateSelect(here, builder_.getInt64(0), pending), loop_refill_slot);
+  auto *at_end = builder_.CreateICmpEQ(end, builder_.getInt64(op.address));
+  auto *here = builder_.CreateAnd(active, at_end);
+  store(builder_.CreateSelect(at_end, builder_.getInt64(0), pending), loop_refill_slot);
   values[extra_cycles_value] = builder_.CreateAdd(
       values[extra_cycles_value],
       builder_.CreateSelect(here, builder_.getInt64(loop_decode_distance), builder_.getInt64(0)));
@@ -2966,7 +3044,8 @@ std::uint32_t context_mask(const std::vector<Instruction> &instructions, const L
   for (const auto &instruction : instructions) {
     mask |= instruction_context(instruction);
     const auto condition = shapes.find(next_pc(instruction, loop_decode_distance));
-    if (condition != shapes.end() && condition->second.arithmetic()) {
+    if ((condition != shapes.end() && condition->second.arithmetic()) ||
+        (loop_setup(instruction) && loop_shape(instruction).arithmetic())) {
       mask |= simd_mode | saturation_mode;
     }
   }
@@ -3005,10 +3084,27 @@ void validate_delay_slots(const InstructionMap &code, std::string_view identity)
   }
 }
 
+void validate_loop_call(LoopPlan &plan,
+                        LoopShape &shape,
+                        const Instruction &op,
+                        unsigned remaining,
+                        std::string_view identity) {
+  const bool sample = shape.arithmetic() && op.address == shape.condition_pc();
+  if (shape.short_body() || remaining == 0 || remaining == loop_fetch_distance || sample ||
+      !call_branch_instruction(op) || delayed(op)) {
+    reject(op, identity, FaultReason::unsupported_instruction, "branch near the DO endpoint");
+  }
+  if (!plan.reentry_calls.emplace(op.address, shape).second) {
+    reject(op, identity, FaultReason::unsupported_instruction, "overlapping loop CALL");
+  }
+  shape.has_reentry = true;
+}
+
 void validate_loop_body(const InstructionMap &code,
                         const Instruction &setup,
+                        LoopPlan &plan,
                         std::string_view identity) {
-  const auto shape = loop_shape(setup);
+  auto shape = loop_shape(setup);
   for (unsigned offset = 1; offset <= shape.length; ++offset) {
     const auto assigned = code.find(next_pc(setup, offset));
     if (assigned == code.end()) {
@@ -3017,7 +3113,7 @@ void validate_loop_body(const InstructionMap &code,
     const auto &op = *assigned->second;
     const auto remaining = shape.length - offset;
     if (branch(op) && remaining <= loop_fetch_distance) {
-      reject(op, identity, FaultReason::unsupported_instruction, "branch near the DO endpoint");
+      validate_loop_call(plan, shape, op, remaining, identity);
     }
     if (!loop_setup(op)) { continue; }
     const auto child = loop_shape(op);
@@ -3042,23 +3138,22 @@ void validate_loop_body(const InstructionMap &code,
              "overlapping nested arithmetic loop lookahead is unqualified");
     }
   }
+  if (!plan.shapes.emplace(shape.end, shape).second) {
+    reject(setup,
+           identity,
+           FaultReason::invalid_encoding,
+           "multiple DO instructions share an endpoint");
+  }
 }
 
-LoopMap validate_loop_bodies(const InstructionMap &code, std::string_view identity) {
-  LoopMap shapes;
+LoopPlan validate_loop_bodies(const InstructionMap &code, std::string_view identity) {
+  LoopPlan plan;
   for (const auto &entry : code) {
     const auto &op = *entry.second;
     if (!loop_setup(op)) { continue; }
-    validate_loop_body(code, op, identity);
-    const auto shape = loop_shape(op);
-    if (!shapes.emplace(shape.end, shape).second) {
-      reject(op,
-             identity,
-             FaultReason::invalid_encoding,
-             "multiple DO instructions share an endpoint");
-    }
+    validate_loop_body(code, op, plan, identity);
   }
-  return shapes;
+  return plan;
 }
 
 bool has_sequential_successor(const Instruction &op) {
@@ -3137,20 +3232,20 @@ std::shared_ptr<const PreparedImage> lower_image(const CodeImage &image,
                           "",
                           llvm::DICompileUnit::LineTablesOnly);
   std::vector<Continuation> continuations;
-  std::map<std::uint32_t, LoopMap> variant_loops;
+  std::map<std::uint32_t, LoopPlan> variant_loops;
   for (const auto &variant : image.variants) {
     validate_memory_layout(variant, result->identity);
     const auto &code = variant_code[variant.id];
     validate_delay_slots(code, result->identity);
-    const auto &loops =
+    const auto &plan =
         variant_loops.emplace(variant.id, validate_loop_bodies(code, result->identity))
             .first->second;
     std::set<std::uint32_t> entries(variant.entries.begin(), variant.entries.end());
     for (const auto &request : variant.interrupt_vectors) { entries.insert(request.vector); }
     for (const auto entry : entries) {
-      const auto connected = connected_code(code, loops, entry);
+      const auto connected = connected_code(code, plan.shapes, entry);
       collect_continuations(continuations, connected, variant, entry);
-      const auto mask = context_mask(connected, loops);
+      const auto mask = context_mask(connected, plan.shapes);
       std::vector<std::uint32_t> contexts{0};
       for (std::uint32_t bit = 1; bit != 0; bit <<= 1) {
         if ((mask & bit) == 0) { continue; }
@@ -3173,15 +3268,16 @@ std::shared_ptr<const PreparedImage> lower_image(const CodeImage &image,
   const NativeAbi abi(module, result->units, continuations);
   for (const auto &unit : result->units) {
     const auto variant = std::ranges::find(image.variants, unit.variant, &CodeVariant::id);
-    const auto &loops = variant_loops.at(unit.variant);
+    const auto &plan = variant_loops.at(unit.variant);
     Lowering(module,
              debug,
              options.memory_mode,
              abi,
              *variant,
-             connected_code(variant_code.at(unit.variant), loops, unit.entry),
-             unit)
-        .emit(loops);
+             connected_code(variant_code.at(unit.variant), plan.shapes, unit.entry),
+             unit,
+             plan.reentry_calls)
+        .emit(plan.shapes);
   }
   finalize_debug(module, debug);
   std::string error;
