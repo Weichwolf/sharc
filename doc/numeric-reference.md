@@ -78,7 +78,7 @@ reference checks numeric bounds; their expected underflow uses a magnitude test.
 Another 12,800 conversions compare against signed quotient/remainder arithmetic
 over both precisions, signs, mode-bit values, instructions and saturation choices,
 ten exponents, eight fraction patterns and five scales.
-Another 133,397 shifter cases route individual bits and count textual prefixes;
+Another 135,002 shifter cases route individual bits and count textual prefixes;
 15,449 FIFO cases use bit lists instead of register shifts, covering every legal
 pointer/length combination for three data patterns, including no-update queries.
 They also check all 128 pointer reads and all low-byte pointer-write patterns
@@ -143,14 +143,13 @@ instruction family and execution mode.
 `Unqualified` prevents the generator from silently supplying a guessed expectation.
 Currently explicit refusals include:
 
-- SZ for a negative BTST position and sign extension of a zero-length field.
 - FIFO operations with a prohibited length, overfull/invalid pointer, or insufficient
   capacity/data. The manual defines SV but leaves the resulting data/pointer
   undefined; no invented full-result expectation is emitted.
 - Operations outside the currently implemented numerical functions.
 
-Still required for complete numerical coverage: the shifter and FIFO details
-above, OR-shift status, parallel memory ordering, other conditional transfer admission and mode/register-bank
+Still required for complete numerical coverage are the undefined FIFO cases
+above, parallel memory ordering, other conditional transfer admission and mode/register-bank
 composition beyond admitted raw writes. Qualified arithmetic and writeback
 composition do not close those architectural gaps.
 The explicit FIX/TRUNC distinction on 11-37 must not be replaced by a shared host
@@ -417,18 +416,28 @@ destinations. Capture the raw destination, ASTAT and STKY. Probe full register
 counts with `-2147483648`, `256` and `2147483647`.
 
 Large magnitudes are bounded before shifting so a signed 32-bit extreme cannot
-allocate excessive oracle storage. Rotations wrap modulo 32. Bit modifications
-outside the word preserve the data. Their SV uses the instruction-specific
-greater-than-31 predicate. BTST writes no data register.
+allocate excessive oracle storage. Rotations wrap modulo 32. The simulator's
+264 single-bit probes match unsigned register positions. Positions above 31,
+including raw words with the sign bit set, set SV. Bit modifiers keep the fixed
+source word outside that range and clear the destination extension byte. BTST
+sets SZ for an outside position and writes no data register. The assembler
+limits immediate BTST to 0–31. It accepts off-scale byte positions for BCLR,
+BSET and BTGL. Nine additional probes covered `-1`, `32` and `255` for those
+modifiers.
 
-FDEP/FEXT use unsigned six-bit position/length inputs. Cross-boundary fields set
-SV even when discarded bits are zero. Sign extension applies only if the field's
-sign bit is in range; OR-deposit combines the completed field with the old
-destination. Leading-bit counts return 0 through 32, with SV for 32 and SZ for
-zero. EXP returns the signed negative count of redundant sign bits, or +1 for
-extended extraction with old AV set; SS uses the old input sign XOR old AV in the
-extended form. Shifter outputs clear the extension byte, preserve other status
-bits and leave all sticky bits unchanged.
+In 684 field probes, FDEP/FEXT consumed the unsigned six-bit position and
+length from the lowest 12 bits of the fixed count or the type 6a DATA/DATAEX
+fields. SV is set when the position plus length exceeds 32, including an
+off-scale empty field. Sign extension requires a nonempty field whose sign
+bit is in range. OR-deposit combines the completed field with the old
+destination before computing SZ.
+
+Another 208 probes checked leading-bit counts and both exponent forms. LEFTZ
+and LEFTO return 0 through 32, with SV for 32 and SZ for zero. EXP returns the
+signed negative count of redundant sign bits, or +1 for extended extraction
+with old AV set. SS uses the old input sign XOR old AV in the extended form.
+The destination extension byte is zero. Unrelated status and sticky bits are
+preserved.
 
 FIFO deposit ORs into the old raw tail, rather than replacing it. Extract aligns
 the remaining bits to the top of the 64-bit FIFO; NU preserves the FIFO, pointer

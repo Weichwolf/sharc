@@ -581,7 +581,7 @@ def _shifter_result(value: int, astat: int, stky: int, *, overflow: bool = False
 
 def shift(operation: str, raw: int, amount: int, *, old_destination: int = 0,
           astat: int = 0, stky: int = 0) -> IntegerResult:
-    """Normalized signed shift/bit position; operand projection is preparation's job."""
+    """Use signed shift counts and interpret bit positions as unsigned words."""
     if not isinstance(amount, int) or not -(1 << 31) <= amount < 1 << 31:
         raise ValueError("shift amount must be a signed 32-bit integer")
     x = raw_word(raw)
@@ -606,10 +606,9 @@ def shift(operation: str, raw: int, amount: int, *, old_destination: int = 0,
         count = amount % 32
         value = (x << count) | (x >> (32 - count))
     elif operation in ("bclr", "bset", "btgl", "btst"):
-        if amount < 0 and operation == "btst":
-            raise Unqualified("negative BTST position has no qualified SZ expectation")
-        overflow = amount > 31
-        bit = 1 << amount if 0 <= amount < 32 else 0
+        position = amount & WORD_MASK
+        overflow = position >= 32
+        bit = 0 if overflow else 1 << position
         value = {"bclr": x & ~bit, "bset": x | bit,
                  "btgl": x ^ bit, "btst": x & bit}[operation]
     else:
@@ -624,8 +623,6 @@ def field(operation: str, raw: int, position: int, length: int, *,
     if any(not isinstance(value, int) or not 0 <= value < 64 for value in (position, length)):
         raise ValueError("field position and length must be unsigned six-bit values")
     x, old = raw_word(raw), raw_word(old_destination)
-    if sign_extend and length == 0:
-        raise Unqualified("sign extension of a zero-length field requires qualification")
     mask = (1 << length) - 1
     if operation in ("deposit", "deposit_or"):
         value = (x & mask) << position
@@ -636,7 +633,7 @@ def field(operation: str, raw: int, position: int, length: int, *,
             value |= old
     elif operation == "extract":
         value = (x >> position) & mask
-        if sign_extend and position + length <= 32 and value & (1 << (length - 1)):
+        if sign_extend and length and position + length <= 32 and value & (1 << (length - 1)):
             value |= WORD_MASK ^ mask
     else:
         raise Unqualified(f"unmodeled field operation: {operation}")

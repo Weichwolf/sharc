@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #include "../support/check.hpp"
 #include "../support/isa.hpp"
+#include "fixed_cases.hpp"
 
 #include <algorithm>
 #include <array>
 #include <bit>
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <sharc/core.hpp>
 #include <span>
 #include <string_view>
@@ -369,6 +371,74 @@ void shifts() {
   }
 }
 
+void verify_shifter_case(sharc::Core &core,
+                         const fixture::ShifterCase &test,
+                         std::uint32_t address) {
+  constexpr unsigned destination = 11;
+  constexpr unsigned source = 3;
+  constexpr unsigned count = 9;
+  for (unsigned configuration = 0; configuration < 32; ++configuration) {
+    auto before = initial(configuration);
+    before.pc = address;
+    for (std::size_t lane = 0; lane < before.pe.size(); ++lane) {
+      auto &pe = before.pe[lane];
+      const auto &input = test.lanes[lane];
+      pe.data[bank(before, source)][source] = input.source;
+      pe.data[bank(before, count)][count] = input.count;
+      pe.data[bank(before, destination)][destination] = input.old_destination;
+      pe.astat = input.old_astat | (pe.astat & 1);
+      pe.stky = input.stky;
+    }
+    core.set_registers(before);
+    auto expected = before;
+    const auto active = (before.mode1 & (1U << simd_bit)) != 0 ? before.pe.size() : 1U;
+    for (std::size_t lane = 0; lane < active; ++lane) {
+      auto &pe = expected.pe[lane];
+      if ((pe.astat & 1) == 0) { continue; }
+      if (test.writes) {
+        pe.data[bank(expected, destination)][destination] = test.lanes[lane].result;
+      }
+      pe.astat = test.lanes[lane].astat | 1;
+    }
+    fixture::boundary(expected, {.pc = address + 1, .clock = 1});
+    verify_prefix(core,
+                  expected,
+                  {.instruction = "shifter operation lost raw data, flags or admission",
+                   .deadline = "shifter operation differed under a cycle bound"});
+  }
+}
+
+void verify_shifter_cases() {
+  constexpr std::uint64_t off_scale_btst = 0x023e00332003;
+  constexpr std::uint64_t immediate_exp = 0x023e00200003;
+  constexpr unsigned entry_stride = 4;
+  check(fixture::refusal(fixture::image(sharc::InstructionSet::isa, off_scale_btst),
+                         "out-of-range immediate BTST was admitted")
+                .reason == sharc::FaultReason::invalid_encoding,
+        "out-of-range immediate BTST lost its encoding fault");
+  (void)fixture::refusal(fixture::image(sharc::InstructionSet::isa, immediate_exp),
+                         "unary EXP was admitted as shift-immediate");
+
+  fixture::Program program(std::array{std::uint64_t{0}});
+  auto &variant = program.code.variants.front();
+  std::map<std::uint64_t, std::uint32_t> addresses;
+  for (const auto &test : fixture::shifter_cases) {
+    const auto address =
+        fixture::code_address + (entry_stride * static_cast<std::uint32_t>(addresses.size() + 1));
+    if (!addresses.try_emplace(test.word, address).second) { continue; }
+    program.add_span(address, std::array{test.word, std::uint64_t{0}});
+    variant.entries.push_back(address);
+  }
+  for (const auto mode : fixture::numeric_modes) {
+    const auto native = fixture::compile(program.code, mode);
+    sharc::Core core(program.memory(), mode);
+    (void)core.install(native, fixture::Program::variant_id);
+    for (const auto &test : fixture::shifter_cases) {
+      verify_shifter_case(core, test, addresses.at(test.word));
+    }
+  }
+}
+
 } // namespace
 
 namespace fixture {
@@ -386,5 +456,6 @@ void rotations() {
     exercise_configurations(program, registers, verify);
   }
   shifts();
+  verify_shifter_cases();
 }
 } // namespace fixture

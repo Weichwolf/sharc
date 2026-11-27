@@ -33,10 +33,11 @@ SHIFTS = [
     ("toggle bit", "btgl", 0x0000000100, 0, IntegerResult(0, 0x1000, 0)),
     ("off-scale set preserves data", "bset", 0x0000000100, 32, IntegerResult(0x0000000100, 0x800, 0)),
     ("negative clear position preserves data", "bclr", 0x0000000100, -1,
-     IntegerResult(0x0000000100, 0, 0)),
+     IntegerResult(0x0000000100, 0x800, 0)),
     ("test one writes no data", "btst", 0x0000000100, 0, IntegerResult(None, 0, 0)),
     ("test zero writes no data", "btst", 0, 31, IntegerResult(None, 0x1000, 0)),
     ("off-scale bit test", "btst", 0xFFFFFFFF00, 32, IntegerResult(None, 0x1800, 0)),
+    ("negative register bit test", "btst", 0xFFFFFFFF00, -1, IntegerResult(None, 0x1800, 0)),
 ]
 
 FIELDS = [
@@ -55,6 +56,10 @@ FIELDS = [
     ("crossing extract does not sign extend", "extract", 0xC000000000, 30, 4,
      {"sign_extend": True}, IntegerResult(0x0000000300, 0x800, 0)),
     ("zero-length field", "extract", 0xFFFFFFFF00, 31, 0, {}, IntegerResult(0, 0x1000, 0)),
+    ("signed empty extract", "extract", 0xFFFFFFFFFF, 32, 0, {"sign_extend": True},
+     IntegerResult(0, 0x1000, 0)),
+    ("signed empty deposit OR", "deposit_or", 0xFFFFFFFFFF, 63, 0,
+     {"sign_extend": True, "old_destination": 0x00000005FF}, IntegerResult(0x0000000500, 0x800, 0)),
     ("off-scale zero-length deposit", "deposit", 0xFFFFFFFF00, 63, 0, {},
      IntegerResult(0, 0x1800, 0)),
     ("length beyond word", "extract", 0x8000000000, 0, 63, {"sign_extend": True},
@@ -130,6 +135,87 @@ def anchors():
     return records
 
 
+def installed_header():
+    """Emit separate operand and result records for native shifter operations."""
+    register_form, immediate_form = 0x010000200000, 0x020000000000
+    destination, source, count_register = 11, 3, 9
+    rows = []
+
+    fields = ("deposit", "deposit_or", "extract")
+
+    def emit(word, operation, sources, amounts, *, leading_operation=False, av=False, extend=False):
+        lanes = []
+        for lane, (x, amount) in enumerate(zip(sources, amounts, strict=True)):
+            raw = (x << 8) | (0x39 + lane)
+            count = ((amount & 0xffffffff) << 8) | (0x91 + lane)
+            old_destination = (0x00000000df, 0x81234567ef)[lane]
+            astat = (0xa5003ffc, 0x5a004ffc)[lane] | (2 if bool(lane) != av else 0)
+            stky = (0x20000004, 0x00000100)[lane]
+            if leading_operation:
+                effect = leading(operation, raw, astat=astat, stky=stky)
+            elif operation in fields:
+                effect = field(operation, raw, amount & 63, (amount >> 6) & 63, sign_extend=extend,
+                               old_destination=old_destination, astat=astat, stky=stky)
+            else:
+                effect = shift(operation, raw, amount, astat=astat, stky=stky)
+            lanes.append("{" + ", ".join(hex(value) for value in
+                         (raw, count, old_destination, 0 if effect.raw is None else effect.raw,
+                          astat, effect.astat, effect.stky)) + "}")
+        writes = str(operation != "btst").lower()
+        rows.append(f"{{{word:#x}, {writes}, {{{{" + ", ".join(lanes) + "}}}")
+
+    positions = (-0x80000000, -257, -1, 0, 1, 7, 15, 30, 31, 32, 33, 255, 256, 0x7fffffff)
+    immediate_positions = (0, 1, 7, 15, 30, 31)
+    sources = ((0, 0xffffffff), (0x80000001, 0x00008000))
+    for opcode, operation in ((0xc0, "bset"), (0xc4, "bclr"), (0xc8, "btgl"), (0xcc, "btst")):
+        target = 0 if operation == "btst" else destination
+        word = register_form | (opcode << 12) | (target << 8) | (source << 4) | count_register
+        for index, amount in enumerate(positions):
+            for pair in sources:
+                emit(word, operation, pair, (amount, positions[(index + 5) % len(positions)]))
+        immediate = immediate_positions if operation == "btst" else (*immediate_positions, 32, 127, 128, 255)
+        for amount in immediate:
+            word = immediate_form | (opcode << 14) | (amount << 8) | (target << 4) | source
+            for pair in sources:
+                emit(word, operation, pair, (amount, amount))
+
+    values = (0, 1, 0x3fffffff, 0x40000000, 0x7fffffff, 0x80000000, 0xc0000000, 0xffffffff)
+    for opcode, operation in ((0x80, "exp"), (0x84, "exp_extended"), (0x88, "leftz"), (0x8c, "lefto")):
+        word = register_form | (opcode << 12) | (destination << 8) | (source << 4)
+        for value, av in cartesian_product(values, (False, True)):
+            emit(word, operation, (value, value ^ 0xffffffff), (0, 0), leading_operation=True, av=av)
+
+    bounds = ((0, 0), (32, 0), (63, 0), (0, 1), (4, 4), (31, 1), (32, 1), (0, 15),
+              (2, 16), (28, 4), (30, 4), (0, 31), (0, 32), (0, 63), (63, 63))
+    amounts = tuple((length << 6) | position for position, length in bounds)
+    ignored = 0xa531e000
+    for base, operation in ((0x40, "extract"), (0x44, "deposit"), (0x64, "deposit_or")):
+        for extend in (False, True):
+            opcode = base | (8 if extend else 0)
+            word = register_form | (opcode << 12) | (destination << 8) | (source << 4) | count_register
+            for index, amount in enumerate(amounts):
+                for pair in sources:
+                    other = amounts[(index + 4) % len(amounts)]
+                    emit(word, operation, pair, (ignored | amount, ignored | other), extend=extend)
+                dataex = (amount >> 8) << 27
+                immediate = immediate_form | (opcode << 14) | dataex | ((amount & 255) << 8)
+                for pair in sources:
+                    emit(immediate | (destination << 4) | source, operation, pair,
+                         (amount, amount), extend=extend)
+
+    return """
+struct ShifterLane {
+  std::uint64_t source, count, old_destination, result;
+  std::uint32_t old_astat, astat, stky;
+};
+struct ShifterCase {
+  std::uint64_t word;
+  bool writes;
+  std::array<ShifterLane, 2> lanes;
+};
+inline constexpr std::array<ShifterCase, """ + str(len(rows)) + "> shifter_cases{{\n" + ",\n".join(rows) + "\n}};\n"
+
+
 def bit_lattice():
     """Route individual bits instead of using whole-word shifts/masks."""
     count = 0
@@ -138,8 +224,6 @@ def bit_lattice():
         bits = [int(char) for char in f"{word:032b}"[::-1]]
         for amount in (*range(-128, 128), -0x80000000, 0x7FFFFFFF):
             for operation in ("lshift", "lshift_or", "ashift", "ashift_or", "rot", "bclr", "bset", "btgl", "btst"):
-                if operation == "btst" and amount < 0:
-                    continue
                 old_destination = 0
                 if operation in ("lshift", "lshift_or", "ashift", "ashift_or", "rot"):
                     arithmetic = operation.startswith("ashift")
@@ -165,7 +249,7 @@ def bit_lattice():
                     if 0 <= amount < 32:
                         output[amount] = {"bclr": 0, "bset": 1, "btgl": 1 - bits[amount],
                                           "btst": bits[amount]}[operation]
-                    sv = amount > 31
+                    sv = not 0 <= amount < 32
                 value = sum(bit * 2**index for index, bit in enumerate(output))
                 flags = 0xFFFFC7FF | (int(sv) << 11) | (int(not any(output)) << 12)
                 expected = IntegerResult(None if operation == "btst" else value * 256, flags, 0x55)
@@ -174,8 +258,6 @@ def bit_lattice():
                         expected, (operation, word, amount))
                 count += 1
         for position, length, sign_extend in cartesian_product(range(64), range(64), (False, True)):
-            if sign_extend and length == 0:
-                continue
             for operation in ("deposit", "deposit_or", "extract"):
                 output = []
                 for target in range(32):
@@ -184,7 +266,7 @@ def bit_lattice():
                               target < length and source < 32)
                     bit = bits[source] if active else 0
                     above = target >= (position + length if operation != "extract" else length)
-                    if sign_extend and position + length <= 32 and above:
+                    if sign_extend and length and position + length <= 32 and above:
                         bit = bits[length - 1 if operation != "extract" else position + length - 1]
                     if operation == "deposit_or":
                         bit |= (target % 3 == 0)
@@ -309,8 +391,6 @@ def unpack_lattice():
 
 def explicit_gaps():
     for call in (
-        lambda: shift("btst", 0, -1),
-        lambda: field("deposit", 0, 0, 0, sign_extend=True),
         lambda: bit_fifo("deposit", 0, 64, length=1),
         lambda: bit_fifo("extract", 0, 0, length=1),
         lambda: bit_fifo("deposit", 0, 0, length=33),
