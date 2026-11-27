@@ -10,6 +10,7 @@
 #include <sharc/core.hpp>
 #include <sharc/memory.hpp>
 #include <span>
+#include <stdexcept>
 #include <string>
 #if defined(__linux__)
 #include "../support/word_space.hpp"
@@ -430,6 +431,204 @@ constexpr std::uint32_t simd_bit = 1U << 21, cbufen = 1U << 24;
 constexpr std::size_t word_bytes = 4;
 constexpr unsigned word_shift = 8;
 
+struct Peripheral {
+  struct Access {
+    sharc::MemorySpace space{};
+    std::uint32_t address{};
+    std::uint64_t word{};
+    bool writing{};
+    bool operator==(const Access &) const = default;
+  };
+
+  sharc::Core *core{};
+  std::array<std::uint64_t, 2> words{};
+  std::array<Access, 4> trace{};
+  unsigned calls{}, refusals{}, yield_on{}, fault_on{};
+
+  bool access(sharc::MemorySpace space,
+              sharc::MemoryView view,
+              std::uint32_t address,
+              std::uint64_t &word,
+              bool writing) noexcept {
+    const auto index = address - ram_address;
+    if (view != sharc::MemoryView::normal_word || index >= words.size() || calls >= trace.size()) {
+      return false;
+    }
+    try {
+      (void)core->run(1);
+    } catch (const std::logic_error &) { ++refusals; }
+    if (!writing) { word = words[index]; }
+    trace[calls++] = {.space = space, .address = address, .word = word, .writing = writing};
+    if (calls == yield_on) { core->request_yield(); }
+    if (calls == fault_on) { return false; }
+    if (writing) { words[index] = word; }
+    return true;
+  }
+
+  sharc::Io binding() noexcept {
+    return {.owner = this,
+            .read =
+                [](void *owner,
+                   sharc::MemorySpace space,
+                   sharc::MemoryView view,
+                   std::uint32_t address,
+                   std::uint64_t &value) noexcept {
+                  return static_cast<Peripheral *>(owner)->access(
+                      space, view, address, value, false);
+                },
+            .write =
+                [](void *owner,
+                   sharc::MemorySpace space,
+                   sharc::MemoryView view,
+                   std::uint32_t address,
+                   const std::uint64_t value) noexcept {
+                  auto word = value;
+                  return static_cast<Peripheral *>(owner)->access(space, view, address, word, true);
+                }};
+  }
+};
+
+void runtime_io() {
+  constexpr std::uint64_t device_word = 0x123456789a;
+  constexpr std::uint64_t normal = 0x3456789a;
+  constexpr unsigned marker = 9;
+  const std::array words{load_r0, store_r0 | 1, fixture::immediate(1, marker)};
+  Program program(words);
+  program.code.code.variants[0].layout.regions.back().initialized = false;
+  const auto native = sharc::Core::compile(program.code.code);
+  Peripheral peripheral{.words = {device_word, 0}, .yield_on = 1, .fault_on = 2};
+  auto memory = program.code.memory();
+  memory.io = peripheral.binding();
+  sharc::Core core(memory);
+  peripheral.core = &core;
+  auto expected = initial();
+  fixture::install(core, native, expected);
+  const auto result = core.run_until(20);
+  expected.pe[0].data[0][0] = normal << word_shift;
+  fixture::boundary(expected, {.pc = expected.pc + 1, .clock = 1});
+  constexpr auto dm = sharc::MemorySpace::data;
+  check(result.execution == sharc::ExecutionState::yielded && !result.has_fault &&
+            result.progress == sharc::Progress{.instructions = 1, .base_cycles = 1} &&
+            core.registers() == expected && peripheral.calls == 1 && peripheral.refusals == 1 &&
+            peripheral.trace[0] ==
+                Peripheral::Access{.space = dm, .address = ram_address, .word = device_word},
+        "I/O read did not complete before the synchronous yield");
+  const auto saved = core.save();
+  const auto fault = core.run(2);
+  check(fault.has_fault && fault.fault.reason == sharc::FaultReason::access_fault &&
+            fault.fault.identity == native.report().identity &&
+            fault.fault.address == expected.pc && fault.fault.instruction == words[1] &&
+            fault.fault.detail.contains(std::to_string(ram_address + 1)) &&
+            fault.progress == sharc::Progress{} && core.registers() == expected &&
+            peripheral.trace[1] ==
+                Peripheral::Access{
+                    .space = dm, .address = ram_address + 1, .word = normal, .writing = true} &&
+            peripheral.words[1] == 0 && peripheral.refusals == 2,
+        "a false I/O result retired the store or lost fault context");
+  core.restore(saved);
+  peripheral.yield_on = 3;
+  const auto retry = core.run(1);
+  fixture::boundary(expected, {.pc = expected.pc + 1, .clock = 2});
+  check(retry.execution == sharc::ExecutionState::yielded &&
+            retry.progress == sharc::Progress{.instructions = 1, .base_cycles = 1} &&
+            core.registers() == expected && peripheral.words[1] == normal,
+        "yield took effect after the instruction budget boundary or lost the store");
+  const auto finish = core.run(1);
+  check(fixture::completed(finish, 1, 1) && peripheral.calls == 3 && peripheral.refusals == 3 &&
+            core.registers().pe[0].data[0][1] == (marker << word_shift),
+        "resume after I/O re-executed the effect or skipped ordinary code");
+}
+
+void delayed_io() {
+  constexpr auto target = fixture::code_address + 4;
+  constexpr std::uint64_t jump_with_delay = 0x063e04000000 | target;
+  const std::array words{jump_with_delay,
+                         fixture::immediate(1, 1),
+                         load_r0,
+                         fixture::immediate(2, 2),
+                         fixture::immediate(3, 3)};
+  Program program(words);
+  program.code.code.variants[0].layout.regions.back().initialized = false;
+  const auto native = sharc::Core::compile(program.code.code);
+  Peripheral peripheral{.words = {7, 0}, .yield_on = 1};
+  auto memory = program.code.memory();
+  memory.io = peripheral.binding();
+  sharc::Core core(memory);
+  peripheral.core = &core;
+  fixture::install(core, native, initial());
+  const auto result = core.run(5);
+  const auto after = core.registers();
+  check(result.execution == sharc::ExecutionState::yielded &&
+            result.progress == sharc::Progress{.instructions = 3, .base_cycles = 4} &&
+            after.pc == target && after.pe[0].data[0][0] == (7U << word_shift) &&
+            after.pe[0].data[0][1] == (1U << word_shift) && after.pe[0].data[0][2] == 0 &&
+            after.pe[0].data[0][3] == 0,
+        "I/O yield lost the delayed branch or advanced into its target");
+  const auto finish = core.run(1);
+  check(fixture::completed(finish, 1, 1) && peripheral.calls == 1 &&
+            core.registers().pe[0].data[0][3] == (3U << word_shift),
+        "delayed I/O yield lost the prepared destination continuation");
+}
+
+void parallel_io() {
+  constexpr std::uint64_t packet = 0x34c89a001401; // DM store, PM load and ADD.
+  const std::array words{packet, fixture::immediate(1, 9)};
+  ParallelProgram program(words, ram_address, 2);
+  auto &regions = program.code.code.variants[0].layout.regions;
+  for (auto &region : std::span(regions).subspan(1)) { region.initialized = false; }
+  const auto native = sharc::Core::compile(program.code.code);
+  for (const bool reject : {false, true}) {
+    Peripheral peripheral{.yield_on = reject ? 0U : 1U, .fault_on = reject ? 4U : 0U};
+    auto memory = program.code.memory();
+    memory.io = peripheral.binding();
+    sharc::Core core(memory);
+    peripheral.core = &core;
+    auto expected = initial();
+    expected.mode1 = simd_bit;
+    expected.dag[0][2].index = ram_address;
+    expected.dag[0][10].index = ram_address;
+    expected.dag[0][3].modifier = 2;
+    expected.dag[0][11].modifier = 2;
+    constexpr std::array<std::uint64_t, 2> stored{11, 12};
+    constexpr unsigned extension_byte = 0xff;
+    for (unsigned lane = 0; lane < stored.size(); ++lane) {
+      expected.pe[lane].data[0][4] = (stored[lane] << word_shift) | extension_byte;
+    }
+    fixture::install(core, native, expected);
+    const auto result = core.run(2);
+    constexpr auto dm = sharc::MemorySpace::data;
+    constexpr auto pm = sharc::MemorySpace::program;
+    constexpr std::array<Peripheral::Access, 4> trace{{
+        {.space = dm, .address = ram_address, .word = stored[0], .writing = true},
+        {.space = dm, .address = ram_address + 1, .word = stored[1], .writing = true},
+        {.space = pm, .address = ram_address, .word = stored[0]},
+        {.space = pm, .address = ram_address + 1, .word = stored[1]},
+    }};
+    check(peripheral.trace == trace && peripheral.calls == trace.size() &&
+              peripheral.words == stored,
+          "parallel callbacks lost DM-before-PM or explicit-before-implicit ordering");
+    if (reject) {
+      check(result.has_fault && result.fault.reason == sharc::FaultReason::access_fault &&
+                result.fault.detail.contains(std::to_string(ram_address + 1)) &&
+                result.progress == sharc::Progress{} && core.registers() == expected,
+            "late callback rejection committed register or DAG effects");
+    } else {
+      for (unsigned lane = 0; lane < stored.size(); ++lane) {
+        expected.pe[lane].data[0][4] = stored[lane] << word_shift;
+      }
+      expected.dag[0][2].index += 2;
+      expected.dag[0][10].index += 2;
+      fixture::boundary(expected, {.pc = expected.pc + 1, .clock = 1});
+      check(result.execution == sharc::ExecutionState::yielded &&
+                result.progress == sharc::Progress{.instructions = 1, .base_cycles = 1} &&
+                core.registers().pc == expected.pc && core.registers().dag == expected.dag &&
+                core.registers().pe[0].data == expected.pe[0].data &&
+                core.registers().pe[1].data == expected.pe[1].data,
+            "yield in the first lane interrupted the memory packet");
+    }
+  }
+}
+
 void parallel_writeback() {
   // Both spaces alias. The load/load packet computes R6 = R4 + R1.
   constexpr std::array<std::uint64_t, 4> words{
@@ -743,6 +942,9 @@ int main() {
     layout_validation();
     ordinary_region_alias();
     incomplete_simd_store();
+    runtime_io();
+    delayed_io();
+    parallel_io();
     parallel_writeback();
     parallel_refusal();
     parallel_circular(ram_address, ram_address);

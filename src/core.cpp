@@ -31,6 +31,22 @@ namespace {
   detail::refuse(
       FaultReason::unsupported_feature, Core::compiler_identity(), 0, pc, std::move(message));
 }
+
+std::uint32_t read_io(const Io *io,
+                      MemorySpace space,
+                      MemoryView view,
+                      std::uint32_t address,
+                      std::uint64_t &word) noexcept {
+  return static_cast<std::uint32_t>(io->read(io->owner, space, view, address, word));
+}
+
+std::uint32_t write_io(const Io *io,
+                       MemorySpace space,
+                       MemoryView view,
+                       std::uint32_t address,
+                       const std::uint64_t &word) noexcept {
+  return static_cast<std::uint32_t>(io->write(io->owner, space, view, address, word));
+}
 } // namespace
 
 PreparationError::PreparationError(Fault fault)
@@ -369,6 +385,8 @@ struct Core::Impl {
     pointers[detail::status_depth_slot] = &state.registers.status_depth;
     pointers[detail::progress_cycle_slot] = &state.progress.base_cycles;
     pointers[detail::interrupt_deadline_slot] = &loops.interrupt_deadline;
+    pointers[detail::io_slot] = &memory.io;
+    pointers[detail::yield_slot] = &yield_requested;
     for (unsigned bank = 0; bank < 2; ++bank) {
       for (unsigned index = 0; index < 16; ++index) {
         auto &dag = state.registers.dag[bank][index];
@@ -516,6 +534,13 @@ struct Core::Impl {
   }
 
   RunResult execute(std::uint64_t instructions, std::uint64_t cycles);
+
+  RunResult yield(Progress progress) noexcept {
+    yield_requested = 0;
+    state.execution = ExecutionState::yielded;
+    return {.progress = progress, .execution = state.execution, .has_fault = false, .fault = {}};
+  }
+
   [[nodiscard]] bool continue_after(detail::NativeExit reason);
   void enter_idle();
   void refresh_interrupt_frame() noexcept;
@@ -527,7 +552,7 @@ struct Core::Impl {
   Memory memory;
   const ExecutionMode mode;
   State state;
-  bool yield_requested{};
+  std::uint8_t yield_requested{};
   bool executing{};
   bool terminal_fault{};
   detail::NativeCall native_call;
@@ -669,6 +694,10 @@ PreparationReport Core::install(const NativeImage &image, std::uint32_t variant)
     const auto release = llvm::make_scope_exit([&] { impl_->executing = false; });
     const auto storage = detail::direct_memory(*image.impl_->image, variant, impl_->memory);
     impl_->pointers.resize(detail::register_pointer_count);
+    impl_->pointers[detail::io_read_slot] =
+        impl_->memory.io.read == nullptr ? nullptr : std::bit_cast<void *>(&read_io);
+    impl_->pointers[detail::io_write_slot] =
+        impl_->memory.io.write == nullptr ? nullptr : std::bit_cast<void *>(&write_io);
     impl_->pointers.insert(impl_->pointers.end(), storage.begin(), storage.end());
     detail::validate_code_storage(*image.impl_->image, variant, impl_->memory);
     if (image.impl_->image->options.memory_mode == CompileOptions::MemoryMode::direct) {
@@ -698,7 +727,7 @@ RunResult Core::run_until(std::uint64_t base_cycle_deadline) {
 }
 
 void Core::request_yield() noexcept {
-  impl_->yield_requested = true;
+  impl_->yield_requested = 1;
 }
 
 bool Core::interrupt_ready(const InterruptRequest &request) const noexcept {
@@ -817,7 +846,7 @@ void Core::reset(std::uint32_t address, InstructionSet instruction_set) {
   state.execution = ExecutionState::stopped;
   state.has_fault = false;
   state.fault = {};
-  impl_->yield_requested = false;
+  impl_->yield_requested = 0;
   impl_->clear_continuation();
   impl_->interrupt_frames.clear();
   impl_->refresh_interrupt_frame();
@@ -882,7 +911,7 @@ Snapshot Core::save() const {
   snapshot.impl_ = std::make_shared<const Snapshot::Impl>(
       Snapshot::Impl{.mode = impl_->mode,
                      .state = impl_->state,
-                     .yield_requested = impl_->yield_requested,
+                     .yield_requested = impl_->yield_requested != 0,
                      .resume = impl_->resume,
                      .pipeline_history = impl_->pipeline_history,
                      .delayed_target = impl_->delayed_target,
@@ -898,7 +927,7 @@ void Core::restore(const Snapshot &snapshot) {
   }
   auto restored = *snapshot.impl_;
   impl_->state = std::move(restored.state);
-  impl_->yield_requested = restored.yield_requested;
+  impl_->yield_requested = static_cast<std::uint8_t>(restored.yield_requested);
   impl_->resume = std::move(restored.resume);
   impl_->pipeline_history = restored.pipeline_history;
   impl_->delayed_target = restored.delayed_target;
@@ -1019,11 +1048,7 @@ RunResult Core::Impl::execute(std::uint64_t instructions, std::uint64_t cycles) 
       return failure(FaultReason::unsupported_feature,
                      "VISA execution or an enabled core timer is not implemented");
     }
-    if (yield_requested) {
-      yield_requested = false;
-      state.execution = ExecutionState::yielded;
-      return {.progress = progress, .execution = state.execution, .has_fault = false, .fault = {}};
-    }
+    if (yield_requested != 0) { return yield(progress); }
     const auto cycle_budget = cycles - std::min(cycles, progress.base_cycles);
     if (instructions == progress.instructions || cycle_budget == 0) { break; }
     const auto index = prepared_unit();
@@ -1046,11 +1071,12 @@ RunResult Core::Impl::execute(std::uint64_t instructions, std::uint64_t cycles) 
                     .entry = static_cast<std::uint32_t>(control[detail::resume_entry])};
     if (const auto result = native_failure(control, progress)) { return *result; }
     const auto reason = static_cast<detail::NativeExit>(control[detail::exit_reason]);
-    if (!continue_after(reason) || progress.instructions == instructions ||
+    if (!continue_after(reason) || yield_requested != 0 || progress.instructions == instructions ||
         progress.base_cycles >= cycles) {
       break;
     }
   }
+  if (yield_requested != 0) { return yield(progress); }
   if (state.execution != ExecutionState::sleeping) { state.execution = ExecutionState::stopped; }
   return {.progress = progress, .execution = state.execution, .has_fault = false, .fault = {}};
 }

@@ -53,8 +53,12 @@ inline constexpr std::size_t interrupt_deadline_slot = progress_cycle_slot + 1;
 inline constexpr std::size_t accumulator_slot = interrupt_deadline_slot + 1;
 inline constexpr unsigned accumulator_banks = 2;
 inline constexpr unsigned accumulator_limbs = 3;
-inline constexpr std::size_t register_pointer_count =
+inline constexpr std::size_t io_slot =
     accumulator_slot + (std::size_t{2} * accumulator_banks * accumulator_limbs);
+inline constexpr std::size_t io_read_slot = io_slot + 1;
+inline constexpr std::size_t io_write_slot = io_read_slot + 1;
+inline constexpr std::size_t yield_slot = io_write_slot + 1;
+inline constexpr std::size_t register_pointer_count = yield_slot + 1;
 
 [[nodiscard]] constexpr std::size_t mr_slot(unsigned lane, unsigned bank, unsigned limb) {
   return accumulator_slot + (((std::size_t{lane} * accumulator_banks) + bank) * accumulator_limbs) +
@@ -133,6 +137,7 @@ enum ControlSlot : std::uint8_t {
   memory_space,
   fault_instruction,
   resume_entry,
+  io_word,
   control_count
 };
 enum class NativeExit : std::uint8_t {

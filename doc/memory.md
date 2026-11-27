@@ -1,7 +1,7 @@
 # Prepared memory access
 
 The core executes classic type 15 pre-indexed and type 1a parallel post-indexed
-normal-word transfers. The remaining access widths, runtime I/O callbacks and
+normal-word transfers with checked runtime I/O. The remaining access widths and
 code-changing stores are open. The reference is Programming Reference 2.4,
 sections 2-6–2-7, 4-110, 6-10–6-31, 7-36–7-40, 9-7–9-9, 9-56–9-59 and
 10-5/21/31/32, pinned in `reference-manifest.json`.
@@ -127,7 +127,8 @@ mutation, saving and restoring that instance are rejected. Use Exact for precise
 resumable faults. The Linux x86-64 fixture exercises actual protected-page and
 truncated-file faults, mask restoration, handler chaining, nested owners and
 independent owner threads. macOS ARM64 fault escape remains unqualified.
-Protected-page peripheral emulation and resumable runtime I/O remain open.
+Protected-page peripheral emulation remains open. A declared callback region
+uses the checked path in either prepared memory mode.
 
 Classic type 19 immediate MODIFY/BITREV updates I in SSA, selecting source and
 destination DAG banks independently. Its circular adjustment uses the source B/L,
@@ -146,7 +147,7 @@ They never reuse a host pointer computed from an obsolete I value.
 ## Boundaries and current gaps
 
 In Exact and checked fallback, denied reads/writes report `access_fault`.
-Unprepared addresses, callback regions,
+Unprepared addresses, missing callback bindings,
 unsupported views and stores whose declared storage may overlap code report
 `unsupported_feature`. Diagnostics retain image identity, guest PC, instruction
 and data-space/address context. The failed instruction does not retire; completed
@@ -158,10 +159,19 @@ memory exceptions.
 Declared byte aliases work for reads. Potential code-alias writes are conservatively
 refused before changing bytes. Stores also require complete initialized
 instruction-view coverage of the declared code to prove its physical backing.
-Actual code transitions, unchanged code stores and
-all other memory views still require implementation and independent qualification.
-`Io` currently supports installation-time instruction reads; runtime data access
-through callbacks is not implemented by this increment.
+Actual code transitions, unchanged code stores and the other data views still
+require implementation and independent qualification.
+
+An uninitialized normal-word region calls the corresponding `Io` function on
+the owner thread with the declared bus, view and resolved word address. Writes
+pass the 32-bit word as an unsigned value. Reads take the low 32 bits of the
+returned value. The core checks permissions and callback availability for all
+selected lanes before executing the first transfer. DM completes before PM, and
+each explicit lane completes before its implicit lane. A false result faults
+at that transfer. Earlier effects remain visible, and the faulting instruction
+has no register writeback, index update or retirement. Callback code may call
+`request_yield()` to return at the next complete instruction boundary, including
+the resolved destination after a delay slot. Execution re-entry is rejected.
 
 `set_memory` revokes bindings. A subsequent install binds the new lent storage.
 Snapshots restore processor state and continuation, including I registers, and

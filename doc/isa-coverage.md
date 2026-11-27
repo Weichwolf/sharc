@@ -456,8 +456,10 @@ read broadcast. Full raw registers and padded storage are checked at every
 instruction/cycle prefix by `test/isa/memory.cpp`. `test/core/memory.cpp` checks
 precise access/refusal prefixes, rebinding, declared code-storage reads, protected
 code-alias writes, ambiguous/truncated layouts and missing implicit SIMD storage.
-Runtime data callbacks, post-modification, other views and actual code transitions
-remain unimplemented. See [memory.md](memory.md) for the exact storage contract.
+Declared normal-word data callbacks are checked in `test/core/memory.cpp` for
+paired access order, refusal, yield, delay-slot continuation and replay.
+Other word views and actual code transitions remain open. See
+[memory.md](memory.md) for the exact storage contract.
 
 Classic type 19 implements immediate MODIFY/BITREV, including distinct source
 and destination I registers. The source B/L define circular adjustment before
