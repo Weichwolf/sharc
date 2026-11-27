@@ -807,8 +807,48 @@ struct MemoryOperands {
   std::array<MemoryWord, 2> words{};
   llvm::Value *callback{};
   llvm::Value *paired{};
+  std::size_t callback_owner{io_slot};
   bool broadcast{};
 };
+
+using LinkedIoCallbacks = std::array<llvm::Function *, 2>;
+
+llvm::FunctionType *io_callback_type(llvm::IRBuilder<> &builder) {
+  return llvm::FunctionType::get(builder.getInt32Ty(),
+                                 {builder.getPtrTy(),
+                                  builder.getInt8Ty(),
+                                  builder.getInt8Ty(),
+                                  builder.getInt32Ty(),
+                                  builder.getPtrTy()},
+                                 false);
+}
+
+LinkedIoCallbacks declare_io_callbacks(llvm::Module &module, const PreparedImage &image) {
+  LinkedIoCallbacks callbacks{};
+  llvm::IRBuilder<> types(module.getContext());
+  for (const auto &binding : image.options.callbacks) {
+    auto *existing = module.getFunction(binding.symbol);
+    if (module.getNamedValue(binding.symbol) != nullptr &&
+        (existing == nullptr || !std::ranges::contains(callbacks, existing))) {
+      refuse(FaultReason::invalid_image,
+             image.identity,
+             0,
+             0,
+             "I/O callback symbol conflicts with generated code: " + binding.symbol);
+    }
+    auto *function = existing != nullptr
+                         ? existing
+                         : llvm::Function::Create(io_callback_type(types),
+                                                  llvm::GlobalValue::ExternalLinkage,
+                                                  binding.symbol,
+                                                  module);
+    function->addFnAttr(llvm::Attribute::NoUnwind);
+    function->addParamAttr(1, llvm::Attribute::ZExt);
+    function->addParamAttr(2, llvm::Attribute::ZExt);
+    callbacks[binding.role == io_write_role ? 1U : 0U] = function;
+  }
+  return callbacks;
+}
 
 bool callback_region(const RegionLayout &layout) {
   return !layout.initialized && layout.view != MemoryView::instruction && layout.count != 0;
@@ -915,6 +955,7 @@ public:
            llvm::DIBuilder &debug,
            CompileOptions::MemoryMode memory_mode,
            const NativeAbi &abi,
+           LinkedIoCallbacks linked_io,
            const CodeVariant &variant,
            bool code_transitions,
            std::vector<Instruction> instructions,
@@ -924,6 +965,7 @@ public:
         memory_mode_(memory_mode),
         code_transitions_(code_transitions),
         abi_(abi),
+        linked_io_(linked_io),
         unit_(unit),
         variant_(variant),
         loop_shapes_(loops.shapes),
@@ -1391,6 +1433,7 @@ private:
   bool code_transitions_{}, code_storage_known_{};
   std::array<bool, 2> code_alias_buses_{};
   const NativeAbi &abi_;
+  LinkedIoCallbacks linked_io_;
   const NativeUnit &unit_;
   const CodeVariant &variant_;
   const LoopMap &loop_shapes_;
@@ -2339,7 +2382,12 @@ MemoryOperands Lowering::memory_operands(const Values &values,
         return callback_region(layout) && layout.space == move.space &&
                (move.write ? layout.writable : layout.readable);
       })) {
-    operands.callback = pointer(move.write ? io_write_slot : io_read_slot);
+    if (auto *linked = linked_io_[move.write ? 1U : 0U]) {
+      operands.callback = linked;
+      operands.callback_owner = io_owner_slot;
+    } else {
+      operands.callback = pointer(move.write ? io_write_slot : io_read_slot);
+    }
   }
   resolve_memory(values, op, move, operands.words[0], operands.callback);
   if (simd_pair) { resolve_implicit(values, op, move, operands); }
@@ -2483,16 +2531,9 @@ llvm::Value *Lowering::memory_word(const Values &values,
   auto *buffer = builder_.CreateGEP(
       builder_.getInt64Ty(), function_->getArg(unit_controls), builder_.getInt64(io_word));
   builder_.CreateStore(move.write ? payload : builder_.getInt64(0), buffer);
-  auto *type = llvm::FunctionType::get(builder_.getInt32Ty(),
-                                       {builder_.getPtrTy(),
-                                        builder_.getInt8Ty(),
-                                        builder_.getInt8Ty(),
-                                        builder_.getInt32Ty(),
-                                        builder_.getPtrTy()},
-                                       false);
-  auto *result = builder_.CreateCall(type,
+  auto *result = builder_.CreateCall(io_callback_type(builder_),
                                      operands.callback,
-                                     {pointer(io_slot),
+                                     {pointer(operands.callback_owner),
                                       builder_.getInt8(static_cast<std::uint8_t>(move.space)),
                                       word.view,
                                       word.address,
@@ -5931,6 +5972,7 @@ std::shared_ptr<const PreparedImage> lower_image(const CodeImage &image,
     }
   }
   const NativeAbi abi(module, result->units, continuations);
+  const auto linked_io = declare_io_callbacks(module, *result);
   for (const auto &unit : result->units) {
     const auto variant = std::ranges::find(image.variants, unit.variant, &CodeVariant::id);
     const auto &plan = variant_loops.at(unit.variant);
@@ -5939,6 +5981,7 @@ std::shared_ptr<const PreparedImage> lower_image(const CodeImage &image,
         debug,
         options.memory_mode,
         abi,
+        linked_io,
         *variant,
         std::ranges::any_of(image.transitions,
                             [&](const auto &edge) { return edge.from_variant == unit.variant; }),

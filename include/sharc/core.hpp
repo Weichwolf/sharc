@@ -163,6 +163,7 @@ struct CodeImage {
 };
 
 struct CallbackBinding {
+  // The read and write roles name consumer-linked functions using the runtime I/O ABI.
   std::string role, symbol;
 };
 

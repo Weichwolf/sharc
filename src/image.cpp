@@ -488,6 +488,16 @@ CompiledSymbols compile_image(const PreparedImage &image) {
   }
   auto context = std::make_unique<llvm::LLVMContext>();
   auto module = parse_module(image, *context);
+  for (const auto &binding : image.options.callbacks) {
+    const auto *callback = module->getFunction(binding.symbol);
+    if (callback != nullptr && !callback->use_empty()) {
+      refuse(FaultReason::unsupported_feature,
+             image.identity,
+             0,
+             0,
+             "consumer link required for I/O callback " + binding.symbol);
+    }
+  }
   module->setDataLayout(jit->getDataLayout());
   module->setTargetTriple(jit->getTargetTriple().str());
   llvm::LoopAnalysisManager loops;

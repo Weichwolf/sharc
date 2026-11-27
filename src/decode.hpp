@@ -65,6 +65,8 @@ struct MemoryMoves {
 [[nodiscard]] MemoryMove memory_move(const Instruction &instruction);
 [[nodiscard]] MemoryMoves memory_moves(const Instruction &instruction);
 
+inline constexpr std::string_view io_read_role = "read";
+inline constexpr std::string_view io_write_role = "write";
 void validate_options(const CompileOptions &options, std::string_view identity);
 
 [[nodiscard]] Compute decode_compute(const Instruction &instruction, std::string_view identity);

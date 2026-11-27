@@ -184,6 +184,25 @@ has no register writeback, index update or retirement. Callback code may call
 `request_yield()` to return at the next complete instruction boundary, including
 the resolved destination after a delay slot. Execution re-entry is rejected.
 
+`CompileOptions::callbacks` can bind `read` and `write` to definitions
+provided by the consumer's LLVM link. The semantic artifact declares each used
+symbol with this C calling convention:
+
+```llvm
+declare i32 @consumer_io(ptr %owner, i8 zeroext %space, i8 zeroext %view,
+                        i32 %address, ptr %word) nounwind
+```
+
+The owner comes from `Memory::io.owner` at installation. A nonzero return
+accepts the transfer. On read, the callback writes the unsigned payload to the
+64-bit `word` cell. On write, that cell contains the guest payload. The cell
+is borrowed for the duration of the call. Any role without a linked binding
+uses its `Memory::io` function pointer. Instruction validation continues to
+read the owner-provided storage or instruction-read callback during installation.
+For an image that uses a named symbol, the consumer links the result of `lower`
+or `load` and supplies the resolved native image to `bind`. Standalone
+compilation reports the unresolved role.
+
 `set_memory` revokes bindings. A subsequent install binds the new lent storage.
 Replacing a loan with the same host address and a new generation also revokes
 the old binding. Installation validates the declared words against the current

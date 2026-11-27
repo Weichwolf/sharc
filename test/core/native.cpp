@@ -5,8 +5,14 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
+#include <llvm/IR/BasicBlock.h>
+#include <llvm/IR/DerivedTypes.h>
+#include <llvm/IR/Function.h>
+#include <llvm/IR/IRBuilder.h>
+#include <llvm/IR/Module.h>
 #include <memory>
 #include <sharc/core.hpp>
 #include <sharc/memory.hpp>
@@ -117,6 +123,93 @@ sharc::NativeImage consumer_roundtrip(const sharc::CodeImage &code,
   const auto semantic = sharc::Core::lower(code, options);
   const auto loaded = sharc::Core::load(code, options, semantic.artifact());
   return sharc::Core::bind(loaded, consumer_compile(loaded));
+}
+
+constexpr auto linked_read = "consumer_io_read";
+constexpr auto linked_write = "consumer_io_write";
+constexpr std::uint32_t io_address = 0x90000;
+
+void yield_from_device(sharc::Core *core) noexcept {
+  core->request_yield();
+}
+
+void define_linked_io(llvm::Module &module) {
+  llvm::IRBuilder<> ir(module.getContext());
+  for (const auto *name : {linked_read, linked_write}) {
+    auto *callback = module.getFunction(name);
+    check(callback != nullptr && callback->isDeclaration(), "linked I/O declaration is absent");
+    ir.SetInsertPoint(llvm::BasicBlock::Create(module.getContext(), "entry", callback));
+    const auto cell = [&](unsigned index) {
+      return ir.CreateGEP(ir.getInt64Ty(), callback->getArg(0), ir.getInt32(index));
+    };
+    const bool writing = callback->getName() == linked_write;
+    const auto expected = io_address + (writing ? 1U : 0U);
+    auto *address = ir.CreateICmpEQ(callback->getArg(3), ir.getInt32(expected));
+    auto *space = ir.CreateICmpEQ(callback->getArg(1),
+                                  ir.getInt8(static_cast<std::uint8_t>(sharc::MemorySpace::data)));
+    auto *view = ir.CreateICmpEQ(
+        callback->getArg(2), ir.getInt8(static_cast<std::uint8_t>(sharc::MemoryView::normal_word)));
+    auto *match = ir.CreateAnd(address, ir.CreateAnd(space, view));
+    if (writing) {
+      auto *enabled = ir.CreateICmpNE(ir.CreateLoad(ir.getInt64Ty(), cell(2)), ir.getInt64(0));
+      match = ir.CreateAnd(match, enabled);
+      auto *value = ir.CreateLoad(ir.getInt64Ty(), callback->getArg(4));
+      auto *previous = ir.CreateLoad(ir.getInt64Ty(), cell(1));
+      ir.CreateStore(ir.CreateSelect(match, value, previous), cell(1));
+    } else {
+      ir.CreateStore(ir.CreateLoad(ir.getInt64Ty(), cell(0)), callback->getArg(4));
+      auto *core = ir.CreateLoad(ir.getPtrTy(), cell(3));
+      auto *yield = ir.CreateLoad(ir.getPtrTy(), cell(4));
+      auto *signature = llvm::FunctionType::get(ir.getVoidTy(), {ir.getPtrTy()}, false);
+      ir.CreateCall(signature, yield, {core});
+    }
+    ir.CreateRet(ir.CreateZExt(match, ir.getInt32Ty()));
+  }
+}
+
+void cached_linked_io() {
+  constexpr std::uint64_t load_r0 = 0xa00000000000;
+  constexpr std::uint64_t store_r0_i_plus_one = 0xa10000000001;
+  const std::array words{load_r0, store_r0_i_plus_one, fixture::immediate(1, 7)};
+  fixture::Program program(words);
+  auto io = fixture::normal_region(io_address, 2, 10);
+  io.initialized = false;
+  program.code.variants.front().layout.regions.push_back(io);
+  const sharc::CompileOptions options{.callbacks = {{.role = "read", .symbol = linked_read},
+                                                    {.role = "write", .symbol = linked_write}}};
+  const auto semantic = sharc::Core::lower(program.code, options);
+  const auto loaded = sharc::Core::load(program.code, options, semantic.artifact());
+  const auto symbols = fixture::link(
+      loaded, std::make_shared<fixture::Provider>(), false, {.link_ir = define_linked_io});
+  const auto native = sharc::Core::bind(loaded, symbols);
+  fixture::throws<sharc::PreparationError>(
+      [&] { (void)sharc::Core::compile(program.code, options); },
+      "standalone compilation accepted an unresolved I/O role");
+  constexpr std::uint64_t value = 0x89abcdef;
+  std::array<std::uint64_t, 5> device{
+      value, 0, 0, 0, std::bit_cast<std::uintptr_t>(&yield_from_device)};
+  auto memory = program.memory();
+  memory.io.owner = device.data();
+  sharc::Core core(memory);
+  device[3] = std::bit_cast<std::uintptr_t>(&core);
+  auto start = initial_registers();
+  start.dag[0][0].index = io_address;
+  fixture::install(core, native, start);
+  const auto read = core.run(3);
+  check(read.execution == sharc::ExecutionState::yielded && !read.has_fault &&
+            read.progress == sharc::Progress{.instructions = 1, .base_cycles = 1} &&
+            core.registers().pe[0].data[0][0] == (value << byte_shift) && device[1] == 0,
+        "consumer-linked read did not resolve its owner or yield after retirement");
+  const auto checkpoint = core.save();
+  const auto refused = core.run(2);
+  check(refused.has_fault && refused.fault.reason == sharc::FaultReason::access_fault &&
+            refused.fault.address == fixture::code_address + 1 &&
+            refused.progress == sharc::Progress{} && device[1] == 0,
+        "consumer-linked false result lost the precise access fault");
+  core.restore(checkpoint);
+  device[2] = 1;
+  check(fixture::completed(core.run(2), 2, 2) && device[1] == value,
+        "consumer-linked store did not continue after replay");
 }
 
 void cached_loop_handoff(bool compatible) {
@@ -438,6 +531,7 @@ int main() {
     cached_call(true, sharc::ExecutionMode::fast_fp32);
     cached_memory();
     cached_dag();
+    cached_linked_io();
     cached_loop_handoff(true);
     cached_loop_handoff(false);
   });

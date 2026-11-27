@@ -238,6 +238,15 @@ void validate_options(const CompileOptions &options, std::string_view identity) 
       options.memory_mode != CompileOptions::MemoryMode::direct) {
     refuse(FaultReason::invalid_image, identity, 0, 0, "unknown memory mode");
   }
+  std::set<std::string_view> roles;
+  for (const auto &binding : options.callbacks) {
+    if ((binding.role != io_read_role && binding.role != io_write_role) ||
+        !roles.insert(binding.role).second || binding.symbol.empty() ||
+        binding.symbol.contains('\0') || binding.symbol.starts_with("llvm.")) {
+      refuse(
+          FaultReason::invalid_image, identity, 0, 0, "invalid or duplicated I/O symbol binding");
+    }
+  }
 }
 
 std::string input_identity(const CodeImage &image, const CompileOptions &options) {

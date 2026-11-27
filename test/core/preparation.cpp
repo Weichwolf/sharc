@@ -217,6 +217,22 @@ void transitions() {
   check(refusal(image).reason == FaultReason::invalid_image, "duplicate transition was accepted");
 }
 
+void callback_bindings() {
+  const auto image = fixture::image(InstructionSet::isa, std::uint64_t{0});
+  sharc::CompileOptions options;
+  options.callbacks = {{.role = "unknown", .symbol = "consumer"}};
+  check(refusal(image, options).reason == FaultReason::invalid_image, "unknown I/O role accepted");
+  options.callbacks.front() = {.role = "read", .symbol = ""};
+  check(refusal(image, options).reason == FaultReason::invalid_image, "empty I/O symbol accepted");
+  options.callbacks.front().symbol = "llvm.bitreverse.i32";
+  check(refusal(image, options).reason == FaultReason::invalid_image,
+        "reserved LLVM symbol accepted as an I/O callback");
+  options.callbacks.front().symbol = "consumer_io_read";
+  options.callbacks.push_back(options.callbacks.front());
+  check(refusal(image, options).reason == FaultReason::invalid_image,
+        "duplicate I/O role accepted");
+}
+
 void identities() {
   auto image = fixture::image(InstructionSet::isa, fixture::add(1, 2, 3));
   const std::string original(Core::lower(image).identity());
@@ -248,6 +264,7 @@ int main() {
     boundaries();
     declarations();
     transitions();
+    callback_bindings();
     identities();
   });
 }

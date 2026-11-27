@@ -57,7 +57,8 @@ inline constexpr std::size_t io_slot =
     accumulator_slot + (std::size_t{2} * accumulator_banks * accumulator_limbs);
 inline constexpr std::size_t io_read_slot = io_slot + 1;
 inline constexpr std::size_t io_write_slot = io_read_slot + 1;
-inline constexpr std::size_t owner_events_slot = io_write_slot + 1;
+inline constexpr std::size_t io_owner_slot = io_write_slot + 1;
+inline constexpr std::size_t owner_events_slot = io_owner_slot + 1;
 inline constexpr std::size_t code_owner_slot = owner_events_slot + 1;
 inline constexpr std::size_t code_check_slot = code_owner_slot + 1;
 inline constexpr std::size_t register_pointer_count = code_check_slot + 1;

@@ -751,6 +751,7 @@ PreparationReport Core::install(const NativeImage &image, std::uint32_t variant)
     const auto release = llvm::make_scope_exit([&] { impl_->executing = false; });
     const auto storage = detail::direct_memory(*image.impl_->image, variant, impl_->memory);
     impl_->pointers.resize(detail::register_pointer_count);
+    impl_->pointers[detail::io_owner_slot] = impl_->memory.io.owner;
     impl_->pointers[detail::io_read_slot] =
         impl_->memory.io.read == nullptr ? nullptr : std::bit_cast<void *>(&read_io);
     impl_->pointers[detail::io_write_slot] =

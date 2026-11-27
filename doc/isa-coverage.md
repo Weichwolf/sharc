@@ -466,6 +466,8 @@ short and normal stores through PM/DM code aliases, including unchanged bytes
 and binding revocation on a later I/O fault. It also checks transfer in a live
 delay slot. The native suite checks active counted-loop handoff and rejection of
 an incompatible loop plan through a cached, consumer-linked artifact.
+It also checks consumer-linked read and write roles through a cached artifact,
+including owner binding, yield after retirement, access fault and replay.
 Forced long-word encodings remain open. See
 [memory.md](memory.md) for the exact storage contract.
 
