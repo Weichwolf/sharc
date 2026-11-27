@@ -56,7 +56,7 @@ constexpr unsigned average = 0x09, compare = 0x0a, compare_unsigned = 0x0b;
 constexpr unsigned pass = 0x21, negate = 0x22, add_carry_only = 0x25, subtract_borrow = 0x26;
 constexpr unsigned increment = 0x29, decrement = 0x2a, absolute = 0x30;
 constexpr unsigned bit_and = 0x40, bit_or = 0x41, bit_xor = 0x42, bit_not = 0x43;
-constexpr unsigned minimum = 0x61, maximum = 0x62, clip = 0x63, dual_add_subtract = 0x70;
+constexpr unsigned minimum = 0x61, maximum = 0x62, clip = 0x63;
 } // namespace alu
 
 namespace shift {
@@ -265,9 +265,9 @@ unsigned multifunction_alu_opcode(const Compute &compute) {
 
 bool supported_compute(const Compute &compute) {
   return compute.kind == ComputeKind::none || fixed_multiplier(compute) ||
-         floating_compute(compute) || floating_dual(compute) || floating_multifunction(compute) ||
-         fixed_multifunction(compute) || compute.kind == ComputeKind::mr_transfer ||
-         shift::fifo(compute) ||
+         floating_compute(compute) || compute.kind == ComputeKind::dual_alu ||
+         floating_multifunction(compute) || fixed_multifunction(compute) ||
+         compute.kind == ComputeKind::mr_transfer || shift::fifo(compute) ||
          (compute.kind == ComputeKind::alu &&
           std::ranges::find(fixed_operations, compute.opcode) != fixed_operations.end()) ||
          ((compute.kind == ComputeKind::shifter || compute.kind == ComputeKind::shift_immediate) &&
@@ -833,11 +833,6 @@ void validate_compute_writeback(const Instruction &instruction, std::string_view
   }
 }
 
-bool supported_standalone_compute(const Compute &compute) {
-  return supported_compute(compute) ||
-         (compute.kind == ComputeKind::dual_alu && compute.opcode == alu::dual_add_subtract);
-}
-
 void validate_conditional_memory(const Instruction &instruction, std::string_view identity) {
   if (instruction.type == immediate_shift_type) {
     validate_immediate_shift(instruction, identity);
@@ -847,7 +842,7 @@ void validate_conditional_memory(const Instruction &instruction, std::string_vie
   if (instruction.type == register_offset_memory_type) {
     validate_memory_register(instruction, identity);
   }
-  if (!supported_standalone_compute(instruction.compute)) {
+  if (!supported_compute(instruction.compute)) {
     reject(instruction,
            identity,
            FaultReason::unsupported_instruction,
@@ -861,7 +856,7 @@ void validate_register_modify(const Instruction &instruction, std::string_view i
     reject(instruction, identity, FaultReason::invalid_encoding, "reserved register MODIFY bits");
   }
   validate_condition(instruction, identity);
-  if (!supported_standalone_compute(instruction.compute)) {
+  if (!supported_compute(instruction.compute)) {
     reject(instruction,
            identity,
            FaultReason::unsupported_instruction,
@@ -919,8 +914,7 @@ void validate(const Instruction &instruction, std::string_view identity) {
     validate_immediate_shift(instruction, identity);
     return;
   }
-  if (instruction.type == parallel_memory_type &&
-      supported_standalone_compute(instruction.compute)) {
+  if (instruction.type == parallel_memory_type && supported_compute(instruction.compute)) {
     return;
   }
   if (instruction.type == conditional_compute_type) {
@@ -933,7 +927,7 @@ void validate(const Instruction &instruction, std::string_view identity) {
              "reserved conditional-compute bits");
     }
     validate_condition(instruction, identity);
-    if (supported_standalone_compute(instruction.compute)) { return; }
+    if (supported_compute(instruction.compute)) { return; }
   }
   reject(instruction,
          identity,

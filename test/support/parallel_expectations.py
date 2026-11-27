@@ -211,6 +211,47 @@ inline constexpr std::array multifunction_cases{
 """ + ",\n".join(rows) + "\n};\n"
 
 
+def fixed_dual_header():
+    """Export numeric dual-ALU effects without encoding or lane-admission logic."""
+    operands = ((1, 1), (0x7fffffff, 1), (0x80000000, 0xffffffff),
+                (0x7fffffff, 0xffffffff), (0x80000000, 1), (0x80000000, 0x80000000),
+                (0, 0), (0xffffffff, 1), (0, 0x80000000), (0xffffffff, 0))
+
+    def lane(pair, number, saturate):
+        x, y = pair
+        inputs = ((x << 8) | (0x13 + number), (y << 8) | (0xc2 - number))
+        astat = (0xa50003fe, 0x5a4307fe)[number]
+        stky = (0x40, 0x80)[number]
+        result = dual_alu("fixed", *inputs, astat=astat, stky=stky, saturate=saturate)
+
+        def pair_literal(values):
+            return "{" + ", ".join(hex(item) for item in values) + "}"
+
+        return (f"FixedDualLane{{{pair_literal(inputs)}, {pair_literal(result.raw)}, "
+                f"{astat:#x}, {stky:#x}, {result.astat:#x}, {result.stky:#x}}}")
+
+    def case(first, second, saturate):
+        lanes = ", ".join(lane(pair, number, saturate)
+                          for number, pair in enumerate((first, second)))
+        return f"FixedDualCase{{{str(saturate).lower()}, {{{lanes}}}}}"
+
+    cases = [case(first, tuple(reversed(operands[(i + 3) % len(operands)])), sat)
+             for (i, first), sat in cartesian_product(enumerate(operands), (False, True))]
+    declaration = """
+struct FixedDualLane {
+  std::array<std::uint64_t, 2> inputs, outputs;
+  std::uint32_t old_astat, old_stky, astat, stky;
+};
+struct FixedDualCase {
+  bool saturate;
+  std::array<FixedDualLane, 2> lanes;
+};
+inline constexpr std::array fixed_dual_cases{
+"""
+    return (declaration + ",\n".join(cases) + "\n};\ninline constexpr auto fixed_dual_packet = "
+            + case(operands[1], (0xffffffff, 1), False) + ";\n")
+
+
 def floating_header():
     """Complete results of the published floating compute fields at raw register boundaries."""
     shapes = [(0x0f808c, "dual-only", (0, 8))]

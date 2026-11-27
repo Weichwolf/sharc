@@ -270,7 +270,8 @@ struct FixedCase {
 inline constexpr std::array fixed_cases{
 """ + ",\n".join("FixedCase" + row for row in rows) + "\n};\n" +
                     branch_header() + multiplier_expectations.installed_header() +
-                    parallel_expectations.installed_header() + shifter_expectations.installed_header() +
+                    parallel_expectations.installed_header() + parallel_expectations.fixed_dual_header() +
+                    shifter_expectations.installed_header() +
                     shifter_expectations.fifo_header() +
                     "} // namespace fixture\n")
 

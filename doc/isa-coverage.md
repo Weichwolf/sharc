@@ -100,8 +100,15 @@ explicitly wraps paired word addresses at the top of the space.
 
 Classic ISA support currently includes NOP, immediate moves into data/DAG registers, and
 conditional compute with the 21 fixed ALU opcodes ADD/SUB, carry/borrow forms,
-AVG, CMP/COMP, PASS, NEG, INC/DEC, ABS, AND/OR/XOR/NOT, MIN/MAX and CLIP. Fixed
-dual ADD/SUB with distinct outputs is lowered but lacks installed ISA qualification.
+AVG, CMP/COMP, PASS, NEG, INC/DEC, ABS, AND/OR/XOR/NOT, MIN/MAX and CLIP.
+Fixed dual ADD/SUB with distinct outputs uses both old inputs and combines
+the two ALU flag and sticky results. Installed-image tests check both numerical
+modes, SISD and SIMD, every lane predicate, ALUSAT, distinct and aliased inputs
+and outputs, and independent low/high register banks. The packet matrix covers
+types 1a, 2a, 3a, 4a, 5a, 7a and 9a, including `ELSE` compute. It checks
+old store and register-move sources, transfer writeback priority, shared index
+updates and branch decisions based on the old flags. Each matrix compares
+complete state at an instruction boundary and through a longer grant.
 Direct non-delayed absolute and PC-relative jumps use both-lane AND predicates in
 SIMD, link known successors inside one LLVM function and preserve backward edges.
 Taken jumps cost four nominal base cycles; a conditional jump immediately after

@@ -306,8 +306,19 @@ and opposite operands, zero, carry and signed overflow in SISD and SIMD with
 and without ALUSAT. They vary all SIMD EQ predicate pairs and let both
 destinations overlap the inputs or select distinct registers. Inactive cases
 establish the readable ASTAT and STKY baselines, including flag-pin and stack
-bits supplied by the simulator. Installed-image qualification of the fixed
-dual forms is still open.
+bits supplied by the simulator.
+
+Another 40 cases cover eight classic packet shapes with fixed dual compute.
+The simulator matched both output words, ASTAT, STKY, the two address indices
+and the observed PM/DM words. Type 1a uses both memory buses and performs the
+compute on each available lane. Types 3a and 4a apply the lane predicates to
+compute and to the indexed load or immediate-offset store. Type 5a transfers
+the old difference register into the sum destination. The memory load or
+register move wins the shared sum destination while the ALU flags remain.
+Type 7a updates the index once when either lane is selected. Type 9a applies
+the SIMD predicates to its parallel compute, and `ELSE` inverts them. The
+installed tests also check the actual branch destination and retirement cost
+with the original conditions.
 
 Chapters 3-35/36 and 11-92/93 define the multifunction input groups and forms.
 The numerical functions take all old operands explicitly, never feed a new
@@ -679,10 +690,11 @@ source and condition for each lane. Combined PX supplies bits 63:24 to a
 data register, and writes from an explicit data register clear bits 23:0.
 An immediate write to combined PX duplicates the immediate in both halves.
 The other 84 cases moved between combined PX and USTAT, a PX half or a
-DAG register. CCES placed the source in the high half and zeroed the low
-half for `PX = USTAT1` and `PX = I12`, while section 2-16 describes two
-status words or a duplicated DAG word. The core leaves the unresolved
-combined-PX/UREG projections explicit during preparation.
+DAG register. The assembled words use the ordinary type-5a combined PX
+operand in both directions. CCES placed the source in the high half and
+zeroed the low half for `PX = USTAT1` and `PX = I12`, while section 2-16
+describes two status words or a duplicated DAG word. The core leaves the
+unresolved combined-PX/UREG projections explicit during preparation.
 
 ## Register MODIFY and DAG interlocks
 
