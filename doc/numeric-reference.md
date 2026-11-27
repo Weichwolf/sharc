@@ -942,7 +942,66 @@ or counted loop. DM offsets remained +4/+2. PM offsets were +3/+1 on the
 first turn and +4/+2 on both later turns. The PM loop took one extra clock
 across all three turns. These observations are consistent with the initial
 PM instruction-fetch cache miss in Programming Reference 2.4, p. 4-80.
-An implementation needs to distinguish the first and subsequent accesses.
+
+### Internal instruction-fetch conflicts
+
+Programming Reference 2.4, pp. 4-80–4-83, and ADSP-214xx Hardware
+Reference 1.1, pp. 4-50–4-51, describe a two-way cache with 16 sets
+indexed by the low four bits of the instruction fetch address. An internal
+instruction fetch consults the cache when it conflicts with a PM data
+access. A miss delays the fetch by one cycle and can install the fetched
+instruction. External instruction fetches use the same cache without a PM
+data conflict.
+
+In 38 additional functional simulator visits, each called routine measured
+`EMUCLK` before and five instructions after `PM(I9,M9)=FADDR`.
+A hit stored PC+4 and elapsed six cycles. A miss stored PC+3 and elapsed
+seven cycles. Sites A, B and C were 16 words apart. D was 17 words after C.
+Each case started with a flush and the cache enabled and unfrozen. Mode
+changes and flushes were separated from the next PM access by NOPs.
+
+| Case | Visits and control changes | Results in visit order |
+| --- | --- | --- |
+| Replacement | A B A C A B D A | miss miss hit miss hit miss miss hit |
+| Disable | A, disable, A B, enable, A B B | miss miss miss hit miss hit |
+| Freeze | A, freeze, A B B, thaw, B B | miss hit miss miss miss hit |
+| Recency during freeze | A B, freeze, A, thaw, C A | miss miss hit miss hit |
+| Invalidate | A A, flush, A A | miss hit miss hit |
+| Invalidate while frozen | A, freeze and flush, A A, thaw, A A | miss miss miss miss hit |
+| Invalidate while disabled | A, disable and flush, A, enable, A A | miss miss miss hit |
+
+Disabling kept the existing entries and bypassed lookup and insertion.
+Freezing suppressed insertion on a miss, while a hit still updated recency.
+`FLUSH CACHE` invalidated the entries in either mode. These are simulator
+observations for internal instruction fetches.
+
+Two PM stores shared a fetch address in eight visits. The linear store
+was at P and the taken delayed jump targeted P+3, with the second store
+in its first slot. With a cold cache, whichever store ran first saw
+FADDR=P+3 and took an extra cycle. The other store then saw FADDR=P+4
+with no extra cycle. Cache identity therefore follows the conflicting
+instruction fetch across paths and is independent of the store's PC or
+data address.
+
+In 48 additional samples, a register transfer read FADDR or DADDR one to
+four instructions before an immediate or delayed jump. The samples kept
+their linear PC+4 and PC+2 offsets for unconditional, taken conditional
+and untaken conditional jumps.
+
+In eight predicated PM load visits and four predicated PM store visits,
+the first visit stalled even when the predicate was false. The false
+load preserved the destination register. The false store preserved RAM
+and the post-modified index. A following true visit to either site hit.
+Address-stage cache arbitration and execute-stage memory effects must
+be accounted for separately.
+
+In four clock-store visits, three consecutive instructions read EMUCLK,
+stored EMUCLK to PM or DM, and read EMUCLK again. The store's clock was
+always one greater than the first read. The last read was two greater on
+the cold PM visit and one greater on the warm PM and both DM visits. The
+miss stretched the execute interval to the successor. An installed-image
+comparison at `517befa` gave intervals of one cycle for both buses and
+retired the three-instruction sequence in three base cycles for both.
 
 ## Fixed multiplier details
 
