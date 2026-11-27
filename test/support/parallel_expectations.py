@@ -152,9 +152,12 @@ def installed_header():
                     saturate=bool(mode1 & 0x2000), truncate=bool(mode1 & 0x8000),
                     astat=astat[lane], stky=stky[lane])
                 pe = "x" if lane == 0 else "y"
+                writes = effect.raw
+                if alu == "dual" and outputs[1] == outputs[2]:
+                    writes = (*writes[:2], None)
                 proposals.extend(RegisterWrite(producer + pe, lane, reg, raw)
                                  for producer, reg, raw in zip(("multiplier_", "alu_", "alu_"),
-                                                              outputs, effect.raw)
+                                                              outputs, writes)
                                  if raw is not None)
                 effects.append((effect.accumulator, effect.astat, effect.stky))
             else:
@@ -193,6 +196,9 @@ def installed_header():
     emit("add beats multiply on the same register", 4, "mul", "register", "add", (8, 8), 0x200000)
     emit("subtract beats multiply with lane-local EQ", 0, "mul", "register", "dual", (4, 0, 4),
          0x200480, True)
+    emit("sum beats difference with lane-local EQ", 0, "mul", "register", "dual", (8, 0, 0),
+         0x200480, True)
+    emit("sum beats both other fixed writes", 0, "mul", "register", "dual", (8, 8, 8), 0x202000)
     emit("SISD MAC uses the swapped physical bank", 8, "mac", "mr", "add", (0, 8), 4)
 
     return """
@@ -254,13 +260,14 @@ inline constexpr std::array fixed_dual_cases{
 
 def floating_header():
     """Complete results of the published floating compute fields at raw register boundaries."""
-    shapes = [(0x0f808c, "dual-only", (0, 8))]
+    shapes = [(0x0f808c, "dual-only", (0, 8)), (0x0f888c, "dual-only", (8, 8))]
     shapes += [(0x400800 | (opcode << 16), operation, (0, 8))
                for opcode, operation in enumerate(("add", "sub", "float", "fix", "avg",
                                                    "abs", "max", "min"), 0x18)]
     shapes += [(0x740800, "dual", (0, 8, 4)), (0x588800, "add", (8, 8)),
                (0x748800, "dual", (8, 8, 4)), (0x744800, "dual", (4, 8, 4)),
-               (0x700800, "dual", (0, 8, 0))]
+               (0x700800, "dual", (0, 8, 0)),
+               (0x780800, "dual", (0, 8, 8)), (0x788800, "dual", (8, 8, 8))]
     ordinary = (0x3f80000180, 0x3fc0000000, 0x3f80000000, 0x3380000000)
     special = (0x0080000000, 0x3f7fffffff, 0x7f7fffffff, 0x7f7fffffff)
     conversions = {"float": (0x0100000357, 0x0000000200),
@@ -304,6 +311,8 @@ def floating_header():
                     result.update(zip(outputs, effect.raw, strict=True))
                     if alu == "dual" and outputs[0] == outputs[2]:
                         result[outputs[0]] = effect.raw[0]
+                    if alu in ("dual", "dual-only") and outputs[-2] == outputs[-1]:
+                        result[outputs[-2]] = effect.raw[-2]
                     after_status, after_sticky = effect.astat, effect.stky
                 else:
                     after_status, after_sticky = status, sticky

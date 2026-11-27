@@ -255,14 +255,6 @@ void floating_register_move() {
 }
 
 void floating_packets() {
-  constexpr std::array tied_outputs{std::uint64_t{0x013e000f888c}, std::uint64_t{0x013e00780800}};
-  for (const auto word : tied_outputs) {
-    const auto fault = fixture::refusal(fixture::image(sharc::InstructionSet::isa, word),
-                                        "duplicate floating ALU destinations were admitted");
-    fixture::check(fault.reason == sharc::FaultReason::unsupported_instruction &&
-                       fault.detail.contains("duplicate dual-ALU output"),
-                   "duplicate floating ALU destinations lost their priority diagnostic");
-  }
   fixture::Program program(std::array{std::uint64_t{0}});
   auto &variant = program.code.variants.front();
   std::map<std::uint64_t, std::uint32_t> entries;

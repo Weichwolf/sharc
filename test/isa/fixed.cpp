@@ -143,8 +143,8 @@ void expect_dual(sharc::Registers &state,
   for (unsigned lane = 0; lane < state.pe.size(); ++lane) {
     if ((active & (1U << lane)) == 0) { continue; }
     const auto &reference = item.lanes[lane];
-    dual_data(state, lane, operands.sum) = reference.outputs[0];
     dual_data(state, lane, operands.difference) = reference.outputs[1];
+    dual_data(state, lane, operands.sum) = reference.outputs[0];
     state.pe[lane].astat = reference.astat;
     state.pe[lane].stky = reference.stky;
   }
@@ -345,6 +345,7 @@ int main() {
   return fixture::run_test([] {
     fixed_dual({.sum = 6, .difference = 15, .x = 1, .y = 10});
     fixed_dual({.sum = 1, .difference = 10, .x = 1, .y = 10});
+    fixed_dual({.sum = 10, .difference = 10, .x = 1, .y = 10});
     dual_packets();
     fixture::rotations();
     fixture::register_transfers();

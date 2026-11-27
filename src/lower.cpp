@@ -877,20 +877,6 @@ void validate_immediate_shift(const Instruction &instruction, std::string_view i
   }
 }
 
-void validate_compute_writeback(const Instruction &instruction, std::string_view identity) {
-  const auto &compute = instruction.compute;
-  const bool tied_alu =
-      compute.kind == ComputeKind::dual_alu && compute.outputs[0] == compute.outputs[1];
-  const bool tied_multifunction =
-      compute.kind == ComputeKind::multiply_dual_alu && compute.outputs[1] == compute.outputs[2];
-  if (tied_alu || tied_multifunction) {
-    reject(instruction,
-           identity,
-           FaultReason::unsupported_instruction,
-           "duplicate dual-ALU output priority is unqualified");
-  }
-}
-
 void validate_conditional_memory(const Instruction &instruction, std::string_view identity) {
   if (instruction.type == immediate_shift_type) {
     validate_immediate_shift(instruction, identity);
@@ -929,7 +915,6 @@ void validate(const Instruction &instruction, std::string_view identity) {
            FaultReason::unsupported_instruction,
            "VISA native pipeline lowering is not implemented");
   }
-  validate_compute_writeback(instruction, identity);
   if ((instruction.type == nop_type && instruction.word == 0) || idle(instruction)) { return; }
   if (instruction.type == index_modify_type) { return; }
   if (instruction.type == register_modify_type) {
@@ -2792,8 +2777,10 @@ Arithmetic Lowering::multifunction(Values &values,
   if (compute.kind == ComputeKind::multiply_dual_alu) {
     const auto difference = is_floating ? floating(before, alu_inputs, FloatingOp::subtract)
                                         : arithmetic(before, alu_inputs, alu::subtract);
-    // ADSP-21489 floating butterfly gives the product priority over the subtraction.
-    if (!is_floating || compute.outputs[0] != compute.outputs[2]) {
+    // The simulator gives the sum priority over the difference on a shared output.
+    // Floating butterflies also give the product priority over the difference.
+    if (compute.outputs[1] != compute.outputs[2] &&
+        (!is_floating || compute.outputs[0] != compute.outputs[2])) {
       write_register(values, compute.outputs[2], difference.raw, selected);
     }
     result.status = builder_.CreateOr(result.status, difference.status);
@@ -2824,6 +2811,7 @@ void Lowering::compute_instruction(Values &values,
                                         : arithmetic(before, compute, alu::subtract);
     result.status = builder_.CreateOr(result.status, difference.status);
     result.sticky = builder_.CreateOr(result.sticky, difference.sticky);
+    // The common writeback below commits the sum after the difference.
     write_register(values, compute.outputs[1], difference.raw, selected);
   } else if (compute.kind == ComputeKind::shifter || compute.kind == ComputeKind::shift_immediate) {
     result = shifter(before, compute);

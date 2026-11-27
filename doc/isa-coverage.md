@@ -131,7 +131,11 @@ multiply or accumulate with ADD, SUB or AVG, plus the multiply/ADD/SUB
 butterfly. Installed-image expectations check both lanes and numerical modes,
 accumulator limbs, separate ALU and multiplier flags, old operands and ALU
 write priority over the multiplier. The suite also checks per-lane predicate
-suppression and rejection of a tied pair of ALU destinations.
+suppression and simultaneous ALU writes to one register. The sum wins over
+the difference in the observed ADSP-21489 simulator behavior. Independently
+checked fixed and floating fixtures preserve both operations' flags, including
+when all three butterfly outputs name one register. Silicon confirmation of
+the tied result remains open.
 
 Classic type 1a pairs normal-word PM and DM loads/stores with supported fixed
 compute. Installed images exercise all four direction pairs, old operands,

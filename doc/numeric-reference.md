@@ -320,6 +320,19 @@ the SIMD predicates to its parallel compute, and `ELSE` inverts them. The
 installed tests also check the actual branch destination and retirement cost
 with the original conditions.
 
+Another 432 probes paired tied destinations with controls using distinct ALU
+destinations. They cover fixed and floating dual ADD/SUB and butterflies,
+including a separate multiplier destination or all three results sharing one
+register. The probes vary three destination registers, both processing modes,
+EQ predicates and ordinary or overflow operands. CCES 2.12.1 emitted the tied
+compute fields and warned about an ambiguous destination. In all 180 active
+lane results the tied destination matched the sum and differed from the
+difference. The separate destination and all checked ASTAT and STKY values
+matched their expected control effects. The lowering keeps the sum and
+retains both ALU flag contributions along with any multiplier effects.
+Native fixtures check the adopted behavior against independent numeric results.
+Silicon confirmation remains open.
+
 Chapters 3-35/36 and 11-92/93 define the multifunction input groups and forms.
 The numerical functions take all old operands explicitly, never feed a new
 product into the ALU, and combine only the ALU's new flags with the multiplier's

@@ -168,12 +168,6 @@ void fixed_multiplier() {
 
 void fixed_multifunction() {
   constexpr std::uint32_t swap = 1U << 2;
-  constexpr std::uint64_t tied_dual_results = 0x013e00600000;
-  const auto tie = fixture::refusal(fixture::image(sharc::InstructionSet::isa, tied_dual_results),
-                                    "duplicate ALU destinations were admitted");
-  fixture::check(tie.reason == sharc::FaultReason::unsupported_instruction &&
-                     tie.detail.contains("duplicate dual-ALU output"),
-                 "duplicate ALU destinations lost their priority diagnostic");
   std::array<std::uint64_t, fixture::multifunction_cases.size()> words{};
   for (std::size_t i = 0; i < words.size(); ++i) {
     words[i] = fixture::multifunction_cases[i].word;
