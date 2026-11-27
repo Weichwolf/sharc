@@ -281,10 +281,22 @@ inline constexpr std::array fixed_cases{
                     "} // namespace fixture\n")
 
 
+def floating_header(path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("""// SPDX-License-Identifier: GPL-3.0-only
+// Generated from the independent rational reference. No production imports.
+#pragma once
+#include <array>
+#include <cstdint>
+namespace fixture {
+""" + floating_expectations.installed_header() + "} // namespace fixture\n")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, help="write qualified numeric cases as JSON")
     parser.add_argument("--fixed-header", type=Path, help="write independent installed-image fixed expectations")
+    parser.add_argument("--floating-header", type=Path, help="write installed-image floating expectations")
     arguments = parser.parse_args()
     records = anchored_cases()
     for module in (multiplier_expectations, conversion_expectations, shifter_expectations,
@@ -315,6 +327,8 @@ def main():
     explicit_gaps()
     if arguments.fixed_header:
         fixed_header(arguments.fixed_header)
+    if arguments.floating_header:
+        floating_header(arguments.floating_header)
     if arguments.output:
         payload = {"contract": "strict-numeric-foundation-v1", "isa_execution_coverage": False,
                    "cases": records}

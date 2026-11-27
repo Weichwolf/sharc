@@ -117,6 +117,7 @@ inline constexpr std::uint32_t saturation_mode = 1U << 13;
 inline constexpr std::uint32_t multiplier_swap_mode = 1U << 2;
 inline constexpr std::uint32_t short_sign_mode = 1U << 14;
 inline constexpr std::uint32_t truncation_mode = 1U << 15;
+inline constexpr std::uint32_t rounding32_mode = 1U << 16;
 inline constexpr std::uint32_t simd_mode = 1U << 21;
 inline constexpr std::uint32_t broadcast9_mode = 1U << 22;
 inline constexpr std::uint32_t broadcast1_mode = 1U << 23;

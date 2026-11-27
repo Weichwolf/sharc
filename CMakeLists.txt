@@ -33,7 +33,7 @@ string(SHA256 compiler_hash "${identity_input}")
 file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/generated/compiler_identity.hpp"
   CONTENT "// SPDX-License-Identifier: GPL-3.0-only\n#pragma once\n#define SHARC_COMPILER_IDENTITY \"sharc-preparation-v1-llvm${LLVM_PACKAGE_VERSION}-${compiler_hash}\"\n")
 
-add_library(sharc_core src/core.cpp src/decode.cpp src/compute.cpp src/image.cpp src/lower.cpp src/memory.cpp src/abi.cpp src/escape.cpp src/landing.c)
+add_library(sharc_core src/core.cpp src/decode.cpp src/compute.cpp src/floating.cpp src/image.cpp src/lower.cpp src/memory.cpp src/abi.cpp src/escape.cpp src/landing.c)
 set_source_files_properties(src/landing.c PROPERTIES COMPILE_DEFINITIONS _POSIX_C_SOURCE=200809L)
 add_library(sharc::core ALIAS sharc_core)
 if(SHARC_POISON_NATIVE_STATE)
@@ -69,9 +69,11 @@ if(BUILD_TESTING)
   find_package(Threads REQUIRED)
   file(GLOB reference_sources CONFIGURE_DEPENDS test/support/*.py)
   set(fixed_expectations "${CMAKE_CURRENT_BINARY_DIR}/generated/fixed_cases.hpp")
-  add_custom_command(OUTPUT "${fixed_expectations}"
+  set(floating_expectations "${CMAKE_CURRENT_BINARY_DIR}/generated/floating_cases.hpp")
+  add_custom_command(OUTPUT "${fixed_expectations}" "${floating_expectations}"
     COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/test/support/generate_expectations.py"
       --fixed-header "${fixed_expectations}"
+      --floating-header "${floating_expectations}"
     DEPENDS ${reference_sources}
     VERBATIM)
   add_executable(sharc_isa_test test/isa/fixed.cpp test/isa/control.cpp test/isa/indirect.cpp test/isa/delay.cpp test/isa/hardware_loop.cpp test/isa/register.cpp test/isa/rotate.cpp test/isa/memory.cpp test/isa/dag.cpp "${fixed_expectations}")
@@ -79,6 +81,11 @@ if(BUILD_TESTING)
   target_include_directories(sharc_isa_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
   target_compile_options(sharc_isa_test PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion -Werror)
   add_test(NAME isa COMMAND sharc_isa_test)
+  add_executable(sharc_isa_floating_test test/isa/floating.cpp "${floating_expectations}")
+  target_link_libraries(sharc_isa_floating_test PRIVATE sharc::core)
+  target_include_directories(sharc_isa_floating_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
+  target_compile_options(sharc_isa_floating_test PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion -Werror)
+  add_test(NAME isa_floating COMMAND sharc_isa_floating_test)
   foreach(suite IN ITEMS preparation state compute native control interrupt memory faultmap concurrency)
     add_executable(sharc_${suite}_test test/core/${suite}.cpp)
     target_link_libraries(sharc_${suite}_test PRIVATE sharc::core)

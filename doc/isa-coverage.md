@@ -11,8 +11,8 @@ is claimed.
 | Classic 48-bit ISA | Every documented instruction class, condition, legal operand and parallel form | Partial: data/DAG transfers, fixed ALU/ROT, direct/indirect flow, normal-word pre-indexed and parallel post-indexed memory, immediate DAG modify/reverse, NOP |
 | VISA 16/32/48 | All compact encodings, fetch boundaries, PC units and mode transitions | Unimplemented |
 | Arithmetic and SIMD | PEx/PEy, fixed point, 32-/40-bit float, rounding, modes, flags and exceptions | Partial: fixed ALU, multiplier/MR, fixed multifunction, register-count ROT and bank/SIMD execution |
-| Strict numerical mode (default) | Exact guest 32-/40-bit behavior, RND32, conversion exceptions and native-path identity | Unimplemented |
-| FastFP32 numerical mode (opt-in) | Independent approximation expectations, rounding/flags, unchanged raw moves/integer behavior, separate translations | Unimplemented |
+| Strict numerical mode (default) | Exact guest 32-/40-bit behavior, RND32, conversion exceptions and native-path identity | Partial, see [single-function floating compute](#single-function-floating-compute) |
+| FastFP32 numerical mode (opt-in) | Independent approximation expectations, rounding/flags, unchanged raw moves/integer behavior, separate translations | Partial, see [single-function floating compute](#single-function-floating-compute) |
 | Parallel operations | Old operands, memory aliases, register exchanges and ordered partial effects | Partial: raw register moves/swaps and type 1a normal-word PM/DM with supported fixed compute |
 | Address generation and memory | Both DAGs, modulo/reverse addressing, PM/DM and physical view aliases | Partial: normal-word pre-indexing, immediate modify/reverse and DAG register-load dependencies |
 | Sequencer and control | Delayed flow, DO/loop endpoints, LR, stacks, reset and interrupts | Partial: classic direct/indirect transfers, hardware DO and admitted reentry, reset, declared maskable vectors, admitted RTI and IDLE |
@@ -109,8 +109,8 @@ a compute adds one interlock cycle, including when not taken (Programming
 Reference 2.4, 4-19–4-21 and 4-115–4-116). The preceding-compute history is SSA
 state, stored at exits and included in snapshots. Cycle bounds may cross the
 deadline to finish the current instruction; cycle credit cannot wrap under zero.
-External conditions refuse preparation. VISA, floating computation,
-timer evolution and remaining shifter and memory forms remain unimplemented.
+External conditions refuse preparation. VISA, timer evolution and remaining
+shifter and memory forms remain unimplemented.
 
 Single fixed multiplier computations include register and MR destinations,
 integer and fractional signedness combinations, MAC, MSUB, convergent rounding,
@@ -547,6 +547,31 @@ both numerical identities, including guard bytes and precise progress.
 See the [current benchmark results](../test/bench/README.md) for inputs,
 independent references and unscaled Linux hardware counts. K1–K3, K6 and
 goal sanitizer qualification remain open.
+
+## Single-function floating compute
+
+Classic type 2a lowers floating ADD, SUB, their absolute forms, average,
+multiply, PASS, negate, ABS, RND, COMP, COPYSIGN, MIN, MAX and CLIP. Strict
+applies the guest rounding mode and RND32 boundary. FastFP32 rounds
+computational inputs and results to binary32 with the guest rounding direction.
+Both identities use the raw register file and leave guest MODE1 visible.
+
+`test/isa/floating.cpp` runs independently authored instruction fields and
+rational expectations through installed images. It checks full register state,
+arithmetic flags, comparison history, sticky flags, and progress for admitted
+blocks and partial bounds in SISD and SIMD, with alternate banks and separate
+lane predicates. A floating compare drives a conditional fixed PASS across the
+mode-specific precision boundary, and a later compare preserves CACC through
+an overwrite of the ordinary ALU flags. The preparation suite round-trips the
+Strict artifact and checks cross-mode refusal.
+
+The matrix omits cases for which the independent model refuses a full result.
+These include some signed-zero and NaN flags, RND32 NaN storage and
+classification, and the threshold just below minimum normal. See
+[numeric-reference.md](numeric-reference.md#unverified-against-a-primary-source).
+Conversions, packing, seeds, floating multifunction execution and floating
+parallel-transfer qualification remain open. Floating-workload performance
+is tracked separately from the fixed K1–K6 identities.
 
 ## S2 independent expectations (complete milestone, numerical gaps retained)
 

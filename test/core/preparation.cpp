@@ -234,13 +234,20 @@ void callback_bindings() {
 }
 
 void identities() {
-  auto image = fixture::image(InstructionSet::isa, fixture::add(1, 2, 3));
-  const std::string original(Core::lower(image).identity());
+  constexpr std::uint64_t floating_add = 0x013e00081123;
+  auto image = fixture::image(InstructionSet::isa, floating_add);
+  const auto strict = Core::lower(image);
+  const auto original = strict.identity();
   check(original.size() == 64 && original == Core::lower(image).identity(),
         "unstable input identity");
+  const auto artifact = strict.artifact();
+  check(original == Core::load(image, {}, artifact).identity(),
+        "Strict floating context failed artifact load");
   sharc::CompileOptions options;
   options.mode = sharc::ExecutionMode::fast_fp32;
   check(original != Core::lower(image, options).identity(), "numerical modes share identity");
+  fixture::throws<sharc::PreparationError>([&] { (void)Core::load(image, options, artifact); },
+                                           "FastFP32 loaded a Strict artifact");
   options = {};
   options.callbacks = {{.role = "read", .symbol = "consumer_read"}};
   check(original != Core::lower(image, options).identity(), "callback symbol absent from identity");
@@ -249,9 +256,9 @@ void identities() {
   image.variants.front().layout.regions.clear();
   image.variants.front().spans.front().parcels.back() ^= 1;
   check(original != Core::lower(image).identity(), "code contents absent from identity");
-  constexpr std::uint64_t floating_add = 0x013e00081123;
+  constexpr std::uint64_t reciprocal_seed = 0x013e000c4120;
   fixture::throws<sharc::PreparationError>(
-      [&] { (void)Core::compile(fixture::image(InstructionSet::isa, floating_add)); },
+      [&] { (void)Core::compile(fixture::image(InstructionSet::isa, reciprocal_seed)); },
       "compile bypassed unsupported lowering");
   fixture::throws<sharc::PreparationError>([&] { (void)Core::load(image, {}, {}); },
                                            "empty artifact accepted");

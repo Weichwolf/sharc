@@ -183,20 +183,36 @@ Normal-range rounding validation does not prove the unqualified underflow bounda
 seed tables, instruction semantics, compiled native results or a supported-host
 performance result. The separately qualified initial native subset is recorded in
 `isa-coverage.md`; it does not complete this reference.
-These gaps remain visible during native lowering; coordination is tracked in issue #2.
+The remaining single-function arithmetic cases are tracked in #11.
+Conversions, packing, and seed operations are tracked in #24.
 
 ## Unverified against a primary source
 
-The following probes remain open in issue #3. When an instruction is implemented
-without a primary observation, its documented behavior and any choice where the
-manual is silent must be recorded here and marked in its independent fixtures.
-Such a choice does not establish bit-exact profile coverage. No floating native
-operation or replacement seed table is implemented in this increment.
+The following probes remain open. The independent installed-image matrix omits
+cases where the reference declines to generate the full outcome. The single-
+function lowering currently makes these choices for the open cases:
+
+- For RND32, classify a NaN using the raw 40-bit operand before masking its
+  extension and write the all-ones 40-bit sentinel. Appendix A defines RND32
+  precision, while sections 3-37–38 describe the general boundary and NaN result.
+- Compute AN and MN as ordered negativity, which clears them for negative zero
+  and NaN. For unordered COMP, set AI/AIS, clear AZ and AN, and shift a zero
+  into CACC. Sections 11-23–33 and 11-57 describe these flags, including
+  AI on NaN input. The CACC parenthesis in COMP contradicts its greater-than
+  wording, and the unordered comparison flags need direct evidence.
+- Round on the subnormal grid at the minimum-normal threshold, then flush
+  any remaining subnormal to signed zero. The post-rounded rule in sections
+  11-23–27 and Appendix A leaves this transition unqualified.
+- Explicit RND consumes the raw extension in Strict. FastFP32 reduces the
+  operand first, using the guest rounding direction. RND's flags then describe
+  the operation on that reduced operand, including when the operand rounded
+  to infinity.
 
 | Boundary awaiting observation | Authored probe |
 |---|---|
 | NaN result extension and extension-only payload under RND32 | PASS raw40 `0x7fc0000000` and `0x7f80000001`, RND32 clear/set |
 | AN/MN for NaN/negative zero and conversion sentinels | PASS negative zero; zero times -1; NaN ADD/MUL; unsaturated FIX infinity; LOGB NaN |
+| Unordered COMP | Compare ordinary and extension-only NaNs against finite values in both source positions, with nonzero CACC and both precisions |
 | Rounding just below minimum normal | Multiply `0x0080000000` by `0x3f7fffffff` in 40-bit mode and `0x3f7fffff00` in 32-bit mode |
 | FPACK inexact result, upper storage and flags | Pack half-way inputs into a nonzero destination; vary TRUNC, RND32 and SSE |
 | MANT with nonzero extension under RND32 | MANT raw40 `0x3f80000001`, RND32 clear/set |

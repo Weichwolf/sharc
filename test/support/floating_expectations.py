@@ -7,8 +7,8 @@ from fractions import Fraction
 
 from expectation_check import anchor, require, require_raises
 from reference import (
-    IntegerResult, Mode, Unqualified, float_parts, floating_alu, floating_compare,
-    floating_multiply,
+    IntegerResult, Mode, Operand, Unqualified, float_parts, floating_alu, floating_compare,
+    floating_multiply, quantize,
 )
 
 
@@ -254,3 +254,80 @@ def explicit_gaps():
         lambda: float_parts("logb", 0x7FC0000000, Mode(40)),
     ):
         require_raises(Unqualified, call, 'unqualified floating flags generated')
+
+
+def installed_header():
+    """Operand-level FastFP32 rounding and full installed-image lane effects."""
+    fields = {"add": 0x081000, "sub": 0x082000, "avg": 0x089000, "cmp": 0x08a000,
+              "absadd": 0x091000, "abssub": 0x092000, "pass": 0x0a1000,
+              "neg": 0x0a2000, "round": 0x0a5000, "abs": 0x0b0000,
+              "copysign": 0x0e0000, "min": 0x0e1000, "max": 0x0e2000, "clip": 0x0e3000,
+              "mul": 0x130000}
+    unary = {"pass", "neg", "round", "abs"}
+    edges = [(0x3f800000ff, 0), (0x3f80000180, 0x3380000000),
+             (0x3f80000000, 0xbf80000000), (0x3f80000000, 0x0080000000),
+             (0x7f7fffffff, 0x7f7fffffff), (0x7f7fffffff, 0x4000000000),
+             (0x0080000000, 0x3f00000000), (0x0080000000, 0x8080000000),
+             (0x7f80000000, 0x3f80000000), (0x0000000001, 0x4000000000)]
+    # Vary significands and alignment distances near and beyond both boundaries.
+    for index in range(24):
+        top = (0x4a + index) << 31
+        lower = (0x4a + index - index * 3) << 31
+        left = top | ((index * 0x2853a7d) & 0x7fffffff)
+        right = lower | ((0x79ae52cf - index * 0x1473c1b) & 0x7fffffff)
+        edges.append((left, right | ((index % 2) << 39)))
+    anchors = {operation: [(left, right) for _, name, left, right, _, _, _ in ALU
+                           if name == operation] for operation in fields}
+    anchors["mul"] = [(left, right) for _, left, right, _, _, _ in MULTIPLY]
+    anchors["cmp"] = [(left, right) for _, left, right, _, _, _ in COMPARE]
+
+    def approximate(raw, mode):
+        value = Operand(raw)
+        if value.kind in ("nan", "infinity"):
+            return raw
+        return quantize(value.number(), mode, negative_zero=value.negative).raw
+
+    def result(operation, left, right, mode, fast, astat, stky):
+        if fast:
+            left, right = approximate(left, mode), approximate(right, mode)
+        if operation == "mul":
+            return floating_multiply(left, right, mode, astat=astat, stky=stky)
+        if operation == "cmp":
+            return floating_compare(left, right, mode, astat=astat, stky=stky)
+        return floating_alu(operation, left, right, mode=mode, astat=astat, stky=stky)
+
+    def array(values):
+        return "{" + ", ".join(f"0x{value:x}ULL" for value in values) + "}"
+
+    rows = []
+    for operation, field in fields.items():
+        pairs = [(x, 0) for x, _ in edges[:12]] if operation in unary else edges
+        for index, (left, right) in enumerate(dict.fromkeys(anchors[operation] + pairs)):
+            for fast, rnd32, truncate in cartesian_product((False, True), repeat=3):
+                mode = Mode(32 if fast or rnd32 else 40, "zero" if truncate else "nearest")
+                phase = index % 2
+                old_astat = (0xa500043a | phase, 0x420003c4 | (1 - phase))
+                old_stky = (0x44, 0x108)
+                x = (left, left ^ (1 << 39)) if operation in unary else (left, right)
+                y = (right, left)
+                try:
+                    expected = [result(operation, a, b, mode, fast, status, sticky)
+                                for a, b, status, sticky in zip(x, y, old_astat, old_stky)]
+                except Unqualified:
+                    continue
+                controls = (fast, rnd32, truncate, operation != "cmp")
+                rows.append("{" + ", ".join((hex(field), *(str(bit).lower() for bit in controls),
+                            array(x), array(y), array(old_astat), array(old_stky),
+                            array(item.raw or 0 for item in expected),
+                            array(item.astat for item in expected),
+                            array(item.stky for item in expected))) + "}")
+    return """struct FloatingCase {
+  std::uint32_t field;
+  bool fast, rnd32, truncate, writes;
+  std::array<std::uint64_t, 2> x, y;
+  std::array<std::uint32_t, 2> old_astat, old_stky;
+  std::array<std::uint64_t, 2> raw;
+  std::array<std::uint32_t, 2> astat, stky;
+};
+inline constexpr std::array<FloatingCase, """ + str(len(rows)) + """> floating_cases{{
+""" + ",\n".join(rows) + "\n}};\n"

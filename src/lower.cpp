@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #include "abi.hpp"
 #include "decode.hpp"
+#include "floating.hpp"
 #include "native.hpp"
 #include "sharc/core.hpp"
 #include "sharc/memory.hpp"
@@ -153,6 +154,11 @@ bool fixed_multiplier(const Compute &compute) {
   return compute.kind == ComputeKind::multiplier && compute.opcode != float_multiply_opcode;
 }
 
+bool floating_compute(const Compute &compute) {
+  return (compute.kind == ComputeKind::alu && floating_alu(compute.opcode)) ||
+         (compute.kind == ComputeKind::multiplier && compute.opcode == float_multiply_opcode);
+}
+
 bool fixed_multifunction(const Compute &compute) {
   constexpr unsigned first_floating_packet = 0x18;
   constexpr unsigned fixed_butterfly = 6;
@@ -181,7 +187,8 @@ unsigned multifunction_alu_opcode(const Compute &compute) {
 
 bool supported_compute(const Compute &compute) {
   return compute.kind == ComputeKind::none || fixed_multiplier(compute) ||
-         fixed_multifunction(compute) || compute.kind == ComputeKind::mr_transfer ||
+         floating_compute(compute) || fixed_multifunction(compute) ||
+         compute.kind == ComputeKind::mr_transfer ||
          (compute.kind == ComputeKind::alu &&
           std::ranges::find(fixed_operations, compute.opcode) != fixed_operations.end()) ||
          ((compute.kind == ComputeKind::shifter || compute.kind == ComputeKind::shift_immediate) &&
@@ -953,7 +960,7 @@ class Lowering {
 public:
   Lowering(llvm::Module &module,
            llvm::DIBuilder &debug,
-           CompileOptions::MemoryMode memory_mode,
+           const CompileOptions &options,
            const NativeAbi &abi,
            LinkedIoCallbacks linked_io,
            const CodeVariant &variant,
@@ -962,7 +969,8 @@ public:
            const NativeUnit &unit,
            const LoopPlan &loops)
       : module_(module),
-        memory_mode_(memory_mode),
+        memory_mode_(options.memory_mode),
+        execution_mode_(options.mode),
         code_transitions_(code_transitions),
         abi_(abi),
         linked_io_(linked_io),
@@ -1429,6 +1437,7 @@ private:
 
   llvm::Module &module_;
   CompileOptions::MemoryMode memory_mode_;
+  ExecutionMode execution_mode_;
   bool runtime_io_{};
   bool code_transitions_{}, code_storage_known_{};
   std::array<bool, 2> code_alias_buses_{};
@@ -2079,7 +2088,18 @@ void Lowering::compute_instruction(Values &values,
                                    const Compute &compute,
                                    llvm::Value *selected) {
   Arithmetic result;
-  if (compute.kind == ComputeKind::dual_alu) {
+  if (floating_compute(compute)) {
+    const auto floating = emit_floating(builder_,
+                                        static_cast<FloatingOp>(compute.opcode),
+                                        {.rnd32 = (context_ & rounding32_mode) != 0,
+                                         .truncate = (context_ & truncation_mode) != 0,
+                                         .fast_fp32 = execution_mode_ == ExecutionMode::fast_fp32},
+                                        {.left = before[compute.inputs[0]],
+                                         .right = before[compute.inputs[1]],
+                                         .status = before[status_value],
+                                         .sticky = before[sticky_value]});
+    result = {.raw = floating.raw, .status = floating.status, .sticky = floating.sticky};
+  } else if (compute.kind == ComputeKind::dual_alu) {
     result = arithmetic(before, compute, alu::add);
     const auto difference = arithmetic(before, compute, alu::subtract);
     result.status = builder_.CreateOr(result.status, difference.status);
@@ -5189,7 +5209,8 @@ std::vector<bool> Lowering::dead_alu_status() const {
         ((op.word >> condition_shift) & true_condition) == true_condition) {
       const auto opcode = op.compute.opcode;
       // Compare history outlives the ordinary ALU flags.
-      dead[i] = overwritten && opcode != alu::compare && opcode != alu::compare_unsigned;
+      dead[i] = overwritten && opcode != alu::compare && opcode != alu::compare_unsigned &&
+                opcode != static_cast<unsigned>(FloatingOp::compare);
       overwritten = opcode != alu::add_carry && opcode != alu::subtract_carry &&
                     opcode != alu::add_carry_only && opcode != alu::subtract_borrow;
     } else if (op.type != nop_type && op.type != immediate_move_type &&
@@ -5456,10 +5477,19 @@ std::uint32_t register_context(const Instruction &instruction) {
   return mask;
 }
 
-std::uint32_t compute_context(const Compute &compute) {
+std::uint32_t compute_context(const Compute &compute, ExecutionMode mode) {
   if (compute.kind == ComputeKind::none) { return 0; }
   std::uint32_t mask{simd_mode};
-  if (fixed_multiplier(compute) || compute.kind == ComputeKind::mr_transfer) {
+  if (floating_compute(compute)) {
+    const auto operation = static_cast<FloatingOp>(compute.opcode);
+    if (mode == ExecutionMode::strict && operation != FloatingOp::round) {
+      mask |= rounding32_mode;
+    }
+    if (mode == ExecutionMode::fast_fp32 || floating_arithmetic(operation) ||
+        operation == FloatingOp::multiply || operation == FloatingOp::round) {
+      mask |= truncation_mode;
+    }
+  } else if (fixed_multiplier(compute) || compute.kind == ComputeKind::mr_transfer) {
     mask |= multiplier_swap_mode;
   } else {
     mask |= saturation_mode;
@@ -5477,8 +5507,8 @@ std::uint32_t compute_context(const Compute &compute) {
   return mask;
 }
 
-std::uint32_t instruction_context(const Instruction &instruction) {
-  std::uint32_t mask = low_bank_mode | compute_context(instruction.compute);
+std::uint32_t instruction_context(const Instruction &instruction, ExecutionMode mode) {
+  std::uint32_t mask = low_bank_mode | compute_context(instruction.compute, mode);
   if (instruction.type == index_modify_type) {
     const auto modify = index_modify(instruction);
     mask |= dag_bank_mode(modify.source) | dag_bank_mode(modify.destination);
@@ -5502,10 +5532,12 @@ std::uint32_t instruction_context(const Instruction &instruction) {
   return mask;
 }
 
-std::uint32_t context_mask(const std::vector<Instruction> &instructions, const LoopPlan &plan) {
+std::uint32_t context_mask(const std::vector<Instruction> &instructions,
+                           const LoopPlan &plan,
+                           ExecutionMode mode) {
   std::uint32_t mask{};
   for (const auto &instruction : instructions) {
-    mask |= instruction_context(instruction);
+    mask |= instruction_context(instruction, mode);
     const auto condition = plan.shapes.find(next_pc(instruction, loop_decode_distance));
     const auto endpoint = plan.shapes.find(instruction.address);
     const bool short_sample = endpoint != plan.shapes.end() && endpoint->second.short_body() &&
@@ -5951,7 +5983,7 @@ std::shared_ptr<const PreparedImage> lower_image(const CodeImage &image,
       const auto connected =
           connected_code(code, plan.shapes, entry, entry_context(*result, variant, entry));
       collect_continuations(continuations, connected, variant, plan.reentry_calls, entry);
-      const auto mask = context_mask(connected, plan);
+      const auto mask = context_mask(connected, plan, options.mode);
       std::vector<std::uint32_t> contexts{0};
       for (std::uint32_t bit = 1; bit != 0; bit <<= 1) {
         if ((mask & bit) == 0) { continue; }
@@ -5979,7 +6011,7 @@ std::shared_ptr<const PreparedImage> lower_image(const CodeImage &image,
     Lowering(
         module,
         debug,
-        options.memory_mode,
+        options,
         abi,
         linked_io,
         *variant,
