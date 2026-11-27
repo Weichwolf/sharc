@@ -624,6 +624,36 @@ the same width discrepancy as the indexed data-register probes. Section 6-8
 limits the override to normal-word addressing. These are functional-simulator
 observations. Silicon timing remains unverified.
 
+## User status and bus exchange registers as memory operands
+
+The CCES 2.12.1 ADSP-21489 functional simulator ran 282 authored DM probes
+with USTAT1–3, PX1, PX2 and combined PX. The absolute, immediate-indexed
+and register-post-modified forms used independently initialized register pairs
+and memory words. The address index matched the expected old index or single
+post-modification in every case. In SIMD normal-word transfers, the PEx
+predicate selects the named USTAT or PX half at the explicit address and
+the PEy predicate selects its peer at the next address. The short-word
+post-modified cases used the same predicates with a stride of two.
+
+Natural and forced long-word indexed transfers used the named USTAT or PX
+half in the low word and its peer in the high word. In Type 3a, a load
+required PEx and a store used the whole pair when either PE was selected.
+All tested absolute long-word transfers of a single USTAT or PX half behaved
+differently: stores duplicated the named register and loads put the high
+word in only that register. This held in SISD and SIMD at natural and forced
+long-word addresses. Programming Reference 2.4, section 2-13, describes a
+long-word USTAT store with both peer registers and a SISD load of only the
+named register. The absolute-versus-indexed data placement still requires
+independent confirmation.
+
+Combined PX moved its low and high halves as one long word for both kinds
+of long-word addressing. Narrow combined-PX transfers behaved differently
+from the single-half transfers and varied with the form and broadcast mode.
+The normal-word broadcast probes for USTAT1 and PX1 followed independent
+lane selection in SIMD and required both stored EQ flags to update the peer
+in SISD, the same simulator behavior seen for the Type 3a data-register
+broadcast probes. These observations are pending native qualification.
+
 ## Register MODIFY and DAG interlocks
 
 In 64 authored type-7a probes, the CCES 2.12.1 ADSP-21489 functional simulator
