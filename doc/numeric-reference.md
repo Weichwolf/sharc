@@ -717,9 +717,21 @@ only PEy was selected. The core follows Programming Reference 2.4, pages
 A write to PX places the named USTAT in PX1 and its complement in PX2,
 or duplicates the DAG word. The reverse transfer copies PX1 to the named
 destination only. PEx gates the whole transfer. These choices are covered
-by installed-image tests. Silicon confirmation remains open. Combined-PX
-moves to or from its own halves still require reference or silicon evidence
-and remain refused during preparation.
+by installed-image tests. Silicon confirmation remains open.
+
+A further 320 CCES 2.12.1 probes isolated moves between combined PX and PX1
+or PX2, and a combined-PX self-move. Each opcode was observed in the
+assembled type-5a instruction with and without parallel ADD. The probes
+used four distinct bit patterns, SISD and SIMD, and all old EQ predicate
+pairs. In transfers to a half, the old PX2 word is the source for each
+selected destination. For example, `PX2 = PX` in SIMD copies old PX2 to
+PX1 when PEy is selected, including when only PEy is selected. A move to
+combined PX puts the explicitly named half in PX2 and clears PX1 when PEx
+is selected. `PX = PX` preserves all 64 bits and retires the parallel compute
+in its selected lanes. The independent checks matched both PX halves, the
+ALU destinations, and ASTAT and STKY in every case. The lowering reuses the
+same raw register path for the half transfers and preserves PX through the
+self-move. These projections have simulator and installed-image evidence.
 
 ## USTAT bit operations
 

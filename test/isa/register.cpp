@@ -44,8 +44,12 @@ bool is_data(unsigned reg) {
   return reg < 16 || (reg >= shadow_first && reg < sreg_first);
 }
 
+bool px_half(unsigned reg) {
+  return reg == px1 || reg == px2;
+}
+
 bool has_peer(unsigned reg) {
-  return is_data(reg) || reg == px1 || reg == px2 || std::ranges::contains(ustat, reg);
+  return is_data(reg) || px_half(reg) || std::ranges::contains(ustat, reg);
 }
 
 unsigned data_bank(const sharc::Registers &state, unsigned reg) {
@@ -71,7 +75,7 @@ std::uint64_t read(const sharc::Registers &state, unsigned reg, bool implicit) {
     constexpr unsigned register_alignment = 24;
     return state.px >> register_alignment;
   }
-  if (reg == px1 || reg == px2) {
+  if (px_half(reg)) {
     constexpr unsigned word_bits = 32;
     const auto shift = ((reg == px2) != implicit) ? word_bits : 0U;
     return std::uint64_t{static_cast<std::uint32_t>(state.px >> shift)} << 8;
@@ -93,7 +97,7 @@ void write(sharc::Registers &state, unsigned reg, bool implicit, std::uint64_t r
     return;
   }
   const auto value = static_cast<std::uint32_t>(raw >> 8);
-  if (reg == px1 || reg == px2) {
+  if (px_half(reg)) {
     constexpr unsigned word_bits = 32;
     const auto shift = ((reg == px2) != implicit) ? word_bits : 0U;
     constexpr std::uint64_t word_mask = 0xffffffff;
@@ -115,17 +119,18 @@ void write(sharc::Registers &state, unsigned reg, bool implicit, std::uint64_t r
 }
 
 void apply(const sharc::Registers &before, Move move, sharc::Registers &state) {
+  if (move.source == px && move.destination == px) { return; }
   const bool x = (before.pe[0].astat & 1) != 0;
   const bool y = (before.pe[1].astat & 1) != 0;
   const bool simd = (before.mode1 & (1U << simd_bit)) != 0;
-  if (move.source == px && !is_data(move.destination)) {
+  if (move.source == px && !is_data(move.destination) && !px_half(move.destination)) {
     if (x) {
       const auto low = static_cast<std::uint32_t>(before.px);
       write(state, move.destination, false, std::uint64_t{low} << 8);
     }
     return;
   }
-  if (move.destination == px && !is_data(move.source)) {
+  if (move.destination == px && !is_data(move.source) && !px_half(move.source)) {
     if (x) {
       constexpr std::uint64_t half_radix = 0x100000000;
       const auto *const reg = std::ranges::find(ustat, move.source);
@@ -271,6 +276,16 @@ void combined_px_moves() {
   }
 }
 
+constexpr std::array px_alias_moves{Move{.source = px1, .destination = px},
+                                    Move{.source = px2, .destination = px},
+                                    Move{.source = px, .destination = px1},
+                                    Move{.source = px, .destination = px2},
+                                    Move{.source = px, .destination = px}};
+
+void combined_px_aliases() {
+  for (const auto &move : px_alias_moves) { verify_moves({move}); }
+}
+
 void verify_parallel(sharc::Core &core, Move move, unsigned configuration) {
   constexpr std::uint64_t positive_rail = 0x7fffffff00;
   constexpr std::uint64_t negative_rail = 0x8000000000;
@@ -308,7 +323,7 @@ void parallel_priority() {
                              Move{.source = px, .destination = ustat[0]},
                              Move{.source = ustat[3], .destination = px},
                              Move{.source = 0x50, .destination = 0, .swap = true}};
-  for (const auto &move : moves) {
+  const auto exercise = [](const Move &move) {
     const std::array words{encoding(move) | add_r0_r2_r3};
     fixture::Program program(words);
     for (const auto mode : fixture::numeric_modes) {
@@ -319,7 +334,9 @@ void parallel_priority() {
         verify_parallel(core, move, configuration);
       }
     }
-  }
+  };
+  std::ranges::for_each(moves, exercise);
+  std::ranges::for_each(px_alias_moves, exercise);
 }
 
 constexpr std::uint32_t immediate_test_word = 0x89abcdef;
@@ -808,6 +825,7 @@ void register_transfers() {
   raw_moves();
   system_moves();
   combined_px_moves();
+  combined_px_aliases();
   parallel_priority();
   for (unsigned quarter = 0; quarter < 4; ++quarter) { immediate_registers(quarter); }
   system_immediates();

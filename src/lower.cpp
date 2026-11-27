@@ -752,7 +752,7 @@ void validate_register_move(const Instruction &instruction, std::string_view ide
   const bool ordinary = ordinary_ureg(move.source) && ordinary_ureg(move.destination);
   const auto peer = move.source == px_register ? move.destination : move.source;
   const bool exchange = (move.source == px_register || move.destination == px_register) &&
-                        ordinary_ureg(peer) && !px_half(peer);
+                        (ordinary_ureg(peer) || peer == px_register);
   if ((!ordinary && !exchange) || !supported_compute(instruction.compute)) {
     reject(instruction,
            identity,
@@ -2161,8 +2161,10 @@ void Lowering::write_register(Values &values,
 
 void Lowering::register_instruction(Values &values, const Instruction &op, const Values &before) {
   const auto move = register_move(op);
+  if (move.source == px_register && move.destination == px_register) { return; }
   auto *selected = condition(before, op);
-  if (move.source == px_register && !data_register(move.destination)) {
+  if (move.source == px_register &&
+      (dag_register(move.destination) || user_status(move.destination))) {
     // The combined-register exception takes PX1, even for a paired USTAT destination.
     auto *x = builder_.CreateExtractElement(selected, builder_.getInt32(0));
     auto *low = builder_.CreateTrunc(load(64, px_slot), builder_.getInt32Ty());
@@ -2171,7 +2173,7 @@ void Lowering::register_instruction(Values &values, const Instruction &op, const
     write_register(values, move.destination, pair(raw, raw, 64), pair(x, builder_.getFalse(), 1));
     return;
   }
-  if (move.destination == px_register && !data_register(move.source)) {
+  if (move.destination == px_register && (dag_register(move.source) || user_status(move.source))) {
     constexpr unsigned half_bits = 32;
     // read_register places the named USTAT first and its complement second.
     // Both elements contain the same word for a DAG source.
