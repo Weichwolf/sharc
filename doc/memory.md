@@ -199,8 +199,13 @@ destination. An ordinary branch, return or sequential flow to a declared PC
 outside the active variant retires its completed prefix and reports
 `ExecutionState::code_transfer`. A delayed branch completes its slots and
 redirection before the handoff. Resident code continues in the active variant.
-An attempted handoff with an active delay slot or hardware loop reports the
-missing cross-variant sequencer continuation at the boundary.
+For a handoff inside an active delay, the destination must declare the same
+branch at its origin. The target entry includes the remaining slot and uses the
+latched redirect. An active hardware loop requires matching prepared loop
+shapes, continuation layouts and relevant jump targets. Preparation records
+those compatible destinations in the artifact and includes the associated
+loop bodies at the target entry. If no declared destination can preserve the
+active sequencer context, the core reports a fault at the handoff boundary.
 
 A checked store that changes prepared bytes revokes the active binding and
 stops at the complete instruction boundary, even when the successor was

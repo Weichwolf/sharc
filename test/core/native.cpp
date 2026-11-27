@@ -119,6 +119,66 @@ sharc::NativeImage consumer_roundtrip(const sharc::CodeImage &code,
   return sharc::Core::bind(loaded, consumer_compile(loaded));
 }
 
+void cached_loop_handoff(bool compatible) {
+  constexpr auto start_pc = fixture::code_address;
+  constexpr auto rewritten_pc = start_pc + 2;
+  constexpr auto data_address = 0x90000;
+  constexpr unsigned target_variant = 8;
+  constexpr unsigned loop_turns = 3;
+  constexpr unsigned loop_length = 2;
+  constexpr unsigned count_shift = 24;
+  constexpr unsigned old_value = 4;
+  constexpr unsigned new_value = 7;
+  constexpr std::uint64_t do_counted =
+      0x0c0000000000 | (std::uint64_t{loop_turns} << count_shift) | loop_length;
+  constexpr std::uint64_t store_r0 = 0xa10000000000;
+  const std::array words{
+      do_counted, store_r0, fixture::immediate(1, old_value), fixture::immediate(2, 1)};
+  fixture::Program program(words);
+  auto alias = fixture::normal_region(data_address, 1, fixture::Program::storage_id);
+  alias.byte_offset = std::uint64_t{rewritten_pc - start_pc} * instruction_bytes;
+  program.code.variants.front().layout.regions.push_back(alias);
+  auto target = program.code.variants.front();
+  target.id = target_variant;
+  target.entries.push_back(rewritten_pc);
+  target.spans.front().parcels[8] = new_value;
+  if (!compatible) { target.spans.front().parcels[2] = 1; }
+  program.code.variants.push_back(target);
+  program.code.transitions.push_back(
+      {.from_variant = variant_id, .address = rewritten_pc, .to_variants = {target_variant}});
+  const auto native = consumer_roundtrip(program.code);
+  sharc::Core core(program.memory());
+  auto initial = initial_registers();
+  initial.dag[0][0].index = data_address;
+  initial.pe[0].data[0][0] = new_value << byte_shift;
+  fixture::install(core, native, initial);
+  const auto prefix = core.run(10);
+  check(prefix.progress.instructions == 2 && core.registers().pc == rewritten_pc &&
+            core.registers().pe[0].data[0][1] == 0,
+        "a loop code store executed the stale instruction after the handoff boundary");
+  if (!compatible) {
+    check(prefix.has_fault && prefix.fault.reason == sharc::FaultReason::unsupported_feature &&
+              prefix.fault.detail.contains("hardware-loop continuation"),
+          "active loop accepted an incompatible prepared loop shape");
+    return;
+  }
+  check(prefix.execution == sharc::ExecutionState::code_transfer && !prefix.has_fault,
+        "compatible active loop did not hand off through the cached artifact");
+  sharc::Core replay(program.memory());
+  replay.restore(core.save());
+  (void)replay.install(native, target_variant);
+  constexpr unsigned total = 1 + (loop_turns * loop_length) + 1;
+  const auto completion = replay.run(total - prefix.progress.instructions);
+  sharc::Core reference(program.memory());
+  reference.set_registers(initial);
+  (void)reference.install(native, target_variant);
+  const auto whole = reference.run(total);
+  check(!completion.has_fault && !whole.has_fault && whole.progress.instructions == total &&
+            replay.state() == reference.state() && replay.registers().loop_counter_depth == 0 &&
+            replay.registers().pe[0].data[0][1] == (new_value << byte_shift),
+        "resumed hardware-loop state or progress differs from uninterrupted preparation");
+}
+
 void lifecycle() {
   fixture::Program program(sample_words);
   const auto semantic = sharc::Core::lower(program.code);
@@ -378,5 +438,7 @@ int main() {
     cached_call(true, sharc::ExecutionMode::fast_fp32);
     cached_memory();
     cached_dag();
+    cached_loop_handoff(true);
+    cached_loop_handoff(false);
   });
 }

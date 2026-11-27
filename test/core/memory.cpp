@@ -1214,12 +1214,16 @@ void rewrite_before_io_fault() {
         "late peripheral refusal retained a modified source binding");
 }
 
-void rewrite_inside_delay() {
+void rewrite_inside_delay(bool compatible) {
   constexpr auto slot = fixture::code_address + 2;
-  constexpr std::uint64_t delayed_jump = 0x063e04000000 | (slot + 1);
+  constexpr auto taken = slot + 2;
+  constexpr std::uint64_t delayed_jump = 0x063e04000000 | taken;
   constexpr auto slot_offset = 2 * fixture::Program::word_bytes;
-  const std::array words{
-      delayed_jump, store_r0, fixture::immediate(1, CodeWriter::before), std::uint64_t{0}};
+  const std::array words{delayed_jump,
+                         store_r0,
+                         fixture::immediate(1, CodeWriter::before),
+                         fixture::immediate(2, 1),
+                         fixture::immediate(3, 2)};
   fixture::Program program(words);
   auto alias = fixture::normal_region(ram_address, 1, fixture::Program::storage_id);
   alias.byte_offset = slot_offset;
@@ -1228,6 +1232,7 @@ void rewrite_inside_delay() {
   target.id = CodeWriter::replacement_variant;
   target.entries = {slot};
   target.spans.front().parcels[8] = CodeWriter::after;
+  if (!compatible) { target.spans.front().parcels[2] ^= 1; }
   program.code.variants.push_back(target);
   program.code.transitions.push_back(
       {.from_variant = fixture::Program::variant_id, .address = slot, .to_variants = {target.id}});
@@ -1237,12 +1242,30 @@ void rewrite_inside_delay() {
   start.pe[0].data[0][0] = CodeWriter::after << word_shift;
   fixture::install(core, native, start);
   const auto result = core.run(10);
-  check(result.has_fault && result.fault.reason == sharc::FaultReason::unsupported_feature &&
-            result.fault.address == slot && result.fault.detail.contains("active delay or loop") &&
-            result.progress == sharc::Progress{.instructions = 2, .base_cycles = 2} &&
-            core.registers().pe[0].data[0][1] == 0 &&
+  check(result.progress == sharc::Progress{.instructions = 2, .base_cycles = 2} &&
+            core.registers().pc == slot && core.registers().pe[0].data[0][1] == 0 &&
             fixture::get_word(program.bytes.data() + slot_offset) == CodeWriter::after,
-        "a code store allowed continuation without the active delay-slot context");
+        "a code store executed the stale second delay slot");
+  if (!compatible) {
+    check(result.has_fault && result.fault.reason == sharc::FaultReason::unsupported_feature &&
+              result.fault.address == slot && result.fault.detail.contains("no compatible delay"),
+          "a code store accepted a destination with a different delayed branch origin");
+    return;
+  }
+  check(result.execution == sharc::ExecutionState::code_transfer && !result.has_fault,
+        "rewrite did not hand off with a live delayed branch");
+  sharc::Core replay(program.memory());
+  replay.restore(core.save());
+  (void)replay.install(native, target.id);
+  const auto second_slot = replay.run(1);
+  const auto boundary = replay.registers();
+  check(fixture::completed(second_slot, 1, 2) && boundary.pc == taken &&
+            boundary.pe[0].data[0][1] == (CodeWriter::after << word_shift) &&
+            boundary.pe[0].data[0][2] == 0,
+        "the replaced slot lost the latched redirect or its refill cycle");
+  check(fixture::completed(replay.run(1), 1, 1) &&
+            replay.registers().pe[0].data[0][3] == (2U << word_shift),
+        "the replaced slot did not continue in the prepared target code");
 }
 
 void refused_code_store(CodeStorage storage) {
@@ -1311,7 +1334,8 @@ int main() {
     rewrite_without_target();
     code_padding_store();
     rewrite_before_io_fault();
-    rewrite_inside_delay();
+    rewrite_inside_delay(true);
+    rewrite_inside_delay(false);
     refused_code_store(CodeStorage::callback);
     refused_code_store(CodeStorage::undeclared);
   });

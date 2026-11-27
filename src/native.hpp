@@ -173,6 +173,10 @@ struct NativeUnit {
   std::string symbol;
 };
 
+struct LoopHandoff {
+  std::uint32_t from{}, to{}, address{};
+};
+
 struct PreparedImage {
   CodeImage code;
   CompileOptions options;
@@ -180,6 +184,7 @@ struct PreparedImage {
   std::vector<std::byte> bitcode;
   std::vector<std::string> exports;
   std::vector<NativeUnit> units;
+  std::vector<LoopHandoff> loop_handoffs;
 };
 
 struct CompiledSymbols {

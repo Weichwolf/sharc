@@ -463,7 +463,10 @@ replay, including 40-bit payloads. The Core control suite checks prepared
 handoffs on direct, computed and delayed control flow, rejected installations,
 generation rebinding and snapshot replay. The memory suite checks coherent
 short and normal stores through PM/DM code aliases, including unchanged bytes
-and binding revocation on a later I/O fault. Forced long-word encodings remain open. See
+and binding revocation on a later I/O fault. It also checks transfer in a live
+delay slot. The native suite checks active counted-loop handoff and rejection of
+an incompatible loop plan through a cached, consumer-linked artifact.
+Forced long-word encodings remain open. See
 [memory.md](memory.md) for the exact storage contract.
 
 Classic type 19 implements immediate MODIFY/BITREV, including distinct source

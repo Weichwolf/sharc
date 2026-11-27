@@ -173,6 +173,21 @@ struct PendingTransfer {
   }
 };
 
+std::optional<std::uint64_t> declared_isa_word(const CodeVariant &variant, std::uint32_t pc) {
+  constexpr auto parcels_per_word = detail::full_instruction_bits / detail::short_instruction_bits;
+  for (const auto &span : variant.spans) {
+    if (span.instruction_set != InstructionSet::isa || pc < span.address) { continue; }
+    const auto index = std::size_t{pc - span.address} * parcels_per_word;
+    if (index + parcels_per_word > span.parcels.size()) { continue; }
+    std::uint64_t word{};
+    for (const auto parcel : std::span(span.parcels).subspan(index, parcels_per_word)) {
+      word = (word << detail::short_instruction_bits) | parcel;
+    }
+    return word;
+  }
+  return std::nullopt;
+}
+
 struct LoopPipeline {
   std::array<std::uint32_t, detail::loop_stack_capacity> frames{};
   std::uint64_t refill{};
@@ -548,6 +563,8 @@ struct Core::Impl {
   std::optional<RunResult> open_run(bool has_budget);
   std::optional<RunResult> native_stop(const detail::ControlWords &control, Progress progress);
   [[nodiscard]] const CodeTransition *transfer_target(bool code_changed) const;
+  [[nodiscard]] bool accepts_delay(std::uint32_t target) const;
+  [[nodiscard]] bool accepts_loop(std::uint32_t target) const;
   RunResult start_transfer(const CodeTransition &edge, Progress progress);
   RunResult stop_after_code_write(const detail::ControlWords &control, Progress progress);
 
@@ -1107,14 +1124,35 @@ const CodeTransition *Core::Impl::transfer_target(bool code_changed) const {
   return resident ? nullptr : &*edge;
 }
 
+bool Core::Impl::accepts_delay(std::uint32_t target) const {
+  if (delayed_target == 0) { return true; }
+  const auto slot = (delayed_target & detail::before_second_delay_slot) != 0 ? 2U : 1U;
+  const auto origin = (state.registers.pc - slot) & detail::maximum_pc;
+  const auto word = declared_isa_word(*installed_variant(), origin);
+  const auto &variants = installed->image->code.variants;
+  const auto destination = std::ranges::find(variants, target, &CodeVariant::id);
+  return word.has_value() && declared_isa_word(*destination, origin) == word;
+}
+
+bool Core::Impl::accepts_loop(std::uint32_t target) const {
+  return std::ranges::any_of(installed->image->loop_handoffs, [&](const auto &edge) {
+    return edge.from == variant && edge.to == target && edge.address == state.registers.pc;
+  });
+}
+
 RunResult Core::Impl::start_transfer(const CodeTransition &edge, Progress progress) {
-  if (delayed_target != 0 || loops.active()) {
+  auto targets = edge.to_variants;
+  const auto live_loop = loops.active();
+  std::erase_if(targets, [&](std::uint32_t target) {
+    return !accepts_delay(target) || (live_loop && !accepts_loop(target));
+  });
+  if (targets.empty()) {
     auto result = fail(FaultReason::unsupported_feature,
-                       "code transition cannot resume an active delay or loop in another variant");
+                       "code transition has no compatible delay or hardware-loop continuation");
     result.progress = progress;
     return result;
   }
-  transfer = PendingTransfer{.identity = installed->image->identity, .targets = edge.to_variants};
+  transfer = PendingTransfer{.identity = installed->image->identity, .targets = std::move(targets)};
   state.execution = ExecutionState::code_transfer;
   return {.progress = progress, .execution = state.execution, .has_fault = false, .fault = {}};
 }

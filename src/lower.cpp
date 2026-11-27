@@ -317,6 +317,8 @@ struct LoopShape {
   bool has_tail_abort{};
   bool suspends_enclosing_tail{};
 
+  bool operator==(const LoopShape &) const = default;
+
   [[nodiscard]] bool counted() const { return term == loop_counter_expired; }
 
   [[nodiscard]] bool arithmetic() const { return !counted() && term != true_condition; }
@@ -430,6 +432,8 @@ struct LoopPlan {
   std::set<std::size_t> lce_slots;
   std::map<std::uint32_t, std::size_t> long_tail_indices;
   std::size_t long_tail_count{};
+
+  bool operator==(const LoopPlan &) const = default;
 };
 
 LoopShape loop_shape(const Instruction &op) {
@@ -819,6 +823,12 @@ std::uint32_t broadcast_mode(const MemoryMove &move) {
 std::uint32_t reverse_mode(unsigned index) {
   if (index == 0) { return reverse0_mode; }
   return index == 8 ? reverse8_mode : 0;
+}
+
+bool declared_entry(const CodeVariant &variant, std::uint32_t address) {
+  return std::ranges::contains(variant.entries, address) ||
+         std::ranges::any_of(variant.interrupt_vectors,
+                             [address](const auto &request) { return request.vector == address; });
 }
 
 struct BlockCost {
@@ -3546,9 +3556,7 @@ void Lowering::plan_hardware_loops(const LoopMap &shapes) {
 
 bool Lowering::prepared_jump_target(const Instruction &op, std::uint32_t target) const {
   if (!indirect_branch(op)) { return target == branch_target(op); }
-  return std::ranges::contains(variant_.entries, target) ||
-         std::ranges::any_of(variant_.interrupt_vectors,
-                             [target](const auto &v) { return v.vector == target; });
+  return declared_entry(variant_, target);
 }
 
 void Lowering::plan_jump_refills() {
@@ -5733,10 +5741,33 @@ bool has_sequential_successor(const Instruction &op) {
          (call_branch_instruction(op) && !delayed(op));
 }
 
-std::vector<Instruction>
-connected_code(const InstructionMap &code, const LoopMap &shapes, std::uint32_t entry) {
-  std::set<std::uint32_t> visited;
+enum class EntryContext : std::uint8_t { ordinary, delay_handoff, loop_handoff };
+
+std::vector<std::uint32_t> connection_roots(const InstructionMap &code,
+                                            const LoopMap &shapes,
+                                            std::uint32_t entry,
+                                            EntryContext context) {
   std::vector<std::uint32_t> pending{entry};
+  if (context == EntryContext::ordinary) { return pending; }
+  // A previously issued delayed branch can supply a continuation into its slots.
+  for (unsigned slot = 1; slot <= delay_slot_count; ++slot) {
+    const auto origin = (entry - slot) & maximum_pc;
+    const auto found = code.find(origin);
+    if (found != code.end() && delayed(*found->second)) { pending.push_back(origin); }
+  }
+  if (context == EntryContext::loop_handoff) {
+    // A suspended call can resume its enclosing loop even from outside the body.
+    for (const auto &item : shapes) { pending.push_back((item.second.start - 1) & maximum_pc); }
+  }
+  return pending;
+}
+
+std::vector<Instruction> connected_code(const InstructionMap &code,
+                                        const LoopMap &shapes,
+                                        std::uint32_t entry,
+                                        EntryContext context) {
+  std::set<std::uint32_t> visited;
+  auto pending = connection_roots(code, shapes, entry, context);
   std::set<std::uint32_t> slots;
   while (!pending.empty()) {
     const auto address = pending.back();
@@ -5761,6 +5792,65 @@ connected_code(const InstructionMap &code, const LoopMap &shapes, std::uint32_t 
   std::vector<Instruction> result;
   result.reserve(visited.size());
   for (const auto address : visited) { result.push_back(*code.at(address)); }
+  return result;
+}
+
+EntryContext
+entry_context(const PreparedImage &image, const CodeVariant &variant, std::uint32_t entry) {
+  if (std::ranges::any_of(image.loop_handoffs, [&](const LoopHandoff &edge) {
+        return edge.to == variant.id && edge.address == entry;
+      })) {
+    return EntryContext::loop_handoff;
+  }
+  const bool transfer =
+      std::ranges::any_of(image.code.transitions, [&](const CodeTransition &edge) {
+        return edge.address == entry && std::ranges::contains(edge.to_variants, variant.id);
+      });
+  return transfer ? EntryContext::delay_handoff : EntryContext::ordinary;
+}
+
+struct VariantLoopPlan {
+  const CodeVariant &variant;
+  const InstructionMap &code;
+  const LoopPlan &loops;
+};
+
+bool same_loop_jumps(const VariantLoopPlan &source, const VariantLoopPlan &destination) {
+  for (const auto &[pc, ends] : source.loops.jump_ends) {
+    const auto &op = *source.code.at(pc);
+    if (op.word != destination.code.at(pc)->word) { return false; }
+    if (!indirect_branch(op)) { continue; }
+    for (const auto end : ends) {
+      for (unsigned offset = 0; offset < loop_fetch_distance; ++offset) {
+        const auto target = (end - offset) & maximum_pc;
+        if (declared_entry(source.variant, target) != declared_entry(destination.variant, target)) {
+          return false;
+        }
+      }
+    }
+  }
+  return true;
+}
+
+std::vector<LoopHandoff> loop_handoffs(const CodeImage &image,
+                                       const std::map<std::uint32_t, InstructionMap> &code,
+                                       const std::map<std::uint32_t, LoopPlan> &loops) {
+  std::vector<LoopHandoff> result;
+  const auto plan = [&](std::uint32_t id) {
+    return VariantLoopPlan{.variant = *std::ranges::find(image.variants, id, &CodeVariant::id),
+                           .code = code.at(id),
+                           .loops = loops.at(id)};
+  };
+  for (const auto &edge : image.transitions) {
+    const auto source = plan(edge.from_variant);
+    if (source.loops.shapes.empty()) { continue; }
+    for (const auto target : edge.to_variants) {
+      const auto destination = plan(target);
+      if (source.loops == destination.loops && same_loop_jumps(source, destination)) {
+        result.push_back({.from = edge.from_variant, .to = target, .address = edge.address});
+      }
+    }
+  }
   return result;
 }
 
@@ -5808,13 +5898,17 @@ std::shared_ptr<const PreparedImage> lower_image(const CodeImage &image,
     validate_memory_layout(variant, result->identity);
     const auto &code = variant_code[variant.id];
     validate_delay_slots(code, result->identity);
-    const auto &plan =
-        variant_loops.emplace(variant.id, validate_loop_bodies(code, result->identity))
-            .first->second;
+    variant_loops.emplace(variant.id, validate_loop_bodies(code, result->identity));
+  }
+  result->loop_handoffs = loop_handoffs(image, variant_code, variant_loops);
+  for (const auto &variant : image.variants) {
+    const auto &code = variant_code.at(variant.id);
+    const auto &plan = variant_loops.at(variant.id);
     std::set<std::uint32_t> entries(variant.entries.begin(), variant.entries.end());
     for (const auto &request : variant.interrupt_vectors) { entries.insert(request.vector); }
     for (const auto entry : entries) {
-      const auto connected = connected_code(code, plan.shapes, entry);
+      const auto connected =
+          connected_code(code, plan.shapes, entry, entry_context(*result, variant, entry));
       collect_continuations(continuations, connected, variant, plan.reentry_calls, entry);
       const auto mask = context_mask(connected, plan);
       std::vector<std::uint32_t> contexts{0};
@@ -5848,7 +5942,10 @@ std::shared_ptr<const PreparedImage> lower_image(const CodeImage &image,
         *variant,
         std::ranges::any_of(image.transitions,
                             [&](const auto &edge) { return edge.from_variant == unit.variant; }),
-        connected_code(variant_code.at(unit.variant), plan.shapes, unit.entry),
+        connected_code(variant_code.at(unit.variant),
+                       plan.shapes,
+                       unit.entry,
+                       entry_context(*result, *variant, unit.entry)),
         unit,
         plan)
         .emit();
