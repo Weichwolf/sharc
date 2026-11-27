@@ -52,24 +52,31 @@ and [K5 memory loans](https://github.com/Weichwolf/sharc/issues/3#issuecomment-7
 
 ## Running the benchmarks
 
-Configure a Release build with Clang 19. Run the four CTest entries for checked
-K4/K5 results in Exact and Direct. Each invocation exercises Strict and FastFP32.
+Configure a Release build with Clang 19. Each benchmark runs Strict and FastFP32
+with the same input. The K1 driver also runs the bounded K1 schedule and K6.
+Use one logical CPU throughout the serial measurement batch.
 
 ```sh
-nice -n 10 cmake --build build --target sharc_k4_bench sharc_k5_bench
-ctest --test-dir build --output-on-failure -R '^bench_k[45](_direct)?$'
-mkdir -p build/local
-build/sharc_k4_bench --measure > build/local/k4-exact.jsonl
-build/sharc_k5_bench --measure > build/local/k5-exact.jsonl
-python3 test/bench/summarize.py build/local/k4-exact.jsonl
-python3 test/bench/summarize.py build/local/k5-exact.jsonl
+nice -n 10 cmake --build build --target sharc_k1_bench sharc_k2_bench sharc_k3_bench \
+  sharc_k4_bench sharc_k5_bench
+nice -n 10 ctest --test-dir build --output-on-failure -R '^bench_k[1-5](_direct)?$'
+mkdir -p build/local/common-kernels
+for kernel in 1 2 3 4 5; do
+  taskset -c 2 nice -n 10 "build/sharc_k${kernel}_bench" --measure \
+    > "build/local/common-kernels/k${kernel}-exact.jsonl" || exit
+  taskset -c 2 nice -n 10 "build/sharc_k${kernel}_bench" --measure --direct \
+    > "build/local/common-kernels/k${kernel}-direct.jsonl" || exit
+done
+python3 test/bench/summarize.py build/local/common-kernels/*.jsonl \
+  > build/local/common-kernels/summary.json
 ```
 
-Append `--direct` to measure Direct and record it in a separate file. Older
-records without `memory_mode` used Exact. The driver pins itself to its current
-allowed CPU. Measurements require a fully scheduled, unscaled per-thread Linux
-hardware counter group for user instructions and cycles. Stop other work owned
-by the measurement session before recording results.
+Choose CPU 2 when available or substitute the same allowed CPU in both commands.
+The summary checks that the recordings agree on CPU and compiler identity and
+that the kernel, schedule, precision and memory mode select a unique result.
+Measurements require a fully scheduled, unscaled per-thread Linux hardware
+counter group for user instructions and cycles. Stop other work owned by the
+measurement session before recording results.
 
 ## Workloads
 
@@ -89,14 +96,6 @@ numerical and memory mode. K6 timing includes owner bounds, eligibility checks,
 steps taken during interrupt deferral and vector entry. The JSON reports calls,
 horizons, requests, accepted interrupts and the maximum and sum of acceptance
 delays in base cycles. Portable reference timing covers the same FIR arithmetic.
-
-```sh
-nice -n 10 cmake --build build --target sharc_k1_bench
-nice -n 10 ctest --test-dir build --output-on-failure -R '^bench_k1(_direct)?$'
-mkdir -p build/local
-nice -n 10 build/sharc_k1_bench --measure > build/local/fir-exact.jsonl
-nice -n 10 build/sharc_k1_bench --measure --direct > build/local/fir-direct.jsonl
-```
 
 | Kernel | Assembly | Unique guest instructions | Instructions retired | Base cycles | Output SHA-256 |
 |---|---|---:|---:|---:|---|

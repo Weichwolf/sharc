@@ -57,8 +57,28 @@ def summary(records):
     return {"host": records[0], "results": result}
 
 
+def combine(files):
+    host = None
+    results = []
+    seen = set()
+    for source in files:
+        report = summary([json.loads(line) for line in source if line.strip()])
+        if host is None:
+            host = report["host"]
+        elif host != report["host"]:
+            raise ValueError(f"incompatible host or compiler in {source.name}")
+        for entry in report["results"]:
+            key = (entry["kernel"], entry.get("schedule", "continuous"),
+                   entry["mode"], entry["memory_mode"])
+            if key in seen:
+                raise ValueError(f"duplicate benchmark result in {source.name}: {key}")
+            seen.add(key)
+            results.append(entry)
+    return {"host": host, "results": results}
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("jsonl", type=argparse.FileType("r"))
+    parser.add_argument("jsonl", nargs="+", type=argparse.FileType("r"))
     args = parser.parse_args()
-    print(json.dumps(summary([json.loads(line) for line in args.jsonl if line.strip()]), indent=2))
+    print(json.dumps(combine(args.jsonl), indent=2))
