@@ -16,6 +16,8 @@ constexpr auto base = fixture::code_address;
 constexpr unsigned source_shift = 38, source_low_shift = 31, destination_shift = 23;
 constexpr unsigned condition_shift = 33, simd_bit = 21;
 constexpr unsigned shadow_first = 0x50, true_condition = 31, i8_code = 0x18;
+constexpr unsigned px = 0x6b, px1 = 0x6c, px2 = 0x6d;
+constexpr std::array ustat{0x70U, 0x71U, 0x7eU, 0x7fU};
 constexpr std::uint64_t extension = 0xab;
 constexpr std::uint32_t old_sticky = 0xa5000040;
 constexpr std::uint64_t clock_seed = 123;
@@ -38,7 +40,12 @@ std::uint64_t encoding(Move move, unsigned condition = 0) {
 }
 
 bool is_data(unsigned reg) {
-  return reg < 16 || reg >= shadow_first;
+  constexpr unsigned sreg_first = 0x60;
+  return reg < 16 || (reg >= shadow_first && reg < sreg_first);
+}
+
+bool has_peer(unsigned reg) {
+  return is_data(reg) || reg == px1 || reg == px2 || std::ranges::contains(ustat, reg);
 }
 
 unsigned data_bank(const sharc::Registers &state, unsigned reg) {
@@ -60,14 +67,47 @@ template <class State> auto &dag(State &state, unsigned reg) {
 }
 
 std::uint64_t read(const sharc::Registers &state, unsigned reg, bool implicit) {
+  if (reg == px) {
+    constexpr unsigned register_alignment = 24;
+    return state.px >> register_alignment;
+  }
+  if (reg == px1 || reg == px2) {
+    constexpr unsigned word_bits = 32;
+    const auto shift = ((reg == px2) != implicit) ? word_bits : 0U;
+    return std::uint64_t{static_cast<std::uint32_t>(state.px >> shift)} << 8;
+  }
+  const auto peer = implicit ? reg ^ 1 : reg;
+  const auto *const status = std::ranges::find(ustat, peer);
+  if (status != ustat.end()) {
+    return std::uint64_t{state.ustat[static_cast<std::size_t>(status - ustat.begin())]} << 8;
+  }
   if (!is_data(reg)) { return std::uint64_t{dag(state, reg)} << 8; }
   const auto lane = unsigned{reg >= shadow_first} ^ unsigned { implicit };
   return state.pe[lane].data[data_bank(state, reg)][reg & 15];
 }
 
 void write(sharc::Registers &state, unsigned reg, bool implicit, std::uint64_t raw) {
+  if (reg == px) {
+    constexpr unsigned register_alignment = 24;
+    state.px = raw << register_alignment;
+    return;
+  }
+  const auto value = static_cast<std::uint32_t>(raw >> 8);
+  if (reg == px1 || reg == px2) {
+    constexpr unsigned word_bits = 32;
+    const auto shift = ((reg == px2) != implicit) ? word_bits : 0U;
+    constexpr std::uint64_t word_mask = 0xffffffff;
+    state.px = (state.px & ~(word_mask << shift)) | (std::uint64_t{value} << shift);
+    return;
+  }
+  const auto peer = implicit ? reg ^ 1 : reg;
+  const auto *const status = std::ranges::find(ustat, peer);
+  if (status != ustat.end()) {
+    state.ustat[static_cast<std::size_t>(status - ustat.begin())] = value;
+    return;
+  }
   if (!is_data(reg)) {
-    dag(state, reg) = static_cast<std::uint32_t>(raw >> 8);
+    dag(state, reg) = value;
     return;
   }
   const auto lane = unsigned{reg >= shadow_first} ^ unsigned { implicit };
@@ -81,7 +121,7 @@ void apply(const sharc::Registers &before, Move move, sharc::Registers &state) {
   if (x) { write(state, move.destination, false, read(before, move.source, false)); }
   if (move.swap) {
     if (simd ? y : x) { write(state, move.source, false, read(before, move.destination, false)); }
-  } else if (simd && y && is_data(move.destination)) {
+  } else if (simd && y && has_peer(move.destination)) {
     write(state, move.destination, true, read(before, move.source, true));
   }
 }
@@ -96,6 +136,11 @@ sharc::Registers initial(unsigned configuration) {
   sharc::Registers state;
   state.pc = base;
   state.emuclk = clock_seed;
+  constexpr std::uint64_t px_seed = 0x89abcdef12ab5678;
+  constexpr std::array<std::uint32_t, 4> status_seed{
+      0x12347268, 0xf1946aef, 0x919d1347, 0xfa8253ea};
+  state.px = px_seed;
+  state.ustat = status_seed;
   state.mode1 = ((configuration & 4) << (simd_bit - 2)) | (((configuration >> 3) & 1) << 10) |
                 (((configuration >> 4) & 1) << 7);
   for (unsigned quarter = 0; quarter < bank_bits.size(); ++quarter) {
@@ -170,6 +215,25 @@ void raw_moves() {
   verify_moves(cross_quarters);
 }
 
+void system_moves() {
+  constexpr unsigned shadow4 = shadow_first + 4;
+  const std::vector<Move> moves{
+      {.source = ustat[0], .destination = ustat[1]},
+      {.source = ustat[3], .destination = px1},
+      {.source = px2, .destination = ustat[2]},
+      {.source = ustat[1], .destination = shadow4},
+      {.source = shadow4, .destination = ustat[1]},
+      {.source = px1, .destination = px2},
+      {.source = i8_code, .destination = ustat[0]},
+      {.source = px2, .destination = i8_code},
+      {.source = px, .destination = 4},
+      {.source = px, .destination = shadow4},
+      {.source = 4, .destination = px},
+      {.source = shadow4, .destination = px},
+  };
+  verify_moves(moves);
+}
+
 void verify_parallel(sharc::Core &core, Move move, unsigned configuration) {
   constexpr std::uint64_t positive_rail = 0x7fffffff00;
   constexpr std::uint64_t negative_rail = 0x8000000000;
@@ -202,6 +266,8 @@ void parallel_priority() {
                              Move{.source = 0, .destination = 0x18},
                              Move{.source = 0x50, .destination = 0x2c},
                              Move{.source = 0x18, .destination = 0},
+                             Move{.source = ustat[0], .destination = 0},
+                             Move{.source = 0, .destination = px2},
                              Move{.source = 0x50, .destination = 0, .swap = true}};
   for (const auto &move : moves) {
     const std::array words{encoding(move) | add_r0_r2_r3};
@@ -217,17 +283,25 @@ void parallel_priority() {
   }
 }
 
-void immediate_registers(unsigned quarter) {
-  constexpr std::uint32_t value = 0x89abcdef;
-  std::vector<unsigned> registers;
-  constexpr unsigned registers_per_quarter = 20;
-  registers.reserve(registers_per_quarter);
-  for (unsigned index = quarter * 4; index < quarter * 4 + 4; ++index) {
-    for (unsigned field = 1; field <= 5; ++field) { registers.push_back((field * 16) + index); }
+constexpr std::uint32_t immediate_test_word = 0x89abcdef;
+
+void apply_immediate(sharc::Registers &state, unsigned reg) {
+  if (reg == px) {
+    constexpr std::uint64_t duplicated = 0x89abcdef89abcdef;
+    state.px = duplicated;
+    return;
   }
+  constexpr auto raw = std::uint64_t{immediate_test_word} << 8;
+  write(state, reg, false, raw);
+  if (has_peer(reg) && (state.mode1 & (1U << simd_bit)) != 0) { write(state, reg, true, raw); }
+}
+
+void verify_immediates(const std::vector<unsigned> &registers) {
   std::vector<std::uint64_t> words;
   words.reserve(registers.size());
-  for (const auto reg : registers) { words.push_back(fixture::immediate(reg, value)); }
+  for (const auto reg : registers) {
+    words.push_back(fixture::immediate(reg, immediate_test_word));
+  }
   fixture::Program program(words);
   for (const auto mode : fixture::numeric_modes) {
     const auto native = fixture::compile(program.code, mode);
@@ -238,19 +312,29 @@ void immediate_registers(unsigned quarter) {
       core.set_registers(expected);
       const auto saved = core.save();
       for (unsigned count = 1; count <= registers.size(); ++count) {
-        const auto reg = registers[count - 1];
-        write(expected, reg, false, std::uint64_t{value} << 8);
-        if (is_data(reg) && (expected.mode1 & (1U << simd_bit)) != 0) {
-          write(expected, reg, true, std::uint64_t{value} << 8);
-        }
+        apply_immediate(expected, registers[count - 1]);
         advance(expected);
         core.restore(saved);
         const auto result = core.run(count);
         check(fixture::completed(result, count, count) && core.registers() == expected,
-              "DAG/S-register immediate lost its width, bank or prefix");
+              "universal-register immediate lost its width, bank or prefix");
       }
     }
   }
+}
+
+void immediate_registers(unsigned quarter) {
+  std::vector<unsigned> registers;
+  constexpr unsigned registers_per_quarter = 20;
+  registers.reserve(registers_per_quarter);
+  for (unsigned index = quarter * 4; index < quarter * 4 + 4; ++index) {
+    for (unsigned field = 1; field <= 5; ++field) { registers.push_back((field * 16) + index); }
+  }
+  verify_immediates(registers);
+}
+
+void system_immediates() {
+  verify_immediates({ustat[0], ustat[1], ustat[2], ustat[3], px1, px2, px});
 }
 
 constexpr std::uint32_t dependency_ram = 0x90000, dependency_ram_id = 11;
@@ -465,8 +549,10 @@ void dependencies() {
 namespace fixture {
 void register_transfers() {
   raw_moves();
+  system_moves();
   parallel_priority();
   for (unsigned quarter = 0; quarter < 4; ++quarter) { immediate_registers(quarter); }
+  system_immediates();
   dependencies();
   two_pending_loads();
   refused_register_fields();

@@ -408,6 +408,10 @@ struct Core::Impl {
     pointers[detail::suspended_call_state_slot] = loops.suspended_calls.data();
     pointers[detail::interrupt_latch_slot] = &state.registers.irptl;
     pointers[detail::mode2_slot] = &state.registers.mode2;
+    pointers[detail::px_slot] = &state.registers.px;
+    for (std::size_t reg = 0; reg < state.registers.ustat.size(); ++reg) {
+      pointers[detail::ustat_slot + reg] = &state.registers.ustat[reg];
+    }
     pointers[detail::interrupt_frame_slot] = &interrupt_frame_guard;
     pointers[detail::status_depth_slot] = &state.registers.status_depth;
     pointers[detail::progress_cycle_slot] = &state.progress.base_cycles;
@@ -464,19 +468,24 @@ struct Core::Impl {
     RunResult result;
     switch (reason) {
       case detail::NativeExit::unsupported_memory:
+      case detail::NativeExit::unsupported_memory_width:
       case detail::NativeExit::access_fault:
-      case detail::NativeExit::code_alias:
+      case detail::NativeExit::code_alias: {
+        const char *message = ": access denied or no prepared data binding";
+        if (reason == detail::NativeExit::code_alias) {
+          message = ": store may alias prepared instruction storage";
+        } else if (reason == detail::NativeExit::unsupported_memory_width) {
+          message = ": combined PX requires a long-word access";
+        }
         result = fail(reason == detail::NativeExit::access_fault ? FaultReason::access_fault
                                                                  : FaultReason::unsupported_feature,
                       "memory space " + std::to_string(control[detail::memory_space]) +
-                          ", address " + std::to_string(control[detail::memory_address]) +
-                          (reason == detail::NativeExit::code_alias
-                               ? ": store may alias prepared instruction storage"
-                               : ": access denied or no prepared data binding"));
+                          ", address " + std::to_string(control[detail::memory_address]) + message);
         result.fault.instruction = control[detail::fault_instruction];
         result.fault.instruction_bits = detail::full_instruction_bits;
         state.fault = result.fault;
         break;
+      }
       case detail::NativeExit::unsupported_stack:
         result = fail(FaultReason::unsupported_feature,
                       "PC stack underflow, overflow or tagged continuation is not implemented");

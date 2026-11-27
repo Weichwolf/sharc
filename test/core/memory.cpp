@@ -1026,6 +1026,32 @@ void forced_dag_load_refusal(sharc::ExecutionMode mode) {
         "forced DAG load changed state or lost the ordered callback fault");
 }
 
+void refused_combined_px(sharc::ExecutionMode mode, bool force) {
+  constexpr std::uint64_t load = 0x106b00000000 | ram_address; // PX = DM(address).
+  const std::array words{load | (force ? forced_long : 0)};
+  Program program(words);
+  program.code.code.variants.front().layout.regions.back().initialized = false;
+  const auto native = fixture::compile(program.code.code, mode);
+  constexpr std::array<std::uint64_t, 2> payload{0x943a8021, 0xae135fd7};
+  Peripheral device{.words = payload, .fault_on = 2};
+  auto memory = program.code.memory();
+  memory.io = device.binding();
+  sharc::Core core(memory, mode);
+  device.core = &core;
+  auto before = initial();
+  constexpr std::uint64_t px_seed = 0xe765dd80e3f0aa14;
+  before.px = px_seed;
+  fixture::install(core, native, before);
+  const auto result = core.run(1);
+  const auto reason =
+      force ? sharc::FaultReason::access_fault : sharc::FaultReason::unsupported_feature;
+  check(result.has_fault && result.fault.reason == reason && result.fault.instruction == words[0] &&
+            result.progress == sharc::Progress{} && core.registers() == before &&
+            device.calls == (force ? 2U : 0U) &&
+            (force || result.fault.detail.contains("combined PX requires a long-word access")),
+        "unsupported width or second callback changed combined PX prematurely");
+}
+
 constexpr std::uint64_t fixed_parallel_add = 0x34c89a001401;
 constexpr std::uint64_t floating_parallel_add = 0x34c89a081401;
 
@@ -1711,6 +1737,7 @@ int main() {
       predicated_forced_pair(mode);
       forced_dag_load_refusal(mode);
       for (const bool force : {false, true}) {
+        refused_combined_px(mode, force);
         for (const bool write : {false, true}) { predicated_wide_implicit(mode, force, write); }
       }
       parallel_io(mode, floating_parallel_add);

@@ -64,7 +64,10 @@ inline constexpr std::size_t code_check_slot = code_owner_slot + 1;
 inline constexpr std::size_t fifo_slot = code_check_slot + 1;
 inline constexpr std::size_t fifo_pointer_slot = fifo_slot + 2;
 inline constexpr std::size_t mode2_slot = fifo_pointer_slot + 2;
-inline constexpr std::size_t register_pointer_count = mode2_slot + 1;
+inline constexpr std::size_t px_slot = mode2_slot + 1;
+inline constexpr std::size_t ustat_slot = px_slot + 1;
+inline constexpr unsigned ustat_register_count = 4;
+inline constexpr std::size_t register_pointer_count = ustat_slot + ustat_register_count;
 inline constexpr std::uint8_t owner_yield_event = 1;
 inline constexpr std::uint8_t code_write_event = 2;
 
@@ -168,7 +171,8 @@ enum class NativeExit : std::uint8_t {
   invalid_interrupt_return,
   interrupt_return_slots,
   interrupt_return_redirect,
-  invalid_fifo
+  invalid_fifo,
+  unsupported_memory_width
 };
 using NativeEntry = void (*)(void **, std::uint64_t *);
 using RegisterPointers = std::vector<void *>;

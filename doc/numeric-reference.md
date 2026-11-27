@@ -300,6 +300,15 @@ semantics and that their new ALU flags are ORed. The model preserves old unrelat
 status bits and unions sticky results. A nonzero sum can therefore coexist with
 AZ from a zero difference, or AV and AUS can be set by different floating results.
 
+In 200 authored fixed dual ADD/SUB cases the CCES 2.12.1 ADSP-21489 simulator
+matched both output words, ASTAT and STKY in both lanes. The cases use equal
+and opposite operands, zero, carry and signed overflow in SISD and SIMD with
+and without ALUSAT. They vary all SIMD EQ predicate pairs and let both
+destinations overlap the inputs or select distinct registers. Inactive cases
+establish the readable ASTAT and STKY baselines, including flag-pin and stack
+bits supplied by the simulator. Installed-image qualification of the fixed
+dual forms is still open.
+
 Chapters 3-35/36 and 11-92/93 define the multifunction input groups and forms.
 The numerical functions take all old operands explicitly, never feed a new
 product into the ALU, and combine only the ALU's new flags with the multiplier's
@@ -652,7 +661,28 @@ from the single-half transfers and varied with the form and broadcast mode.
 The normal-word broadcast probes for USTAT1 and PX1 followed independent
 lane selection in SIMD and required both stored EQ flags to update the peer
 in SISD, the same simulator behavior seen for the Type 3a data-register
-broadcast probes. These observations are pending native qualification.
+broadcast probes. The lowering uses the documented SISD broadcast rule and
+the documented two-word store for the paired absolute form.
+
+A further 48 indexed long-word broadcast probes covered USTAT1, PX1 and
+combined PX at natural and forced addresses. With only PEx selected, each
+named register received the low word and its peer received the high word.
+With the implicit transfer selected, the order was reversed, including
+immediate-indexed and SISD broadcast reads. The complete pair came from the
+same address. The installed memory fixtures check that order and the original
+single address update.
+
+In a separate 194-case register probe, 110 cases matched the expectations
+for USTAT and PX-half moves, combined-PX moves to and from the raw40 data
+files, and immediate writes. SIMD paired writes use the corresponding
+source and condition for each lane. Combined PX supplies bits 63:24 to a
+data register, and writes from an explicit data register clear bits 23:0.
+An immediate write to combined PX duplicates the immediate in both halves.
+The other 84 cases moved between combined PX and USTAT, a PX half or a
+DAG register. CCES placed the source in the high half and zeroed the low
+half for `PX = USTAT1` and `PX = I12`, while section 2-16 describes two
+status words or a duplicated DAG word. The core leaves the unresolved
+combined-PX/UREG projections explicit during preparation.
 
 ## Register MODIFY and DAG interlocks
 

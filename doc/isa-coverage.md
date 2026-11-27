@@ -717,9 +717,19 @@ reserve both before evaluating the predicate. Simulator timing, including
 the additional PM access clock in the probe, is recorded separately in
 [the reference notes](numeric-reference.md#dag-registers-as-memory-operands).
 
-Remaining system UREG transfers, DAG addressing variants and silicon
-confirmation of contended register writeback are tracked in #26. Remaining
-compound control forms are tracked in #27.
+USTAT1–4 and PX1/PX2 support classic register and immediate moves and
+types 3a, 14a and 15a memory transfers. Combined PX supports its raw40
+register moves with R/S, immediate replication and full long-word memory
+transfers. Installed fixtures cover independent predicates, register aliases,
+old sources in parallel compute, both buses, long-word broadcast order and
+precise refusal if a forced load's second callback fails. Combined-PX moves
+with other UREGs and narrow combined-PX memory transfers remain open. See
+[the register and memory observations](numeric-reference.md#user-status-and-bus-exchange-registers-as-memory-operands)
+for the absolute long-word store discrepancy and other pending projections.
+
+Other system UREG transfers, DAG addressing variants and silicon confirmation
+of contended register writeback are tracked in #26. Remaining compound control
+forms are tracked in #27.
 
 ## S2 independent expectations (complete milestone, numerical gaps retained)
 

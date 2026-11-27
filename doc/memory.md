@@ -90,6 +90,22 @@ with the named register supplying or receiving the low word. A forced
 long access uses successive normal-word addresses, including when the
 address is odd. Register writeback waits for both reads to succeed.
 
+USTAT1/2, USTAT3/4 and PX1/PX2 each form a complementary pair. In scalar
+memory views the explicit and implicit transfers use separate lane predicates.
+An indexed long-word load or store uses the named register for the low word
+and its peer for the high word. Broadcast copies the pair in complementary
+order when the implicit read is selected. Absolute long-word loads into one
+USTAT or PX half select the high word, following the simulator observations.
+Absolute stores use the named register and its peer as specified for USTAT
+in the programming reference. The simulator duplicates the named word in
+this form, so silicon confirmation remains open for both register classes.
+
+Combined PX can transfer all 64 bits through a long-word view or a forced
+long-word access to two successive normal words. Long-word broadcast selects
+the reversed halves if its implicit transfer is selected. Narrow combined-PX
+transfers require further qualification and report an unsupported memory access
+before invoking I/O or changing either half.
+
 Type 1a transfers address DM using DAG1 and PM using DAG2. Both addresses use
 their old I. The packet updates each I once using the selected signed M from the
 same DAG. CBUFEN enables circular limits and the documented I7/I15 overflow
