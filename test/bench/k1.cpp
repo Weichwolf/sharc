@@ -2,6 +2,7 @@
 #include "../support/check.hpp"
 #include "../support/isa.hpp"
 #include "../support/word_space.hpp"
+#include "filter.hpp"
 #include "reference.hpp"
 #include "runner.hpp"
 
@@ -10,11 +11,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
-#include <llvm/ADT/StringExtras.h>
-#include <llvm/Support/SHA256.h>
 #include <sharc/core.hpp>
 #include <sharc/memory.hpp>
-#include <span>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -22,9 +20,9 @@
 
 namespace {
 using fixture::check;
-constexpr unsigned frames = 1024;
-constexpr unsigned blocks = 256;
-constexpr unsigned samples = frames * blocks;
+constexpr auto frames = bench::filter_frames;
+constexpr auto blocks = bench::filter_blocks;
+constexpr auto samples = bench::filter_samples;
 constexpr unsigned history = bench::fir_taps - 1;
 constexpr unsigned word_bytes = sizeof(std::uint32_t);
 constexpr unsigned raw_shift = 8;
@@ -108,36 +106,6 @@ fixture::Program kernel() {
   pm.writable = false;
   variant.layout.regions.push_back(pm);
   return program;
-}
-
-std::vector<std::uint32_t> signal() {
-  constexpr std::uint32_t seed = 0x243f6a88;
-  constexpr std::uint32_t multiplier = 1664525;
-  constexpr std::uint32_t increment = 1013904223;
-  constexpr unsigned pulse_period = 97;
-  constexpr auto rail = std::uint32_t{1} << 31;
-  std::vector<std::uint32_t> input(samples + history);
-  auto state = seed;
-  for (unsigned i = 0; i < samples; ++i) {
-    state = (state * multiplier) + increment;
-    auto sample = static_cast<std::uint32_t>((std::int64_t{state} - rail) / 2);
-    if (i % pulse_period == 0) { sample = rail - 1; }
-    if (i % pulse_period == 1) { sample = rail; }
-    input[i + history] = sample;
-  }
-  return input;
-}
-
-std::string digest(std::span<const std::uint32_t> words) {
-  llvm::SHA256 hash;
-  for (const auto word : words) {
-    std::array<std::uint8_t, word_bytes> bytes{};
-    for (unsigned i = 0; i < bytes.size(); ++i) {
-      bytes[i] = static_cast<std::uint8_t>(word >> (i * raw_shift));
-    }
-    hash.update(bytes);
-  }
-  return llvm::toHex(hash.final(), true);
 }
 
 sharc::Registers initial_registers() {
@@ -233,10 +201,11 @@ void validate_progress(const sharc::Core &core, const bench::SampleRun &run, Sch
 }
 
 void run(sharc::ExecutionMode mode, bench::Options options) {
-  const auto input = signal();
+  const auto input = bench::filter_signal(history);
   std::vector<std::uint32_t> expected(samples);
   bench::fir(input, coefficients, expected);
-  check(digest(expected) == "e0dd28045a3afa7150f68203e73f97539933139b0823efd64705cc1c63ea7462",
+  check(bench::word_digest(expected) ==
+            "e0dd28045a3afa7150f68203e73f97539933139b0823efd64705cc1c63ea7462",
         "K1 independent C++ output does not match the common Q1.31 hash");
   const bench::WordSpace dm;
   const bench::WordSpace pm;

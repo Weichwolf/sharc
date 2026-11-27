@@ -1,7 +1,7 @@
 # Common benchmarks
 
-K1, K4, K5 and K6 have checked Linux results. K2, K3, macOS ARM64 and
-protected-page peripheral I/O remain open.
+K1, K2, K4, K5 and K6 have checked Linux results. K3 qualification, macOS ARM64
+and protected-page peripheral I/O remain open.
 
 ## Current Linux results
 
@@ -111,6 +111,28 @@ waiting for eligibility. The longest IRQ delay is three base cycles and the
 sum is 964. These counts agree across Strict, FastFP32, Exact and Direct.
 The native size denominator uses all 20 prepared guest sites for both kernels,
 including the IRQ2 handler.
+
+[K2](k2.asm) feeds the same signal through four transposed direct-form II
+biquads. The guest loads the two old state words, puts each state contribution
+in the signed fractional multiply accumulator and combines it with products
+before rounding and saturating. Both updated state words and the stage output
+have their own quantization. State persists over all 256 blocks. The independent
+C++ implementation compares all samples and the eight final state words with
+the contract hashes. The guest retires 29,098,754 instructions in 29,885,183
+base cycles.
+
+[K3](k3.asm) processes 512 copies of a 256-point complex radix-2 transform.
+The real and imaginary input components at natural index `i` are
+`((i*97+13)&4095)-2048` and `((i*53+7)&4095)-2048`, scaled by 2^16 from
+the common Q1.15 input to Q1.31. The owner stages bit-reversed input for both
+implementations. The guest walks interleaved complex words in place using eight
+PM stage descriptors and Q1.31 twiddles from exp(-2πij/256). Twiddles round to
+the nearest integer at scale 2^31 and clip symmetrically to ±(2^31−1). The guest
+rounds each complete complex product and divides each butterfly output by two
+with nearest-even rounding. Output bins are in natural order with total scale
+1/256. The C++ reference iterates twiddles before groups and independently
+computes signed products and quantization. Each test compares all 512 words
+of every transform.
 
 K4 starts at state 3 with accumulator `0x2468ace0` and executes 1,048,576
 transitions. The masked state selects one of eight DM table entries. The
