@@ -1284,6 +1284,52 @@ void control_memory_access(sharc::ExecutionMode mode) {
   }
 }
 
+void store_sequencer_registers(sharc::ExecutionMode mode) {
+  constexpr unsigned pc = 0x63;
+  constexpr unsigned pcstk = 0x64;
+  constexpr unsigned stack_cell = dag_cell + 2;
+  constexpr std::uint32_t tagged_return = 0x02345678;
+  constexpr RegisterMemoryCase item{.form = RegisterMemoryForm::post,
+                                    .space = sharc::MemorySpace::data,
+                                    .view = sharc::MemoryView::normal_word,
+                                    .reg = pcstk,
+                                    .width = 4,
+                                    .force = true};
+  constexpr unsigned index = 1;
+  const std::array words{
+      encoding(AbsoluteMove{
+          .space = item.space, .write = true, .ureg = pc, .address = ram_address + dag_cell}),
+      register_memory_encoding(item, index, true)};
+  fixture::Program program(words);
+  program.code.variants.front().layout.regions.push_back({.space = item.space,
+                                                          .first = ram_address,
+                                                          .count = dag_capture_count,
+                                                          .storage_id = ram_id,
+                                                          .byte_offset = offset,
+                                                          .byte_stride = immediate_stride,
+                                                          .initialized = true});
+  auto ram = register_memory_seed(item);
+  auto expected_ram = ram;
+  put_register_word(expected_ram, dag_cell, item, fixture::code_address);
+  put_register_word(expected_ram, stack_cell, item, tagged_return);
+  put_register_word(expected_ram, stack_cell + 1, item, tagged_return);
+  sharc::Core core(program.memory(ram_id, ram), mode);
+  const auto native = fixture::compile(program.code, mode);
+  sharc::Registers expected;
+  expected.pc = fixture::code_address;
+  expected.pc_stack_pointer = 1;
+  expected.pc_stack[0] = tagged_return;
+  expected.pe[0].astat = 1;
+  expected.dag[0][index].index = ram_address + stack_cell;
+  expected.dag[0][index + 2].modifier = 2;
+  fixture::install(core, native, expected);
+  expected.dag[0][index].index += 2;
+  fixture::boundary(expected, {.pc = fixture::code_address + 2, .clock = 2});
+  check(fixture::completed(core.run(words.size()), words.size(), words.size()) &&
+            core.registers() == expected && ram == expected_ram,
+        "sequencer stores lost the execute address or unpaired stack word");
+}
+
 void store_emulation_clock(sharc::ExecutionMode mode) {
   constexpr std::uint64_t read_r4 = 0x76be82000000;
   constexpr std::uint64_t read_r5 = 0x76be82800000;
@@ -1455,6 +1501,7 @@ void memory_access() {
     system_memory_access(mode);
     loop_preload_memory(mode);
     control_memory_access(mode);
+    store_sequencer_registers(mode);
     store_emulation_clock(mode);
     store_live_alu_status(mode);
     for (const auto space : {sharc::MemorySpace::data, sharc::MemorySpace::program}) {

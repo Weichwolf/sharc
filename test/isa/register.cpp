@@ -21,6 +21,9 @@ constexpr unsigned px = 0x6b, px1 = 0x6c, px2 = 0x6d;
 constexpr std::array ustat{0x70U, 0x71U, 0x7eU, 0x7fU};
 constexpr unsigned lcntr_code = 0x68;
 constexpr unsigned emuclk_code = 0x69, emuclk2_code = 0x6a;
+constexpr unsigned pc_code = 0x63, pcstk_code = 0x64, pcstkp_code = 0x65;
+constexpr unsigned laddr_code = 0x66, curlcntr_code = 0x67;
+constexpr std::uint32_t empty_pc_stack = 0x03ffffff, empty_loop_stack = 0xffffffff;
 constexpr unsigned mode1_code = 0x72, astat_x_code = 0x76, astat_y_code = 0x77;
 constexpr unsigned stky_x_code = 0x78, stky_y_code = 0x79, irptl_code = 0x7a;
 constexpr std::array lane_status_codes{astat_x_code, astat_y_code, stky_x_code, stky_y_code};
@@ -443,6 +446,121 @@ void emulation_clock_short_loop() {
               data[5] == ((seed + 5) << 8) && data[6] == ((seed + 9) << 8),
           "clock read in a short DO lost a turn or refill cycle");
   }
+}
+
+void verify_sequencer_reads(sharc::Core &core, bool filled) {
+  constexpr std::uint32_t tagged_return = 0x03543210;
+  constexpr std::uint32_t loop_address = 0xef000133;
+  constexpr std::uint32_t count = 0x56781234;
+  auto expected = initial(4);
+  expected.pc_stack_pointer = filled ? 2 : 0;
+  expected.loop_address_depth = expected.loop_counter_depth = filled ? 2 : 0;
+  expected.pc_stack[1] = tagged_return;
+  expected.loop_address_stack[1] = loop_address;
+  expected.loop_counter_stack[1] = count;
+  core.set_registers(expected);
+  const std::array reads{base,
+                         filled ? tagged_return : empty_pc_stack,
+                         filled ? 2U : 0U,
+                         filled ? loop_address : empty_loop_stack,
+                         filled ? count : empty_loop_stack};
+  for (auto &pe : expected.pe) {
+    for (std::size_t i = 0; i < reads.size(); ++i) {
+      pe.data[0][4 + i] = std::uint64_t{reads[i]} << 8;
+    }
+  }
+  fixture::boundary(expected, {.pc = base + 5, .clock = clock_seed + 5});
+  check(fixture::completed(core.run(reads.size()), reads.size(), reads.size()) &&
+            core.registers() == expected,
+        "sequencer read lost a tag, logical stack top, empty value or lane");
+}
+
+void sequencer_register_reads() {
+  const std::array words{encoding({.source = pc_code, .destination = 4}, true_condition),
+                         encoding({.source = pcstk_code, .destination = 5}, true_condition),
+                         encoding({.source = pcstkp_code, .destination = 6}, true_condition),
+                         encoding({.source = laddr_code, .destination = 7}, true_condition),
+                         encoding({.source = curlcntr_code, .destination = 8}, true_condition)};
+  fixture::Program program(words);
+  for (const auto mode : fixture::numeric_modes) {
+    const auto native = fixture::compile(program.code, mode);
+    sharc::Core core(program.memory(), mode);
+    (void)core.install(native, fixture::Program::variant_id);
+    for (const bool filled : {false, true}) { verify_sequencer_reads(core, filled); }
+  }
+}
+
+void pc_and_stack_in_delay_slots() {
+  constexpr std::uint64_t call_db = 0x06be04000000;
+  constexpr std::uint64_t rts = 0x0a3e00000000;
+  constexpr auto target = base + 5;
+  constexpr std::uint64_t nop = 0;
+  const std::array words{call_db | target,
+                         encoding({.source = pc_code, .destination = 4}, true_condition),
+                         encoding({.source = pcstk_code, .destination = 5}, true_condition),
+                         encoding({.source = pcstkp_code, .destination = 6}, true_condition),
+                         nop,
+                         encoding({.source = pcstkp_code, .destination = 7}, true_condition),
+                         rts};
+  fixture::Program program(words);
+  for (const auto mode : fixture::numeric_modes) {
+    const auto native = fixture::compile(program.code, mode);
+    sharc::Core core(program.memory(), mode);
+    sharc::Core replay(program.memory(), mode);
+    fixture::install(core, native, initial(0));
+    (void)replay.install(native, fixture::Program::variant_id);
+    const auto beginning = core.save();
+    check(fixture::completed(core.run(2), 2, 2), "CALL and its first slot did not retire");
+    replay.restore(core.save());
+    check(fixture::completed(replay.run(4), 4, 8), "delay-slot stack observation did not replay");
+    const auto expected = replay.registers();
+    const auto &data = expected.pe[0].data[0];
+    constexpr auto return_with_call_tag = (base + 3) | (1U << 24);
+    check(data[4] == ((base + 1) << 8) && data[5] == (std::uint64_t{return_with_call_tag} << 8) &&
+              data[6] == 0 && data[7] == (1U << 8) && expected.pc == base + 4,
+          "PC or PC stack read selected the wrong delayed address or stack frame");
+    core.restore(beginning);
+    check(fixture::completed(core.run(6), 6, 10) && core.registers() == expected,
+          "continuous delay-slot stack observation differed from replay");
+  }
+}
+
+struct LoopRegisterRead {
+  unsigned port, length, position;
+  std::uint32_t word;
+};
+
+void loop_register_read(LoopRegisterRead probe) {
+  constexpr std::uint64_t three_turns = 0x0c0003000000;
+  std::vector<std::uint64_t> words(probe.length + 2);
+  words.front() = three_turns | probe.length;
+  words[probe.position + 1] = encoding({.source = probe.port, .destination = 4}, true_condition);
+  fixture::Program program(words);
+  for (const auto mode : fixture::numeric_modes) {
+    const auto native = fixture::compile(program.code, mode);
+    sharc::Core core(program.memory(), mode);
+    fixture::install(core, native, initial(0));
+    const auto count = 1 + (3 * probe.length);
+    const auto report = core.run(count);
+    const auto state = core.registers();
+    check(!report.has_fault && report.progress.instructions == count &&
+              state.pe[0].data[0][4] == (std::uint64_t{probe.word} << 8) &&
+              state.loop_counter_depth == 0,
+          "sequencer read lost the loop count or the early pop on the final turn");
+  }
+}
+
+void loop_register_reads() {
+  constexpr std::uint32_t long_counted = 0xef000000;
+  constexpr std::array cases{
+      LoopRegisterRead{.port = curlcntr_code, .length = 1, .position = 0, .word = empty_loop_stack},
+      LoopRegisterRead{.port = curlcntr_code, .length = 7, .position = 1, .word = 1},
+      LoopRegisterRead{
+          .port = laddr_code, .length = 5, .position = 0, .word = long_counted | (base + 5)},
+      LoopRegisterRead{.port = laddr_code, .length = 5, .position = 1, .word = empty_loop_stack},
+      LoopRegisterRead{.port = pcstkp_code, .length = 5, .position = 0, .word = 1},
+      LoopRegisterRead{.port = pcstk_code, .length = 5, .position = 1, .word = empty_pc_stack}};
+  std::ranges::for_each(cases, loop_register_read);
 }
 
 void combined_px_moves() {
@@ -1269,6 +1387,9 @@ void register_transfers() {
   read_latched_dag_overflow();
   emulation_clock_wrap();
   emulation_clock_short_loop();
+  sequencer_register_reads();
+  pc_and_stack_in_delay_slots();
+  loop_register_reads();
   combined_px_moves();
   combined_px_aliases();
   parallel_priority();

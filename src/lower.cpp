@@ -106,6 +106,8 @@ bool fifo_transfer(const Compute &compute) {
 
 constexpr unsigned shadow_register_first = 0x50;
 constexpr unsigned system_register_first = 0x60;
+constexpr unsigned pc_register = 0x63, pcstk_register = 0x64, pcstkp_register = 0x65;
+constexpr unsigned laddr_register = 0x66, curlcntr_register = 0x67;
 constexpr unsigned px_register = 0x6b;
 constexpr unsigned px1_register = 0x6c, px2_register = 0x6d;
 constexpr unsigned emuclk_register = 0x69, emuclk2_register = 0x6a;
@@ -401,6 +403,11 @@ bool clock_register(unsigned reg) {
   return reg == emuclk_register || reg == emuclk2_register;
 }
 
+bool stack_register(unsigned reg) {
+  return reg == pcstk_register || reg == pcstkp_register || reg == laddr_register ||
+         reg == curlcntr_register;
+}
+
 bool writable_ureg(unsigned reg) {
   return ordinary_ureg(reg) || reg == px_register || reg == lcntr_register ||
          lane_status_register(reg);
@@ -421,8 +428,13 @@ std::optional<std::size_t> scalar_control_slot(unsigned reg) {
   }
 }
 
+bool unpaired_control_register(unsigned reg) {
+  return reg == pc_register || stack_register(reg) || clock_register(reg) ||
+         scalar_control_slot(reg).has_value();
+}
+
 bool readable_control_register(unsigned reg) {
-  return lane_status_register(reg) || clock_register(reg) || scalar_control_slot(reg).has_value();
+  return lane_status_register(reg) || unpaired_control_register(reg);
 }
 
 std::size_t user_status_slot(unsigned reg) {
@@ -734,13 +746,16 @@ unsigned source_register(const Instruction &op) {
   return 0;
 }
 
-bool reads_emuclk(const Instruction &op) {
-  if (clock_register(source_register(op))) { return true; }
+unsigned data_source_register(const Instruction &op) {
   if (single_memory_transfer(op.type) || conditional_memory(op)) {
     const auto move = memory_move(op);
-    return move.write && clock_register(move.reg);
+    return move.write ? move.reg : 0U;
   }
-  return false;
+  return source_register(op);
+}
+
+bool reads_emuclk(const Instruction &op) {
+  return clock_register(data_source_register(op));
 }
 
 void validate_loop(const Instruction &op, std::string_view identity) {
@@ -1629,6 +1644,7 @@ private:
                            const MemoryOperands &operands,
                            unsigned lane);
   llvm::Value *store_word(const Values &values,
+                          const Instruction &op,
                           const MemoryMove &move,
                           const MemoryOperands &operands,
                           unsigned lane);
@@ -1842,7 +1858,9 @@ private:
   void write_system_register(unsigned reg, llvm::Value *raw, llvm::Value *selected);
   void write_px(llvm::Value *word, llvm::Value *enabled);
   void system_bit_instruction(Values &values, const Instruction &op);
-  llvm::Value *read_register(const Values &values, unsigned reg);
+  llvm::Value *read_register(const Values &values, const Instruction &op, unsigned reg);
+  llvm::Value *read_stack_register(const Values &values, unsigned reg);
+  llvm::Value *stack_top(llvm::Value *depth, std::size_t slot, llvm::ConstantInt *empty_value);
   void write_register(Values &values, unsigned reg, llvm::Value *raw, llvm::Value *selected);
   void write_lane_status(Values &values, unsigned reg, llvm::Value *words, llvm::Value *selected);
   void register_instruction(Values &values, const Instruction &op, const Values &before);
@@ -2202,7 +2220,7 @@ void Lowering::system_bit_instruction(Values &values, const Instruction &op) {
   const auto operation = system_bit_operation(op);
   const auto reg = system_bit_register(op);
   auto *selected = condition(values, true_condition);
-  auto *word = fixed_word(read_register(values, reg));
+  auto *word = fixed_word(read_register(values, op, reg));
   auto *immediate = vector(32, static_cast<std::uint32_t>(op.word));
   if (tests_system_bits(operation)) {
     auto *tested =
@@ -2226,7 +2244,33 @@ void Lowering::system_bit_instruction(Values &values, const Instruction &op) {
   write_register(values, reg, raw_words(updated), selected);
 }
 
-llvm::Value *Lowering::read_register(const Values &values, unsigned reg) {
+llvm::Value *
+Lowering::stack_top(llvm::Value *depth, std::size_t slot, llvm::ConstantInt *empty_value) {
+  auto *empty = builder_.CreateIsNull(depth);
+  auto *index = builder_.CreateSub(
+      depth, builder_.CreateZExt(builder_.CreateNot(empty), builder_.getInt32Ty()));
+  auto *word = builder_.CreateLoad(builder_.getInt32Ty(), loop_cell(slot, index));
+  return builder_.CreateSelect(empty, empty_value, word);
+}
+
+llvm::Value *Lowering::read_stack_register(const Values &values, unsigned reg) {
+  if (reg == pcstk_register || reg == pcstkp_register) {
+    auto *depth = stack_written_
+                      ? values[pc_stack_depth_value]
+                      : builder_.CreateZExt(load(8, stack_depth_slot), builder_.getInt32Ty());
+    constexpr std::uint32_t empty_pc_stack = 0x03ffffff;
+    return reg == pcstkp_register ? depth
+                                  : stack_top(depth, stack_slot, builder_.getInt32(empty_pc_stack));
+  }
+  const bool counter = reg == curlcntr_register;
+  auto *depth = builder_.CreateZExt(
+      load(8, counter ? loop_counter_depth_slot : loop_address_depth_slot), builder_.getInt32Ty());
+  return stack_top(depth,
+                   counter ? loop_counter_slot : loop_address_slot,
+                   builder_.getInt32(std::numeric_limits<std::uint32_t>::max()));
+}
+
+llvm::Value *Lowering::read_register(const Values &values, const Instruction &op, unsigned reg) {
   if (dag_register(reg)) {
     auto *word = values[index_value + dag_number(reg)];
     return raw_words(pair(word, word, 32));
@@ -2241,6 +2285,11 @@ llvm::Value *Lowering::read_register(const Values &values, unsigned reg) {
                       ? builder_.CreateLShr(clock_sample_, builder_.getInt64(word_bits))
                       : clock_sample_;
     auto *word = builder_.CreateTrunc(clock, builder_.getInt32Ty());
+    return raw_words(pair(word, word, 32));
+  }
+  if (reg == pc_register) { return vector(64, std::uint64_t{op.address} << raw_extension_bits); }
+  if (stack_register(reg)) {
+    auto *word = read_stack_register(values, reg);
     return raw_words(pair(word, word, 32));
   }
   if (const auto slot = scalar_control_slot(reg)) {
@@ -2348,7 +2397,7 @@ void Lowering::register_instruction(Values &values, const Instruction &op, const
     // read_register places the named USTAT first and its complement second.
     // Other system registers supply the named word to both halves.
     auto *words =
-        builder_.CreateLShr(read_register(before, move.source), vector(64, raw_extension_bits));
+        builder_.CreateLShr(read_register(before, op, move.source), vector(64, raw_extension_bits));
     auto *low = builder_.CreateExtractElement(words, builder_.getInt32(0));
     auto *high =
         user_status(move.source) ? builder_.CreateExtractElement(words, builder_.getInt32(1)) : low;
@@ -2357,7 +2406,7 @@ void Lowering::register_instruction(Values &values, const Instruction &op, const
     return;
   }
   if (!move.swap) {
-    write_register(values, move.destination, read_register(before, move.source), selected);
+    write_register(values, move.destination, read_register(before, op, move.source), selected);
     return;
   }
   auto *x = builder_.CreateExtractElement(selected, builder_.getInt32(0));
@@ -2366,11 +2415,11 @@ void Lowering::register_instruction(Values &values, const Instruction &op, const
                 : x;
   write_register(values,
                  move.destination,
-                 read_register(before, move.source),
+                 read_register(before, op, move.source),
                  pair(x, builder_.getFalse(), 1));
   write_register(values,
                  move.source,
-                 read_register(before, move.destination),
+                 read_register(before, op, move.destination),
                  pair(y, builder_.getFalse(), 1));
 }
 
@@ -3482,7 +3531,7 @@ llvm::Value *Lowering::check_code_store(const Values &values,
   auto *result = builder_.CreateCall(type,
                                      pointer(code_check_slot),
                                      {pointer(code_owner_slot),
-                                      store_word(values, move, operands, lane),
+                                      store_word(values, op, move, operands, lane),
                                       builder_.getInt8(static_cast<std::uint8_t>(move.space)),
                                       word.view,
                                       word.address});
@@ -3696,7 +3745,7 @@ llvm::Value *Lowering::memory_word(const Values &values,
                                    const MemoryOperands &operands,
                                    unsigned lane) {
   const auto &word = operands.words[lane];
-  auto *payload = move.write ? store_word(values, move, operands, lane) : nullptr;
+  auto *payload = move.write ? store_word(values, op, move, operands, lane) : nullptr;
   const auto direct_access = [&] {
     auto *result = direct_word(move, word, payload);
     if (code_transitions_ && word.code_event != nullptr) {
@@ -3760,6 +3809,7 @@ MemoryRead Lowering::memory_transfer(const Values &values,
 }
 
 llvm::Value *Lowering::store_word(const Values &values,
+                                  const Instruction &op,
                                   const MemoryMove &move,
                                   const MemoryOperands &operands,
                                   unsigned lane) {
@@ -3784,14 +3834,14 @@ llvm::Value *Lowering::store_word(const Values &values,
         short_word, cell, builder_.CreateSelect(packed_word, packed, normal));
   }
   auto *element = builder_.getInt32(lane);
-  const bool unpaired = clock_register(move.reg) || scalar_control_slot(move.reg).has_value();
+  const bool unpaired = unpaired_control_register(move.reg);
   const auto wide_peer = unpaired ? move.reg : move.reg ^ 1;
   auto *raw = move.immediate.has_value()
                   ? builder_.getInt64(std::uint64_t{*move.immediate} << raw_extension_bits)
-                  : builder_.CreateExtractElement(read_register(values, move.reg), element);
+                  : builder_.CreateExtractElement(read_register(values, op, move.reg), element);
   if (lane != 0 && operands.forced_pair != builder_.getFalse()) {
     auto *neighbor =
-        builder_.CreateExtractElement(read_register(values, wide_peer), builder_.getInt32(0));
+        builder_.CreateExtractElement(read_register(values, op, wide_peer), builder_.getInt32(0));
     raw = builder_.CreateSelect(operands.forced_pair, neighbor, raw);
   }
   auto *normal = builder_.CreateLShr(raw, builder_.getInt64(raw_extension_bits));
@@ -3800,7 +3850,7 @@ llvm::Value *Lowering::store_word(const Values &values,
                                          builder_.getInt64Ty());
   auto *upper = normal;
   if (!move.immediate.has_value()) {
-    auto *neighbor = builder_.CreateExtractElement(read_register(values, wide_peer), element);
+    auto *neighbor = builder_.CreateExtractElement(read_register(values, op, wide_peer), element);
     upper = builder_.CreateLShr(neighbor, builder_.getInt64(raw_extension_bits));
   }
   auto *wide = builder_.CreateOr(normal, builder_.CreateShl(upper, builder_.getInt64(normal_bits)));
@@ -4952,7 +5002,7 @@ void Lowering::loop_push(Values &values, const Instruction &op, bool partial) {
   auto *count = load(32, lcntr_slot);
   if (op.type == counted_loop_type) {
     if (register_count(op)) {
-      auto *raw = builder_.CreateExtractElement(read_register(values, count_register(op)),
+      auto *raw = builder_.CreateExtractElement(read_register(values, op, count_register(op)),
                                                 builder_.getInt32(0));
       count = builder_.CreateTrunc(builder_.CreateLShr(raw, builder_.getInt64(raw_extension_bits)),
                                    builder_.getInt32Ty());
@@ -5973,7 +6023,8 @@ void Lowering::plan_hardware_grants(const LoopMap &shapes) {
                   (shape.counted() && fetch->second.counted() &&
                    overlapping_tail(shape, fetch->second))) &&
                  !modifies_index(op) && !dag_register(loaded_register(op)) && !writes_astat(op) &&
-                 !reads_emuclk(op) && !shift::fifo_transfer(op.compute);
+                 !reads_emuclk(op) && !stack_register(data_source_register(op)) &&
+                 !shift::fifo_transfer(op.compute);
         })) {
       continue;
     }

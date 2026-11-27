@@ -776,8 +776,13 @@ EMUCLK and EMUCLK2 are program-readable sources for type 5a and for stores
 in types 3a, 14a and 15a. Fixtures check both halves across rollover, SIMD,
 snapshot replay, a post-modifying store after a DAG interlock, and execute
 timing inside a short DO. See [emulation clock reads](numeric-reference.md#emulation-clock-reads).
-Other system-register writes and their pipeline effects, dynamic sequencer
-register reads and unresolved event semantics remain open. See
+PC, PCSTK, PCSTKP, LADDR and CURLCNTR are read sources in the same classic
+forms. Installed fixtures cover the executing address in a delay slot, raw
+PC-stack tags, empty-stack values, a CALL and return across a snapshot,
+and the loop sequencer's early pop. Stack observers inside a hardware loop
+use the per-instruction path. See [sequencer register reads](numeric-reference.md#sequencer-register-reads).
+Other system-register writes and their pipeline effects, FADDR/DADDR
+reads and unresolved event semantics remain open. See
 [the simulator probes](numeric-reference.md#control-register-read-operands)
 and the observations on [loop preload](numeric-reference.md#loop-preload-writes),
 [arithmetic status writes](numeric-reference.md#explicit-arithmetic-status-writes)

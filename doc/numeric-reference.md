@@ -909,6 +909,41 @@ clock observation at an exact execution boundary so a batched loop or
 straight-line grant cannot omit cycles from the sample. Programming
 Reference 2.4, pp. 8-14 and A-31, assigns writes to emulation space.
 
+## Sequencer register reads
+
+The CCES 2.12.1 ADSP-21489 functional simulator ran 113 authored probes.
+PC was the executing word address in linear code, either delay slot, the
+target of a jump, a PM store and a register transfer paired with ADD.
+PCSTKP reflected the pushed CALL frame in both delay slots and the popped
+frame after RTS. The simulator returned the low 24 bits for PCSTK and
+`0x00ffffff` when empty. The core uses the complete 26-bit entry and
+`0x03ffffff` when empty, following Programming Reference 2.4, pp. 4-13
+and A-10. Silicon readback of the tag bits remains unverified.
+
+In the final turn of a three-turn counted DO, the first word of a five-word
+body could read the remaining count of one and the loop address word.
+The second word saw an empty loop stack. Both sampled positions in a
+seven-word body saw the active frame. LADDR and CURLCNTR return
+`0xffffffff` when empty (pp. 4-48–4-49). Native tests also check unpaired
+stores and a retained stack word from an owner-provided stack.
+
+FADDR and DADDR remain open for guest reads. In the simulator, ordinary
+register transfers saw PC+4 and PC+2 in linear code. Another 36 probes
+compared absolute and post-modifying DM and PM stores in linear code and
+both slots of a taken delayed branch. Linear DM stores matched the register
+transfers. Linear PM stores saw PC+3 and PC+1. In the delay slots, DM stores
+saw Fetch1 at target+1 and target+2, while PM stores saw target and target+1.
+Decode redirected in the second slot for DM and remained at the slot's
+PC+1 for PM. A preceding load of the addressing DAG register did not change
+these samples.
+
+Eight further probes executed the same store site three times in a software
+or counted loop. DM offsets remained +4/+2. PM offsets were +3/+1 on the
+first turn and +4/+2 on both later turns. The PM loop took one extra clock
+across all three turns. These observations are consistent with the initial
+PM instruction-fetch cache miss in Programming Reference 2.4, p. 4-80.
+An implementation needs to distinguish the first and subsequent accesses.
+
 ## Fixed multiplier details
 
 The raw accumulator has 80 bits. Inputs use the upper 32 bits of each data
