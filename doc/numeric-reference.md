@@ -310,14 +310,35 @@ and foreground accumulator destinations; floating multiplication remains a
 separate operation rather than a floating MAC. Register-destination products
 preserve the old accumulator, while MRF destinations return its updated 80 bits.
 
-The aliasing fixtures use legal source groups with outputs that replace old
-sources in both groups. Their result tuples and destination maps are expectation
-data for future ISA fixtures; no register-file executor or instruction decoder
-was added to the reference. Numeric lane records keep ASTATx/STKYx separate from
-ASTATy/STKYy, including different old sticky bits. They assume two admitted lanes;
-SISD inactivity, predicates, banks, parallel memory transfers, duplicated output
-priority and architectural interrupts still require installed-image qualification.
+The installed floating packet tests use legal source groups with outputs that
+replace old sources in both groups. The reference supplies result tuples and
+destination maps. It computes separate ASTAT and STKY expectations for the two
+lanes and preserves the complete inactive state. FastFP32 narrows each
+computational floating operand to binary32 under guest rounding, then applies
+the scalar operations at binary32 precision. The fixed operands of scaled
+FLOAT and the signed scales of FLOAT and FIX retain their raw fixed widths.
 Unqualified scalar results refuse the entire dual or multifunction expectation.
+
+The CCES 2.12.1 ADSP-21489 simulator matched 160 authored scalar and 144 paired
+SIMD dual-ALU and multifunction cases. The probes cover the ten forms in PRM
+chapters 11-92/93 and 12-13–18, with extended and RND32 precision, nearest and
+truncating rounding, and ALUSAT for scaled FIX. The SIMD probes also check both
+directions of lane-local `IF EQ` admission. Capture raw destination words and
+both lane status registers using the procedure above.
+
+The writeback follow-up used different product, sum and difference results and
+repeated the collisions with overflow, negative zero and an exact zero
+difference in 48 scalar cases. A shared binary multifunction destination takes
+the ALU result.
+For the floating butterfly the sum wins over the product, and the product wins
+over the difference. The losing operation still contributes status and sticky
+effects. CCES assembler warning `ea2010` classifies a shared sum/difference
+destination as ambiguous. The core rejects that case pending a specified
+priority.
+
+Another 12 paired simulator probes combine the butterfly with a type 5a raw
+register move. They confirm that the move reads the old subtraction destination,
+wins the shared product destination, and follows the separate lane predicates.
 
 ## Numeric conditions and predicated lanes
 

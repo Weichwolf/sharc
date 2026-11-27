@@ -8,8 +8,8 @@ from fractions import Fraction
 from conversion_expectations import CONVERSIONS
 from expectation_check import anchor, require
 from reference import (
-    IntegerResult, Mode, Operand, fixed_float_effects, fixed_from_float, float_pack, float_parts,
-    float_unpack, floating_alu, floating_compare, floating_multiply, floating_seed, quantize,
+    IntegerResult, Mode, binary32_operand, fixed_float_effects, fixed_from_float, float_pack, float_parts,
+    float_unpack, floating_alu, floating_compare, floating_multiply, floating_seed,
     raw_word, signed,
 )
 
@@ -374,35 +374,25 @@ def installed_header():
         (0x3f80000000, 0x7fffffff00),
     ]
 
-    def approximate(raw, mode):
-        value = Operand(raw)
-        if value.kind == "nan":
-            # Preserve the computational NaN class and sign, including payloads
-            # that are confined to the source extension byte.
-            return 0x7fc0000000 | (raw & 0x8000000000)
-        if value.kind == "infinity":
-            return raw
-        return quantize(value.number(), mode, negative_zero=value.negative).raw
-
     def result(operation, left, right, mode, fast, saturate, astat, stky):
         if operation in ("float", "float-scaled"):
             scale = signed(raw_word(right)) if operation == "float-scaled" else None
             return fixed_float_effects(left, mode, scale=scale, precision=32 if fast else 40,
                                        astat=astat, stky=stky)
         if operation == "scale":
-            return floating_alu(operation, approximate(left, mode) if fast else left,
+            return floating_alu(operation, binary32_operand(left, mode) if fast else left,
                                 mode=mode, scale=signed(raw_word(right)), astat=astat, stky=stky)
         if operation in fixed_conversions:
             base, _, scaled = operation.partition("-")
             scale = signed(raw_word(right)) if scaled else 0
-            return fixed_from_float(base, approximate(left, mode) if fast else left, mode,
+            return fixed_from_float(base, binary32_operand(left, mode) if fast else left, mode,
                                     scale=scale, saturate=saturate, astat=astat, stky=stky)
         if operation == "pack":
-            return float_pack(approximate(left, mode) if fast else left, astat=astat, stky=stky)
+            return float_pack(binary32_operand(left, mode) if fast else left, astat=astat, stky=stky)
         if operation == "unpack":
             return float_unpack(left, astat=astat, stky=stky)
         if fast:
-            left, right = approximate(left, mode), approximate(right, mode)
+            left, right = binary32_operand(left, mode), binary32_operand(right, mode)
         if operation in ("mant", "logb"):
             return float_parts(operation, left, mode, saturate=saturate, astat=astat, stky=stky)
         if operation in ("recips", "rsqrts"):
