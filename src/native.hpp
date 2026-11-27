@@ -87,6 +87,7 @@ inline constexpr unsigned suspended_call_state_words = 4 + loop_stack_capacity +
 inline constexpr std::uint32_t loop_pc_index_mask = 31;
 inline constexpr std::uint32_t loop_frame_live = 1U << 5;
 inline constexpr std::uint32_t loop_repeat_scheduled = 1U << 6;
+inline constexpr std::uint32_t loop_counter_written = 1U << 7;
 inline constexpr unsigned loop_fetch_distance = 4;
 inline constexpr unsigned loop_decode_distance = 2;
 inline constexpr unsigned loop_refill_end_shift = 24;
@@ -189,7 +190,10 @@ enum class NativeExit : std::uint8_t {
   invalid_fifo,
   unsupported_memory_width,
   unsupported_pc_stack_write,
-  unsupported_pc_stack_pointer_write
+  unsupported_pc_stack_pointer_write,
+  unsupported_loop_counter_write,
+  unsupported_pm_loop_counter_write,
+  unsupported_loop_stack_wide_load
 };
 using NativeEntry = void (*)(void **, std::uint64_t *);
 using RegisterPointers = std::vector<void *>;

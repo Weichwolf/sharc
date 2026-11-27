@@ -414,7 +414,8 @@ bool stack_register(unsigned reg) {
 
 bool writable_ureg(unsigned reg) {
   return ordinary_ureg(reg) || reg == px_register || reg == lcntr_register ||
-         reg == pcstk_register || reg == pcstkp_register || lane_status_register(reg);
+         reg == pcstk_register || reg == pcstkp_register || reg == curlcntr_register ||
+         lane_status_register(reg);
 }
 
 std::optional<std::size_t> scalar_control_slot(unsigned reg) {
@@ -488,7 +489,8 @@ bool dag_memory_read(const MemoryMove &move) {
 }
 
 bool unpaired_control_load(unsigned reg) {
-  return reg == lcntr_register || reg == pcstk_register || reg == pcstkp_register;
+  return reg == lcntr_register || reg == pcstk_register || reg == pcstkp_register ||
+         reg == curlcntr_register;
 }
 
 bool selects_packed_view(const MemoryMove &move) {
@@ -1336,6 +1338,11 @@ void finalize_debug(llvm::Module &module, llvm::DIBuilder &debug) {
   debug.finalize();
 }
 
+struct StackWrites {
+  bool pointer{};
+  bool loop_counter{};
+};
+
 class Lowering {
 public:
   Lowering(llvm::Module &module,
@@ -1348,12 +1355,13 @@ public:
            std::vector<Instruction> instructions,
            const NativeUnit &unit,
            const LoopPlan &loops,
-           bool stack_pointer_effects)
+           StackWrites stack_writes)
       : module_(module),
         memory_mode_(options.memory_mode),
         execution_mode_(options.mode),
         code_transitions_(code_transitions),
-        stack_pointer_effects_(stack_pointer_effects),
+        stack_pointer_effects_(stack_writes.pointer),
+        loop_counter_writes_(stack_writes.loop_counter),
         abi_(abi),
         linked_io_(linked_io),
         unit_(unit),
@@ -1750,7 +1758,13 @@ private:
                     llvm::Value *old_status,
                     std::uint32_t pc,
                     llvm::Value *refill,
-                    RefillSample sample = RefillSample::instruction);
+                    RefillSample sample = RefillSample::instruction,
+                    bool fetch_already_sampled = false);
+  void sample_loop_fetch(Values &values,
+                         const LoopShape &shape,
+                         std::uint32_t pc,
+                         llvm::Value *refill,
+                         RefillSample sample);
   void loop_refill(Values &values, const Instruction &op);
   void check_loop_end(const Values &values, const Instruction &op, bool partial);
 
@@ -1879,6 +1893,7 @@ private:
   llvm::Value *read_stack_register(const Values &values, unsigned reg);
   llvm::Value *pc_stack_depth(const Values &values);
   llvm::Value *pc_stack_top_present(llvm::Value *depth);
+  llvm::Value *scalar_move_condition(const Values &values, const Instruction &op);
   llvm::Value *pending_pc_stack(const Values &values);
   llvm::Value *forwarded_pc_stack_depth(const Values &values);
   void apply_pc_stack_pointer(Values &values, llvm::Value *enabled);
@@ -1888,6 +1903,14 @@ private:
                                     const Instruction &op,
                                     llvm::Value *enabled,
                                     bool partial);
+  void guard_loop_counter_write(const Values &values, const Instruction &op, bool partial);
+  void age_loop_counter_write(const Values &values,
+                              const Instruction &op,
+                              llvm::Value *stall,
+                              bool partial);
+  [[nodiscard]] bool loop_fetch_before_counter_write(const Instruction &op) const;
+  void sample_before_counter_write(Values &values, const Instruction &op);
+  void mark_loop_counter_write(const Values &values, const Instruction &op);
   llvm::Value *stack_top(llvm::Value *depth, std::size_t slot, llvm::ConstantInt *empty_value);
   void write_register(Values &values, unsigned reg, llvm::Value *raw, llvm::Value *selected);
   void write_lane_status(Values &values, unsigned reg, llvm::Value *words, llvm::Value *selected);
@@ -1914,6 +1937,7 @@ private:
   bool runtime_io_{};
   bool code_transitions_{}, code_storage_known_{};
   bool stack_pointer_effects_{};
+  bool loop_counter_writes_{};
   std::array<bool, 2> code_alias_buses_{};
   const NativeAbi &abi_;
   LinkedIoCallbacks linked_io_;
@@ -1952,6 +1976,7 @@ private:
   llvm::Value *memory_admitted_{};
   llvm::Value *clock_sample_{};
   llvm::Value *pc_stack_write_{};
+  llvm::Value *loop_count_written_{};
   std::set<unsigned> written_;
   std::set<unsigned> y_written_;
   std::array<bool, accumulator_banks> accumulator_written_{};
@@ -2435,6 +2460,21 @@ void Lowering::write_register(Values &values,
     write_lane_status(values, reg, fixed_word(raw), selected);
     return;
   }
+  if (reg == curlcntr_register) {
+    auto *depth = builder_.CreateZExt(load(8, loop_counter_depth_slot), builder_.getInt32Ty());
+    auto *word = builder_.CreateExtractElement(fixed_word(raw), builder_.getInt32(0));
+    loop_count_written_ =
+        builder_.CreateAnd(builder_.CreateIsNotNull(depth),
+                           builder_.CreateExtractElement(selected, builder_.getInt32(0)));
+    optional_memory(
+        loop_count_written_,
+        [&] {
+          auto *index = builder_.CreateSub(depth, builder_.getInt32(1));
+          return builder_.CreateStore(word, loop_cell(loop_counter_slot, index));
+        },
+        nullptr);
+    return;
+  }
   if (reg == pcstkp_register) {
     auto *first = builder_.getInt32(0);
     auto *word = builder_.CreateExtractElement(fixed_word(raw), first);
@@ -2506,6 +2546,7 @@ void Lowering::register_instruction(Values &values, const Instruction &op, const
     auto *low = builder_.CreateTrunc(load(64, px_slot), builder_.getInt32Ty());
     auto *raw = builder_.CreateShl(builder_.CreateZExt(low, builder_.getInt64Ty()),
                                    builder_.getInt64(raw_extension_bits));
+    sample_before_counter_write(values, op);
     write_register(values, move.destination, pair(raw, raw, 64), pair(x, builder_.getFalse(), 1));
     return;
   }
@@ -2524,7 +2565,9 @@ void Lowering::register_instruction(Values &values, const Instruction &op, const
     return;
   }
   if (!move.swap) {
-    write_register(values, move.destination, read_register(before, op, move.source), selected);
+    auto *raw = read_register(before, op, move.source);
+    sample_before_counter_write(values, op);
+    write_register(values, move.destination, raw, selected);
     return;
   }
   auto *x = builder_.CreateExtractElement(selected, builder_.getInt32(0));
@@ -3223,13 +3266,12 @@ llvm::Value *Lowering::compute_condition(const Values &values, const Instruction
 
 void Lowering::instruction(Values &values, const Instruction &op, bool partial) {
   values[astat_written_value] = builder_.getFalse();
+  loop_count_written_ = nullptr;
   if (loaded_register(op) == pcstk_register) { guard_pc_stack_write(values, op, partial); }
   if (loaded_register(op) == pcstkp_register) {
-    auto *enabled = op.type == register_move_type || conditional_memory(op)
-                        ? builder_.CreateExtractElement(condition(values, op), builder_.getInt32(0))
-                        : static_cast<llvm::Value *>(builder_.getTrue());
-    guard_pc_stack_pointer_write(values, op, enabled, partial);
+    guard_pc_stack_pointer_write(values, op, scalar_move_condition(values, op), partial);
   }
+  if (loaded_register(op) == curlcntr_register) { guard_loop_counter_write(values, op, partial); }
   if (clock_reads_.contains(op.address)) {
     // Clock readers run after the preceding instructions have been charged.
     // Their own decode and address stalls precede the sampled execute cycle.
@@ -3261,6 +3303,7 @@ void Lowering::instruction(Values &values, const Instruction &op, bool partial) 
       return;
     }
     auto *raw = vector(64, word << raw_extension_bits);
+    sample_before_counter_write(values, op);
     write_register(values, reg, raw, condition(values, true_condition));
     return;
   }
@@ -3510,6 +3553,20 @@ void Lowering::memory_instruction(Values &values, const Instruction &op, bool pa
     if (wide != builder_.getFalse()) {
       auto *writes_pointer = builder_.CreateAnd(wide, operands.selected[0]);
       guard_pc_stack_pointer_write(values, op, writes_pointer, partial);
+    }
+  }
+  if (!move.write && move.reg == curlcntr_register &&
+      move.addressing != MemoryAddressing::absolute) {
+    auto *wide = wide_memory_view(move, operands.words[0].view);
+    if (wide != builder_.getFalse()) {
+      auto *occupied = builder_.CreateIsNotNull(load(8, loop_address_depth_slot));
+      auto *writes_address =
+          builder_.CreateAnd(occupied, builder_.CreateAnd(wide, operands.selected[0]));
+      instruction_guard(values,
+                        op,
+                        builder_.CreateNot(writes_address),
+                        partial,
+                        NativeExit::unsupported_loop_stack_wide_load);
     }
   }
   const auto read = memory_transfer(values, op, move, operands);
@@ -4121,6 +4178,11 @@ void Lowering::memory_writeback(Values &values,
   }
 }
 
+llvm::Value *Lowering::scalar_move_condition(const Values &values, const Instruction &op) {
+  if (op.type != register_move_type && !conditional_memory(op)) { return builder_.getTrue(); }
+  return builder_.CreateExtractElement(condition(values, op), builder_.getInt32(0));
+}
+
 void Lowering::guard_pc_stack_write(const Values &values, const Instruction &op, bool partial) {
   auto *depth = forwarded_pc_stack_depth(values);
   auto *occupied = pc_stack_top_present(depth);
@@ -4141,12 +4203,85 @@ void Lowering::guard_pc_stack_write(const Values &values, const Instruction &op,
       builder_.CreateAnd(load(32, interrupt_frame_slot), builder_.getInt32(loop_pc_index_mask));
   auto *owned = builder_.CreateOr(loop_top, builder_.CreateIsNotNull(call));
   owned = builder_.CreateOr(owned, builder_.CreateICmpEQ(interrupt, depth));
-  auto *selected = op.type == register_move_type || conditional_memory(op)
-                       ? builder_.CreateExtractElement(condition(values, op), builder_.getInt32(0))
-                       : static_cast<llvm::Value *>(builder_.getTrue());
+  auto *selected = scalar_move_condition(values, op);
   auto *refused = builder_.CreateAnd(selected, builder_.CreateAnd(occupied, owned));
   instruction_guard(
       values, op, builder_.CreateNot(refused), partial, NativeExit::unsupported_pc_stack_write);
+}
+
+void Lowering::guard_loop_counter_write(const Values &values, const Instruction &op, bool partial) {
+  if (single_memory_transfer(op.type) || conditional_memory(op)) {
+    const auto next_fetch = loop_fetches_.find(next_pc(op));
+    if (next_fetch != loop_fetches_.end() && next_fetch->second.counted() &&
+        memory_move(op).space == MemorySpace::program) {
+      const auto frame = active_loop(values, next_fetch->second);
+      auto *writes = builder_.CreateAnd(frame.matches, scalar_move_condition(values, op));
+      instruction_guard(values,
+                        op,
+                        builder_.CreateNot(writes),
+                        partial,
+                        NativeExit::unsupported_pm_loop_counter_write);
+    }
+  }
+  llvm::Value *short_counter = nullptr;
+  llvm::Value *address = nullptr;
+  for (const auto &[end, shape] : loop_shapes_) {
+    (void)end;
+    if (!shape.short_body() || !shape.counted()) { continue; }
+    if (address == nullptr) {
+      address = read_stack_register(values, laddr_register);
+      short_counter = builder_.getFalse();
+    }
+    auto *same = builder_.CreateICmpEQ(address, builder_.getInt32(shape.address_word()));
+    short_counter = builder_.CreateOr(short_counter, same);
+  }
+  if (short_counter == nullptr) { return; }
+  auto *depth = builder_.CreateZExt(load(8, loop_address_depth_slot), builder_.getInt32Ty());
+  auto *metadata = stack_top(depth, loop_frames_slot, builder_.getInt32(0));
+  auto *live =
+      builder_.CreateIsNotNull(builder_.CreateAnd(metadata, builder_.getInt32(loop_frame_live)));
+  auto *buffered = builder_.CreateAnd(short_counter, live);
+  const auto short_body = short_bodies_.find(op.address);
+  if (short_body != short_bodies_.end() && short_body->second.counted()) {
+    buffered =
+        builder_.CreateOr(buffered, short_active(short_body->second, short_word(short_remaining)));
+  }
+  auto *refused = builder_.CreateAnd(buffered, scalar_move_condition(values, op));
+  instruction_guard(
+      values, op, builder_.CreateNot(refused), partial, NativeExit::unsupported_loop_counter_write);
+}
+
+void Lowering::age_loop_counter_write(const Values &values,
+                                      const Instruction &op,
+                                      llvm::Value *stall,
+                                      bool partial) {
+  if (!loop_counter_writes_) { return; }
+  const auto fetch = loop_fetches_.find(op.address);
+  if (fetch == loop_fetches_.end() || !fetch->second.counted()) { return; }
+  const auto pm_transfer = std::ranges::any_of(
+      memory_moves(op), [](const MemoryMove &move) { return move.space == MemorySpace::program; });
+  auto *stalled = builder_.CreateIsNotNull(stall);
+  if (!pm_transfer && stalled == builder_.getFalse()) { return; }
+  const auto frame = active_loop(values, fetch->second);
+  auto *written = builder_.CreateAnd(frame.metadata, builder_.getInt32(loop_counter_written));
+  auto *pending = builder_.CreateAnd(frame.matches, builder_.CreateIsNotNull(written));
+  if (pm_transfer) {
+    auto *unknown = builder_.CreateAnd(pending, builder_.CreateNot(stalled));
+    instruction_guard(values,
+                      op,
+                      builder_.CreateNot(unknown),
+                      partial,
+                      NativeExit::unsupported_pm_loop_counter_write);
+  }
+  // A stall at the sampling instruction separates the fetch from the write.
+  optional_memory(
+      builder_.CreateAnd(pending, stalled),
+      [&] {
+        auto *metadata =
+            builder_.CreateAnd(frame.metadata, builder_.getInt32(~loop_counter_written));
+        return builder_.CreateStore(metadata, loop_cell(loop_frames_slot, frame.index));
+      },
+      nullptr);
 }
 
 void Lowering::guard_pc_stack_pointer_write(const Values &values,
@@ -5964,7 +6099,12 @@ void Lowering::loop_fetch(Values &values,
     auto *cell = loop_cell(loop_counter_slot, frame.index);
     auto *count = builder_.CreateLoad(builder_.getInt32Ty(), cell);
     auto *remaining = builder_.CreateSub(count, builder_.getInt32(1));
-    builder_.CreateStore(remaining, cell);
+    auto *update = remaining;
+    if (loop_counter_writes_) {
+      auto *written = builder_.CreateAnd(frame.metadata, builder_.getInt32(loop_counter_written));
+      update = builder_.CreateSelect(builder_.CreateIsNotNull(written), count, remaining);
+    }
+    builder_.CreateStore(update, cell);
     auto *repeat = llvm::BasicBlock::Create(module_.getContext(), "loop.fetch.repeat", function_);
     auto *terminate = llvm::BasicBlock::Create(module_.getContext(), "loop.fetch.exit", function_);
     builder_.CreateCondBr(
@@ -5978,7 +6118,11 @@ void Lowering::loop_fetch(Values &values,
     jump(continuation, popped);
     builder_.SetInsertPoint(repeat);
   }
-  auto *scheduled = builder_.CreateOr(frame.metadata, builder_.getInt32(loop_repeat_scheduled));
+  auto *metadata =
+      loop_counter_writes_
+          ? builder_.CreateAnd(frame.metadata, builder_.getInt32(~loop_counter_written))
+          : frame.metadata;
+  auto *scheduled = builder_.CreateOr(metadata, builder_.getInt32(loop_repeat_scheduled));
   builder_.CreateStore(scheduled, loop_cell(loop_frames_slot, frame.index));
   jump(continuation, values);
   builder_.SetInsertPoint(continuation.block);
@@ -6186,23 +6330,69 @@ void Lowering::loop_retirement(Values &values,
       clear_counted_tail(end->second);
     }
   }
-  loop_samples(values, old_status, op.address, refill);
+  loop_samples(values,
+               old_status,
+               op.address,
+               refill,
+               RefillSample::instruction,
+               loop_fetch_before_counter_write(op));
+  mark_loop_counter_write(values, op);
   if (end != hardware_ends_.end()) { loop_backedge(values, op, end->second, partial); }
+}
+
+bool Lowering::loop_fetch_before_counter_write(const Instruction &op) const {
+  if (loaded_register(op) != curlcntr_register) { return false; }
+  const auto fetch = loop_fetches_.find(op.address);
+  return fetch != loop_fetches_.end() && fetch->second.counted();
+}
+
+void Lowering::sample_before_counter_write(Values &values, const Instruction &op) {
+  if (!loop_fetch_before_counter_write(op)) { return; }
+  const auto &shape = loop_fetches_.at(op.address);
+  auto *refill =
+      shifted_fetches_.contains(shape.end) ? load(64, loop_refill_slot) : builder_.getInt64(0);
+  // A write concurrent with Fetch1 sees the top left by the sample, including a pop.
+  sample_loop_fetch(values, shape, op.address, refill, RefillSample::instruction);
+}
+
+void Lowering::mark_loop_counter_write(const Values &values, const Instruction &op) {
+  if (loop_count_written_ == nullptr) { return; }
+  const auto fetch = loop_fetches_.find(next_pc(op));
+  if (fetch == loop_fetches_.end() || !fetch->second.counted()) { return; }
+  const auto frame = active_loop(values, fetch->second);
+  auto *unsampled = builder_.CreateAnd(frame.matches, builder_.CreateNot(repeat_scheduled(frame)));
+  auto *mark = builder_.CreateAnd(unsampled, loop_count_written_);
+  optional_memory(
+      mark,
+      [&] {
+        auto *metadata = builder_.CreateOr(frame.metadata, builder_.getInt32(loop_counter_written));
+        return builder_.CreateStore(metadata, loop_cell(loop_frames_slot, frame.index));
+      },
+      nullptr);
+}
+
+void Lowering::sample_loop_fetch(Values &values,
+                                 const LoopShape &shape,
+                                 std::uint32_t pc,
+                                 llvm::Value *refill,
+                                 RefillSample sample) {
+  llvm::Value *enabled = builder_.getTrue();
+  if (shifted_fetches_.contains(shape.end)) {
+    enabled = builder_.CreateNot(
+        builder_.CreateOr(refill_at(refill, pc), refill_at(refill, (pc + 1) & maximum_pc)));
+  }
+  loop_fetch(values, shape, enabled, sample == RefillSample::call_return);
 }
 
 void Lowering::loop_samples(Values &values,
                             llvm::Value *old_status,
                             std::uint32_t pc,
                             llvm::Value *refill,
-                            RefillSample sample) {
+                            RefillSample sample,
+                            bool fetch_already_sampled) {
   const auto fetch = loop_fetches_.find(pc);
-  if (fetch != loop_fetches_.end()) {
-    llvm::Value *enabled = builder_.getTrue();
-    if (shifted_fetches_.contains(fetch->second.end)) {
-      enabled = builder_.CreateNot(
-          builder_.CreateOr(refill_at(refill, pc), refill_at(refill, (pc + 1) & maximum_pc)));
-    }
-    loop_fetch(values, fetch->second, enabled, sample == RefillSample::call_return);
+  if (fetch != loop_fetches_.end() && !fetch_already_sampled) {
+    sample_loop_fetch(values, fetch->second, pc, refill, sample);
   }
   const auto test = loop_tests_.find(pc);
   if (test != loop_tests_.end()) {
@@ -6241,7 +6431,8 @@ void Lowering::plan_hardware_grants(const LoopMap &shapes) {
                   (shape.counted() && fetch->second.counted() &&
                    overlapping_tail(shape, fetch->second))) &&
                  !modifies_index(op) && !dag_register(loaded_register(op)) && !writes_astat(op) &&
-                 loaded_register(op) != pcstk_register && !writes_stack_pointer(op) &&
+                 loaded_register(op) != pcstk_register &&
+                 loaded_register(op) != curlcntr_register && !writes_stack_pointer(op) &&
                  !reads_emuclk(op) && !stack_register(data_source_register(op)) &&
                  !shift::fifo_transfer(op.compute);
         })) {
@@ -6583,6 +6774,7 @@ void Lowering::plan_loops() {
       linear = linear && instructions_[i].address + 1 == instructions_[i + 1].address &&
                !branch(instructions_[i]) && !dag_register(loaded_register(instructions_[i])) &&
                loaded_register(instructions_[i]) != pcstk_register &&
+               loaded_register(instructions_[i]) != curlcntr_register &&
                !writes_stack_pointer(instructions_[i]) && !writes_astat(instructions_[i]) &&
                !reads_emuclk(instructions_[i]) && !shift::fifo_transfer(instructions_[i].compute);
     }
@@ -6833,6 +7025,7 @@ void Lowering::emit_instruction(std::size_t i,
   auto *lanes = branch_lanes(values, op, false);
   auto pipeline =
       PipelineEffects{.stall = pipeline_stall(values, op), .tag = loaded_tag(values, op)};
+  age_loop_counter_write(values, op, pipeline.stall, false);
   apply_pc_stack_stall(values, pipeline.stall);
   auto *old_status = values[status_value];
   if (branch(op)) { delayed_slot(values, op, false, old_status); }
@@ -6871,6 +7064,7 @@ void Lowering::emit_instruction(std::size_t i,
   check_loop_end(values, op, true);
   lanes = branch_lanes(values, op, true);
   pipeline = {.stall = pipeline_stall(values, op), .tag = loaded_tag(values, op)};
+  age_loop_counter_write(values, op, pipeline.stall, true);
   apply_pc_stack_stall(values, pipeline.stall);
   old_status = values[status_value];
   instruction(values, op, true);
@@ -7238,6 +7432,19 @@ void validate_nested_loop(const InstructionMap &code,
   }
 }
 
+void validate_loop_counter_sample(const Instruction &op,
+                                  const LoopShape &shape,
+                                  unsigned remaining,
+                                  std::string_view identity) {
+  if (shape.counted() && remaining == loop_fetch_distance &&
+      loaded_register(op) == curlcntr_register && memory_moves(op).count != 0) {
+    reject(op,
+           identity,
+           FaultReason::unsupported_instruction,
+           "memory write to CURLCNTR at a counted DO fetch sample");
+  }
+}
+
 void validate_loop_body(const InstructionMap &code,
                         const Instruction &setup,
                         LoopPlan &plan,
@@ -7250,6 +7457,7 @@ void validate_loop_body(const InstructionMap &code,
     }
     const auto &op = *assigned->second;
     const auto remaining = shape.length - offset;
+    validate_loop_counter_sample(op, shape, remaining, identity);
     if (!shape.short_body() && jump_instruction(op) &&
         (indirect_branch(op) ||
          ((shape.end - branch_target(op)) & maximum_pc) < loop_fetch_distance)) {
@@ -7301,6 +7509,13 @@ void validate_loop_aborts(const InstructionMap &code, LoopPlan &plan, std::strin
 void validate_not_lce(const InstructionMap &code, LoopPlan &plan, std::string_view identity) {
   for (const auto &[pc, op] : code) {
     if (!observes_not_lce(*op)) { continue; }
+    const auto previous = code.find((pc - 1) & maximum_pc);
+    if (previous != code.end() && loaded_register(*previous->second) == curlcntr_register) {
+      reject(*op,
+             identity,
+             FaultReason::unsupported_instruction,
+             "IF NOT LCE immediately after a CURLCNTR write");
+    }
     const LoopShape *owner = nullptr;
     for (const auto &[end, shape] : plan.shapes) {
       if (shape.contains(pc) && (owner == nullptr || shape.length < owner->length)) {
@@ -7585,7 +7800,11 @@ std::shared_ptr<const PreparedImage> lower_image(const CodeImage &image,
   }
   const NativeAbi abi(module, result->units, continuations);
   const auto linked_io = declare_io_callbacks(module, *result);
-  const bool stack_pointer_effects = std::ranges::any_of(instructions, writes_stack_pointer);
+  const StackWrites stack_writes{.pointer = std::ranges::any_of(instructions, writes_stack_pointer),
+                                 .loop_counter =
+                                     std::ranges::any_of(instructions, [](const Instruction &op) {
+                                       return loaded_register(op) == curlcntr_register;
+                                     })};
   for (const auto &unit : result->units) {
     const auto variant = std::ranges::find(image.variants, unit.variant, &CodeVariant::id);
     const auto &plan = variant_loops.at(unit.variant);
@@ -7604,7 +7823,7 @@ std::shared_ptr<const PreparedImage> lower_image(const CodeImage &image,
                        entry_context(*result, *variant, unit.entry)),
         unit,
         plan,
-        stack_pointer_effects)
+        stack_writes)
         .emit();
   }
   finalize_debug(module, debug);

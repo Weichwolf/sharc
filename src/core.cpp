@@ -521,6 +521,21 @@ struct Core::Impl {
         result.fault.instruction_bits = detail::full_instruction_bits;
         state.fault = result.fault;
         break;
+      case detail::NativeExit::unsupported_loop_counter_write:
+      case detail::NativeExit::unsupported_pm_loop_counter_write:
+      case detail::NativeExit::unsupported_loop_stack_wide_load: {
+        const char *message = "indexed long-word CURLCNTR load also writes LADDR";
+        if (reason == detail::NativeExit::unsupported_loop_counter_write) {
+          message = "CURLCNTR write to a buffered counted DO";
+        } else if (reason == detail::NativeExit::unsupported_pm_loop_counter_write) {
+          message = "PM transfer at a CURLCNTR write or its loop sample needs cache timing";
+        }
+        result = fail(FaultReason::unsupported_feature, message);
+        result.fault.instruction = control[detail::fault_instruction];
+        result.fault.instruction_bits = detail::full_instruction_bits;
+        state.fault = result.fault;
+        break;
+      }
       case detail::NativeExit::unsupported_loop_reentry:
         result = fail(FaultReason::unsupported_feature, "loop continuation requires RTS (LR)");
         result.fault.instruction = control[detail::fault_instruction];

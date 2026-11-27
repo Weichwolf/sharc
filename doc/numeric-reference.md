@@ -1069,6 +1069,40 @@ as did all three DM visits. The memory transfers are lowered. Aging the
 pending pointer on the cold PM fetch stall remains part of the
 instruction-cache timing work.
 
+## Current loop counter writes
+
+The CCES 2.12.1 ADSP-21489 functional simulator ran 305 authored probes of
+CURLCNTR. In counted bodies longer than four words, let `E` be the last
+word. A register write at `E-6` or earlier reaches the normal fetch sample
+and its decrement. At `E-5` the sample tests the replacement value and
+the write takes priority over the decrement. A replacement of one exits
+on that turn. A larger replacement remains intact on the repeat edge. At
+`E-4` the sample uses the old value before the write. If the sample pops
+the frame, the write sees the new top, including an enclosing loop in the
+nested cases. A write at `E-3` also sees the frame left by the sample. The
+tests varied initial and replacement counts independently and observed the
+readback and total turns.
+
+An interlocked DM load to CURLCNTR at `E-5` retains the write priority even
+with one or two extra DAG clocks. A DAG stall at `E-4` instead separates
+the sample from the write and restores the decrement. A cold PM access at
+either site also restores the decrement. The core handles the modeled DAG
+stall and refuses PM sequences whose result depends on the unmodeled
+instruction-fetch cache. The Programming Reference, pp. 4-55–4-56,
+prohibits a memory load to CURLCNTR at `E-4` and `IF NOT LCE` immediately
+after a write. Preparation checks both restrictions.
+
+Absolute long-word loads use the upper word, including `(LW)` on a normal
+view. Indexed narrow loads use the addressed word. PEx selects the shared
+register write and either predicate enables post-modification. The empty
+stack ignores a write and reads as `0xffffffff`. The simulator returned
+the written word in an arithmetic DO and on a manually occupied stack,
+without changing LCNTR or the arithmetic termination condition. The core
+preserves that raw readback. Silicon behavior remains open where the
+Programming Reference, p. 4-50, says writes outside a counted DO have no
+effect. Buffered short counted loops, indexed wide loads also writing a
+live LADDR, and competing refill or asynchronous events remain open.
+
 ## Fixed multiplier details
 
 The raw accumulator has 80 bits. Inputs use the upper 32 bits of each data

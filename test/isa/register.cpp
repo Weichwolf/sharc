@@ -809,6 +809,123 @@ void loop_register_reads() {
   std::ranges::for_each(cases, loop_register_read);
 }
 
+struct LoopCounterWrite {
+  unsigned distance, count, replacement, turns;
+  std::uint32_t observed;
+};
+
+void loop_counter_write(LoopCounterWrite probe) {
+  constexpr unsigned length = 9;
+  constexpr unsigned count_shift = 24;
+  constexpr unsigned first_moved = 6;
+  constexpr unsigned readback = 8;
+  constexpr unsigned read_distance = 2;
+  constexpr std::uint64_t immediate_do = 0x0c0000000000;
+  std::array<std::uint64_t, length + 2> words{};
+  words.front() = immediate_do | (std::uint64_t{probe.count} << count_shift) | length;
+  const auto write_site = length - probe.distance;
+  words[write_site] = encoding({.source = first_moved, .destination = curlcntr_code});
+  words[length - read_distance] = encoding({.source = curlcntr_code, .destination = readback});
+  words[length] = fixture::add(0, 0, 1);
+  fixture::Program program(words);
+  auto before = initial(1);
+  before.pe[0].data[0].fill(0);
+  before.pe[0].data[0][1] = 1U << 8;
+  before.pe[0].data[0][first_moved] = std::uint64_t{probe.replacement} << 8;
+  const auto prefix = write_site + 1;
+  const auto retired = 1 + (length * probe.turns);
+  for (const auto mode : fixture::numeric_modes) {
+    const auto native = fixture::compile(program.code, mode);
+    sharc::Core core(program.memory(), mode);
+    fixture::install(core, native, before);
+    check(fixture::completed(core.run(retired), retired, retired),
+          "CURLCNTR write changed loop retirement or clock");
+    const auto expected = core.registers();
+    check(expected.pe[0].data[0][0] == (std::uint64_t{probe.turns} << 8) &&
+              expected.pe[0].data[0][readback] == (std::uint64_t{probe.observed} << 8) &&
+              expected.loop_counter_depth == 0 && expected.lcntr == probe.count &&
+              expected.pc == base + length + 1,
+          "CURLCNTR write lost sample precedence or changed the preload");
+    fixture::install(core, native, before);
+    check(fixture::completed(core.run(prefix), prefix, prefix),
+          "CURLCNTR write did not reach the snapshot boundary");
+    sharc::Core resumed(program.memory(), mode);
+    (void)resumed.install(native, fixture::Program::variant_id);
+    resumed.restore(core.save());
+    const auto remaining = retired - prefix;
+    check(fixture::completed(resumed.run(remaining), remaining, remaining) &&
+              resumed.registers() == expected,
+          "CURLCNTR write changed after snapshot replay");
+  }
+}
+
+void loop_counter_writes() {
+  constexpr std::array cases{
+      LoopCounterWrite{.distance = 6, .count = 1, .replacement = 4, .turns = 4, .observed = 3},
+      LoopCounterWrite{.distance = 5, .count = 1, .replacement = 4, .turns = 5, .observed = 4},
+      LoopCounterWrite{
+          .distance = 5, .count = 2, .replacement = 1, .turns = 1, .observed = empty_loop_stack},
+      LoopCounterWrite{
+          .distance = 4, .count = 1, .replacement = 4, .turns = 1, .observed = empty_loop_stack},
+      LoopCounterWrite{.distance = 4, .count = 2, .replacement = 1, .turns = 2, .observed = 1},
+      LoopCounterWrite{.distance = 3, .count = 2, .replacement = 4, .turns = 5, .observed = 4}};
+  std::ranges::for_each(cases, loop_counter_write);
+}
+
+void loop_counter_write_after_nested_pop() {
+  constexpr unsigned outer_end = 19;
+  constexpr unsigned inner_setup = 2;
+  constexpr unsigned inner_end = 11;
+  constexpr unsigned fetch_distance = 4;
+  constexpr unsigned source = 6;
+  constexpr unsigned readback = 8;
+  constexpr unsigned turns = 4;
+  constexpr std::uint64_t do_twice = 0x0c0002000000;
+  constexpr std::uint64_t do_once = 0x0c0001000000;
+  std::array<std::uint64_t, outer_end + 2> words{};
+  words.front() = do_twice | outer_end;
+  words[inner_setup] = do_once | (inner_end - inner_setup);
+  words[inner_end - fetch_distance] = encoding({.source = source, .destination = curlcntr_code});
+  words[inner_end - fetch_distance + 1] =
+      encoding({.source = curlcntr_code, .destination = readback});
+  words[inner_end] = fixture::add(0, 0, 1);
+  fixture::Program program(words);
+  for (const auto mode : fixture::numeric_modes) {
+    const auto native = fixture::compile(program.code, mode);
+    sharc::Core core(program.memory(), mode);
+    sharc::Registers before;
+    before.pc = base;
+    before.pe[0].astat = 1;
+    before.pe[0].data[0][1] = 1U << 8;
+    before.pe[0].data[0][source] = turns << 8;
+    fixture::install(core, native, before);
+    constexpr auto retired = 1 + (turns * outer_end);
+    check(fixture::completed(core.run(retired), retired, retired),
+          "CURLCNTR write after the inner pop changed retirement or clock");
+    const auto result = core.registers();
+    check(result.pe[0].data[0][0] == (turns << 8) &&
+              result.pe[0].data[0][readback] == (turns << 8) && result.loop_address_depth == 0 &&
+              result.loop_counter_depth == 0 && result.pc == base + outer_end + 1,
+          "CURLCNTR did not replace the outer counter after the inner fetch popped its frame");
+  }
+}
+
+void refuse_buffered_loop_counter_write() {
+  constexpr std::uint64_t do_three = 0x0c0003000004;
+  constexpr auto write = fixture::immediate(curlcntr_code, 2);
+  const std::array<std::uint64_t, 6> words{do_three, write};
+  fixture::Program program(words);
+  const auto native = fixture::compile(program.code, sharc::ExecutionMode::strict);
+  sharc::Core core(program.memory());
+  fixture::install(core, native, initial(0));
+  const auto result = core.run(words.size());
+  check(result.has_fault && result.fault.reason == sharc::FaultReason::unsupported_feature &&
+            result.fault.address == base + 1 && result.fault.instruction == write &&
+            result.progress == sharc::Progress{.instructions = 1, .base_cycles = 1} &&
+            core.registers().loop_counter_stack[0] == 3,
+        "an unsupported buffered CURLCNTR write changed the frame or lost the exact prefix");
+}
+
 void combined_px_moves() {
   for (unsigned quarter = 0; quarter < 4; ++quarter) {
     std::vector<Move> from_px;
@@ -1645,6 +1762,9 @@ void register_transfers() {
   refuse_unimplemented_loop_stack_write(pcstkp_code);
   pc_and_stack_in_delay_slots();
   loop_register_reads();
+  loop_counter_writes();
+  loop_counter_write_after_nested_pop();
+  refuse_buffered_loop_counter_write();
   combined_px_moves();
   combined_px_aliases();
   parallel_priority();
