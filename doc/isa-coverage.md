@@ -560,9 +560,10 @@ Both identities use the raw register file and leave guest MODE1 visible.
 rational expectations through installed images. It checks full register state,
 arithmetic flags, comparison history, sticky flags, and progress for admitted
 blocks and partial bounds in SISD and SIMD, with alternate banks and separate
-lane predicates. A floating compare drives a conditional fixed PASS across the
-mode-specific precision boundary, and a later compare preserves CACC through
-an overwrite of the ordinary ALU flags. The compare sequence runs with upward
+lane predicates. A raw register move carries an extended midpoint between
+physical banks. A floating compare of that copy drives a conditional fixed
+PASS across the mode-specific precision boundary, and a later compare preserves
+CACC through an overwrite of the ordinary ALU flags. The sequence runs with upward
 host rounding and checks the unchanged host rounding mode. The preparation
 suite round-trips the Strict artifact and checks cross-mode refusal.
 

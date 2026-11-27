@@ -26,9 +26,14 @@ constexpr std::uint32_t entry_stride = 8;
 constexpr std::uint32_t conditional_offset = 4;
 constexpr std::uint32_t zero_flag = 1;
 constexpr std::uint32_t alternate_high = 1U << 7;
+constexpr std::uint64_t copy_to_low = 0x70bf02000000; // R4 = R10
+constexpr std::uint64_t compare_copy = 0x013e0008a04b;
 constexpr std::uint64_t compare_high = 0x013e0008a0ab;
-constexpr std::array comparison_program{
-    compare_high, std::uint64_t{0x010000021540}, compare_high, std::uint64_t{0x013e00021760}};
+constexpr std::array comparison_program{copy_to_low,
+                                        compare_copy,
+                                        std::uint64_t{0x010000021540},
+                                        compare_high,
+                                        std::uint64_t{0x013e00021760}};
 
 struct Entry {
   std::uint32_t address;
@@ -96,16 +101,17 @@ void verify_compare_sequence(sharc::Core &core, bool fast_mode) {
   auto &pe = initial.pe[0];
   pe.data[1][10] = midpoint;
   pe.data[1][11] = one;
-  pe.data[0][4] = fixed_source;
+  pe.data[0][4] = raw_seed;
   pe.data[0][5] = raw_seed;
   pe.data[0][6] = fixed_source;
   pe.astat = original_history;
   core.set_registers(initial);
   auto expected = initial;
-  // The first compare controls IF EQ. The second contributes CACC even though
-  // the following fixed PASS overwrites the ordinary ALU flags.
+  // The raw move preserves the midpoint. The first compare controls IF EQ.
+  // The second contributes CACC across an overwrite of the ordinary ALU flags.
   auto &finished = expected.pe[0];
-  finished.data[0][5] = fast_mode ? fixed_result : raw_seed;
+  finished.data[0][4] = midpoint;
+  finished.data[0][5] = fast_mode ? one : raw_seed;
   finished.data[0][7] = fixed_result;
   finished.astat = fast_mode ? equal_twice : greater_twice;
   constexpr auto count = static_cast<std::uint32_t>(comparison_program.size());
