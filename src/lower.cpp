@@ -5526,25 +5526,29 @@ std::uint32_t register_context(const Instruction &instruction) {
   return mask;
 }
 
+std::uint32_t single_floating_context(const Compute &compute, ExecutionMode mode) {
+  const auto operation = static_cast<FloatingOp>(compute.opcode);
+  std::uint32_t mask{};
+  if (mode == ExecutionMode::strict && compute.kind != ComputeKind::shifter &&
+      operation != FloatingOp::float_fixed && operation != FloatingOp::float_scaled) {
+    mask |= rounding32_mode;
+  }
+  if (operation == FloatingOp::exponent || fixed_conversion(operation)) { mask |= saturation_mode; }
+  if ((mode == ExecutionMode::fast_fp32 && operation != FloatingOp::unpack_short) ||
+      floating_arithmetic(operation) || operation == FloatingOp::fix ||
+      operation == FloatingOp::fix_scaled || operation == FloatingOp::multiply ||
+      operation == FloatingOp::round || operation == FloatingOp::float_scaled ||
+      operation == FloatingOp::scale) {
+    mask |= truncation_mode;
+  }
+  return mask;
+}
+
 std::uint32_t compute_context(const Compute &compute, ExecutionMode mode) {
   if (compute.kind == ComputeKind::none) { return 0; }
   std::uint32_t mask{simd_mode};
   if (floating_compute(compute)) {
-    const auto operation = static_cast<FloatingOp>(compute.opcode);
-    if (mode == ExecutionMode::strict && compute.kind != ComputeKind::shifter &&
-        operation != FloatingOp::float_fixed && operation != FloatingOp::float_scaled) {
-      mask |= rounding32_mode;
-    }
-    if (operation == FloatingOp::exponent || fixed_conversion(operation)) {
-      mask |= saturation_mode;
-    }
-    if ((mode == ExecutionMode::fast_fp32 && operation != FloatingOp::unpack_short) ||
-        floating_arithmetic(operation) || operation == FloatingOp::fix ||
-        operation == FloatingOp::fix_scaled || operation == FloatingOp::multiply ||
-        operation == FloatingOp::round || operation == FloatingOp::float_scaled ||
-        operation == FloatingOp::scale) {
-      mask |= truncation_mode;
-    }
+    mask |= single_floating_context(compute, mode);
   } else if (floating_dual(compute) || floating_multifunction(compute)) {
     if (mode == ExecutionMode::strict) { mask |= rounding32_mode; }
     mask |= truncation_mode;

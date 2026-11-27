@@ -878,7 +878,7 @@ void floating_parallel_writeback() {
     const auto native = fixture::compile(program.code.code, mode);
     std::array<std::byte, word_bytes * loaded.size()> ram{};
     for (std::size_t index = 0; index < loaded.size(); ++index) {
-      fixture::put_word(ram.data() + word_bytes * index, loaded[index]);
+      fixture::put_word(ram.data() + (word_bytes * index), loaded[index]);
     }
     const auto untouched = ram;
     sharc::Core core(program.code.memory(ram_id, ram), mode);

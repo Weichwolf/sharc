@@ -326,6 +326,10 @@ truncating rounding, and ALUSAT for scaled FIX. The SIMD probes also check both
 directions of lane-local `IF EQ` admission. Capture raw destination words and
 both lane status registers using the procedure above.
 
+Another 96 paired cases share the product and ALU destination for each of the
+eight binary multifunction forms. The simulator returned the ALU value with
+both operations' flags and sticky effects in every admitted lane.
+
 The writeback follow-up used different product, sum and difference results and
 repeated the collisions with overflow, negative zero and an exact zero
 difference in 48 scalar cases. A shared binary multifunction destination takes
