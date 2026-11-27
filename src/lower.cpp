@@ -98,6 +98,10 @@ bool fifo(const Compute &compute) {
           (fifo_transfer(compute.opcode) || compute.opcode == fifo_write)) ||
          (compute.kind == ComputeKind::shifter && compute.opcode == fifo_read);
 }
+
+bool fifo_transfer(const Compute &compute) {
+  return fifo(compute) && fifo_transfer(compute.opcode);
+}
 } // namespace shift
 
 constexpr unsigned shadow_register_first = 0x50;
@@ -2170,7 +2174,7 @@ llvm::Value *Lowering::fifo_length(const Values &values, const Compute &compute)
 }
 
 void Lowering::guard_fifo(const Values &values, const Instruction &op, bool partial) {
-  if (!shift::fifo(op.compute) || !shift::fifo_transfer(op.compute.opcode)) { return; }
+  if (!shift::fifo_transfer(op.compute)) { return; }
   auto *pointer = values[fifo_pointer_value];
   auto *length = fifo_length(values, op.compute);
   auto *capacity = vector(32, shift::fifo_bits);
@@ -5152,6 +5156,7 @@ void Lowering::plan_hardware_grants(const LoopMap &shapes) {
       continue;
     }
     const auto body = std::span(instructions_).subspan(start->second, shape.length);
+    // Whole turns bypass per-instruction guards.
     if (!std::ranges::all_of(body, [this, &shape](const Instruction &op) {
           const auto fetch = loop_fetches_.find(op.address);
           const auto test = loop_tests_.find(op.address);
@@ -5165,7 +5170,8 @@ void Lowering::plan_hardware_grants(const LoopMap &shapes) {
                   overlapping_short_tail(shape, fetch->second) ||
                   (shape.counted() && fetch->second.counted() &&
                    overlapping_tail(shape, fetch->second))) &&
-                 !modifies_index(op) && !dag_register(loaded_register(op));
+                 !modifies_index(op) && !dag_register(loaded_register(op)) &&
+                 !shift::fifo_transfer(op.compute);
         })) {
       continue;
     }
@@ -5488,10 +5494,12 @@ void Lowering::plan_loops() {
     const auto count = end - start + 1;
     const bool conditional = ((op.word >> condition_shift) & true_condition) != true_condition;
     if ((count == 1 && conditional) || costs_[start].instructions != count) { continue; }
+    // A FIFO refusal needs the exact retired prefix, including completed turns.
     bool linear = true;
     for (std::size_t i = start; i < end; ++i) {
       linear = linear && instructions_[i].address + 1 == instructions_[i + 1].address &&
-               !branch(instructions_[i]) && !dag_register(loaded_register(instructions_[i]));
+               !branch(instructions_[i]) && !dag_register(loaded_register(instructions_[i])) &&
+               !shift::fifo_transfer(instructions_[i].compute);
     }
     if (!linear) { continue; }
     const bool stall = conditional && instructions_[end - 1].compute.kind != ComputeKind::none;

@@ -8,16 +8,16 @@ is claimed.
 
 | Area | Required evidence | Status |
 |---|---|---|
-| Classic 48-bit ISA | Every documented instruction class, condition, legal operand and parallel form | Partial: data/DAG transfers, fixed ALU/ROT, direct/indirect flow, normal-word pre-indexed and parallel post-indexed memory, immediate DAG modify/reverse, NOP |
-| VISA 16/32/48 | All compact encodings, fetch boundaries, PC units and mode transitions | Unimplemented |
-| Arithmetic and SIMD | PEx/PEy, fixed point, 32-/40-bit float, rounding, modes, flags and exceptions | Partial: fixed ALU, multiplier/MR, fixed multifunction, register-count ROT and bank/SIMD execution |
+| Classic 48-bit ISA | Every documented instruction class, condition, legal operand and parallel form | Partial: installed arithmetic, data/DAG transfers, direct/indirect flow, normal-word memory, register MODIFY and immediate MODIFY/BITREV |
+| VISA 16/32/48 | All compact encodings, fetch boundaries, PC units and mode transitions | Format and boundary checks during preparation. Native execution remains open |
+| Arithmetic and SIMD | PEx/PEy, fixed point, 32-/40-bit float, rounding, modes, flags and exceptions | Partial: fixed and floating arithmetic and multifunction compute, shifter and FIFO, physical banks and lane predicates |
 | Strict numerical mode (default) | Exact guest 32-/40-bit behavior, RND32, conversion exceptions and native-path identity | Partial, see [single-function floating compute](#single-function-floating-compute) |
 | FastFP32 numerical mode (opt-in) | Independent approximation expectations, rounding/flags, unchanged raw moves/integer behavior, separate translations | Partial, see [single-function floating compute](#single-function-floating-compute) |
-| Parallel operations | Old operands, memory aliases, register exchanges and ordered partial effects | Partial: raw register moves/swaps and type 1a normal-word PM/DM with supported fixed compute |
-| Address generation and memory | Both DAGs, modulo/reverse addressing, PM/DM and physical view aliases | Partial: normal-word pre-indexing, immediate modify/reverse and DAG register-load dependencies |
+| Parallel operations | Old operands, memory aliases, register exchanges and ordered partial effects | Partial: raw register moves/swaps and type 1a PM/DM with supported compute |
+| Address generation and memory | Both DAGs, modulo/reverse addressing, PM/DM and physical view aliases | Partial: normal-word indexed transfers, shared DAG updates, circular and bit-reverse addressing, and DAG load dependencies |
 | Sequencer and control | Delayed flow, DO/loop endpoints, LR, stacks, reset and interrupts | Partial: classic direct/indirect transfers, hardware DO and admitted reentry, reset, declared maskable vectors, admitted RTI and IDLE |
-| Chip-profile boundaries | ADSP-21489 memory/vector parameters and explicit I/O ownership | Unimplemented |
-| JIT coherence and hosts | Self-modifying aliases, natural loops, precise exits, x86-64 and ARM64 | Unimplemented |
+| Chip-profile boundaries | ADSP-21489 memory/vector parameters and explicit I/O ownership | Partial: declared layouts, vectors and I/O. Timer and unresolved exceptions remain open |
+| JIT coherence and hosts | Self-modifying aliases, natural loops, precise exits, x86-64 and ARM64 | Partial: cached IR, native loops, precise exits and declared code-write handoffs on Linux x86-64. macOS ARM64 remains untested |
 
 ## S1 preparation evidence (complete milestone)
 
@@ -475,6 +475,9 @@ pointer thresholds, bank selection and lane predicates. A five-instruction
 sequence checks raw FIFO state and write pointers at a bound and after replay
 on a second Core. Selected lanes with prohibited operands fault at the
 instruction with its raw encoding and the retired prefix preserved.
+Software and counted hardware loops check that a second-turn FIFO fault
+preserves the first turn's state and progress. Multi-turn grants use the
+per-instruction path for FIFO transfers that can refuse an operand.
 `test/core/memory.cpp` checks that such a refusal leaves both transfers of an
 unconditional type-1 packet untouched. The reference uses the documented
 left shift for extraction. Silicon behavior of the simulator's differing
@@ -580,16 +583,11 @@ and replays the return. Cached bitcode also executes a call/return after loading
 and binding through consumer-linked IR. Cached memory IR is also loaded and
 bound with alternate DAG/data banks and broadcast.
 
-Linux x86-64: Clang/LLVM 19.1.7 Release; all 16 CTest checks pass, including an
-installed consumer executing native instructions. clang-format and clang-tidy
-are clean. macOS ARM64 remains untested. The benchmark layer includes K4:
-a table-driven eight-state machine with nested calls, register-count rotation,
-complete registers/table/stack output and exact progress in both identities.
-K5 checks a full 4096-word copy and running checksum repeated 512 times under
-both numerical identities, including guard bytes and precise progress.
-See the [current benchmark results](../test/bench/README.md) for inputs,
-independent references and unscaled Linux hardware counts. K1–K3, K6 and
-goal sanitizer qualification remain open.
+The Linux x86-64 Release regression for PR #35 passed 24 CTest checks with
+Clang/LLVM 19.1.7, including both ISA suites and an installed CMake consumer.
+The [benchmark report](../test/bench/README.md) records checked K1–K6 results
+and Linux hardware counts for its measured revision. Final macOS ARM64 and
+sanitizer qualification remain open.
 
 ## Single-function floating compute
 
@@ -732,4 +730,3 @@ and parallel memory ordering expectations are still required. See
 [numeric-reference.md](numeric-reference.md) for the exact scope, source sections
 and gaps. Oracle validation is not installed-image ISA execution coverage. No
 complete numerical or profile acceptance follows from these oracle checks.
-Native coverage is limited to the separate subset above; benchmarks remain open.

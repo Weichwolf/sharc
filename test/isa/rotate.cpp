@@ -608,6 +608,55 @@ void fifo_faults() {
   }
 }
 
+constexpr std::uint64_t bitext_one = 0x023e001401b0; // R11 = BITEXT 1.
+
+struct FifoLoopPrefix {
+  unsigned instructions, clocks, header_offset;
+};
+
+void verify_fifo_loop_fault(std::span<const std::uint64_t> words, FifoLoopPrefix prefix) {
+  constexpr unsigned budget = 12;
+  constexpr std::uint64_t high_bit = std::uint64_t{1} << 63;
+  constexpr std::uint64_t extracted = 0x100;
+  constexpr unsigned full_width = 48;
+  fixture::Program program(words);
+  for (const auto mode : fixture::numeric_modes) {
+    const auto native = fixture::compile(program.code, mode);
+    sharc::Core core(program.memory(), mode);
+    auto input = initial(0);
+    input.pe[0].bit_fifo = high_bit;
+    input.pe[0].bit_fifo_write_pointer = 1;
+    fixture::install(core, native, input);
+    const auto beginning = core.save();
+    check(fixture::completed(core.run(prefix.instructions), prefix.instructions, prefix.clocks),
+          "FIFO loop lost its first turn");
+    const auto boundary = core.registers();
+    const auto &pe = boundary.pe[0];
+    check(boundary.pc == input.pc + prefix.header_offset && pe.bit_fifo == 0 &&
+              pe.bit_fifo_write_pointer == 0 && pe.data[0][11] == extracted,
+          "FIFO loop lost its first extraction or header");
+    core.restore(beginning);
+    const auto result = core.run(budget);
+    check(result.has_fault && result.fault.reason == sharc::FaultReason::unsupported_feature &&
+              result.fault.address == boundary.pc && result.fault.instruction == bitext_one &&
+              result.fault.instruction_bits == full_width &&
+              result.progress == sharc::Progress{.instructions = prefix.instructions,
+                                                 .base_cycles = prefix.clocks} &&
+              core.registers() == boundary,
+          "FIFO loop refusal lost the first turn or committed part of the failing turn");
+  }
+}
+
+void fifo_loop_faults() {
+  constexpr auto jump_to_header = 0x063e00000000 | fixture::code_address;
+  constexpr std::uint64_t counted_do = 0x0c0004000005; // LCNTR = 4, DO pc+5 UNTIL LCE.
+  constexpr std::uint64_t nop = 0;
+  verify_fifo_loop_fault(std::array{bitext_one, std::uint64_t{jump_to_header}},
+                         {.instructions = 2, .clocks = 5, .header_offset = 0});
+  verify_fifo_loop_fault(std::array{counted_do, bitext_one, nop, nop, nop, nop, nop},
+                         {.instructions = 6, .clocks = 6, .header_offset = 1});
+}
+
 } // namespace
 
 namespace fixture {
@@ -628,5 +677,6 @@ void rotations() {
   verify_shifter_cases();
   fifo_sequence();
   fifo_faults();
+  fifo_loop_faults();
 }
 } // namespace fixture
