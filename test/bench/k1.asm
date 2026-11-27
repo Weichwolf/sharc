@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
-// Entry: I0 = first sample after zero history, I1 = output, R5 = block count.
+// At entry I0 points to the first sample after zero history, I1 to the output.
+// R5 holds the block count.
 // I2 walks backward by M2. I10 wraps around the 64 coefficients with M10 = 1.
 .SECTION/PM seg_pmco;
 .GLOBAL _k1;

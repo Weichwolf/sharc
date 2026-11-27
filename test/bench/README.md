@@ -5,6 +5,29 @@ protected-page peripheral I/O remain open.
 
 ## Current Linux results
 
+### K1 and K6
+
+Medians of three unscaled runs on an Intel i5-1135G7 pinned to logical CPU 2,
+with Clang/LLVM 19.1.7. The preparation time and native size refer to the shared
+image, which is prepared once per numerical and memory mode.
+
+| Kernel | Schedule | Identity | Memory | Host inst./guest inst. | Host cycles/guest inst. | M guest inst./s | Guest/Clang O3 | Prepare s | Native bytes |
+|---|---|---|---|---:|---:|---:|---:|---:|---:|
+| K1 | continuous | Strict | exact | 121.130 | 32.813 | 109.96 | 51.02 | 27.260 | 1,420,189 |
+| K1 | bounded | Strict | exact | 128.054 | 35.359 | 102.17 | 56.84 | 27.260 | 1,420,189 |
+| K6 | interrupts | Strict | exact | 129.566 | 35.670 | 101.18 | 52.33 | 27.260 | 1,420,189 |
+| K1 | continuous | FastFP32 | exact | 121.130 | 33.985 | 106.21 | 48.32 | 28.850 | 1,420,189 |
+| K1 | bounded | FastFP32 | exact | 128.054 | 39.638 | 91.32 | 56.27 | 28.850 | 1,420,189 |
+| K6 | interrupts | FastFP32 | exact | 129.566 | 36.247 | 99.38 | 57.68 | 28.850 | 1,420,189 |
+| K1 | continuous | Strict | direct | 120.810 | 32.457 | 111.51 | 49.27 | 28.817 | 1,404,861 |
+| K1 | bounded | Strict | direct | 128.050 | 36.347 | 99.51 | 57.72 | 28.817 | 1,404,861 |
+| K6 | interrupts | Strict | direct | 129.585 | 38.168 | 94.80 | 56.82 | 28.817 | 1,404,861 |
+| K1 | continuous | FastFP32 | direct | 120.810 | 32.984 | 109.90 | 48.54 | 28.042 | 1,404,861 |
+| K1 | bounded | FastFP32 | direct | 128.050 | 35.673 | 101.43 | 56.94 | 28.042 | 1,404,861 |
+| K6 | interrupts | FastFP32 | direct | 129.585 | 36.229 | 99.90 | 56.81 | 28.042 | 1,404,861 |
+
+### K4 and K5
+
 Medians of three unscaled runs on an Intel i5-1135G7, pinned to logical CPU 3,
 with Clang/LLVM 19.1.7. K4 was measured for [PR #15](https://github.com/Weichwolf/sharc/pull/15)
 and K5 for [PR #16](https://github.com/Weichwolf/sharc/pull/16). Both workloads
@@ -70,6 +93,7 @@ delays in base cycles. Portable reference timing covers the same FIR arithmetic.
 ```sh
 nice -n 10 cmake --build build --target sharc_k1_bench
 nice -n 10 ctest --test-dir build --output-on-failure -R '^bench_k1(_direct)?$'
+mkdir -p build/local
 nice -n 10 build/sharc_k1_bench --measure > build/local/fir-exact.jsonl
 nice -n 10 build/sharc_k1_bench --measure --direct > build/local/fir-direct.jsonl
 ```
