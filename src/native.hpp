@@ -63,7 +63,8 @@ inline constexpr std::size_t code_owner_slot = owner_events_slot + 1;
 inline constexpr std::size_t code_check_slot = code_owner_slot + 1;
 inline constexpr std::size_t fifo_slot = code_check_slot + 1;
 inline constexpr std::size_t fifo_pointer_slot = fifo_slot + 2;
-inline constexpr std::size_t register_pointer_count = fifo_pointer_slot + 2;
+inline constexpr std::size_t mode2_slot = fifo_pointer_slot + 2;
+inline constexpr std::size_t register_pointer_count = mode2_slot + 1;
 inline constexpr std::uint8_t owner_yield_event = 1;
 inline constexpr std::uint8_t code_write_event = 2;
 

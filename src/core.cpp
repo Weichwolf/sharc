@@ -407,6 +407,7 @@ struct Core::Impl {
     pointers[detail::short_parent_tail_slot] = &loops.short_parent_tail;
     pointers[detail::suspended_call_state_slot] = loops.suspended_calls.data();
     pointers[detail::interrupt_latch_slot] = &state.registers.irptl;
+    pointers[detail::mode2_slot] = &state.registers.mode2;
     pointers[detail::interrupt_frame_slot] = &interrupt_frame_guard;
     pointers[detail::status_depth_slot] = &state.registers.status_depth;
     pointers[detail::progress_cycle_slot] = &state.progress.base_cycles;

@@ -59,7 +59,7 @@ enum class MemoryAddressing : std::uint8_t { indexed_offset, absolute, postmodif
 struct MemoryMove {
   unsigned index{}, reg{}, lane{}, modifier{};
   MemorySpace space{};
-  bool write{};
+  bool write{}, force_long{};
   MemoryAddressing addressing{};
   std::uint32_t address_operand{};
   std::optional<std::uint32_t> immediate = std::nullopt;

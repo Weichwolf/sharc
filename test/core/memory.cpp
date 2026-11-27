@@ -23,6 +23,7 @@ namespace {
 using fixture::check;
 constexpr std::uint32_t ram_address = 0x90000, ram_id = 11;
 constexpr std::uint64_t load_r0 = 0xa00000000000, store_r0 = 0xa10000000000;
+constexpr std::uint64_t forced_long = 1ULL << 39;
 constexpr unsigned instruction_bits = 48;
 constexpr std::array<std::byte, 8> initial_ram{std::byte{0x11},
                                                std::byte{0x22},
@@ -435,11 +436,12 @@ constexpr std::uint32_t simd_bit = 1U << 21, cbufen = 1U << 24;
 constexpr std::size_t word_bytes = 4;
 constexpr unsigned word_shift = 8;
 
-void short_word_alias() {
+void short_word_alias(bool force) {
   constexpr auto normal_address = ram_address + 16;
   constexpr std::uint64_t load_pm_r2 = 0xb00200000000;
   constexpr std::uint64_t negative_offset = 0xffffffff;
-  const std::array words{load_r0, store_r0 | negative_offset, load_pm_r2};
+  const auto qualifier = force ? forced_long : 0;
+  const std::array words{load_r0 | qualifier, store_r0 | negative_offset | qualifier, load_pm_r2};
   fixture::Program program(words);
   auto &regions = program.code.variants.front().layout.regions;
   regions.push_back({.view = sharc::MemoryView::short_word,
@@ -483,14 +485,19 @@ void short_word_alias() {
   }
 }
 
-void wide_words() {
+void wide_words(bool force) {
   constexpr auto extended_address = ram_address + 16;
   constexpr std::uint64_t store_s5_i1 = 0xa35500000000;
   constexpr std::uint64_t load_r5_i1 = 0xa20500000000;
   constexpr std::uint64_t store_s6_i2 = 0xa55600000000;
   constexpr std::uint64_t load_r7_i2 = 0xa40700000000;
   constexpr std::uint64_t mixed_packet = 0x22c89a800000; // R4=DM(I1,M3), R5=PM(I10,M11).
-  const std::array words{store_s5_i1, load_r5_i1, store_s6_i2, load_r7_i2, mixed_packet};
+  const auto qualifier = force ? forced_long : 0;
+  const std::array words{store_s5_i1 | qualifier,
+                         load_r5_i1 | qualifier,
+                         store_s6_i2 | qualifier,
+                         load_r7_i2 | qualifier,
+                         mixed_packet};
   fixture::Program program(words);
   auto &regions = program.code.variants.front().layout.regions;
   constexpr unsigned extended_offset = 11;
@@ -783,6 +790,38 @@ void immediate_store_io(sharc::ExecutionMode mode) {
             "immediate store yielded before both writes and the shared DAG update");
     }
   }
+}
+
+void forced_store_io(sharc::ExecutionMode mode) {
+  constexpr std::uint64_t store_s5 = 0x115500000000 | forced_long | ram_address;
+  constexpr std::array<std::uint64_t, 2> payload{0x12345678, 0xaabbccdd};
+  const std::array words{store_s5, std::uint64_t{0}};
+  Program program(words);
+  program.code.code.variants.front().layout.regions.back().initialized = false;
+  const auto native = fixture::compile(program.code.code, mode);
+  Peripheral device{.fault_on = 2};
+  auto memory = program.code.memory();
+  memory.io = device.binding();
+  sharc::Core core(memory, mode);
+  device.core = &core;
+  auto before = initial();
+  before.mode1 = simd_bit;
+  before.pe[1].data[0][5] = (payload[0] << word_shift) | 1;
+  before.pe[1].data[0][4] = (payload[1] << word_shift) | 2;
+  fixture::install(core, native, before);
+  const auto result = core.run(2);
+  constexpr auto dm = sharc::MemorySpace::data;
+  const std::array expected{
+      Peripheral::Access{.space = dm, .address = ram_address, .word = payload[0], .writing = true},
+      Peripheral::Access{
+          .space = dm, .address = ram_address + 1, .word = payload[1], .writing = true}};
+  check(result.has_fault && result.fault.reason == sharc::FaultReason::access_fault &&
+            result.fault.instruction == store_s5 && result.progress == sharc::Progress{} &&
+            result.fault.detail.contains(std::to_string(ram_address + 1)) &&
+            device.calls == expected.size() && device.trace[0] == expected[0] &&
+            device.trace[1] == expected[1] && device.words[0] == payload[0] &&
+            device.words[1] == 0 && core.registers() == before,
+        "forced long callback refusal lost ordered same-PE payloads or precise progress");
 }
 
 constexpr std::uint64_t fixed_parallel_add = 0x34c89a001401;
@@ -1450,8 +1489,10 @@ int main() {
     layout_validation();
     ordinary_region_alias();
     incomplete_simd_store();
-    short_word_alias();
-    wide_words();
+    for (const bool force : {false, true}) {
+      short_word_alias(force);
+      wide_words(force);
+    }
     extended_io();
     runtime_io();
     delayed_io();
@@ -1461,6 +1502,7 @@ int main() {
     parallel_refusal(sharc::ExecutionMode::strict, fixed_parallel_add);
     for (const auto mode : fixture::numeric_modes) {
       immediate_store_io(mode);
+      forced_store_io(mode);
       parallel_io(mode, floating_parallel_add);
       parallel_refusal(mode, floating_parallel_add);
       parallel_fifo_refusal(mode);

@@ -18,6 +18,7 @@ constexpr unsigned simd_bit = 21, low_data_bit = 10, high_data_bit = 7;
 constexpr unsigned broadcast1_bit = 23, broadcast9_bit = 22;
 constexpr unsigned lane_shift = 32, bank_shift = 24;
 constexpr std::uint64_t raw_seed = 0x8001020355;
+constexpr std::uint64_t forced_long = 1ULL << 39;
 constexpr std::array<std::uint32_t, 2> old_status{0x12340000, 0x87650000};
 constexpr std::array<std::uint32_t, 2> old_sticky{0xa5000240, 0x95012345};
 constexpr std::uint32_t old_modifier = 0x12345678, old_length = 31;
@@ -279,6 +280,114 @@ void absolute_transfers(sharc::MemorySpace space, sharc::ExecutionMode mode) {
   }
 }
 
+struct ForcedForm {
+  sharc::MemorySpace space;
+  bool indexed, odd;
+};
+
+constexpr unsigned explicit_register = 5;
+constexpr unsigned neighboring_register = explicit_register ^ 1;
+constexpr unsigned load_address = 2;
+constexpr unsigned store_address = 8;
+constexpr unsigned monitor = 1U << 21;
+constexpr unsigned unaligned_sticky = 1U << 20;
+constexpr unsigned illegal_input = 1U << 2;
+
+void expect_forced(sharc::Registers &state,
+                   std::vector<std::byte> &ram,
+                   const ForcedForm &form,
+                   unsigned count) {
+  const auto bank = (state.mode1 >> low_data_bit) & 1U;
+  const unsigned first = load_address + static_cast<unsigned>(form.odd);
+  const unsigned target = store_address + static_cast<unsigned>(form.odd);
+  const auto broadcast_bit =
+      form.space == sharc::MemorySpace::data ? broadcast1_bit : broadcast9_bit;
+  const bool broadcast = form.indexed && (state.mode1 & (1U << broadcast_bit)) != 0;
+  auto &x = state.pe[0].data[bank];
+  auto &y = state.pe[1].data[bank];
+  x[explicit_register] = std::uint64_t{words[first]} << byte_bits;
+  x[neighboring_register] = std::uint64_t{words[first + 1]} << byte_bits;
+  if (broadcast) {
+    y[explicit_register] = x[explicit_register];
+    y[neighboring_register] = x[neighboring_register];
+  }
+  if (count == 2) {
+    put(ram, target, static_cast<std::uint32_t>(y[explicit_register] >> byte_bits));
+    put(ram, target + 1, static_cast<std::uint32_t>(y[neighboring_register] >> byte_bits));
+  }
+  if (form.odd && (state.mode2 & monitor) != 0) {
+    state.pe[0].stky |= unaligned_sticky;
+    state.irptl |= illegal_input;
+  }
+  fixture::boundary(state, {.pc = state.pc + count, .clock = count});
+}
+
+std::array<std::uint64_t, 2> forced_program(const ForcedForm &form, unsigned index) {
+  constexpr unsigned shadow_register = 0x50 + explicit_register;
+  const auto first = load_address + static_cast<unsigned>(form.odd);
+  const auto target = store_address + static_cast<unsigned>(form.odd);
+  if (form.indexed) {
+    return {forced_long | encoding(Move{.reg = explicit_register,
+                                        .index = index,
+                                        .displacement = static_cast<std::int32_t>(first)}),
+            forced_long | encoding(Move{.reg = shadow_register,
+                                        .index = index,
+                                        .write = true,
+                                        .displacement = static_cast<std::int32_t>(target)})};
+  }
+  return {forced_long | encoding(AbsoluteMove{.space = form.space,
+                                              .write = false,
+                                              .ureg = explicit_register,
+                                              .address = ram_address + first}),
+          forced_long | encoding(AbsoluteMove{.space = form.space,
+                                              .write = true,
+                                              .ureg = shadow_register,
+                                              .address = ram_address + target})};
+}
+
+void forced_transfers(const ForcedForm &form, sharc::ExecutionMode mode) {
+  constexpr std::uint32_t configuration_count = 16;
+  constexpr unsigned capacity = 128;
+  const auto index = form.space == sharc::MemorySpace::data ? 1U : 9U;
+  const auto code = forced_program(form, index);
+  fixture::Program program(code);
+  auto region = fixture::normal_region(ram_address, words.size(), ram_id);
+  region.space = form.space;
+  region.byte_offset = offset;
+  region.byte_stride = stride;
+  program.code.variants.front().layout.regions.push_back(region);
+  const auto native = fixture::compile(program.code, mode);
+  std::vector<std::byte> ram(capacity, padding);
+  for (unsigned i = 0; i < words.size(); ++i) { put(ram, i, words[i]); }
+  const auto seed = ram;
+  for (std::uint32_t flags = 0; flags < configuration_count; ++flags) {
+    const auto broadcast_bit =
+        form.space == sharc::MemorySpace::data ? broadcast1_bit : broadcast9_bit;
+    const auto bank = flags & 1;
+    const auto controls = (bank << low_data_bit) | (bank << dag_bank_bits[index]) |
+                          (((flags >> 1) & 1) << simd_bit) | (((flags >> 2) & 1) << broadcast_bit);
+    auto state = initial({.index = index, .mode = controls});
+    state.dag[bank][index].index = ram_address;
+    state.mode2 = (flags & 8) != 0 ? monitor : 0;
+    sharc::Core core(program.memory(ram_id, ram), mode);
+    fixture::install(core, native, state);
+    const auto start = core.save();
+    for (unsigned count = 1; count <= code.size(); ++count) {
+      auto expected = state;
+      auto expected_ram = seed;
+      expect_forced(expected, expected_ram, form, count);
+      for (const bool cycles : {false, true}) {
+        core.restore(start);
+        std::ranges::copy(seed, ram.begin());
+        const auto result = cycles ? core.run_until(count) : core.run(count);
+        check(fixture::completed(result, count, count) && core.registers() == expected &&
+                  ram == expected_ram,
+              "forced long transfer lost its same-PE neighbor, address order or alignment event");
+      }
+    }
+  }
+}
+
 constexpr std::uint32_t immediate_payload = 0x765432ab;
 constexpr unsigned immediate_stride = 11;
 
@@ -366,6 +475,13 @@ void memory_access() {
   for (const auto mode : fixture::numeric_modes) {
     absolute_transfers(sharc::MemorySpace::data, mode);
     absolute_transfers(sharc::MemorySpace::program, mode);
+    for (const auto space : {sharc::MemorySpace::data, sharc::MemorySpace::program}) {
+      for (const bool indexed : {false, true}) {
+        for (const bool odd : {false, true}) {
+          forced_transfers({.space = space, .indexed = indexed, .odd = odd}, mode);
+        }
+      }
+    }
     constexpr std::array views{StoreView{.view = sharc::MemoryView::normal_word,
                                          .width = 4,
                                          .implicit_offset = 1,

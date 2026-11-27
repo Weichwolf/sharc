@@ -511,8 +511,15 @@ delay slot. The native suite checks active counted-loop handoff and rejection of
 an incompatible loop plan through a cached, consumer-linked artifact.
 It also checks consumer-linked read and write roles through a cached artifact,
 including owner binding, yield after retirement, access fault and replay.
-Forced long-word encodings remain open. See
-[memory.md](memory.md) for the exact storage contract.
+Types 14 and 15 now lower the data-register forced-long form. Normal-word
+fixtures check the same-PE neighbor, explicit R5 loads and S5 stores, both
+buses, both address forms, data/DAG banks, SIMD, broadcast and odd-address
+alignment latches. Short, long and extended native views retain their own
+transfer widths. A checked callback test retains the first write when the
+second callback refuses the transfer without retiring the guest instruction.
+The odd-address placement and short-word override differences between CCES
+and Programming Reference 2.4 remain unverified on silicon. See
+[memory.md](memory.md) for the storage contract.
 
 Classic type 7a register `MODIFY` supports the implicit source destination and
 an explicit destination in the same DAG. Computation evaluates each lane's
@@ -683,7 +690,7 @@ loads remains open. Both reference observations are recorded in
 [numeric-reference.md](numeric-reference.md#parallel-arithmetic-and-lane-expectations).
 
 General classic single-bus compute-and-memory forms (types 3a and 4a),
-forced long-word forms, the remaining DAG addressing variants and silicon
+remaining forced long-word UREG forms, DAG addressing variants and silicon
 confirmation of contended register writeback are tracked in #26. Remaining
 compound control forms are tracked in #27.
 

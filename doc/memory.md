@@ -2,8 +2,8 @@
 
 The core executes classic absolute type 14, pre-indexed type 15 and parallel
 post-indexed type 1a data-register transfers, and type 16 immediate stores.
-These forms use the declared storage views and checked runtime I/O. Forced
-long-word instruction encodings remain open. The reference is Programming
+Types 14 and 15 include the data-register long-word override. These forms use
+the declared storage views and checked runtime I/O. The reference is Programming
 Reference 2.4, sections 2-6–2-13, 4-110, 6-10–6-31, 7-36–7-40, 9-7–9-9,
 9-53–9-61 and 10-5/20–22, pinned in `reference-manifest.json`.
 
@@ -33,6 +33,17 @@ Their stores use the corresponding bits. A long word transfers the low 32 bits
 through the explicit register and the upper 32 bits through its same-PE neighbor
 (`register ^ 1`). An extended word transfers all 40 raw bits. Transfers preserve
 flags and use the same raw format in Strict and FastFP32.
+
+The `(LW)` qualifier on a normal-word address uses the original address and
+the following word. The explicit register supplies the first word and its
+same-PE neighbor supplies the second, including in SIMD. An indexed broadcast
+read copies both results into the other PE. The qualifier leaves the short,
+long and extended addressing rules unchanged, as specified by Programming
+Reference 2.4, section 6-8. The core resolves both normal-word layouts before
+access and uses their declared strides and callbacks in address order. A
+completed odd-address normal-word pair sets STKYx.U64MA and IRPTL.IICDI when
+MODE2.U64MAE is set. See `numeric-reference.md` for the unaligned placement
+and short-word differences observed in CCES.
 
 ## Address and lane behavior
 

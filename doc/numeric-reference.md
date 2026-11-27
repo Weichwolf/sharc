@@ -520,8 +520,7 @@ read the resulting words through their normal-word aliases in the
 
 Eight separate aligned forced-long probes loaded or stored R5 through a
 normal-word address using the `(LW)` qualifier. The addressed word used R5
-and the next word used R4 in SISD and SIMD. These observations concern the
-forced encoding, whose native lowering remains open.
+and the next word used R4 in SISD and SIMD.
 
 In a further 32 forced-long probes at an odd normal-word address, the CCES
 simulator rounded the address down to the preceding even word. It used the
@@ -531,7 +530,16 @@ MODE2.U64MAE set it also raised STKYx.U64MA and IRPTL.IICDI with IICDI masked.
 The same two words transferred with monitoring clear. Programming Reference
 2.4, section 7-25 and Figure 7-9, describe an unaligned access across two
 successive rows. The data placement and timing of the odd-address form remain
-unverified on silicon.
+unverified on silicon. The lowered form uses the specified address and the
+next word in that order, with the observed monitor-dependent latches.
+
+The 32 indexed probes used `R5 = DM(2,I1)(LW)` or the PM counterpart. For
+normal-word and long-word addresses, both registers in the pair reached the
+other PE when broadcast was enabled, including in SISD. Without broadcast
+the other PE was unchanged. The simulator also interpreted `(LW)` at a short
+address as a long-word row access. The core follows section 6-8, which applies
+the qualifier to normal-word accesses, and retains the short view width and
+lane stride.
 
 ## Register MODIFY and DAG interlocks
 

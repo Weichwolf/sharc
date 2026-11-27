@@ -125,7 +125,6 @@ constexpr unsigned rti_opcode = 0x0b;
 constexpr unsigned counted_loop_type = 12;
 constexpr unsigned conditional_loop_type = 13;
 constexpr unsigned index_modify_type = 19;
-constexpr std::uint64_t forced_long = std::uint64_t{1} << 39;
 constexpr std::uint64_t relative_branch = std::uint64_t{1} << 40;
 constexpr std::uint64_t call_branch = std::uint64_t{1} << 39;
 constexpr std::uint64_t abort_branch = std::uint64_t{1} << 38;
@@ -709,13 +708,11 @@ void validate_memory_move(const Instruction &instruction, std::string_view ident
   constexpr unsigned y_first = 0x50;
   constexpr unsigned y_limit = 0x60;
   const auto ureg = (instruction.word >> register_shift) & 0x7f;
-  if ((instruction.word & forced_long) == 0 && (ureg < 16 || (ureg >= y_first && ureg < y_limit))) {
-    return;
-  }
+  if (ureg < 16 || (ureg >= y_first && ureg < y_limit)) { return; }
   reject(instruction,
          identity,
          FaultReason::unsupported_instruction,
-         "forced long-word or non-data-register memory transfer is not lowered");
+         "non-data-register memory transfer is not lowered");
 }
 
 void validate_immediate_move(const Instruction &instruction, std::string_view identity) {
@@ -958,6 +955,7 @@ struct MemoryOperands {
   std::array<MemoryWord, 2> words{};
   llvm::Value *callback{};
   llvm::Value *paired{};
+  llvm::Value *forced_pair{};
   std::size_t callback_owner{io_slot};
   bool broadcast{};
 };
@@ -1319,6 +1317,10 @@ private:
   void dag_modify(
       Values &values, IndexModify modify, llvm::Value *delta, bool circular, llvm::Value *selected);
   void dag_overflow(Values &values, unsigned index, llvm::Value *overflow);
+  void latch_memory_event(Values &values,
+                          llvm::Value *raised,
+                          std::uint32_t sticky,
+                          std::uint32_t interrupt);
   llvm::Value *planned_pointer(const MemoryPlan &plan, llvm::Value *address, unsigned transfer);
   bool plan_changing_memory(const Instruction &op, const MemoryMove &move);
   llvm::Value *effective_address(const MemoryMove &move, llvm::Value *index);
@@ -1340,7 +1342,9 @@ private:
   void resolve_implicit(const Values &values,
                         const Instruction &op,
                         const MemoryMove &move,
+                        bool simd_pair,
                         MemoryOperands &operands);
+  void observe_memory_alignment(Values &values, const MemoryOperands &operands);
   void plan_code_writes();
   llvm::Value *check_code_store(const Values &values,
                                 const Instruction &op,
@@ -1383,8 +1387,10 @@ private:
                            const MemoryMove &move,
                            const MemoryOperands &operands,
                            unsigned lane);
-  llvm::Value *
-  store_word(const Values &values, const MemoryMove &move, const MemoryWord &word, unsigned lane);
+  llvm::Value *store_word(const Values &values,
+                          const MemoryMove &move,
+                          const MemoryOperands &operands,
+                          unsigned lane);
   llvm::Value *load_word(llvm::Value *payload, llvm::Value *view);
   void write_memory_register(Values &values,
                              const MemoryMove &move,
@@ -1656,7 +1662,7 @@ private:
   bool uses_fifo_{}, fifo_written_{}, fifo_pointer_written_{};
   std::array<llvm::Value *, 64> dag_{};
   std::set<unsigned> dag_written_;
-  bool dag_status_written_{};
+  bool interrupt_latch_written_{};
   bool has_plain_loop_returns_{};
   bool has_loop_sample_returns_{};
   bool has_short_loop_returns_{};
@@ -2689,17 +2695,22 @@ void Lowering::dag_overflow(Values &values, unsigned index, llvm::Value *overflo
   constexpr unsigned first_sticky_bit = 17;
   constexpr unsigned first_interrupt_bit = 20;
   const auto dag = index / 8;
+  latch_memory_event(
+      values, overflow, 1U << (first_sticky_bit + dag), 1U << (first_interrupt_bit + dag));
+}
+
+void Lowering::latch_memory_event(Values &values,
+                                  llvm::Value *raised,
+                                  std::uint32_t sticky_mask,
+                                  std::uint32_t interrupt_mask) {
   auto *sticky = builder_.CreateExtractElement(values[sticky_value], builder_.getInt32(0));
   sticky = builder_.CreateOr(
-      sticky,
-      builder_.CreateSelect(
-          overflow, builder_.getInt32(1U << (first_sticky_bit + dag)), builder_.getInt32(0)));
+      sticky, builder_.CreateSelect(raised, builder_.getInt32(sticky_mask), builder_.getInt32(0)));
   values[sticky_value] =
       builder_.CreateInsertElement(values[sticky_value], sticky, builder_.getInt32(0));
   values[interrupt_latch_value] = builder_.CreateOr(
       values[interrupt_latch_value],
-      builder_.CreateSelect(
-          overflow, builder_.getInt32(1U << (first_interrupt_bit + dag)), builder_.getInt32(0)));
+      builder_.CreateSelect(raised, builder_.getInt32(interrupt_mask), builder_.getInt32(0)));
 }
 
 llvm::Value *
@@ -2803,6 +2814,7 @@ void Lowering::memory_instruction(Values &values, const Instruction &op, bool pa
   const auto move = memory_move(op);
   const auto operands = memory_operands(values, op, move, partial);
   memory_writeback(values, move, operands, memory_transfer(values, op, move, operands));
+  if (move.force_long) { observe_memory_alignment(values, operands); }
   if (move.addressing == MemoryAddressing::postmodified) { postmodify_memory(values, move); }
 }
 
@@ -2855,17 +2867,19 @@ MemoryOperands Lowering::memory_operands(const Values &values,
   operands.words[0].address = address;
   operands.broadcast = (context_ & broadcast_mode(move)) != 0;
   operands.paired = builder_.getFalse();
+  operands.forced_pair = builder_.getFalse();
   const bool simd_pair = !operands.broadcast && (context_ & simd_mode) != 0;
   if (!partial) {
     const auto &plan = memory_plan_.at({op.address, move.space});
     auto *view = view_tag(MemoryView::normal_word);
     operands.words[0] = {
         .address = address, .host = planned_pointer(plan, address, 0), .view = view};
-    if (simd_pair) {
+    if (simd_pair || move.force_long) {
       auto *implicit = builder_.CreateAdd(address, builder_.getInt32(1));
       operands.words[1] = {
           .address = implicit, .host = planned_pointer(plan, implicit, 1), .view = view};
       operands.paired = builder_.getTrue();
+      operands.forced_pair = builder_.getInt1(move.force_long);
     }
     return operands;
   }
@@ -2881,7 +2895,7 @@ MemoryOperands Lowering::memory_operands(const Values &values,
     }
   }
   resolve_memory(values, op, move, operands.words[0], operands.callback);
-  if (simd_pair) { resolve_implicit(values, op, move, operands); }
+  if (simd_pair || move.force_long) { resolve_implicit(values, op, move, simd_pair, operands); }
   if (move.write && code_alias_buses_[static_cast<std::size_t>(move.space)]) {
     operands.words[0].code_event = check_code_store(values, op, move, operands, 0);
     operands.words[1].code_event = optional_memory(
@@ -2905,7 +2919,7 @@ llvm::Value *Lowering::check_code_store(const Values &values,
   auto *result = builder_.CreateCall(type,
                                      pointer(code_check_slot),
                                      {pointer(code_owner_slot),
-                                      store_word(values, move, word, lane),
+                                      store_word(values, move, operands, lane),
                                       builder_.getInt8(static_cast<std::uint8_t>(move.space)),
                                       word.address});
   result->setDoesNotThrow();
@@ -2923,11 +2937,13 @@ llvm::Value *Lowering::check_code_store(const Values &values,
 void Lowering::resolve_implicit(const Values &values,
                                 const Instruction &op,
                                 const MemoryMove &move,
+                                bool simd_pair,
                                 MemoryOperands &operands) {
   const auto &first = operands.words[0];
   auto *short_word = builder_.CreateICmpEQ(first.view, view_tag(MemoryView::short_word));
   auto *normal_word = builder_.CreateICmpEQ(first.view, view_tag(MemoryView::normal_word));
-  operands.paired = builder_.CreateOr(short_word, normal_word);
+  if (move.force_long) { operands.forced_pair = normal_word; }
+  operands.paired = simd_pair ? builder_.CreateOr(short_word, normal_word) : operands.forced_pair;
   if (operands.paired == builder_.getFalse()) { return; }
   auto *offset = builder_.CreateSelect(short_word, builder_.getInt32(2), builder_.getInt32(1));
   auto &second = operands.words[1];
@@ -2940,6 +2956,22 @@ void Lowering::resolve_implicit(const Values &values,
         return second.host;
       },
       llvm::PoisonValue::get(builder_.getPtrTy()));
+}
+
+void Lowering::observe_memory_alignment(Values &values, const MemoryOperands &operands) {
+  if (operands.forced_pair == builder_.getFalse()) { return; }
+  constexpr std::uint32_t monitor_bit = 1U << 21;
+  constexpr std::uint32_t sticky_bit = 1U << 20;
+  constexpr std::uint32_t interrupt_bit = 1U << 2;
+  auto *address = operands.words[0].address;
+  auto *odd = builder_.CreateTrunc(address, builder_.getInt1Ty());
+  if (odd == builder_.getFalse()) { return; }
+  auto *mask = builder_.CreateAnd(load(32, mode2_slot), builder_.getInt32(monitor_bit));
+  auto *monitor = builder_.CreateICmpNE(mask, builder_.getInt32(0));
+  latch_memory_event(values,
+                     builder_.CreateAnd(operands.forced_pair, builder_.CreateAnd(odd, monitor)),
+                     sticky_bit,
+                     interrupt_bit);
 }
 
 llvm::Value *
@@ -2998,7 +3030,7 @@ llvm::Value *Lowering::memory_word(const Values &values,
                                    const MemoryOperands &operands,
                                    unsigned lane) {
   const auto &word = operands.words[lane];
-  auto *payload = move.write ? store_word(values, move, word, lane) : nullptr;
+  auto *payload = move.write ? store_word(values, move, operands, lane) : nullptr;
   const auto direct_access = [&] {
     auto *result = direct_word(move, word, payload);
     if (code_transitions_ && word.code_event != nullptr) {
@@ -3060,13 +3092,19 @@ std::array<llvm::Value *, 2> Lowering::memory_transfer(const Values &values,
 
 llvm::Value *Lowering::store_word(const Values &values,
                                   const MemoryMove &move,
-                                  const MemoryWord &word,
+                                  const MemoryOperands &operands,
                                   unsigned lane) {
   constexpr unsigned normal_bits = 32;
+  const auto &word = operands.words[lane];
   auto *element = builder_.getInt32(move.lane ^ lane);
   auto *raw = move.immediate.has_value()
                   ? builder_.getInt64(std::uint64_t{*move.immediate} << raw_extension_bits)
                   : builder_.CreateExtractElement(values[move.reg], element);
+  if (lane != 0 && operands.forced_pair != builder_.getFalse()) {
+    auto *neighbor =
+        builder_.CreateExtractElement(values[move.reg ^ 1], builder_.getInt32(move.lane));
+    raw = builder_.CreateSelect(operands.forced_pair, neighbor, raw);
+  }
   auto *normal = builder_.CreateLShr(raw, builder_.getInt64(raw_extension_bits));
   if (word.view == view_tag(MemoryView::normal_word)) { return normal; }
   auto *short_word = builder_.CreateZExt(builder_.CreateTrunc(normal, builder_.getInt16Ty()),
@@ -3135,12 +3173,18 @@ void Lowering::memory_writeback(Values &values,
   if (operands.broadcast) {
     write_memory_register(values, implicit, raw, builder_.getTrue());
   } else if (operands.paired != builder_.getFalse()) {
-    write_memory_register(values, implicit, load_word(read[1], view), operands.paired);
+    auto *other_lane =
+        builder_.CreateAnd(operands.paired, builder_.CreateNot(operands.forced_pair));
+    write_memory_register(values, implicit, load_word(read[1], view), other_lane);
   }
-  auto *wide = builder_.CreateICmpEQ(view, view_tag(MemoryView::long_word));
+  auto *long_view = builder_.CreateICmpEQ(view, view_tag(MemoryView::long_word));
+  auto *wide = builder_.CreateOr(long_view, operands.forced_pair);
   if (wide == builder_.getFalse()) { return; }
   constexpr unsigned normal_bits = 32;
   auto *high = builder_.CreateLShr(read[0], builder_.getInt64(normal_bits));
+  if (operands.forced_pair != builder_.getFalse()) {
+    high = builder_.CreateSelect(operands.forced_pair, read[1], high);
+  }
   auto *neighbor_raw = load_word(high, view_tag(MemoryView::normal_word));
   auto neighbor = move;
   neighbor.reg ^= 1;
@@ -5411,7 +5455,7 @@ void Lowering::emit_exit() {
     store(builder_.CreateTrunc(values[pc_stack_depth_value], builder_.getInt8Ty()),
           stack_depth_slot);
   }
-  if (stack_written_ || dag_status_written_) {
+  if (stack_written_ || interrupt_latch_written_) {
     store(values[interrupt_latch_value], interrupt_latch_slot);
   }
   std::vector<llvm::Value *> args{
@@ -5476,7 +5520,7 @@ void Lowering::load_dag(unsigned reg) {
 void Lowering::load_modified_index(const Instruction &op) {
   const auto modify = index_modify(op);
   dag_written_.insert(modify.destination);
-  dag_status_written_ |= (modify.source & 7) == 7;
+  interrupt_latch_written_ |= (modify.source & 7) == 7;
   for (const auto reg :
        {modify.source, modify.destination, 32 + modify.source, 48 + modify.source}) {
     load_dag(reg);
@@ -5496,6 +5540,7 @@ void Lowering::load_indices() {
       load_dag(16 + branch_modifier(op));
     }
     for (const auto &move : memory_moves(op)) {
+      interrupt_latch_written_ |= move.force_long;
       if (move.addressing == MemoryAddressing::absolute) { continue; }
       load_dag(move.index);
       if (move.addressing != MemoryAddressing::postmodified) { continue; }
@@ -5504,7 +5549,7 @@ void Lowering::load_indices() {
       if ((context_ & circular_mode) != 0) {
         load_dag(static_cast<unsigned>(base_value - index_value) + move.index);
         load_dag(static_cast<unsigned>(length_value - index_value) + move.index);
-        dag_status_written_ |= (move.index & 7) == 7;
+        interrupt_latch_written_ |= (move.index & 7) == 7;
       }
     }
     if (modifies_index(op)) { load_modified_index(op); }
@@ -5617,7 +5662,8 @@ void Lowering::plan_memory(const Instruction &op, const MemoryMove &move) {
     return;
   }
   const bool broadcast = (context_ & broadcast_mode(move)) != 0;
-  const unsigned transfers = !broadcast && (context_ & simd_mode) != 0 ? 2U : 1U;
+  const bool paired = move.force_long || (!broadcast && (context_ & simd_mode) != 0);
+  const unsigned transfers = paired ? 2U : 1U;
   auto &plan = memory_plan_[{op.address, move.space}];
   auto *base = effective_address(move, dag_[move.index]);
   for (unsigned transfer = 0; transfer < transfers; ++transfer) {
@@ -5927,7 +5973,7 @@ void Lowering::emit() {
     initial[pc_stack_depth_value] =
         builder_.CreateZExt(load(8, stack_depth_slot), builder_.getInt32Ty());
   }
-  if (stack_written_ || dag_status_written_) {
+  if (stack_written_ || interrupt_latch_written_) {
     initial[interrupt_latch_value] = load(32, interrupt_latch_slot);
   }
   auto *pc = function_->getArg(unit_pc);

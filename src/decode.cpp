@@ -192,6 +192,7 @@ MemoryMove memory_move(const Instruction &instruction) {
   constexpr unsigned absolute_space_shift = 41;
   constexpr unsigned register_shift = 32;
   constexpr std::uint64_t memory_write = std::uint64_t{1} << 40;
+  constexpr std::uint64_t forced_long = std::uint64_t{1} << 39;
   if (instruction.type == immediate_memory_store_type) {
     constexpr unsigned dag_shift = 37;
     constexpr unsigned modifier_shift = 38;
@@ -214,6 +215,7 @@ MemoryMove memory_move(const Instruction &instruction) {
           .lane = ureg < 16 ? 0U : 1U,
           .space = program ? MemorySpace::program : MemorySpace::data,
           .write = (instruction.word & memory_write) != 0,
+          .force_long = (instruction.word & forced_long) != 0,
           .addressing = absolute ? MemoryAddressing::absolute : MemoryAddressing::indexed_offset,
           .address_operand = static_cast<std::uint32_t>(instruction.word)};
 }
