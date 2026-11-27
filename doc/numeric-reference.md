@@ -810,6 +810,17 @@ replication rule, including LCNTR (p. 2-13), and uses the complementary status
 pair in both addressing forms (pp. 4-95–4-96 and 10-31–10-32). Silicon
 confirmation of the differing wide stores remains open.
 
+## Control-register bit tests
+
+In 576 authored `BIT TST` and `BIT XOR` probes, the CCES 2.12.1 ADSP-21489
+functional simulator updated PEx BTF in SISD and both BTF values in SIMD.
+Each ASTAT or STKY test used the named word in PEx and its counterpart in PEy.
+MODE1, MODE2, MMASK, FLAGS, IRPTL, IMASK, IMASKP and LIRPTL produced the same
+BTF result on both lanes. Probes varied the old BTF values and covered an
+adjacent transfer conditional on TF. The flags and transfer results matched
+the per-lane operands read before the bit test. All other ASTAT bits retained
+their prior values.
+
 ## Fixed multiplier details
 
 The raw accumulator has 80 bits. Inputs use the upper 32 bits of each data

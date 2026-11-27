@@ -425,6 +425,11 @@ the entire word. Both set or clear only the corresponding BTF. The installed
 ISA tests check complete state, both numerical modes and each named/peer
 direction. They also exercise TF and NOT TF predicated transfers, an adjacent
 conditional branch's interlock, snapshot replay and a batched backward branch.
+BIT TST and XOR also read MODE1/2, MMASK, FLAGS, ASTATx/y, STKYx/y, IRPTL,
+IMASK, IMASKP and LIRPTL. With SIMD on, unpaired sources supply the same word
+to both BTF evaluations. ASTAT and STKY supply their named and complementary
+words independently. Fixtures check complete state after each test, including
+when ASTAT supplies the old BTF. See [the simulator probes](numeric-reference.md#control-register-bit-tests).
 Other SREG operands and their architectural effects are tracked in #27.
 
 DAG loads retain two recent physical-register dependency tags across owner

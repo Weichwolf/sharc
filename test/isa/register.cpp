@@ -480,15 +480,17 @@ struct UserBit {
 constexpr std::uint32_t btf = 1U << 18;
 constexpr unsigned tf_condition = 13, not_tf_condition = 29;
 
-std::uint64_t bit_word(UserBit bit) {
+std::uint64_t bit_word(UserBitAction action, unsigned reg, std::uint32_t mask) {
   constexpr std::uint64_t prefix = 0x140000000000;
   constexpr unsigned operation_shift = 37;
   constexpr unsigned register_shift = 32;
   constexpr std::array operations{0U, 1U, 2U, 4U, 5U};
-  constexpr std::array ports{0U, 1U, 14U, 15U};
-  return prefix |
-         (std::uint64_t{operations[static_cast<unsigned>(bit.action)]} << operation_shift) |
-         (std::uint64_t{ports[bit.port]} << register_shift) | bit.mask;
+  return prefix | (std::uint64_t{operations[static_cast<unsigned>(action)]} << operation_shift) |
+         (std::uint64_t{reg & 15} << register_shift) | mask;
+}
+
+std::uint64_t bit_word(UserBit bit) {
+  return bit_word(bit.action, ustat[bit.port], bit.mask);
 }
 
 void expected_user_bits(sharc::Registers &state, UserBit bit, unsigned lanes) {
@@ -541,6 +543,70 @@ void user_status_bits() {
         }
       }
     }
+  }
+}
+
+void expected_control_bits(sharc::Registers &state,
+                           unsigned reg,
+                           UserBitAction action,
+                           std::uint32_t mask) {
+  const auto before = state;
+  const auto lanes = (state.mode1 & (1U << simd_bit)) != 0 ? 2U : 1U;
+  for (unsigned lane = 0; lane < lanes; ++lane) {
+    const auto word = static_cast<std::uint32_t>(read(before, reg, lane != 0) >> 8);
+    const auto tested = action == UserBitAction::test ? word & mask : word;
+    auto &astat = state.pe[lane].astat;
+    astat = (astat & ~btf) | (tested == mask ? btf : 0);
+  }
+  advance(state);
+}
+
+struct ControlBitSource {
+  unsigned reg;
+  std::uint32_t compare_value;
+};
+
+void control_bit_reads(ControlBitSource source) {
+  using enum UserBitAction;
+  constexpr std::uint32_t status_x = 0xa5000040;
+  constexpr std::uint32_t status_y = 0xd2000020;
+  const std::array operations{test, compare, test, compare, test};
+  const std::array masks{0U, source.compare_value, btf, status_x | btf, 0x40U};
+  std::array<std::uint64_t, operations.size()> words{};
+  for (std::size_t i = 0; i < words.size(); ++i) {
+    words[i] = bit_word(operations[i], source.reg, masks[i]);
+  }
+  fixture::Program program(words);
+  for (const auto mode : fixture::numeric_modes) {
+    const auto native = fixture::compile(program.code, mode);
+    sharc::Core core(program.memory(), mode);
+    (void)core.install(native, fixture::Program::variant_id);
+    for (unsigned configuration = 0; configuration < 8; ++configuration) {
+      auto expected = initial(configuration);
+      for (const auto &control : scalar_controls) { expected.*control.member |= control.seed; }
+      expected.pe[0].astat = status_x | ((configuration & 1) * btf);
+      expected.pe[1].astat = status_y | (((configuration >> 1) & 1) * btf);
+      core.set_registers(expected);
+      const auto saved = core.save();
+      for (std::size_t i = 0; i < words.size(); ++i) {
+        expected_control_bits(expected, source.reg, operations[i], masks[i]);
+        core.restore(saved);
+        const auto count = i + 1;
+        check(fixture::completed(core.run(count), count, count) && core.registers() == expected,
+              "control-register bit test lost the named source, peer, or old ASTAT");
+      }
+    }
+  }
+}
+
+void control_bit_reads() {
+  for (const auto &control : scalar_controls) {
+    if (control.code >= mode1_code) {
+      control_bit_reads({.reg = control.code, .compare_value = control.seed});
+    }
+  }
+  for (const auto reg : lane_status_codes) {
+    control_bit_reads({.reg = reg, .compare_value = old_sticky});
   }
 }
 
@@ -907,6 +973,7 @@ void register_transfers() {
   for (unsigned quarter = 0; quarter < 4; ++quarter) { immediate_registers(quarter); }
   system_immediates();
   user_status_bits();
+  control_bit_reads();
   bit_flag_consumers();
   user_status_bit_refusals();
   dependencies();

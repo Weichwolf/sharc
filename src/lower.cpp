@@ -873,7 +873,8 @@ void validate_system_bit(const Instruction &op, std::string_view identity) {
       (operation > SystemBitOperation::toggle && !tests_system_bits(operation))) {
     reject(op, identity, FaultReason::invalid_encoding, "reserved system bit operation or SREG");
   }
-  if (!user_status(system_bit_register(op))) {
+  const auto reg = system_bit_register(op);
+  if (!user_status(reg) && !(tests_system_bits(operation) && readable_control_register(reg))) {
     reject(op,
            identity,
            FaultReason::unsupported_instruction,
@@ -2123,7 +2124,7 @@ void Lowering::system_bit_instruction(Values &values, const Instruction &op) {
   const auto operation = system_bit_operation(op);
   const auto reg = system_bit_register(op);
   auto *selected = condition(values, true_condition);
-  auto *word = fixed_word(read_system_register(reg));
+  auto *word = fixed_word(read_register(values, reg));
   auto *immediate = vector(32, static_cast<std::uint32_t>(op.word));
   if (tests_system_bits(operation)) {
     auto *tested =
