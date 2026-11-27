@@ -4,8 +4,8 @@
 from itertools import product as cartesian_product
 from dataclasses import asdict
 
-from expectation_check import anchor, require, require_raises
-from reference import IntegerResult, Mode, Unqualified, fixed_from_float
+from expectation_check import anchor, require
+from reference import IntegerResult, Mode, fixed_from_float
 
 
 CONVERSIONS = [
@@ -45,10 +45,16 @@ CONVERSIONS = [
      IntegerResult(0x0000000100, 0x400, 0)),
     ("exact positive maximum", "fix", 0x4EFFFFFFFE, Mode(40), {},
      IntegerResult(0x7FFFFFFF00, 0x400, 0)),
-    ("representable negative minimum sets AV", "fix", 0xCF00000000, Mode(40), {},
-     IntegerResult(0x8000000000, 0x406, 2)),
-    ("rounding overflow with AV clear saturates", "fix", 0x4EFFFFFFFF, Mode(40),
-     {"saturate": True}, IntegerResult(0x7FFFFFFF00, 0x400, 0)),
+    ("representable negative minimum leaves AV clear", "fix", 0xCF00000000, Mode(40), {},
+     IntegerResult(0x8000000000, 0x404, 0)),
+    ("rounding overflow sets AV and saturates", "fix", 0x4EFFFFFFFF, Mode(40),
+     {"saturate": True}, IntegerResult(0x7FFFFFFF00, 0x402, 2)),
+    ("unsaturated FIX overflow writes the extended sentinel", "fix", 0x4EFFFFFFFF, Mode(40),
+     {}, IntegerResult(0xFFFFFFFFFF, 0x422, 0x22)),
+    ("RND32 TRUNC invalid output clears extension", "trunc", 0xFFC0000000, Mode(32),
+     {"saturate": True}, IntegerResult(0xFFFFFFFF00, 0x420, 0x20)),
+    ("FIX zero ignores the scale exponent", "fix", 0, Mode(40),
+     {"scale": 0x7fffffff}, IntegerResult(0, 0x401, 0)),
     ("TRUNC below overflow", "trunc", 0x4EFFFFFFFF, Mode(40), {},
      IntegerResult(0x7FFFFFFF00, 0x400, 0)),
     ("positive overflow saturates", "fix", 0x4F00000000, Mode(40), {"saturate": True},
@@ -83,7 +89,7 @@ def quotient_lattice():
     Build input rationals directly from authored exponent/fraction fields. No
     reference operand classification, normalization or rounding helper is used.
     """
-    count, refusals = 0, 0
+    count = 0
     for exponent in (1, 125, 126, 127, 128, 156, 157, 158, 159, 254):
         for fraction, width in cartesian_product((0, 1, 127, 128, 255, 256, 0x7FFFFF00, 0x7FFFFFFF), (32, 40)):
             mantissa = (1 << 31) + (fraction if width == 40 else fraction & ~255)
@@ -105,19 +111,17 @@ def quotient_lattice():
                             options = dict(scale=scale, saturate=saturate,
                                            astat=0xFFFFFFFF, stky=0x100)
                             overflow = not -(1 << 31) <= quotient < 1 << 31
+                            sticky = 0x100 | int(0 < abs(number) < denominator) | (int(overflow) << 1)
                             if overflow and not saturate:
-                                require_raises(Unqualified, fixed_from_float, 'unqualified conversion accepted',
-                                               operation, raw, Mode(width, rounding), **options)
-                                refusals += 1
-                                continue
-                            value = min(max(quotient, -(1 << 31)), (1 << 31) - 1)
-                            av = exponent + scale > 157
-                            flags = 0xFFFFFFC0 | int(value == 0) | (int(av) << 1)
-                            flags |= int(value < 0) << 2
-                            sticky = 0x100 | int(0 < abs(number) < denominator) | (int(av) << 1)
-                            expected = IntegerResult((value & 0xFFFFFFFF) << 8, flags, sticky)
+                                raw_result = 0xFFFFFFFFFF if width == 40 else 0xFFFFFFFF00
+                                expected = IntegerResult(raw_result, 0xFFFFFFE2, sticky | 0x20)
+                            else:
+                                value = min(max(quotient, -(1 << 31)), (1 << 31) - 1)
+                                flags = 0xFFFFFFC0 | int(value == 0) | (int(overflow) << 1)
+                                flags |= int(value < 0) << 2
+                                expected = IntegerResult((value & 0xFFFFFFFF) << 8, flags, sticky)
                             actual = fixed_from_float(operation, raw, Mode(width, rounding),
                                                       **options)
                             require(actual, expected, (operation, raw, rounding, options))
                             count += 1
-    return count, refusals
+    return count

@@ -257,8 +257,13 @@ void identities() {
   image.variants.front().spans.front().parcels.back() ^= 1;
   check(original != Core::lower(image).identity(), "code contents absent from identity");
   constexpr std::uint64_t reciprocal_seed = 0x013e000c4120;
+  const auto seed_image = fixture::image(InstructionSet::isa, reciprocal_seed);
+  const auto seed = Core::lower(seed_image);
+  check(seed.identity() == Core::load(seed_image, {}, seed.artifact()).identity(),
+        "floating seed table failed artifact load");
+  constexpr std::uint64_t logical_shift = 0x013e00200123;
   fixture::throws<sharc::PreparationError>(
-      [&] { (void)Core::compile(fixture::image(InstructionSet::isa, reciprocal_seed)); },
+      [&] { (void)Core::compile(fixture::image(InstructionSet::isa, logical_shift)); },
       "compile bypassed unsupported lowering");
   fixture::throws<sharc::PreparationError>([&] { (void)Core::load(image, {}, {}); },
                                            "empty artifact accepted");

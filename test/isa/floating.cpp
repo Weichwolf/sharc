@@ -43,7 +43,9 @@ struct Entry {
 void verify(sharc::Core &core, const fixture::FloatingCase &test, Entry entry, unsigned mode1) {
   sharc::Registers initial;
   initial.pc = entry.address;
-  initial.mode1 = mode1 | (test.rnd32 ? round32_mode : 0) | (test.truncate ? truncate_mode : 0);
+  constexpr unsigned alusat_mode = 1U << 13;
+  initial.mode1 = mode1 | (test.rnd32 ? round32_mode : 0) | (test.truncate ? truncate_mode : 0) |
+                  (test.saturate ? alusat_mode : 0);
   const unsigned bank = (mode1 & alternate_low) != 0 ? 1U : 0U;
   const std::size_t lanes = (mode1 & simd_mode) != 0 ? initial.pe.size() : 1;
   for (std::size_t lane = 0; lane < initial.pe.size(); ++lane) {

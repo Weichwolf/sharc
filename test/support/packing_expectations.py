@@ -4,8 +4,8 @@
 from itertools import product as cartesian_product
 from dataclasses import asdict
 
-from expectation_check import require, require_raises
-from reference import IntegerResult, Mode, Unqualified, float_pack_value, floating_seed
+from expectation_check import require
+from reference import IntegerResult, Mode, float_pack_value, floating_seed
 
 
 PACK = [
@@ -38,9 +38,9 @@ SEEDS = [
     ("RECIPS negative large exponent has input-based AN", "recips", 0xFE80000000, Mode(40), {},
      IntegerResult(0x8000000000, 0x405, 1)),
     ("RECIPS positive infinity", "recips", 0x7F80000000, Mode(32), {},
-     IntegerResult(0, 0x401, 1)),
+     IntegerResult(0, 0x401, 0)),
     ("RECIPS negative infinity", "recips", 0xFF80000000, Mode(40), {},
-     IntegerResult(0x8000000000, 0x405, 1)),
+     IntegerResult(0x8000000000, 0x405, 0)),
     ("RECIPS positive NaN", "recips", 0x7F80000001, Mode(40), {},
      IntegerResult(0xFFFFFFFFFF, 0x420, 0x20)),
     ("RSQRTS positive zero", "rsqrts", 0, Mode(32), {}, IntegerResult(0x7F80000000, 0x402, 2)),
@@ -102,18 +102,23 @@ def packing_lattice():
             short = (32768 if negative else 0) + (32767 if exponent > 135 else 0)
             require(float_pack_value(word * 256 + 165), short, (exponent, negative, fraction))
             count += 1
-    refusals = 0
     for exponent, fraction, negative in cartesian_product(range(110, 136), (1, 127, 128, 255, 4095), (False, True)):
         word = int(negative) * 2147483648 + exponent * 8388608 + fraction
-        require_raises(Unqualified, float_pack_value, 'unqualified FPACK rounding accepted', word * 256)
-        refusals += 1
-    return count, refusals
+        if exponent <= 120:
+            divisor = 2 ** (133 - exponent)
+            high, low = divmod(0x800000 + fraction, divisor)
+            field = high + (2 * low >= divisor)
+        else:
+            field = (exponent - 120) * 2048 + (fraction >= 2048)
+        expected = field + negative * 32768
+        require(float_pack_value(word * 256), expected, (exponent, fraction, negative))
+        count += 1
+    return count
 
 
 def seed_lattice():
     count = 0
-    # These tuples specify documented special cases and literal full effects;
-    # ordinary seeds never use a reciprocal/square-root approximation here.
+    # These tuples specify special cases and literal full effects.
     cases = []
     for negative in (False, True):
         sign = 0x8000000000 if negative else 0
@@ -124,7 +129,7 @@ def seed_lattice():
         for exponent, fraction in cartesian_product((253, 254), (0, 1, 127, 128, 255, 256, 0x7FFFFFFF)):
             cases += [("recips", sign | (exponent << 31) | fraction, width, sign,
                        0x405 if negative else 0x401, 1) for width in (32, 40)]
-        cases += [("recips", sign | 0x7F80000000, width, sign, 0x405 if negative else 0x401, 1)
+        cases += [("recips", sign | 0x7F80000000, width, sign, 0x405 if negative else 0x401, 0)
                   for width in (32, 40)]
     cases += [("rsqrts", 0x7F80000000, width, 0, 0x401, 0) for width in (32, 40)]
     for exponent, fraction in cartesian_product((1, 126, 127, 254, 255), (0, 0x40000000)):
@@ -136,11 +141,4 @@ def seed_lattice():
             require(floating_seed(operation, raw, Mode(width, rounding), astat=old, stky=previous),
                     expected, (operation, raw, width, rounding, old, previous))
             count += 1
-    for call in (
-        lambda: floating_seed("recips", 0x3F80000000, Mode(40)),
-        lambda: floating_seed("rsqrts", 0x3F80000000, Mode(40)),
-        lambda: floating_seed("recips", 0xFFC0000000, Mode(40)),
-        lambda: floating_seed("rsqrts", 0xBF80000000, Mode(32)),
-    ):
-        require_raises(Unqualified, call, 'unqualified seed expectation generated')
     return count

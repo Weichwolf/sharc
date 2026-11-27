@@ -7,6 +7,7 @@ floating-point evaluation. See doc/numeric-reference.md for its qualified scope.
 
 from dataclasses import dataclass
 from fractions import Fraction
+from seed_observations import RECIPROCAL, RSQRT_EVEN, RSQRT_ODD
 
 
 WORD_MASK = (1 << 32) - 1
@@ -360,9 +361,13 @@ def floating(operation: str, left: int, right: int, mode: Mode) -> FloatingResul
     return result
 
 
-def float_from_fixed(raw: int, mode: Mode, *, scale: int = 0) -> FloatingResult:
+def float_from_fixed(raw: int, mode: Mode, *, scale: int = 0,
+                     precision: int = 40) -> FloatingResult:
     # FLOAT's 40-bit boundary is independent of MODE1.RND32 (11-39).
-    return quantize(Fraction(signed(raw_word(raw))), Mode(40, mode.rounding), scale=scale)
+    result = quantize(Fraction(signed(raw_word(raw))), Mode(precision, mode.rounding), scale=scale)
+    if result.underflow:
+        return FloatingResult(result.raw & SIGN, underflow=True)
+    return result
 
 
 def float_round(raw: int, mode: Mode) -> FloatingResult:
@@ -384,7 +389,7 @@ def _floating_order(raw: int):
 
 
 def _floating_effects(result: FloatingResult, astat: int, stky: int, *,
-                      zero_sticky: bool = False, overflow_sticky: bool = True,
+                      underflow_sticky: bool = False, overflow_sticky: bool = True,
                       absolute: bool = False, input_sign: bool = False) -> IntegerResult:
     validate_flags(astat, stky)
     x = Operand(result.raw)
@@ -393,9 +398,16 @@ def _floating_effects(result: FloatingResult, astat: int, stky: int, *,
     flags |= AN if negative else 0
     flags |= (AV if result.overflow else 0) | (AI if result.invalid else 0)
     flags |= AS if input_sign else 0
-    sticky = (AUS if zero_sticky and flags & AZ else 0)
+    sticky = AUS if underflow_sticky else 0
     sticky |= (AVS if overflow_sticky and flags & AV else 0) | (AIS if flags & AI else 0)
     return IntegerResult(x.raw, (astat & ~ALU_FLAGS) | flags, stky | sticky)
+
+
+def fixed_float_effects(raw: int, mode: Mode, *, scale: int | None = None,
+                        precision: int = 40, astat: int = 0, stky: int = 0) -> IntegerResult:
+    result = float_from_fixed(raw, mode, scale=0 if scale is None else scale, precision=precision)
+    return _floating_effects(result, astat, stky, underflow_sticky=result.underflow,
+                             overflow_sticky=scale is not None)
 
 
 def floating_alu(operation: str, left: int, right: int = 0, *, mode: Mode,
@@ -407,17 +419,16 @@ def floating_alu(operation: str, left: int, right: int = 0, *, mode: Mode,
         raise ValueError("scale must be a signed 32-bit integer")
     if operation == "scale" and scale is None:
         raise ValueError("SCALB requires a scale factor")
-    zero_sticky, overflow_sticky, absolute, input_sign = False, True, False, False
+    underflow_sticky, overflow_sticky, absolute, input_sign = False, True, False, False
     if operation in ("add", "sub", "avg", "absadd", "abssub"):
         base = {"absadd": "add", "abssub": "sub"}.get(operation, operation)
         result = floating(base, left, right, mode)
         absolute = operation in ("absadd", "abssub")
         if absolute and not result.invalid:
             result = FloatingResult(result.raw & ~SIGN, result.overflow, result.underflow)
-        zero_sticky, overflow_sticky = result.underflow, operation != "avg"
+        underflow_sticky, overflow_sticky = result.underflow, operation != "avg"
     elif operation == "float":
-        result = float_from_fixed(left, mode, scale=0 if scale is None else scale)
-        zero_sticky = overflow_sticky = scale is not None
+        return fixed_float_effects(left, mode, scale=scale, astat=astat, stky=stky)
     elif operation == "round":
         result = float_round(left, mode)
     elif operation in ("neg", "abs", "pass", "scale", "min", "max", "clip", "copysign"):
@@ -454,10 +465,10 @@ def floating_alu(operation: str, left: int, right: int = 0, *, mode: Mode,
                 result = FloatingResult(raw)
         absolute = operation == "abs"
         input_sign = absolute and x.negative and x.kind != "nan"
-        zero_sticky = operation == "scale"
+        underflow_sticky = operation == "scale" and result.underflow
     else:
         raise Unqualified(f"unmodeled floating ALU operation: {operation}")
-    return _floating_effects(result, astat, stky, zero_sticky=zero_sticky,
+    return _floating_effects(result, astat, stky, underflow_sticky=underflow_sticky,
                              overflow_sticky=overflow_sticky, absolute=absolute,
                              input_sign=input_sign)
 
@@ -477,22 +488,17 @@ def float_parts(operation: str, raw: int, mode: Mode, *, saturate: bool = False,
                 astat: int = 0, stky: int = 0) -> IntegerResult:
     """MANT/LOGB: mixed fixed/floating outputs with instruction-specific flags."""
     validate_flags(astat, stky)
-    if operation == "mant":
-        if mode.precision == 32 and raw & 255:
-            raise Unqualified("MANT extension input with RND32 requires qualification")
     x = operand(raw, mode)
     flags = AF
-    if operation == "mant":
-        value = ((1 << 31) | x.fraction) if x.kind == "normal" else 0
-        if x.kind in ("infinity", "nan"):
-            value = WORD_MASK
+    if x.kind == "nan" and operation in ("mant", "logb"):
+        result = _invalid(mode).raw
+        flags |= AI
+    elif operation == "mant":
+        value = ((1 << 31) | x.fraction) if x.kind in ("normal", "infinity") else 0
         flags |= AS if x.negative else 0
         flags |= AV if x.kind == "infinity" else 0
-        flags |= AI if x.kind == "nan" else 0
         result = value << 8
     elif operation == "logb":
-        if x.kind == "nan":
-            raise Unqualified("LOGB NaN sentinel status requires qualification")
         if x.kind == "normal":
             value = x.exponent - 127
             result = (value & WORD_MASK) << 8
@@ -512,11 +518,7 @@ def float_parts(operation: str, raw: int, mode: Mode, *, saturate: bool = False,
 def fixed_from_float(operation: str, raw: int, mode: Mode, *, scale: int = 0,
                      saturate: bool = False, astat: int = 0,
                      stky: int = 0) -> IntegerResult:
-    """Qualified FIX/TRUNC result and flags, including exponent-based AV.
-
-    The all-ones floating sentinel's AN effect remains unqualified. This function
-    refuses NaNs and unsaturated overflow rather than guessing complete flags.
-    """
+    """FIX/TRUNC signed rounding, post-round range checks and full effects."""
     if operation not in ("fix", "trunc"):
         raise Unqualified(f"unmodeled float-to-fixed conversion: {operation}")
     if not isinstance(scale, int) or not -(1 << 31) <= scale < 1 << 31:
@@ -524,9 +526,8 @@ def fixed_from_float(operation: str, raw: int, mode: Mode, *, scale: int = 0,
     validate_flags(astat, stky)
     x = operand(raw, mode)
     if x.kind == "nan":
-        raise Unqualified("FIX/TRUNC NaN sentinel status requires qualification")
+        return IntegerResult(_invalid(mode).raw, (astat & ~ALU_FLAGS) | AF | AI, stky | AIS)
     shifted_exponent = x.exponent + scale
-    overflow_flag = x.kind == "infinity" or shifted_exponent > 157
     small = False
     if x.kind in ("zero", "denormal"):
         value = 0
@@ -544,13 +545,15 @@ def fixed_from_float(operation: str, raw: int, mode: Mode, *, scale: int = 0,
             value = number.numerator // number.denominator
         else:
             value = rounded_integer(number, "zero" if operation == "trunc" else "nearest")
-    if not -(1 << 31) <= value < 1 << 31:
+    overflow = not -(1 << 31) <= value < 1 << 31
+    sticky = (AUS if small else 0) | (AVS if overflow else 0)
+    if overflow:
         if not saturate:
-            raise Unqualified("FIX/TRUNC unsaturated overflow sentinel status requires qualification")
+            return IntegerResult(_invalid(mode).raw, (astat & ~ALU_FLAGS) | AF | AV | AI,
+                                 stky | sticky | AIS)
         value = -(1 << 31) if value < 0 else (1 << 31) - 1
     flags = AF | (AZ if value == 0 else 0) | (AN if value < 0 else 0)
-    flags |= AV if overflow_flag else 0
-    sticky = (AUS if small else 0) | (AVS if overflow_flag else 0)
+    flags |= AV if overflow else 0
     return IntegerResult((value & WORD_MASK) << 8,
                          (astat & ~ALU_FLAGS) | flags, stky | sticky)
 
@@ -702,56 +705,64 @@ def float_unpack(raw: int, *, astat: int = 0, stky: int = 0) -> IntegerResult:
     return IntegerResult(value, flags, stky)
 
 
-def float_pack_value(raw: int) -> int:
-    """Qualified 16-bit FPACK field only, not full register/status effects.
-
-    The table specifies exponent clipping and exact fields, but does not settle
-    inexact rounding or the complete upper result storage. Those remain gaps.
-    """
+def _pack_short(raw: int) -> tuple[int, bool]:
     word = raw_word(raw)  # FPACK consumes the IEEE32 field, not the extension.
     sign, exponent, fraction = (word >> 16) & 32768, (word >> 23) & 255, word & 0x7FFFFF
     if exponent > 135:
-        return sign | 32767
+        return sign | 32767, True
     if exponent < 110:
-        return sign
+        return sign, False
     if exponent > 120:
-        value, discarded = divmod(fraction, 4096)
-        value |= (exponent - 120) << 11
+        divisor = 4096
+        magnitude = Fraction(fraction, divisor) + (exponent - 120) * 2048
     else:
-        value, discarded = divmod((1 << 23) | fraction, 1 << (133 - exponent))
-    if discarded:
-        raise Unqualified("inexact FPACK rounding requires qualification")
-    return sign | value
+        magnitude = Fraction((1 << 23) | fraction, 1 << (133 - exponent))
+    rounded = (magnitude + Fraction(1, 2)) // 1
+    return sign | min(32767, rounded), rounded > 32767
+
+
+def float_pack_value(raw: int) -> int:
+    return _pack_short(raw)[0]
+
+
+def float_pack(raw: int, *, astat: int = 0, stky: int = 0) -> IntegerResult:
+    validate_flags(astat, stky)
+    field, overflow = _pack_short(raw)
+    return IntegerResult(field << 8, (astat & ~SHIFTER_FLAGS) | (SV if overflow else 0), stky)
 
 
 def floating_seed(operation: str, raw: int, mode: Mode, *, astat: int = 0,
                   stky: int = 0) -> IntegerResult:
-    """RECIPS/RSQRTS special cases; ordinary ROM seeds are never approximated."""
+    """RECIPS/RSQRTS anchored at observed complete seed words."""
     if operation not in ("recips", "rsqrts"):
         raise Unqualified(f"unmodeled seed operation: {operation}")
     validate_flags(astat, stky)
-    if mode.precision == 32 and Operand(raw).kind == "nan" and (raw & (FRACTION_MASK ^ 255)) == 0:
-        raise Unqualified("seed classification with extension-only NaN requires qualification")
     x = operand(raw, mode)
     zero_input = x.kind in ("zero", "denormal")
     invalid = x.kind == "nan" or (operation == "rsqrts" and x.negative and not zero_input)
+    tiny = operation == "recips" and x.kind == "normal" and x.exponent > 252
     if invalid:
-        if mode.precision == 32:
-            raise Unqualified("seed RND32 invalid result requires qualification")
-        if operation == "recips" and x.negative:
-            raise Unqualified("RECIPS negative NaN input AN requires qualification")
         result = _invalid(mode).raw
     elif zero_input:
         result = INFINITY | (SIGN if x.negative else 0)
-    elif (operation == "recips" and x.exponent > 252) or x.kind == "infinity":
-        result = SIGN if operation == "recips" and x.negative else 0
+    elif tiny or x.kind == "infinity":
+        result = SIGN if x.negative else 0
     else:
-        raise Unqualified(f"{operation.upper()} ROM entry requires independent qualification")
-    zero_result = not invalid and not zero_input
-    negative = x.negative if operation == "recips" else x.negative and zero_input
+        unbiased = x.exponent - 127
+        if operation == "recips":
+            base = RECIPROCAL[x.fraction // (1 << 24)]
+            delta = -unbiased
+        else:
+            odd = unbiased % 2
+            table = RSQRT_ODD if odd else RSQRT_EVEN
+            base = table[x.fraction // (1 << 25)]
+            delta = (-odd - unbiased) // 2
+        result = ((base + delta * (1 << 23)) << 8) | (SIGN if x.negative else 0)
+    zero_result = result in (0, SIGN)
+    negative = bool(result & SIGN) and not invalid
     flags = AF | (AZ if zero_result else 0) | (AN if negative else 0)
     flags |= (AV if zero_input else 0) | (AI if invalid else 0)
-    sticky = (AUS if operation == "recips" and zero_result else 0)
+    sticky = AUS if tiny else 0
     sticky |= (AVS if zero_input else 0) | (AIS if invalid else 0)
     return IntegerResult(result, (astat & ~ALU_FLAGS) | flags, stky | sticky)
 

@@ -22,18 +22,18 @@ reference processor. See issue #2.
 | Finite FP rounding | Exact rational nearest ties-to-even and toward-zero, 24-/32-bit significands, overflow to infinity or format-specific maximum finite |
 | FP value operations | ADD, SUB, average before rounding, multiply; independent value and exception metadata |
 | Qualified FP effects | ADD/SUB and absolute forms, average, negate/absolute/pass, RND, SCALB, FLOAT, MIN/MAX/CLIP/COPYSIGN, compare and floating multiply; complete scalar flags/sticky results within the stated domain |
-| MANT/LOGB effects | Raw mantissa with hidden bit, unbiased fixed exponent, instruction-specific infinity/zero/saturation results, AF/AS/AV/AI and sticky effects; explicit RND32/sentinel gaps |
+| MANT/LOGB effects | Raw mantissa with hidden bit, unbiased fixed exponent, RND32 input projection, zero/infinity/saturation results and width-specific invalid sentinels |
 | Computational input views | Strict RND32 clears eight extension bits before arithmetic; denormal inputs become signed zeros without a new numeric underflow event |
 | Special values | Signed zeros and their sign flags, infinities, NaN formats and signs, unordered COMP, and the minimum-normal rounding boundary for single-function arithmetic |
 | Conversion values | FLOAT always returns a 40-bit result, including with RND32 selected; explicit RND consumes the current computational view and returns 32-bit precision |
-| FIX/TRUNC effects | Finite integer outputs and saturated overflow/infinity, scaled inputs, input precision, nearest/floor/toward-zero distinctions, exponent-based AV and pre-rounded AUS; sentinel-result flags explicitly refused |
+| FIX/TRUNC effects | Scaled inputs, nearest/floor/toward-zero distinctions, post-round integer range, pre-round AUS, saturation and width-specific invalid sentinels |
 | Fixed multiplier | SSI/SUI/USI/UUI and fractional/rounded variants, full 80-bit multiply/MAC/MSUB, separate MR/register destinations and preserved old flags |
 | Accumulator operations | Signed/unsigned integer/fraction saturation, explicit nearest rounding, clear, all three limb reads/writes; MR1 writes extend their sign into MR2 |
 | Scalar shifter | Logical/arithmetic shifts, rotation, bit clear/set/toggle/test, field deposit/extract with sign extension and deposit OR, leading zero/one counts and normal/extended exponent extraction |
 | Bit FIFO | 64-bit raw storage, seven-bit pointer read/write, append, extract and no-update query; defined scalar results and status, explicit refusal of undefined data/pointer results |
 | Short float unpack | All 65,536 short encodings, including gradual underflow, signed zero and maximum finite magnitude; exact binary32 results independent of ALU modes |
-| Short float pack values | Exact finite fields, source-exponent clipping and signed-zero fields; 16-bit values only, inexact rounding and full register/status effects remain unqualified |
-| Seed special cases | RECIPS/RSQRTS zeros, flushed denormals, infinities and qualified 40-bit invalid results; RECIPS large-exponent zero; ordinary ROM entries explicitly refused |
+| Short float pack | Exact and rounded short fields, signed zero, clipping and shifter flags |
+| Reciprocal seeds | Every observed RECIPS/RSQRTS ROM bin, exponent reconstruction, signed zero and denormal inputs, infinity and width-specific invalid sentinels |
 | Dual ALU | ADD/SUB from common old inputs, OR of the new ALU status bits, sticky union; fixed saturation and qualified 32-/40-bit floating results |
 | Multifunction arithmetic | Fixed product/MAC/MSUB with ALU, floating product with ALU/conversions, multiply plus dual ALU; disjoint flag ownership and old 80-bit accumulator |
 | SIMD numeric expectations | Authored paired PEx/PEy values with distinct carry/overflow, saturation, floating exceptions and old flag/sticky inputs; no cross-lane flag union |
@@ -65,7 +65,7 @@ architecture; the introductory default-mode sentence on 3-37 is inconsistent.
 python3 test/support/generate_expectations.py --output build/local/strict-expectations.json
 ```
 
-The generator checks 279 independently authored numeric/conversion/accumulator/shifter
+The generator checks 311 independently authored numeric/conversion/accumulator/shifter
 anchors and 48,768 positions between neighboring normal encodings. The latter
 span both precisions, both signs, all 254 normal exponents, six fraction patterns, four
 quarter-ULP positions and both rounding directions. Expected neighbors are formed
@@ -75,10 +75,9 @@ cases. Another 27,648 multiplier cases compare direct unbounded arithmetic with
 schoolbook 16-bit partial products, signed-input corrections and five-limb carry/
 borrow propagation. Their expected overflow uses guard-bit patterns while the
 reference checks numeric bounds; their expected underflow uses a magnitude test.
-Another 10,972 conversions compare against signed quotient/remainder arithmetic
+Another 12,800 conversions compare against signed quotient/remainder arithmetic
 over both precisions, signs, mode-bit values, instructions and saturation choices,
-ten exponents, eight fraction patterns and five scales. The same lattice requires
-1,828 explicit refusals for unqualified unsaturated overflow results.
+ten exponents, eight fraction patterns and five scales.
 Another 130,817 shifter cases route individual bits and count textual prefixes;
 15,449 FIFO cases use bit lists instead of register shifts, covering every legal
 pointer/length combination for three data patterns, including no-update queries.
@@ -86,22 +85,21 @@ They also check all 128 pointer reads and all low-byte pointer-write patterns
 with both input SF states and unrelated upper bits.
 All 65,536 short encodings are unpacked and checked by decoding the resulting
 binary32 rational and comparing it to the short format's value equation.
-Another 30,008 full scalar FP cases use an authored wire-value codebook for exact
+Another 35,088 full scalar FP cases use an authored wire-value codebook for exact
 dyadic arithmetic, textual compare history and direct mantissa/exponent field
 checks. They span both precisions and rounding settings, ALU/multiplier flag
 ownership, unary/scaled operations, all normal exponents and eight fraction
-patterns. The same checks require 5,080 explicit refusals at the unqualified
-MANT extension boundary.
+patterns.
 Another 13,072 multifunction cases compare the composed reference against
 sign-bit overflow identities, independently rounded fixed averages, five-limb
 products/accumulations and the exact floating wire-value codebook. Authored
 multifunction records map old R0/R4/R8/R12 inputs to overlapping destination
 registers, supplying expectations for later installed-image dependency checks.
 Paired lane records give independent complete scalar effects for each PE.
-Another 133,832 PACK field checks construct IEEE inputs with bit strings from all
-65,536 short encodings and exercise exponent clipping; 260 inexact inputs require
-explicit refusal. A further 896 seed special cases check both precisions, both
-rounding settings where qualified, signs, denormals and old status/sticky bits.
+Another 134,092 PACK field checks construct IEEE inputs with bit strings from all
+65,536 short encodings and exercise exponent clipping and inexact rounding.
+A further 896 seed special cases check both precisions, rounding settings,
+signs, denormals and old status/sticky bits.
 Another 928 predicate and aggregation checks use literal truth tables, independent
 single-flag bit positions and all four true/false lane combinations in SISD/SIMD.
 The output contains fixed and qualified FIX/TRUNC result/flag records and floating
@@ -145,25 +143,14 @@ instruction family and execution mode.
 `Unqualified` prevents the generator from silently supplying a guessed expectation.
 Currently explicit refusals include:
 
-- Complete FIX/TRUNC flags when the result is the all-ones floating sentinel
-  (NaN input, or unsaturated infinity/overflow). The sentinel value is documented;
-  its AN effect is not established by the fixed-point result wording. Saturated
-  infinities and finite integer results already have complete scalar expectations.
-- LOGB's NaN sentinel, and MANT with RND32 selected
-  and nonzero extension input. MANT's exact-output wording and the general input
-  precision rule need stronger evidence to resolve that input boundary.
-- Inexact FPACK rounding, its complete upper result storage and status effects;
-  ordinary RECIPS/RSQRTS ROM entries, their RND32 invalid/extension-only NaN
-  cases and RECIPS AN for a negative NaN input.
 - SZ for a negative BTST position and sign extension of a zero-length field.
 - FIFO operations with a prohibited length, overfull/invalid pointer, or insufficient
   capacity/data. The manual defines SV but leaves the resulting data/pointer
   undefined; no invented full-result expectation is emitted.
 - Operations outside the currently implemented numerical functions.
 
-Still required for complete numerical coverage: the floating, conversion, packing and seed details
-above, OR-shift status, and
-parallel memory ordering, other conditional transfer admission and mode/register-bank
+Still required for complete numerical coverage: the shifter and FIFO details
+above, OR-shift status, parallel memory ordering, other conditional transfer admission and mode/register-bank
 composition beyond admitted raw writes. Qualified arithmetic and writeback
 composition do not close those architectural gaps.
 The explicit FIX/TRUNC distinction on 11-37 must not be replaced by a shared host
@@ -226,16 +213,55 @@ FastFP32 rounds finite inputs first and preserves the class and sign of NaN
 inputs, including extension-only payloads. Its expected effects come from the
 independent approximation and the qualified operations.
 
-Remaining observation targets include FIX/TRUNC sentinel flags, LOGB NaN,
-FPACK inexact storage and flags, and MANT with nonzero extension under RND32.
-The reciprocal and reciprocal-square-root seed probes need every ordinary
-mantissa bin and both square-root exponent parities. Shifter gaps include
-zero-source OR-shift, BTST position -1 and sign-extended empty fields.
+Shifter observation targets include zero-source OR-shift, BTST position -1
+and sign-extended empty fields.
+
+## Floating conversion and seed observations
+
+The first ADSP-21489 conversion batch contained 432 authored cases for eight
+MODE1 configurations. All 48 cases for FLOAT and scaled FLOAT matched the
+independent model after distinguishing exact zero from nonzero underflow.
+Strict FLOAT retains 40-bit precision with RND32 set. Scaled FLOAT sets
+AUS when a nonzero result underflows and preserves it when the input is zero.
+Its signed scale includes the full fixed 32-bit range. FastFP32 rounds the
+floating result to binary32 using the guest rounding direction.
+
+SCALB matched the independent model in 144 cases across the first batch
+and a 336-case follow-up. The scale is a signed 32-bit fixed operand. In
+nearest rounding, an exact midpoint below minimum normal returns minimum
+normal with AUS set and AZ clear. Scaling an input signed zero or a
+denormal consumed as zero generates no AUS.
+
+A separate sweep checked 1,024 RECIPS and RSQRTS lookups in both widths and
+rounding modes. It covered the 128 RECIPS indices and both groups of 64
+RSQRTS indices. For each index the fraction matched across lower and upper
+bin endpoints and different input exponents. The result exponents matched
+`-e - 1` for RECIPS and `-floor(e/2) - 1` for RSQRTS, where `e` is the
+unbiased source exponent. Seed lowering and installed-image qualification
+use these observed values.
+
+The 244-case seed boundary follow-up also distinguishes two RECIPS zero
+results. Finite inputs with unbiased exponent 126 or 127 set AUS on signed
+zero output. Infinity inputs produce signed zero and preserve AUS.
+
+In total 1,272 non-control conversions and special cases matched the
+independent model, including the 288-case FIX/TRUNC and packing follow-up.
+The separate 1,024-case ROM sweep supplies the expected words in
+`test/support/seed_observations.py`. To reproduce the sweep, run one
+RECIPS probe for each of the 128 mantissa indices at unbiased exponent zero,
+and one RSQRTS probe for each of the 64 indices at unbiased exponents
+minus one and zero. Repeat with each rounding width and direction, varying
+the exponent within the same parity and using both endpoints of each bin.
+Capture the raw destination and both status words through the procedure above.
+
+An additional 72 paired SIMD probes checked FIX, scaled TRUNC, MANT, LOGB,
+FPACK, FUNPACK, RECIPS and RSQRTS with independent inputs and flags in the
+two lanes. The conditional FPACK probes preserved the masked lane's raw
+destination and status. All outputs and flags matched the independent model.
 
 ## Primary observation tools
 
-The remaining exceptional and seed details require primary observations or
-further primary specification. The CCES 2.12.1 Installation Guide (June 2024,
+The CCES 2.12.1 Installation Guide (June 2024,
 sections 6–7) lists classic SHARC simulation/debugging under Windows. Its optional
 Linux functional tools support SHARC+ families and exclude earlier SHARCs such
 as ADSP-21489. Results from a different SHARC+ profile cannot settle these gaps.
@@ -253,15 +279,16 @@ bits are MVS/MUS, while MOS remains unchanged.
 
 ADD/SUB, their absolute forms and average set AUS for nonzero underflow.
 Negate, absolute, pass, RND, selection operations and compare leave AUS
-unchanged. Average clears AV and preserves AVS. The conversion reference still
-uses the manual rule for SCALB and scaled FLOAT. Their observable status
-boundaries remain part of #24. Unscaled FLOAT preserves AUS and AVS.
+unchanged. Average clears AV and preserves AVS. SCALB and scaled FLOAT
+set AUS on nonzero underflow and AVS on overflow. Unscaled FLOAT preserves
+both sticky bits.
 
 Ordered compare treats both zeros as equal and orders infinities normally. It
 shifts CACC independently of the numeric result, preserves other non-ALU bits,
 sets AF and writes no data register. MANT returns a fixed 1.31 field with AN
-cleared, AS from the input sign, and an all-ones **fixed field** for infinity/NaN.
-This differs from the all-40-bit-ones floating NaN sentinel. LOGB returns a fixed
+cleared and AS from the sign of a valid input. Infinity yields the hidden bit
+and AV. A NaN yields the width-specific floating sentinel and AI with AS clear.
+LOGB returns a fixed
 unbiased exponent for a normal input; its zero exponent sets AZ without changing
 AUS. Zero/denormal and infinity inputs use its separately specified saturated
 fixed limits or floating infinities. None of these scalar oracle checks establish
@@ -323,14 +350,15 @@ the exponent before conversion; the model bounds extreme signed 32-bit scales
 before allocating powers of two. Normal inputs use the computational precision
 rule on 3-37; denormal inputs flush before conversion and do not set AUS.
 
-AV uses the stated biased-exponent-plus-scale threshold of 157, independently
-of signed integer range overflow. Consequently exact negative INT_MIN sets AV,
-while rounding the greatest representable value below positive 2**31 can overflow
-without setting AV. Saturation clamps the rounded integer but leaves this AV rule
-intact. AUS describes a nonzero pre-rounded magnitude below one, including when
-nearest rounding produces one or negative floor produces minus one. Unrelated
-ASTAT bits and old sticky bits survive, AF is set and AC/AS/AI are cleared for the
-qualified cases. No sentinel flag expectation is fabricated to fill the gap.
+The ADSP-21489 simulator sets AV/AVS when the rounded result exceeds signed
+32-bit range or the input is infinite. Exact negative INT_MIN leaves AV clear,
+and rounding a value just below positive 2**31 can set AV. The implementation
+follows these observations at the range limits described on 11-38. Saturation clamps
+the result. An unsaturated overflow or infinity sets AI/AIS and writes the
+all-ones floating sentinel at the current result width. A NaN sets AI/AIS with
+AV clear. Both invalid cases clear AN. AUS describes a nonzero pre-rounded
+magnitude below one, including when nearest rounding produces one or negative
+floor produces minus one. Unrelated ASTAT bits and old sticky bits survive.
 
 ## Shifter and bit FIFO details
 
@@ -362,27 +390,25 @@ the short format's gradual underflow, and clears SZ/SV/SS even for signed zero.
 It ignores unrelated upper input bits and clears the result's extension byte.
 The exact format equations and independently authored anchors follow appendix C.
 
-## Packing fields and seed special cases
+## Packing and seed effects
 
-FPACK's source is the IEEE32 field, independently of the raw extension byte.
-The description on 11-84 and table C-2 specify clipping to the largest short magnitude above source
-biased exponent 135 and a signed-zero field below exponent 110. Within that range
-the value model emits only exactly representable short fields; it refuses any
-discarded nonzero bit instead of guessing the rounding rule. Source exponent 255
-uses the table's clipping branch for the value field; no floating exception or
-complete shifter-status expectation is inferred from it. The exact-input checks
-do not assume a rule for upper destination bits or prove inexact packing.
+Strict FPACK consumes the IEEE32 field. FastFP32 applies its computational
+input rounding first. The description on 11-84 and table C-2 specify clipping
+to the largest short magnitude above biased exponent 135 and signed zero
+below exponent 110. Within that range the shifter rounds ties up in magnitude,
+independently of MODE1.TRUNC. A rounding carry past the largest short value
+sets SV and clips, as does source exponent 255. The 16-bit result is
+right-justified in the fixed field and all other destination bits are cleared.
+Both FPACK and FUNPACK clear SZ and SS and preserve non-shifter flags and STKY.
 
 Chapters 11-41 through 11-44 specify seed exceptions separately from ordinary
 ROM lookup. Both operations map computational signed zero, including a flushed
-denormal, to signed infinity with AV/AVS. RECIPS maps large finite exponents and
-infinities to signed zero and updates AZ/AUS, with AN from its input. RSQRTS maps
-positive infinity to positive zero with AZ but preserves AUS; negative nonzero
-inputs and NaNs return the qualified all-ones 40-bit NaN with AI/AIS and AN clear.
-Its AN rule explicitly names negative-zero input, so those seed cases can be
-qualified without guessing the general ALU AN rule for a negative-zero result.
-RND32 canonical NaNs and every ordinary ROM seed remain refused. No mathematical
-reciprocal or square-root approximation substitutes for a hardware seed.
+denormal, to signed infinity with AV/AVS. RECIPS maps large finite exponents
+to signed zero with AZ/AUS and infinities to signed zero with AZ. RSQRTS maps
+positive infinity to positive zero with AZ and preserves AUS. Negative nonzero
+RSQRTS inputs and either operation's NaNs produce an all-ones floating sentinel
+with AI/AIS and AN clear. The result width controls the sentinel extension byte.
+Ordinary seeds use the observed ROM fraction and instruction-specific exponent.
 
 ## Fixed multiplier details
 

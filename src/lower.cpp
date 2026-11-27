@@ -156,7 +156,10 @@ bool fixed_multiplier(const Compute &compute) {
 
 bool floating_compute(const Compute &compute) {
   return (compute.kind == ComputeKind::alu && floating_alu(compute.opcode)) ||
-         (compute.kind == ComputeKind::multiplier && compute.opcode == float_multiply_opcode);
+         (compute.kind == ComputeKind::multiplier && compute.opcode == float_multiply_opcode) ||
+         (compute.kind == ComputeKind::shifter &&
+          (compute.opcode == static_cast<unsigned>(FloatingOp::pack_short) ||
+           compute.opcode == static_cast<unsigned>(FloatingOp::unpack_short)));
 }
 
 bool fixed_multifunction(const Compute &compute) {
@@ -2093,7 +2096,8 @@ void Lowering::compute_instruction(Values &values,
                                         static_cast<FloatingOp>(compute.opcode),
                                         {.rnd32 = (context_ & rounding32_mode) != 0,
                                          .truncate = (context_ & truncation_mode) != 0,
-                                         .fast_fp32 = execution_mode_ == ExecutionMode::fast_fp32},
+                                         .fast_fp32 = execution_mode_ == ExecutionMode::fast_fp32,
+                                         .saturate = (context_ & saturation_mode) != 0},
                                         {.left = before[compute.inputs[0]],
                                          .right = before[compute.inputs[1]],
                                          .status = before[status_value],
@@ -5482,9 +5486,18 @@ std::uint32_t compute_context(const Compute &compute, ExecutionMode mode) {
   std::uint32_t mask{simd_mode};
   if (floating_compute(compute)) {
     const auto operation = static_cast<FloatingOp>(compute.opcode);
-    if (mode == ExecutionMode::strict) { mask |= rounding32_mode; }
-    if (mode == ExecutionMode::fast_fp32 || floating_arithmetic(operation) ||
-        operation == FloatingOp::multiply || operation == FloatingOp::round) {
+    if (mode == ExecutionMode::strict && compute.kind != ComputeKind::shifter &&
+        operation != FloatingOp::float_fixed && operation != FloatingOp::float_scaled) {
+      mask |= rounding32_mode;
+    }
+    if (operation == FloatingOp::exponent || fixed_conversion(operation)) {
+      mask |= saturation_mode;
+    }
+    if ((mode == ExecutionMode::fast_fp32 && operation != FloatingOp::unpack_short) ||
+        floating_arithmetic(operation) || operation == FloatingOp::fix ||
+        operation == FloatingOp::fix_scaled || operation == FloatingOp::multiply ||
+        operation == FloatingOp::round || operation == FloatingOp::float_scaled ||
+        operation == FloatingOp::scale) {
       mask |= truncation_mode;
     }
   } else if (fixed_multiplier(compute) || compute.kind == ComputeKind::mr_transfer) {
