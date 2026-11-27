@@ -1,49 +1,49 @@
 # Common benchmarks
 
-K1 through K6 have checked Linux x86-64 executions. K3 has passed Strict in
-Exact and Direct. The common measurement batch covers FastFP32 and the complete
-mode matrix. macOS ARM64 and protected-page peripheral I/O remain open.
+K1 through K6 have checked Linux x86-64 results in Strict and FastFP32 with
+Exact and Direct memory. macOS ARM64 and protected-page peripheral I/O remain open.
 
 ## Current Linux results
 
-### K1 and K6
-
 Medians of three unscaled runs on an Intel i5-1135G7 pinned to logical CPU 2,
-with Clang/LLVM 19.1.7. The preparation time and native size refer to the shared
-image, which is prepared once per numerical and memory mode.
+with Clang/LLVM 19.1.7 at measured revision `cdd517e`. K1 continuous, K1 bounded
+and K6 reuse the same prepared image for each numerical and memory mode.
 
 | Kernel | Schedule | Identity | Memory | Host inst./guest inst. | Host cycles/guest inst. | M guest inst./s | Guest/Clang O3 | Prepare s | Native bytes |
 |---|---|---|---|---:|---:|---:|---:|---:|---:|
-| K1 | continuous | Strict | exact | 121.130 | 32.813 | 109.96 | 51.02 | 27.260 | 1,420,189 |
-| K1 | bounded | Strict | exact | 128.054 | 35.359 | 102.17 | 56.84 | 27.260 | 1,420,189 |
-| K6 | interrupts | Strict | exact | 129.566 | 35.670 | 101.18 | 52.33 | 27.260 | 1,420,189 |
-| K1 | continuous | FastFP32 | exact | 121.130 | 33.985 | 106.21 | 48.32 | 28.850 | 1,420,189 |
-| K1 | bounded | FastFP32 | exact | 128.054 | 39.638 | 91.32 | 56.27 | 28.850 | 1,420,189 |
-| K6 | interrupts | FastFP32 | exact | 129.566 | 36.247 | 99.38 | 57.68 | 28.850 | 1,420,189 |
-| K1 | continuous | Strict | direct | 120.810 | 32.457 | 111.51 | 49.27 | 28.817 | 1,404,861 |
-| K1 | bounded | Strict | direct | 128.050 | 36.347 | 99.51 | 57.72 | 28.817 | 1,404,861 |
-| K6 | interrupts | Strict | direct | 129.585 | 38.168 | 94.80 | 56.82 | 28.817 | 1,404,861 |
-| K1 | continuous | FastFP32 | direct | 120.810 | 32.984 | 109.90 | 48.54 | 28.042 | 1,404,861 |
-| K1 | bounded | FastFP32 | direct | 128.050 | 35.673 | 101.43 | 56.94 | 28.042 | 1,404,861 |
-| K6 | interrupts | FastFP32 | direct | 129.585 | 36.229 | 99.90 | 56.81 | 28.042 | 1,404,861 |
+| K1 | continuous | Strict | exact | 121.130 | 31.997 | 113.92 | 51.28 | 25.966 | 1,420,189 |
+| K1 | continuous | Strict | direct | 120.810 | 32.382 | 111.84 | 47.66 | 28.098 | 1,404,861 |
+| K1 | continuous | FastFP32 | exact | 121.130 | 32.050 | 112.87 | 51.06 | 27.872 | 1,420,189 |
+| K1 | continuous | FastFP32 | direct | 120.810 | 32.803 | 110.37 | 42.05 | 25.890 | 1,404,861 |
+| K1 | bounded | Strict | exact | 128.054 | 35.005 | 104.10 | 59.24 | 25.966 | 1,420,189 |
+| K1 | bounded | Strict | direct | 128.050 | 36.082 | 100.34 | 60.32 | 28.098 | 1,404,861 |
+| K1 | bounded | FastFP32 | exact | 128.054 | 34.539 | 104.81 | 54.50 | 27.872 | 1,420,189 |
+| K1 | bounded | FastFP32 | direct | 128.050 | 35.558 | 102.05 | 56.07 | 25.890 | 1,404,861 |
+| K2 | continuous | Strict | exact | 65.432 | 17.776 | 181.69 | 24.89 | 190.149 | 5,277,010 |
+| K2 | continuous | Strict | direct | 65.576 | 19.150 | 170.78 | 26.52 | 209.526 | 5,301,851 |
+| K2 | continuous | FastFP32 | exact | 65.432 | 18.105 | 177.87 | 25.03 | 208.633 | 5,277,010 |
+| K2 | continuous | FastFP32 | direct | 65.576 | 18.732 | 170.88 | 26.73 | 205.044 | 5,301,851 |
+| K3 | continuous | Strict | exact | 57.326 | 15.098 | 241.39 | 16.39 | 958.294 | 22,847,601 |
+| K3 | continuous | Strict | direct | 57.326 | 15.448 | 236.17 | 16.99 | 918.490 | 22,706,971 |
+| K3 | continuous | FastFP32 | exact | 57.326 | 27.200 | 133.30 | 23.36 | 953.960 | 22,847,601 |
+| K3 | continuous | FastFP32 | direct | 57.326 | 15.405 | 234.21 | 16.93 | 826.272 | 22,706,971 |
+| K4 | continuous | Strict | exact | 24.278 | 5.745 | 629.81 | 39.59 | 6.193 | 361,783 |
+| K4 | continuous | Strict | direct | 24.278 | 5.543 | 652.82 | 38.73 | 6.165 | 361,783 |
+| K4 | continuous | FastFP32 | exact | 24.278 | 5.648 | 639.07 | 38.22 | 6.161 | 361,783 |
+| K4 | continuous | FastFP32 | direct | 24.278 | 5.775 | 625.04 | 39.91 | 6.122 | 361,783 |
+| K5 | continuous | Strict | exact | 7.863 | 2.042 | 1763.21 | 71.22 | 1.159 | 55,540 |
+| K5 | continuous | Strict | direct | 7.863 | 2.040 | 1763.77 | 68.75 | 1.124 | 55,609 |
+| K5 | continuous | FastFP32 | exact | 7.863 | 2.150 | 1679.50 | 74.34 | 1.134 | 55,540 |
+| K5 | continuous | FastFP32 | direct | 7.863 | 2.039 | 1774.06 | 67.21 | 1.092 | 55,609 |
+| K6 | interrupts | Strict | exact | 129.566 | 36.772 | 99.13 | 59.22 | 25.966 | 1,420,189 |
+| K6 | interrupts | Strict | direct | 129.585 | 36.215 | 99.93 | 54.47 | 28.098 | 1,404,861 |
+| K6 | interrupts | FastFP32 | exact | 129.566 | 35.957 | 100.53 | 58.02 | 27.872 | 1,420,189 |
+| K6 | interrupts | FastFP32 | direct | 129.585 | 35.779 | 101.14 | 57.71 | 25.890 | 1,404,861 |
 
-### K4 and K5
-
-Medians of three unscaled runs on an Intel i5-1135G7, pinned to logical CPU 3,
-with Clang/LLVM 19.1.7. K4 was measured for [PR #15](https://github.com/Weichwolf/sharc/pull/15)
-and K5 for [PR #16](https://github.com/Weichwolf/sharc/pull/16). Both workloads
-check complete output and precise progress in each numerical identity.
-
-| Kernel | Identity | Memory | Host inst./guest inst. | Host cycles/guest inst. | M guest inst./s | Guest/Clang O3 | Prepare s | Native bytes |
-|---|---|---|---:|---:|---:|---:|---:|---:|
-| K4 | Strict | exact | 24.278 | 5.683 | 657.9 | 39.33 | 5.823 | 361,783 |
-| K4 | FastFP32 | exact | 24.278 | 5.694 | 655.7 | 39.24 | 5.832 | 361,783 |
-| K4 | Strict | direct | 24.278 | 5.531 | 675.6 | 38.87 | 5.764 | 361,783 |
-| K4 | FastFP32 | direct | 24.278 | 5.545 | 675.5 | 39.16 | 5.661 | 361,783 |
-| K5 | Strict | exact | 7.720 | 2.037 | 1855.4 | 59.78 | 0.998 | 55,032 |
-| K5 | FastFP32 | exact | 7.720 | 2.033 | 1861.8 | 60.05 | 1.004 | 55,032 |
-| K5 | Strict | direct | 7.720 | 2.034 | 1862.6 | 59.50 | 1.015 | 55,037 |
-| K5 | FastFP32 | direct | 7.720 | 2.032 | 1864.8 | 57.05 | 1.009 | 55,037 |
+K3 preparation took 826.3 to 958.3 seconds per image, with 22,706,971 to
+22,847,601 native bytes. The FastFP32 Exact measurement for this fixed-point
+workload recorded 27.200 host cycles per guest instruction, compared with
+15.098 to 15.448 across the other three K3 cases. The cause is open.
 
 Keep raw JSONL, summaries and host receipts under `build/local/`. The baseline,
 cost attribution and before/after measurements are recorded in
