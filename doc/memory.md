@@ -1,8 +1,9 @@
 # Prepared memory access
 
 The core executes classic type 15 pre-indexed and type 1a parallel post-indexed
-normal-word transfers with checked runtime I/O. The remaining access widths and
-code-changing stores are open. The reference is Programming Reference 2.4,
+data-register transfers over the declared storage views, with checked runtime
+I/O. Forced long-word instruction encodings and code-changing stores remain
+open. The reference is Programming Reference 2.4,
 sections 2-6–2-7, 4-110, 6-10–6-31, 7-36–7-40, 9-7–9-9, 9-56–9-59 and
 10-5/21/31/32, pinned in `reference-manifest.json`.
 
@@ -13,19 +14,25 @@ permissions. Data views must be disjoint within each space, as must instruction
 views. An instruction view may alias a data view. Zero-length regions contribute
 no addresses. A region must fit the 32-bit address space.
 
-For the implemented normal-word view, each value is an unsigned 32-bit number
-stored in four little-endian bytes. The address selects
-`byte_offset + (address - first) * byte_stride` in the lent storage id. A direct
-region has `initialized` set, stride at least four, and sufficient actual storage
-for its entire declared range. Padding and unaligned byte offsets are supported.
+Values are serialized little-endian. One short, normal, long, extended or
+instruction word occupies 2, 4, 8, 5 or 6 bytes respectively. The address selects
+`byte_offset + (address - first) * byte_stride` in the lent storage id. An
+initialized data region needs a stride at least as large as its word width and
+storage for its entire declared range. Padding and unaligned byte offsets are
+supported.
 Installation validates geometry and binds actual host pointers. Borrowed nonempty
 byte ranges must not overlap under different storage ids: physical storage has
-one canonical id, and logical aliases use that id in their layouts. No host address
-or memory contents enter LLVM artifacts; loading an artifact does not lower code.
+one canonical id, and logical aliases use that id in their layouts. For example,
+an extended-word alias can select the five significant bytes of a six-byte word
+by using a one-byte offset and six-byte stride. No host address or memory contents
+enter LLVM artifacts. Loading an artifact does not lower code.
 
-A normal-word load places those 32 bits in register bits 39:8 and clears the
-extension byte. A store discards the extension byte. These are raw transfers in
-both execution modes; they perform no floating conversion and change no flags.
+A normal-word load fills register bits 39:8 and clears the extension byte. A
+short-word load fills bits 23:8 and extends through bit 39 according to MODE1.SSE.
+Their stores use the corresponding bits. A long word transfers the low 32 bits
+through the explicit register and the upper 32 bits through its same-PE neighbor
+(`register ^ 1`). An extended word transfers all 40 raw bits. Transfers preserve
+flags and use the same raw format in Strict and FastFP32.
 
 ## Address and lane behavior
 
@@ -43,9 +50,11 @@ The post-modifier still updates the original unreversed I.
 The I register comes from the selected physical DAG bank: I0–3, I4–7, I8–11 and
 I12–15 have independent bank selections. Data-file bank selection remains separate.
 An explicit S register can transfer in SISD. SIMD transfers the explicit register
-and its complement at consecutive normal-word addresses, including odd explicit
-addresses. Read broadcast through I1 or I9 loads both complementary registers
-from one word independently of PEYEN. Broadcast does not duplicate stores.
+and its complement at offsets 0 and 1 for normal words and 0 and 2 for short words,
+including odd explicit addresses. Both addresses must resolve to the same view.
+An extended or long word uses the explicit PE. Read broadcast through I1 or I9
+loads both PEs from one word independently of PEYEN, including both neighboring
+registers for a long word. Broadcast does not duplicate stores.
 
 Type 1a stores and compute read the original register values. Same-packet
 loads write back over compute results, with DM taking precedence over PM for
@@ -159,14 +168,14 @@ memory exceptions.
 Declared byte aliases work for reads. Potential code-alias writes are conservatively
 refused before changing bytes. Stores also require complete initialized
 instruction-view coverage of the declared code to prove its physical backing.
-Actual code transitions, unchanged code stores and the other data views still
-require implementation and independent qualification.
+Actual code transitions and unchanged code stores still require implementation
+and independent qualification.
 
-An uninitialized normal-word region calls the corresponding `Io` function on
-the owner thread with the declared bus, view and resolved word address. Writes
-pass the 32-bit word as an unsigned value. Reads take the low 32 bits of the
-returned value. The core checks permissions and callback availability for all
-selected lanes before executing the first transfer. DM completes before PM, and
+An uninitialized data region calls the corresponding `Io` function on the owner
+thread with the declared bus, view and resolved word address. A payload uses
+the low bits of the `uint64_t` for its view. The core checks permissions and
+callback availability for all selected lanes before executing the first
+transfer. DM completes before PM, and
 each explicit lane completes before its implicit lane. A false result faults
 at that transfer. Earlier effects remain visible, and the faulting instruction
 has no register writeback, index update or retirement. Callback code may call

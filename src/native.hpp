@@ -110,6 +110,7 @@ inline constexpr std::uint32_t high_bank_mode = 1U << 7;
 inline constexpr std::uint32_t low_bank_mode = 1U << 10;
 inline constexpr std::uint32_t saturation_mode = 1U << 13;
 inline constexpr std::uint32_t multiplier_swap_mode = 1U << 2;
+inline constexpr std::uint32_t short_sign_mode = 1U << 14;
 inline constexpr std::uint32_t truncation_mode = 1U << 15;
 inline constexpr std::uint32_t simd_mode = 1U << 21;
 inline constexpr std::uint32_t broadcast9_mode = 1U << 22;
@@ -197,4 +198,15 @@ void validate_memory_layout(const CodeVariant &variant, std::string_view identit
 [[nodiscard]] std::vector<void *>
 direct_memory(const PreparedImage &image, std::uint32_t variant, const Memory &memory);
 [[nodiscard]] bool aliases_code(const CodeVariant &variant, std::size_t region);
+
+[[nodiscard]] constexpr unsigned memory_bytes(MemoryView view) {
+  switch (view) {
+    case MemoryView::short_word: return 2;
+    case MemoryView::normal_word: return 4;
+    case MemoryView::long_word: return 8;
+    case MemoryView::instruction: return 6;
+    case MemoryView::extended: return 5;
+  }
+  return 0;
+}
 } // namespace sharc::detail

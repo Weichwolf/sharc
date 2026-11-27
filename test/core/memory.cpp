@@ -12,6 +12,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #if defined(__linux__)
 #include "../support/word_space.hpp"
 
@@ -307,21 +308,24 @@ void code_alias_read() {
   Program program(words);
   auto &layout = program.code.code.variants[0].layout.regions.back();
   layout.storage_id = fixture::Program::storage_id;
-  layout.byte_offset = 2;
   layout.byte_stride = fixture::Program::word_bytes;
   layout.writable = false;
   const auto original = program.code.bytes;
-  const auto native = sharc::Core::compile(program.code.code);
-  sharc::Core core(program.memory());
-  auto expected = initial();
-  fixture::install(core, native, expected);
-  const auto result = core.run(1);
-  constexpr std::uint64_t projected_opcode = 0xa000000000;
-  expected.pe[0].data[0][0] = projected_opcode;
-  fixture::boundary(expected, {.pc = expected.pc + 1, .clock = 1});
-  check(fixture::completed(result, 1, 1) && core.registers() == expected &&
-            program.code.bytes == original,
-        "normal-word projection through a declared code-storage alias differs");
+  for (const auto view : {sharc::MemoryView::normal_word, sharc::MemoryView::extended}) {
+    layout.view = view;
+    layout.byte_offset = view == sharc::MemoryView::normal_word ? 2 : 1;
+    const auto native = sharc::Core::compile(program.code.code);
+    sharc::Core core(program.memory());
+    auto expected = initial();
+    fixture::install(core, native, expected);
+    const auto result = core.run(1);
+    constexpr std::uint64_t projected_opcode = 0xa000000000;
+    expected.pe[0].data[0][0] = projected_opcode;
+    fixture::boundary(expected, {.pc = expected.pc + 1, .clock = 1});
+    check(fixture::completed(result, 1, 1) && core.registers() == expected &&
+              program.code.bytes == original,
+          "data projection through a declared code-storage alias differs");
+  }
 }
 
 void layout_validation() {
@@ -431,6 +435,143 @@ constexpr std::uint32_t simd_bit = 1U << 21, cbufen = 1U << 24;
 constexpr std::size_t word_bytes = 4;
 constexpr unsigned word_shift = 8;
 
+void short_word_alias() {
+  constexpr auto normal_address = ram_address + 16;
+  constexpr std::uint64_t load_pm_r2 = 0xb00200000000;
+  constexpr std::uint64_t negative_offset = 0xffffffff;
+  const std::array words{load_r0, store_r0 | negative_offset, load_pm_r2};
+  fixture::Program program(words);
+  auto &regions = program.code.variants.front().layout.regions;
+  regions.push_back({.view = sharc::MemoryView::short_word,
+                     .first = ram_address,
+                     .count = 4,
+                     .storage_id = ram_id,
+                     .byte_stride = 2,
+                     .initialized = true});
+  auto alias = fixture::normal_region(normal_address, 2, ram_id);
+  regions.push_back(alias);
+  alias.space = sharc::MemorySpace::program;
+  regions.push_back(alias);
+  const auto native = sharc::Core::compile(program.code);
+  for (const bool sign : {false, true}) {
+    constexpr unsigned sse = 1U << 14;
+    constexpr std::uint32_t x_word = 0x80014433;
+    constexpr std::uint32_t y_word = 0xf1238877;
+    constexpr std::uint32_t new_x = 0x80018001;
+    constexpr std::uint32_t new_y = 0xf123f123;
+    std::array<std::byte, 2 * word_bytes> ram{};
+    fixture::put_word(ram.data(), x_word);
+    fixture::put_word(ram.data() + word_bytes, y_word);
+    sharc::Core core(program.memory(ram_id, ram));
+    auto expected = initial();
+    expected.mode1 = simd_bit | (sign ? sse : 0);
+    expected.dag[0][0].index = ram_address + 1;
+    expected.dag[0][8].index = normal_address;
+    fixture::install(core, native, expected);
+    const auto result = core.run(3);
+    constexpr std::array<std::uint64_t, 2> x_raw{0x800100, 0xffff800100};
+    constexpr std::array<std::uint64_t, 2> y_raw{0xf12300, 0xfffff12300};
+    expected.pe[0].data[0][0] = x_raw[sign ? 1U : 0U];
+    expected.pe[1].data[0][0] = y_raw[sign ? 1U : 0U];
+    expected.pe[0].data[0][2] = std::uint64_t{new_x} << word_shift;
+    expected.pe[1].data[0][2] = std::uint64_t{new_y} << word_shift;
+    fixture::boundary(expected, {.pc = expected.pc + 3, .clock = 3});
+    check(fixture::completed(result, 3, 3) && core.registers() == expected &&
+              fixture::get_word(ram.data()) == new_x &&
+              fixture::get_word(ram.data() + word_bytes) == new_y,
+          "short-word stride, SSE or PM/DM storage alias differs");
+  }
+}
+
+void wide_words() {
+  constexpr auto extended_address = ram_address + 16;
+  constexpr std::uint64_t store_s5_i1 = 0xa35500000000;
+  constexpr std::uint64_t load_r5_i1 = 0xa20500000000;
+  constexpr std::uint64_t store_s6_i2 = 0xa55600000000;
+  constexpr std::uint64_t load_r7_i2 = 0xa40700000000;
+  constexpr std::uint64_t mixed_packet = 0x22c89a800000; // R4=DM(I1,M3), R5=PM(I10,M11).
+  const std::array words{store_s5_i1, load_r5_i1, store_s6_i2, load_r7_i2, mixed_packet};
+  fixture::Program program(words);
+  auto &regions = program.code.variants.front().layout.regions;
+  constexpr unsigned extended_offset = 11;
+  regions.push_back({.view = sharc::MemoryView::long_word,
+                     .first = ram_address,
+                     .count = 1,
+                     .storage_id = ram_id,
+                     .byte_offset = 1,
+                     .byte_stride = 10,
+                     .initialized = true});
+  regions.push_back({.view = sharc::MemoryView::extended,
+                     .first = extended_address,
+                     .count = 1,
+                     .storage_id = ram_id,
+                     .byte_offset = extended_offset,
+                     .byte_stride = 6,
+                     .initialized = true});
+  auto pm = regions.back();
+  pm.space = sharc::MemorySpace::program;
+  regions.push_back(pm);
+  const auto native = sharc::Core::compile(program.code);
+  for (const bool broadcast : {false, true}) {
+    constexpr std::uint32_t broadcast1 = 1U << 23;
+    constexpr std::uint64_t raw_low = 0x2233445501;
+    constexpr std::uint64_t raw_high = 0xb1b2b3b4ab;
+    constexpr std::uint64_t raw_extended = 0x91a2b3c4d5;
+    constexpr auto guard = std::byte{0x67};
+    constexpr unsigned ram_bytes = 17;
+    std::array<std::byte, ram_bytes> ram;
+    ram.fill(guard);
+    sharc::Core core(program.memory(ram_id, ram));
+    auto expected = initial();
+    expected.mode1 = simd_bit | (broadcast ? broadcast1 : 0);
+    expected.dag[0][1].index = ram_address;
+    expected.dag[0][2].index = extended_address;
+    expected.dag[0][10].index = extended_address;
+    auto &x = expected.pe[0].data[0];
+    auto &y = expected.pe[1].data[0];
+    y[4] = raw_high;
+    y[5] = raw_low;
+    y[6] = raw_extended;
+    fixture::install(core, native, expected);
+    const auto result = core.run(4);
+    x[4] = (raw_high >> word_shift) << word_shift;
+    x[5] = (raw_low >> word_shift) << word_shift;
+    x[7] = raw_extended;
+    if (broadcast) {
+      y[4] = x[4];
+      y[5] = x[5];
+    }
+    fixture::boundary(expected, {.pc = expected.pc + 4, .clock = 4});
+    constexpr std::array expected_bytes{
+        guard,
+        std::byte{0x55},
+        std::byte{0x44},
+        std::byte{0x33},
+        std::byte{0x22},
+        std::byte{0xb4},
+        std::byte{0xb3},
+        std::byte{0xb2},
+        std::byte{0xb1},
+        guard,
+        guard,
+        std::byte{0xd5},
+        std::byte{0xc4},
+        std::byte{0xb3},
+        std::byte{0xa2},
+        std::byte{0x91},
+        guard,
+    };
+    check(fixture::completed(result, 4, 4) && core.registers() == expected && ram == expected_bytes,
+          "long or extended word transfer lost width, neighbor, broadcast or guard bytes");
+    const auto mixed = core.run(1);
+    std::swap(x[4], x[5]);
+    if (broadcast) { std::swap(y[4], y[5]); }
+    fixture::boundary(expected, {.pc = expected.pc + 1, .clock = 5});
+    check(fixture::completed(mixed, 1, 1) && core.registers() == expected && ram == expected_bytes,
+          "PM extended-word writeback overrode a DM long-word neighbor");
+  }
+}
+
 struct Peripheral {
   struct Access {
     sharc::MemorySpace space{};
@@ -441,6 +582,7 @@ struct Peripheral {
   };
 
   sharc::Core *core{};
+  sharc::MemoryView format{sharc::MemoryView::normal_word};
   std::array<std::uint64_t, 2> words{};
   std::array<Access, 4> trace{};
   unsigned calls{}, refusals{}, yield_on{}, fault_on{};
@@ -451,9 +593,7 @@ struct Peripheral {
               std::uint64_t &word,
               bool writing) noexcept {
     const auto index = address - ram_address;
-    if (view != sharc::MemoryView::normal_word || index >= words.size() || calls >= trace.size()) {
-      return false;
-    }
+    if (view != format || index >= words.size() || calls >= trace.size()) { return false; }
     try {
       (void)core->run(1);
     } catch (const std::logic_error &) { ++refusals; }
@@ -487,6 +627,32 @@ struct Peripheral {
                 }};
   }
 };
+
+void extended_io() {
+  const std::array words{load_r0, store_r0 | 1};
+  Program program(words);
+  auto &region = program.code.code.variants.front().layout.regions.back();
+  region.initialized = false;
+  region.view = sharc::MemoryView::extended;
+  constexpr auto mode = sharc::ExecutionMode::fast_fp32;
+  const auto native = fixture::compile(program.code.code, mode);
+  constexpr std::uint64_t device_word = 0xaabbcc123456789a;
+  constexpr std::uint64_t raw = 0x123456789a;
+  Peripheral peripheral{.format = region.view, .words = {device_word, 0}};
+  auto memory = program.code.memory();
+  memory.io = peripheral.binding();
+  sharc::Core core(memory, mode);
+  peripheral.core = &core;
+  auto expected = initial();
+  expected.mode1 = simd_bit;
+  fixture::install(core, native, expected);
+  const auto result = core.run(2);
+  expected.pe[0].data[0][0] = raw;
+  fixture::boundary(expected, {.pc = expected.pc + 2, .clock = 2});
+  check(fixture::completed(result, 2, 2) && core.registers() == expected && peripheral.calls == 2 &&
+            peripheral.words[1] == raw,
+        "extended I/O lost its declared width, raw extension or explicit lane");
+}
 
 void runtime_io() {
   constexpr std::uint64_t device_word = 0x123456789a;
@@ -942,6 +1108,9 @@ int main() {
     layout_validation();
     ordinary_region_alias();
     incomplete_simd_store();
+    short_word_alias();
+    wide_words();
+    extended_io();
     runtime_io();
     delayed_io();
     parallel_io();

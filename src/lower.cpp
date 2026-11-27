@@ -30,6 +30,7 @@
 #include <llvm/IR/Module.h>
 #include <llvm/IR/Verifier.h>
 #include <llvm/Support/Alignment.h>
+#include <llvm/Support/Casting.h>
 #include <llvm/Support/TypeSize.h>
 #include <llvm/Support/raw_ostream.h>
 #include <map>
@@ -786,15 +787,27 @@ struct MemoryPlan {
   std::uint64_t stride{};
 };
 
+struct MemoryWord {
+  llvm::Value *address{}, *host{}, *view{};
+};
+
+llvm::Value *resolved_phi(llvm::PHINode *phi) {
+  auto *value = phi->getNumIncomingValues() == 0 ? llvm::PoisonValue::get(phi->getType())
+                                                 : phi->hasConstantValue();
+  if (value == nullptr) { return phi; }
+  phi->eraseFromParent();
+  return value;
+}
+
 struct MemoryOperands {
-  std::array<llvm::Value *, 2> pointers{};
-  std::array<llvm::Value *, 2> addresses{};
+  std::array<MemoryWord, 2> words{};
   llvm::Value *callback{};
-  bool paired{}, broadcast{};
+  llvm::Value *paired{};
+  bool broadcast{};
 };
 
 bool callback_region(const RegionLayout &layout) {
-  return !layout.initialized && layout.view == MemoryView::normal_word && layout.count != 0;
+  return !layout.initialized && layout.view != MemoryView::instruction && layout.count != 0;
 }
 
 std::uint32_t broadcast_mode(const MemoryMove &move) {
@@ -1072,11 +1085,11 @@ private:
   void dag_overflow(Values &values, unsigned index, llvm::Value *overflow);
   llvm::Value *planned_pointer(const MemoryPlan &plan, llvm::Value *address, unsigned transfer);
   bool plan_changing_memory(const Instruction &op, const MemoryMove &move);
-  llvm::Value *memory_pointer(const Values &values,
-                              const Instruction &op,
-                              const MemoryMove &move,
-                              const MemoryOperands &operands,
-                              unsigned lane);
+  void resolve_memory(const Values &values,
+                      const Instruction &op,
+                      const MemoryMove &move,
+                      MemoryWord &word,
+                      llvm::Value *callback);
   void memory_failure(const Values &values,
                       const Instruction &op,
                       const MemoryMove &move,
@@ -1086,21 +1099,56 @@ private:
                                  const Instruction &op,
                                  const MemoryMove &move,
                                  bool partial);
+  void resolve_implicit(const Values &values,
+                        const Instruction &op,
+                        const MemoryMove &move,
+                        MemoryOperands &operands);
+
+  llvm::ConstantInt *view_tag(MemoryView view) {
+    return builder_.getInt8(static_cast<std::uint8_t>(view));
+  }
+
+  template <typename Emit>
+  llvm::Value *optional_memory(llvm::Value *enabled, Emit emit, llvm::Value *skipped) {
+    if (const auto *constant = llvm::dyn_cast<llvm::ConstantInt>(enabled)) {
+      return constant->isZero() ? skipped : emit();
+    }
+    auto *from = builder_.GetInsertBlock();
+    auto *access = llvm::BasicBlock::Create(module_.getContext(), "memory.implicit", function_);
+    auto *done = llvm::BasicBlock::Create(module_.getContext(), "memory.pair", function_);
+    builder_.CreateCondBr(enabled, access, done);
+    builder_.SetInsertPoint(access);
+    auto *value = emit();
+    auto *completed = builder_.GetInsertBlock();
+    builder_.CreateBr(done);
+    builder_.SetInsertPoint(done);
+    if (skipped == nullptr) { return nullptr; }
+    auto *joined = builder_.CreatePHI(skipped->getType(), 2);
+    joined->addIncoming(skipped, from);
+    joined->addIncoming(value, completed);
+    return joined;
+  }
+
   std::array<llvm::Value *, 2> memory_transfer(const Values &values,
                                                const Instruction &op,
                                                const MemoryMove &move,
                                                const MemoryOperands &operands);
+  llvm::Value *direct_word(const MemoryMove &move, const MemoryWord &word, llvm::Value *payload);
+  llvm::Value *memory_word(const Values &values,
+                           const Instruction &op,
+                           const MemoryMove &move,
+                           const MemoryOperands &operands,
+                           unsigned lane);
   llvm::Value *
-  memory_word(const MemoryMove &move, llvm::Value *host, llvm::Value *word, bool observable);
-  llvm::Value *io_word_access(const Values &values,
-                              const Instruction &op,
-                              const MemoryMove &move,
-                              const MemoryOperands &operands,
-                              unsigned lane,
-                              llvm::Value *word,
-                              bool observable);
+  store_word(const Values &values, const MemoryMove &move, const MemoryWord &word, unsigned lane);
+  llvm::Value *load_word(llvm::Value *payload, llvm::Value *view);
+  void write_memory_register(Values &values,
+                             const MemoryMove &move,
+                             llvm::Value *raw,
+                             llvm::Value *enabled);
   void memory_writeback(Values &values,
                         const MemoryMove &move,
+                        const MemoryOperands &operands,
                         const std::array<llvm::Value *, 2> &read);
   void finish(Values values, std::uint32_t next, bool partial);
   void finish_instruction(Values values, const Instruction &op, std::uint32_t next, bool partial);
@@ -2136,16 +2184,16 @@ bool Lowering::plan_changing_memory(const Instruction &op, const MemoryMove &mov
   return false;
 }
 
-llvm::Value *Lowering::memory_pointer(const Values &values,
-                                      const Instruction &op,
-                                      const MemoryMove &move,
-                                      const MemoryOperands &operands,
-                                      unsigned lane) {
-  auto *address = operands.addresses[lane];
-  auto *callback = operands.callback;
+void Lowering::resolve_memory(const Values &values,
+                              const Instruction &op,
+                              const MemoryMove &move,
+                              MemoryWord &word,
+                              llvm::Value *callback) {
+  auto *address = word.address;
   auto *done = llvm::BasicBlock::Create(module_.getContext(), "memory.address", function_);
   llvm::IRBuilder<> join(done);
-  auto *result = join.CreatePHI(builder_.getPtrTy(), 2);
+  auto *hosts = join.CreatePHI(builder_.getPtrTy(), 2);
+  auto *views = join.CreatePHI(builder_.getInt8Ty(), 2);
   const auto &regions = variant_.layout.regions;
   for (std::size_t i = 0; i < regions.size(); ++i) {
     const auto &layout = regions[i];
@@ -2161,41 +2209,55 @@ llvm::Value *Lowering::memory_pointer(const Values &values,
                              index, builder_.getInt32(static_cast<std::uint32_t>(layout.count)));
     builder_.CreateCondBr(inside, hit, next);
     builder_.SetInsertPoint(hit);
+    auto *tag = view_tag(layout.view);
     if (!host_protected(layout) && !(move.write ? layout.writable : layout.readable)) {
       memory_failure(values, op, move, address, NativeExit::access_fault);
-    } else if (layout.view != MemoryView::normal_word ||
-               (!layout.initialized && callback == nullptr)) {
+    } else if (!layout.initialized && callback == nullptr) {
       memory_failure(values, op, move, address, NativeExit::unsupported_memory);
     } else if (!host_protected(layout) && move.write && aliases_code(variant_, i)) {
       memory_failure(values, op, move, address, NativeExit::code_alias);
-    } else if (!layout.initialized) {
-      auto *missing = llvm::BasicBlock::Create(module_.getContext(), "cold.missing.io", function_);
-      result->addIncoming(llvm::ConstantPointerNull::get(builder_.getPtrTy()), hit);
-      builder_.CreateCondBr(builder_.CreateIsNotNull(callback), done, missing);
-      builder_.SetInsertPoint(missing);
-      memory_failure(values, op, move, address, NativeExit::unsupported_memory);
     } else {
-      auto *offset = builder_.CreateMul(builder_.CreateZExt(index, builder_.getInt64Ty()),
-                                        builder_.getInt64(layout.byte_stride));
-      auto *host = builder_.CreateGEP(builder_.getInt8Ty(), memory_binding(i, move.write), offset);
-      result->addIncoming(host, builder_.GetInsertBlock());
+      if (word.view != nullptr) {
+        auto *matched = llvm::BasicBlock::Create(module_.getContext(), "memory.view", function_);
+        auto *mismatch =
+            llvm::BasicBlock::Create(module_.getContext(), "cold.memory.view", function_);
+        builder_.CreateCondBr(builder_.CreateICmpEQ(word.view, tag), matched, mismatch);
+        builder_.SetInsertPoint(mismatch);
+        memory_failure(values, op, move, address, NativeExit::access_fault);
+        builder_.SetInsertPoint(matched);
+      }
+      llvm::Value *host = llvm::ConstantPointerNull::get(builder_.getPtrTy());
+      if (layout.initialized) {
+        auto *offset = builder_.CreateMul(builder_.CreateZExt(index, builder_.getInt64Ty()),
+                                          builder_.getInt64(layout.byte_stride));
+        host = builder_.CreateGEP(builder_.getInt8Ty(), memory_binding(i, move.write), offset);
+      } else {
+        auto *defined =
+            llvm::BasicBlock::Create(module_.getContext(), "memory.callback", function_);
+        auto *missing =
+            llvm::BasicBlock::Create(module_.getContext(), "cold.missing.io", function_);
+        builder_.CreateCondBr(builder_.CreateIsNotNull(callback), defined, missing);
+        builder_.SetInsertPoint(missing);
+        memory_failure(values, op, move, address, NativeExit::unsupported_memory);
+        builder_.SetInsertPoint(defined);
+      }
+      hosts->addIncoming(host, builder_.GetInsertBlock());
+      views->addIncoming(tag, builder_.GetInsertBlock());
       builder_.CreateBr(done);
     }
     builder_.SetInsertPoint(next);
   }
   memory_failure(values, op, move, address, NativeExit::unsupported_memory);
   builder_.SetInsertPoint(done);
-  if (result->getNumIncomingValues() == 0) {
-    result->eraseFromParent();
-    return llvm::PoisonValue::get(builder_.getPtrTy());
-  }
-  return result;
+  word.host = resolved_phi(hosts);
+  auto *view = resolved_phi(views);
+  if (word.view == nullptr) { word.view = view; }
 }
 
 void Lowering::memory_instruction(Values &values, const Instruction &op, bool partial) {
   const auto move = memory_move(op);
   const auto operands = memory_operands(values, op, move, partial);
-  memory_writeback(values, move, memory_transfer(values, op, move, operands));
+  memory_writeback(values, move, operands, memory_transfer(values, op, move, operands));
 }
 
 void Lowering::parallel_memory_instruction(Values &values, const Instruction &op, bool partial) {
@@ -2210,8 +2272,8 @@ void Lowering::parallel_memory_instruction(Values &values, const Instruction &op
     compute_instruction(values, before, op.compute, condition(before, true_condition));
   }
   // Register priority is DAG1, DAG2, then the compute units.
-  memory_writeback(values, program, program_read);
-  memory_writeback(values, data, data_read);
+  memory_writeback(values, program, program_operands, program_read);
+  memory_writeback(values, data, data_operands, data_read);
   for (const auto &move : {data, program}) {
     dag_modify(values,
                {.source = move.index, .destination = move.index},
@@ -2231,68 +2293,129 @@ MemoryOperands Lowering::memory_operands(const Values &values,
   } else if ((context_ & reverse_mode(move.index)) != 0) {
     address = builder_.CreateUnaryIntrinsic(llvm::Intrinsic::bitreverse, address);
   }
-  llvm::Value *callback = nullptr;
-  if (partial && runtime_io_ &&
-      std::ranges::any_of(variant_.layout.regions, [&](const auto &layout) {
+  MemoryOperands operands;
+  operands.words[0].address = address;
+  operands.broadcast = (context_ & broadcast_mode(move)) != 0;
+  operands.paired = builder_.getFalse();
+  const bool simd_pair = !operands.broadcast && (context_ & simd_mode) != 0;
+  if (!partial) {
+    const auto &plan = memory_plan_.at({op.address, move.space});
+    auto *view = view_tag(MemoryView::normal_word);
+    operands.words[0] = {
+        .address = address, .host = planned_pointer(plan, address, 0), .view = view};
+    if (simd_pair) {
+      auto *implicit = builder_.CreateAdd(address, builder_.getInt32(1));
+      operands.words[1] = {
+          .address = implicit, .host = planned_pointer(plan, implicit, 1), .view = view};
+      operands.paired = builder_.getTrue();
+    }
+    return operands;
+  }
+  if (runtime_io_ && std::ranges::any_of(variant_.layout.regions, [&](const auto &layout) {
         return callback_region(layout) && layout.space == move.space &&
                (move.write ? layout.writable : layout.readable);
       })) {
-    callback = pointer(move.write ? io_write_slot : io_read_slot);
+    operands.callback = pointer(move.write ? io_write_slot : io_read_slot);
   }
-  const bool broadcast = (context_ & broadcast_mode(move)) != 0;
-  const bool paired = broadcast || (context_ & simd_mode) != 0;
-  auto *second = paired && !broadcast ? builder_.CreateAdd(address, builder_.getInt32(1)) : address;
-  MemoryOperands operands{.addresses = {address, second},
-                          .callback = callback,
-                          .paired = paired,
-                          .broadcast = broadcast};
-  for (unsigned lane = 0; lane < (paired && !broadcast ? 2U : 1U); ++lane) {
-    auto *word_address = operands.addresses[lane];
-    operands.pointers[lane] =
-        partial ? memory_pointer(values, op, move, operands, lane)
-                : planned_pointer(memory_plan_.at({op.address, move.space}), word_address, lane);
-  }
+  resolve_memory(values, op, move, operands.words[0], operands.callback);
+  if (simd_pair) { resolve_implicit(values, op, move, operands); }
   return operands;
 }
 
-llvm::Value *Lowering::memory_word(const MemoryMove &move,
-                                   llvm::Value *host,
-                                   llvm::Value *word,
-                                   bool observable) {
-  if (move.write) {
-    auto *write = builder_.CreateStore(word, host);
-    write->setAlignment(llvm::Align(1));
-    write->setVolatile(observable);
-    return nullptr;
-  }
-  auto *read = builder_.CreateLoad(builder_.getInt32Ty(), host);
-  read->setAlignment(llvm::Align(1));
-  read->setVolatile(observable);
-  return read;
+void Lowering::resolve_implicit(const Values &values,
+                                const Instruction &op,
+                                const MemoryMove &move,
+                                MemoryOperands &operands) {
+  const auto &first = operands.words[0];
+  auto *short_word = builder_.CreateICmpEQ(first.view, view_tag(MemoryView::short_word));
+  auto *normal_word = builder_.CreateICmpEQ(first.view, view_tag(MemoryView::normal_word));
+  operands.paired = builder_.CreateOr(short_word, normal_word);
+  if (operands.paired == builder_.getFalse()) { return; }
+  auto *offset = builder_.CreateSelect(short_word, builder_.getInt32(2), builder_.getInt32(1));
+  auto &second = operands.words[1];
+  second.address = builder_.CreateAdd(first.address, offset);
+  second.view = first.view;
+  second.host = optional_memory(
+      operands.paired,
+      [&] {
+        resolve_memory(values, op, move, second, operands.callback);
+        return second.host;
+      },
+      llvm::PoisonValue::get(builder_.getPtrTy()));
 }
 
-llvm::Value *Lowering::io_word_access(const Values &values,
-                                      const Instruction &op,
-                                      const MemoryMove &move,
-                                      const MemoryOperands &operands,
-                                      unsigned lane,
-                                      llvm::Value *word,
-                                      bool observable) {
-  auto *host = operands.pointers[lane];
+llvm::Value *
+Lowering::direct_word(const MemoryMove &move, const MemoryWord &word, llvm::Value *payload) {
+  // Checked regions can share backing with protected Direct views.
+  const bool observable =
+      !variant_.layout.ordinary_regions ||
+      std::ranges::any_of(variant_.layout.regions,
+                          [&](const RegionLayout &layout) { return host_protected(layout); });
+  const auto transfer = [&](MemoryView view) -> llvm::Value * {
+    constexpr unsigned bits_per_byte = 8;
+    const auto bits = memory_bytes(view) * bits_per_byte;
+    auto *type = llvm::IntegerType::get(module_.getContext(), bits);
+    if (move.write) {
+      auto *value = builder_.CreateTruncOrBitCast(payload, type);
+      builder_.CreateAlignedStore(value, word.host, llvm::Align(1), observable);
+      return nullptr;
+    }
+    auto *read = builder_.CreateAlignedLoad(type, word.host, llvm::Align(1), observable);
+    return builder_.CreateZExtOrBitCast(read, builder_.getInt64Ty());
+  };
+  if (const auto *constant = llvm::dyn_cast<llvm::ConstantInt>(word.view)) {
+    return transfer(static_cast<MemoryView>(constant->getZExtValue()));
+  }
+  auto *unknown = llvm::BasicBlock::Create(module_.getContext(), "memory.bad.view", function_);
+  llvm::IRBuilder<>(unknown).CreateUnreachable();
+  auto *done = llvm::BasicBlock::Create(module_.getContext(), "memory.word", function_);
+  auto *choose = builder_.CreateSwitch(word.view, unknown);
+  auto *result = move.write ? nullptr : llvm::IRBuilder<>(done).CreatePHI(builder_.getInt64Ty(), 4);
+  constexpr std::array views{
+      MemoryView::normal_word, MemoryView::short_word, MemoryView::long_word, MemoryView::extended};
+  for (const auto view : views) {
+    if (std::ranges::none_of(variant_.layout.regions, [&](const auto &layout) {
+          return layout.space == move.space && layout.view == view && layout.initialized;
+        })) {
+      continue;
+    }
+    auto *access = llvm::BasicBlock::Create(module_.getContext(), "memory.width", function_);
+    choose->addCase(view_tag(view), access);
+    builder_.SetInsertPoint(access);
+    auto *value = transfer(view);
+    if (result != nullptr) { result->addIncoming(value, access); }
+    builder_.CreateBr(done);
+  }
+  builder_.SetInsertPoint(done);
+  if (result != nullptr && result->getNumIncomingValues() == 0) {
+    result->eraseFromParent();
+    return llvm::PoisonValue::get(builder_.getInt64Ty());
+  }
+  return result;
+}
+
+llvm::Value *Lowering::memory_word(const Values &values,
+                                   const Instruction &op,
+                                   const MemoryMove &move,
+                                   const MemoryOperands &operands,
+                                   unsigned lane) {
+  const auto &word = operands.words[lane];
+  auto *payload = move.write ? store_word(values, move, word, lane) : nullptr;
+  if (operands.callback == nullptr) { return direct_word(move, word, payload); }
   auto *direct = llvm::BasicBlock::Create(module_.getContext(), "memory.native", function_);
   auto *callback = llvm::BasicBlock::Create(module_.getContext(), "cold.memory.io", function_);
   auto *failed = llvm::BasicBlock::Create(module_.getContext(), "cold.io.fault", function_);
   auto *accepted = llvm::BasicBlock::Create(module_.getContext(), "io.complete", function_);
   auto *done = llvm::BasicBlock::Create(module_.getContext(), "memory.complete", function_);
-  builder_.CreateCondBr(builder_.CreateIsNotNull(host), direct, callback);
+  builder_.CreateCondBr(builder_.CreateIsNotNull(word.host), direct, callback);
   builder_.SetInsertPoint(direct);
-  auto *native_word = memory_word(move, host, word, observable);
+  auto *native_word = direct_word(move, word, payload);
+  auto *native_done = builder_.GetInsertBlock();
   builder_.CreateBr(done);
   builder_.SetInsertPoint(callback);
   auto *buffer = builder_.CreateGEP(
       builder_.getInt64Ty(), function_->getArg(unit_controls), builder_.getInt64(io_word));
-  builder_.CreateStore(
-      move.write ? builder_.CreateZExt(word, builder_.getInt64Ty()) : builder_.getInt64(0), buffer);
+  builder_.CreateStore(move.write ? payload : builder_.getInt64(0), buffer);
   auto *type = llvm::FunctionType::get(builder_.getInt32Ty(),
                                        {builder_.getPtrTy(),
                                         builder_.getInt8Ty(),
@@ -2300,31 +2423,26 @@ llvm::Value *Lowering::io_word_access(const Values &values,
                                         builder_.getInt32Ty(),
                                         builder_.getPtrTy()},
                                        false);
-  auto *address = operands.addresses[lane];
-  auto *result =
-      builder_.CreateCall(type,
-                          operands.callback,
-                          {pointer(io_slot),
-                           builder_.getInt8(static_cast<std::uint8_t>(move.space)),
-                           builder_.getInt8(static_cast<std::uint8_t>(MemoryView::normal_word)),
-                           address,
-                           buffer});
+  auto *result = builder_.CreateCall(type,
+                                     operands.callback,
+                                     {pointer(io_slot),
+                                      builder_.getInt8(static_cast<std::uint8_t>(move.space)),
+                                      word.view,
+                                      word.address,
+                                      buffer});
   result->setDoesNotThrow();
   result->addParamAttr(1, llvm::Attribute::ZExt);
   result->addParamAttr(2, llvm::Attribute::ZExt);
   builder_.CreateCondBr(builder_.CreateICmpNE(result, builder_.getInt32(0)), accepted, failed);
   builder_.SetInsertPoint(failed);
-  memory_failure(values, op, move, address, NativeExit::access_fault);
+  memory_failure(values, op, move, word.address, NativeExit::access_fault);
   builder_.SetInsertPoint(accepted);
-  auto *io_read = move.write
-                      ? nullptr
-                      : builder_.CreateTrunc(builder_.CreateLoad(builder_.getInt64Ty(), buffer),
-                                             builder_.getInt32Ty());
+  auto *io_read = move.write ? nullptr : builder_.CreateLoad(builder_.getInt64Ty(), buffer);
   builder_.CreateBr(done);
   builder_.SetInsertPoint(done);
   if (move.write) { return nullptr; }
-  auto *joined = builder_.CreatePHI(builder_.getInt32Ty(), 2);
-  joined->addIncoming(native_word, direct);
+  auto *joined = builder_.CreatePHI(builder_.getInt64Ty(), 2);
+  joined->addIncoming(native_word, native_done);
   joined->addIncoming(io_read, accepted);
   return joined;
 }
@@ -2333,44 +2451,100 @@ std::array<llvm::Value *, 2> Lowering::memory_transfer(const Values &values,
                                                        const Instruction &op,
                                                        const MemoryMove &move,
                                                        const MemoryOperands &operands) {
-  // Checked regions can share backing with protected Direct views.
-  const bool observable =
-      !variant_.layout.ordinary_regions ||
-      std::ranges::any_of(variant_.layout.regions,
-                          [&](const RegionLayout &layout) { return host_protected(layout); });
-  const auto count = operands.paired ? 2U : 1U;
-  std::array<llvm::Value *, 2> read{};
-  for (unsigned transfer = 0; transfer < count; ++transfer) {
-    if (transfer == 1 && operands.broadcast) {
-      read[1] = read[0];
-      break;
-    }
-    llvm::Value *word = nullptr;
-    if (move.write) {
-      auto *raw =
-          builder_.CreateExtractElement(values[move.reg], builder_.getInt32(move.lane ^ transfer));
-      word = builder_.CreateTrunc(builder_.CreateLShr(raw, builder_.getInt64(raw_extension_bits)),
-                                  builder_.getInt32Ty());
-    }
-    read[transfer] = operands.callback == nullptr
-                         ? memory_word(move, operands.pointers[transfer], word, observable)
-                         : io_word_access(values, op, move, operands, transfer, word, observable);
+  auto *first = memory_word(values, op, move, operands, 0);
+  auto *second = optional_memory(
+      operands.paired,
+      [&] { return memory_word(values, op, move, operands, 1); },
+      move.write ? nullptr : builder_.getInt64(0));
+  return {first, second};
+}
+
+llvm::Value *Lowering::store_word(const Values &values,
+                                  const MemoryMove &move,
+                                  const MemoryWord &word,
+                                  unsigned lane) {
+  constexpr unsigned normal_bits = 32;
+  auto *element = builder_.getInt32(move.lane ^ lane);
+  auto *raw = builder_.CreateExtractElement(values[move.reg], element);
+  auto *normal = builder_.CreateLShr(raw, builder_.getInt64(raw_extension_bits));
+  if (word.view == view_tag(MemoryView::normal_word)) { return normal; }
+  auto *short_word = builder_.CreateZExt(builder_.CreateTrunc(normal, builder_.getInt16Ty()),
+                                         builder_.getInt64Ty());
+  auto *neighbor = builder_.CreateExtractElement(values[move.reg ^ 1], element);
+  auto *upper = builder_.CreateLShr(neighbor, builder_.getInt64(raw_extension_bits));
+  auto *wide = builder_.CreateOr(normal, builder_.CreateShl(upper, builder_.getInt64(normal_bits)));
+  auto *fixed = builder_.CreateSelect(
+      builder_.CreateICmpEQ(word.view, view_tag(MemoryView::short_word)), short_word, normal);
+  auto *integer = builder_.CreateSelect(
+      builder_.CreateICmpEQ(word.view, view_tag(MemoryView::long_word)), wide, fixed);
+  return builder_.CreateSelect(
+      builder_.CreateICmpEQ(word.view, view_tag(MemoryView::extended)), raw, integer);
+}
+
+llvm::Value *Lowering::load_word(llvm::Value *payload, llvm::Value *view) {
+  const auto raw = [&](llvm::Value *word) {
+    return builder_.CreateShl(builder_.CreateZExt(word, builder_.getInt64Ty()),
+                              builder_.getInt64(raw_extension_bits));
+  };
+  auto *normal = raw(builder_.CreateTrunc(payload, builder_.getInt32Ty()));
+  if (view == view_tag(MemoryView::normal_word) || view == view_tag(MemoryView::long_word)) {
+    return normal;
   }
-  return read;
+  auto *short_word = builder_.CreateTrunc(payload, builder_.getInt16Ty());
+  auto *mode = builder_.CreateAnd(function_->getArg(unit_mode), builder_.getInt32(short_sign_mode));
+  auto *sign = builder_.CreateICmpNE(mode, builder_.getInt32(0));
+  auto *short_value = builder_.CreateSelect(sign,
+                                            builder_.CreateSExt(short_word, builder_.getInt32Ty()),
+                                            builder_.CreateZExt(short_word, builder_.getInt32Ty()));
+  auto *fixed = builder_.CreateSelect(
+      builder_.CreateICmpEQ(view, view_tag(MemoryView::short_word)), raw(short_value), normal);
+  constexpr unsigned extended_mask_bits = 40;
+  constexpr auto extended_mask = (std::uint64_t{1} << extended_mask_bits) - 1;
+  return builder_.CreateSelect(builder_.CreateICmpEQ(view, view_tag(MemoryView::extended)),
+                               builder_.CreateAnd(payload, builder_.getInt64(extended_mask)),
+                               fixed);
+}
+
+void Lowering::write_memory_register(Values &values,
+                                     const MemoryMove &move,
+                                     llvm::Value *raw,
+                                     llvm::Value *enabled) {
+  if (enabled == builder_.getFalse()) { return; }
+  auto *lane = builder_.getInt32(move.lane);
+  auto *old = builder_.CreateExtractElement(values[move.reg], lane);
+  values[move.reg] = builder_.CreateInsertElement(
+      values[move.reg], builder_.CreateSelect(enabled, raw, old), lane);
+  written_.insert(move.reg);
+  if (move.lane != 0) { y_written_.insert(move.reg); }
 }
 
 void Lowering::memory_writeback(Values &values,
                                 const MemoryMove &move,
+                                const MemoryOperands &operands,
                                 const std::array<llvm::Value *, 2> &read) {
   if (move.write) { return; }
-  for (unsigned transfer = 0; transfer < read.size() && read[transfer] != nullptr; ++transfer) {
-    auto *raw = builder_.CreateShl(builder_.CreateZExt(read[transfer], builder_.getInt64Ty()),
-                                   builder_.getInt64(raw_extension_bits));
-    values[move.reg] = builder_.CreateInsertElement(
-        values[move.reg], raw, builder_.getInt32(move.lane ^ transfer));
+  auto *view = operands.words[0].view;
+  auto *raw = load_word(read[0], view);
+  write_memory_register(values, move, raw, builder_.getTrue());
+  auto implicit = move;
+  implicit.lane ^= 1;
+  if (operands.broadcast) {
+    write_memory_register(values, implicit, raw, builder_.getTrue());
+  } else if (operands.paired != builder_.getFalse()) {
+    write_memory_register(values, implicit, load_word(read[1], view), operands.paired);
   }
-  written_.insert(move.reg);
-  if (move.lane != 0 || read[1] != nullptr) { y_written_.insert(move.reg); }
+  auto *wide = builder_.CreateICmpEQ(view, view_tag(MemoryView::long_word));
+  if (wide == builder_.getFalse()) { return; }
+  constexpr unsigned normal_bits = 32;
+  auto *high = builder_.CreateLShr(read[0], builder_.getInt64(normal_bits));
+  auto *neighbor_raw = load_word(high, view_tag(MemoryView::normal_word));
+  auto neighbor = move;
+  neighbor.reg ^= 1;
+  write_memory_register(values, neighbor, neighbor_raw, wide);
+  if (operands.broadcast) {
+    neighbor.lane ^= 1;
+    write_memory_register(values, neighbor, neighbor_raw, wide);
+  }
 }
 
 void Lowering::stack_guard(const Values &values,
