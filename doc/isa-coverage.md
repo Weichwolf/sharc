@@ -551,13 +551,15 @@ goal sanitizer qualification remain open.
 ## Single-function floating compute
 
 Classic type 2a lowers floating ADD, SUB, their absolute forms, average,
-multiply, PASS, negate, ABS, RND, COMP, COPYSIGN, MIN, MAX and CLIP. Strict
-applies the guest rounding mode and RND32 boundary. FastFP32 rounds
+multiply, PASS, negate, ABS, RND, COMP, COPYSIGN, MIN, MAX and CLIP. It also
+lowers FLOAT, FIX and TRUNC with and without a scale, SCALB, MANT, LOGB,
+FPACK, FUNPACK, RECIPS and RSQRTS. Strict applies the instruction-specific
+guest rounding and precision rules. FastFP32 rounds
 computational inputs and results to binary32 with the guest rounding direction.
 Both identities use the raw register file and leave guest MODE1 visible.
 
 `test/isa/floating.cpp` runs independently authored instruction fields and
-5,160 paired rational expectations, split evenly between Strict and FastFP32,
+14,288 paired expectations, split evenly between Strict and FastFP32,
 through installed images. It checks full register state,
 arithmetic flags, comparison history, sticky flags, and progress for admitted
 blocks and partial bounds in SISD and SIMD, with alternate banks and separate
@@ -582,25 +584,31 @@ matrix covers integer low bits, ignored raw operand extension, exact zero,
 overflow, signed underflow, and extreme scales in both widths and rounding
 modes. SCALB covers signed fixed scaling, infinity and NaN classification,
 and the midpoint where minimum normal and AUS occur together.
-The other conversions, packing, seeds, floating multifunction
-execution and floating parallel-transfer qualification remain open.
+FIX and TRUNC check signed rounding and saturation, with full invalid-result
+flags and raw widths. MANT and LOGB check projected mantissas, fixed exponent
+outputs, signed-zero and infinity handling, and NaN sentinels. FPACK and
+FUNPACK cover short subnormals, inexact packing, clipping and shifter flags.
+RECIPS and RSQRTS exercise both endpoints of every observed seed bin,
+with signed and exceptional inputs and unchanged inactive lanes. Preparation
+tests also load an artifact containing a seed table.
+Floating multifunction execution and floating parallel-transfer qualification
+remain open.
 Floating-workload performance is tracked separately from the fixed K1–K6 identities.
 
 ## S2 independent expectations (complete milestone, numerical gaps retained)
 
 `test/support/reference.py` supplies a separate exact integer/rational numeric
-model. `generate_expectations.py` checks 305 numeric/conversion/accumulator/shifter
+model. `generate_expectations.py` checks 311 numeric/conversion/accumulator/shifter
 anchors, 48,768 normal-range rounding positions and 27,648 limb-based multiplier
 cases and can emit deterministic machine-readable expectations without loading
 production code. Fixed ALU records include complete
 modeled scalar flags and sticky effects, including fixed 80-bit arithmetic,
-saturation, rounding and accumulator transfers. Qualified FIX/TRUNC records cover
-finite integer and saturated results with flags, including exponent-based AV and
-pre-rounded AUS; 10,972 signed-quotient comparisons and 1,828 required refusals
-cross-check both conversion instructions. Floating value-only records remain
+saturation, rounding and accumulator transfers. FIX/TRUNC records cover
+integer, saturated and invalid results with flags, including post-round range
+checks and pre-round AUS. 12,800 signed-quotient comparisons cross-check both
+conversion instructions. Floating value-only records remain
 separate from new qualified complete ALU, compare, MANT/LOGB and multiply effects.
-The latter pass 30,008 independent full-result checks and 5,080 required
-refusals for the unqualified MANT input boundary.
+The latter pass 35,088 independent full-result checks.
 Another 130,817 shifter, 15,449 bit FIFO and 65,536 short-float unpack cases use
 independent bit routing, bit lists and rational value checks. Scalar shifter
 expectations preserve unrelated flags and sticky bits. FIFO records refuse
@@ -611,11 +619,10 @@ records include different old status/sticky bits and independent exceptions.
 The installed fixed multifunction fixture uses an independently generated subset
 of these numerical expectations. The remaining records do not qualify native
 execution.
-Another 133,832 FPACK field-only checks and 896 complete seed-special-case checks
-cover exact short values, exponent clipping, signed zeros, infinities and qualified
-invalid seed inputs. The 260 refused inexact PACK inputs, complete FPACK storage/
-status and ordinary seed ROM entries remain gaps. Field-only records cannot
-establish full instruction effects.
+Another 134,092 FPACK field checks and 896 complete seed-special-case checks
+cover exact and inexact short values, exponent clipping, signed zeros, infinities
+and invalid seed inputs. The installed fixture adds full FPACK storage and status
+checks and compares native seeds with independently observed words at every ROM index.
 Another 928 numeric/status predicate and lane-aggregation checks use independent
 truth tables. Conditional numerical records preserve inactive raw destinations,
 old flags and SISD PEy state. These are not sequencer, DAG, memory-transfer or
@@ -635,8 +642,8 @@ each half has its own predicate. Authored ADD/swap expectations preserve old AZ
 selection and new ALU flags even when a swap replaces the ALU data result.
 This is expectation generation, not installed-image swap coverage.
 
-The S2 generation criterion is met. Remaining conversion and seed exceptions,
-OR-shift status, complete FPACK, full conditional execution/bank composition
+The S2 generation criterion is met. Remaining shifter and FIFO cases,
+full conditional execution/bank composition
 and parallel memory ordering expectations are still required. See
 [numeric-reference.md](numeric-reference.md) for the exact scope, source sections
 and gaps. Oracle validation is not installed-image ISA execution coverage. No

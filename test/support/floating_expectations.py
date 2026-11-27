@@ -5,10 +5,12 @@ from itertools import product as cartesian_product
 from dataclasses import asdict
 from fractions import Fraction
 
-from expectation_check import anchor, require, require_raises
+from conversion_expectations import CONVERSIONS
+from expectation_check import anchor, require
 from reference import (
-    IntegerResult, Mode, Operand, Unqualified, fixed_float_effects, float_parts, floating_alu,
-    floating_compare, floating_multiply, quantize, raw_word, signed,
+    IntegerResult, Mode, Operand, fixed_float_effects, fixed_from_float, float_pack, float_parts,
+    float_unpack, floating_alu, floating_compare, floating_multiply, floating_seed, quantize,
+    raw_word, signed,
 )
 
 
@@ -109,9 +111,13 @@ PARTS = [
      IntegerResult(0x8000000100, 0x410, 0)),
     ("MANT negative denormal", "mant", 0x8000000001, Mode(40), {}, IntegerResult(0, 0x411, 0)),
     ("MANT positive infinity", "mant", 0x7F80000000, Mode(32), {},
-     IntegerResult(0xFFFFFFFF00, 0x402, 2)),
-    ("MANT negative NaN fixed sentinel", "mant", 0xFFC0000000, Mode(40), {},
-     IntegerResult(0xFFFFFFFF00, 0x430, 0x20)),
+     IntegerResult(0x8000000000, 0x402, 2)),
+    ("MANT negative NaN sentinel clears AS", "mant", 0xFFC0000000, Mode(40), {},
+     IntegerResult(0xFFFFFFFFFF, 0x420, 0x20)),
+    ("MANT selects a binary32 input with RND32", "mant", 0xBF80001234, Mode(32), {},
+     IntegerResult(0x8000120000, 0x410, 0)),
+    ("MANT RND32 sees infinity in an extension-only NaN", "mant", 0xFF80000001, Mode(32), {},
+     IntegerResult(0x8000000000, 0x412, 2)),
     ("LOGB exact zero exponent does not set AUS", "logb", 0xBF80000000, Mode(40), {},
      IntegerResult(0, 0x401, 0)),
     ("LOGB minimum normal", "logb", 0x0080000000, Mode(32), {},
@@ -124,6 +130,8 @@ PARTS = [
      IntegerResult(0x8000000000, 0x406, 2)),
     ("LOGB infinity saturated", "logb", 0xFF80000000, Mode(40), {"saturate": True},
      IntegerResult(0x7FFFFFFF00, 0x402, 2)),
+    ("LOGB invalid supersedes saturation", "logb", 0xFFC0000000, Mode(40), {"saturate": True},
+     IntegerResult(0xFFFFFFFFFF, 0x420, 0x20)),
 ]
 
 MULTIPLY = [
@@ -266,18 +274,14 @@ def unary_lattice():
 
 
 def parts_lattice():
-    count, refusals = 0, 0
+    count = 0
     for exponent in range(1, 255):
         for fraction, negative in cartesian_product((0, 1, 127, 128, 255, 256, 0x7FFFFF00, 0x7FFFFFFF), (False, True)):
             raw = (int(negative) << 39) | (exponent << 31) | fraction
             for width, rounding, operation in cartesian_product((32, 40), ("nearest", "zero"), ("mant", "logb")):
-                if operation == "mant" and width == 32 and fraction % 256:
-                    require_raises(Unqualified, float_parts, 'unqualified MANT extension accepted',
-                                   operation, raw, Mode(width, rounding))
-                    refusals += 1
-                    continue
                 if operation == "mant":
-                    value = (2147483648 + fraction) * 256
+                    bits = fraction if width == 40 else fraction // 256 * 256
+                    value = (2147483648 + bits) * 256
                     flags = 0xFFFFFFC0 | (int(negative) << 4)
                 else:
                     value = (exponent - 127) % 4294967296 * 256
@@ -286,12 +290,7 @@ def parts_lattice():
                                     astat=0xFFFFFFFF, stky=0x44),
                         IntegerResult(value, flags, 0x44), (operation, raw, width, rounding))
                 count += 1
-    return count, refusals
-
-
-def explicit_gaps():
-    require_raises(Unqualified, float_parts, 'unqualified floating flags generated',
-                   "logb", 0x7FC0000000, Mode(40))
+    return count
 
 
 def installed_header():
@@ -299,10 +298,15 @@ def installed_header():
     fields = {"add": 0x081000, "sub": 0x082000, "avg": 0x089000, "cmp": 0x08a000,
               "absadd": 0x091000, "abssub": 0x092000, "pass": 0x0a1000,
               "neg": 0x0a2000, "round": 0x0a5000, "abs": 0x0b0000,
-              "scale": 0x0bd000, "float": 0x0ca000, "float-scaled": 0x0da000,
+              "mant": 0x0ad000, "scale": 0x0bd000, "logb": 0x0c1000,
+              "recips": 0x0c4000, "rsqrts": 0x0c5000,
+              "fix": 0x0c9000, "float": 0x0ca000, "trunc": 0x0cd000,
+              "fix-scaled": 0x0d9000, "float-scaled": 0x0da000, "trunc-scaled": 0x0dd000,
               "copysign": 0x0e0000, "min": 0x0e1000, "max": 0x0e2000, "clip": 0x0e3000,
-              "mul": 0x130000}
-    unary = {"pass", "neg", "round", "abs", "float"}
+              "mul": 0x130000, "pack": 0x290000, "unpack": 0x294000}
+    unary = {"pass", "neg", "round", "abs", "float", "mant", "logb", "recips", "rsqrts",
+             "fix", "trunc", "pack", "unpack"}
+    fixed_conversions = {"fix", "fix-scaled", "trunc", "trunc-scaled"}
     edges = [(0x3f800000ff, 0), (0x3f80000180, 0x3380000000),
              (0x3f80000000, 0xbf80000000), (0x3f80000000, 0x0080000000),
              (0x7f7fffffff, 0x7f7fffffff), (0x7f7fffffff, 0x4000000000),
@@ -322,6 +326,28 @@ def installed_header():
                            if name == operation] for operation in fields}
     anchors["mul"] = [(left, right) for _, left, right, _, _, _ in MULTIPLY]
     anchors["cmp"] = [(left, right) for _, left, right, _, _, _ in COMPARE]
+    for _, operation, raw, _, _, _ in PARTS:
+        anchors[operation].append((raw, 0))
+    for _, operation, raw, _, options, _ in CONVERSIONS:
+        if "scale" in options:
+            anchors[f"{operation}-scaled"].append((raw, (options["scale"] & 0xffffffff) << 8))
+        else:
+            anchors[operation].append((raw, 0))
+    anchors["pack"] = [
+        (exponent << 31 | fraction << 8 | 0xff, 0)
+        for exponent, fraction in ((109, 0x7fffff), (110, 0x400000), (120, 0x7fffff),
+                                   (121, 0x7fffff), (127, 0x7ff), (127, 0x800), (127, 0x1800),
+                                   (135, 0x7ff7ff), (135, 0x7ff800), (135, 0x7fffff))
+    ]
+    anchors["unpack"] = [(0xf135000042 | (value << 8), 0)
+                         for value in (0, 1, 2, 1023, 1024, 2047, 2048, 2049, 0x7fff)]
+    for operation, exponents, bins in (("recips", (127,), 128), ("rsqrts", (126, 127), 64)):
+        step = (1 << 31) // bins
+        anchors[operation] += [
+            ((exponent << 31) | (index * step + tail), 0)
+            for exponent, index, tail in cartesian_product(exponents, range(bins), (0, step - 1))
+        ]
+        anchors[operation] += [(exponent << 31, 0) for exponent in (1, 252, 253, 254, 255)]
     anchors["float-scaled"] = [
         (left, (options["scale"] & 0xffffffff) << 8)
         for _, name, left, _, _, options, _ in ALU if name == "float" and "scale" in options
@@ -358,7 +384,7 @@ def installed_header():
             return raw
         return quantize(value.number(), mode, negative_zero=value.negative).raw
 
-    def result(operation, left, right, mode, fast, astat, stky):
+    def result(operation, left, right, mode, fast, saturate, astat, stky):
         if operation in ("float", "float-scaled"):
             scale = signed(raw_word(right)) if operation == "float-scaled" else None
             return fixed_float_effects(left, mode, scale=scale, precision=32 if fast else 40,
@@ -366,8 +392,21 @@ def installed_header():
         if operation == "scale":
             return floating_alu(operation, approximate(left, mode) if fast else left,
                                 mode=mode, scale=signed(raw_word(right)), astat=astat, stky=stky)
+        if operation in fixed_conversions:
+            base, _, scaled = operation.partition("-")
+            scale = signed(raw_word(right)) if scaled else 0
+            return fixed_from_float(base, approximate(left, mode) if fast else left, mode,
+                                    scale=scale, saturate=saturate, astat=astat, stky=stky)
+        if operation == "pack":
+            return float_pack(approximate(left, mode) if fast else left, astat=astat, stky=stky)
+        if operation == "unpack":
+            return float_unpack(left, astat=astat, stky=stky)
         if fast:
             left, right = approximate(left, mode), approximate(right, mode)
+        if operation in ("mant", "logb"):
+            return float_parts(operation, left, mode, saturate=saturate, astat=astat, stky=stky)
+        if operation in ("recips", "rsqrts"):
+            return floating_seed(operation, left, mode, astat=astat, stky=stky)
         if operation == "mul":
             return floating_multiply(left, right, mode, astat=astat, stky=stky)
         if operation == "cmp":
@@ -383,16 +422,21 @@ def installed_header():
         inputs = op_edges.get(operation, edges)
         pairs = [(x, 0) for x, _ in inputs] if operation in unary else inputs
         for index, (left, right) in enumerate(dict.fromkeys(anchors[operation] + pairs)):
-            for fast, rnd32, truncate in cartesian_product((False, True), repeat=3):
+            saturation_modes = (False, True) if operation == "logb" or operation in fixed_conversions else (False,)
+            for (fast, rnd32, truncate), saturate in cartesian_product(
+                    cartesian_product((False, True), repeat=3), saturation_modes):
                 mode = Mode(32 if fast or rnd32 else 40, "zero" if truncate else "nearest")
                 phase = index % 2
                 old_astat = (0xa500043a | phase, 0x420003c4 | (1 - phase))
+                if operation in ("pack", "unpack"):
+                    old_astat = (old_astat[0] | 0x7800, old_astat[1] | 0x3800)
                 old_stky = (0x44 | phase, 0x108 | (1 - phase))
-                x = (left, left ^ (1 << 39)) if operation in unary else (left, right)
+                sign = 1 << (23 if operation == "unpack" else 39)
+                x = (left, left ^ sign) if operation in unary else (left, right)
                 y = (right, left)
-                expected = [result(operation, a, b, mode, fast, status, sticky)
+                expected = [result(operation, a, b, mode, fast, saturate, status, sticky)
                             for a, b, status, sticky in zip(x, y, old_astat, old_stky)]
-                controls = (fast, rnd32, truncate, operation != "cmp")
+                controls = (fast, rnd32, truncate, saturate, operation != "cmp")
                 rows.append("{" + ", ".join((hex(field), *(str(bit).lower() for bit in controls),
                             array(x), array(y), array(old_astat), array(old_stky),
                             array(item.raw or 0 for item in expected),
@@ -400,7 +444,7 @@ def installed_header():
                             array(item.stky for item in expected))) + "}")
     return """struct FloatingCase {
   std::uint32_t field;
-  bool fast, rnd32, truncate, writes;
+  bool fast, rnd32, truncate, saturate, writes;
   std::array<std::uint64_t, 2> x, y;
   std::array<std::uint32_t, 2> old_astat, old_stky;
   std::array<std::uint64_t, 2> raw;

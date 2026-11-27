@@ -23,7 +23,7 @@ import writeback_expectations
 
 from expectation_check import anchor, require, require_raises
 from reference import (
-    FloatingResult, IntegerResult, Mode, Unqualified, fixed, fixed_from_float,
+    FloatingResult, IntegerResult, Mode, Unqualified, fixed,
     float_from_fixed, float_round, floating, quantize,
 )
 
@@ -190,9 +190,6 @@ def rounding_lattice():
 def explicit_gaps():
     calls = [
         lambda: fixed("unimplemented", 0),
-        lambda: fixed_from_float("fix", 0x7FC0000000, Mode(40), saturate=True),
-        lambda: fixed_from_float("fix", 0x4EFFFFFFFF, Mode(40)),
-        lambda: fixed_from_float("trunc", 0x7F80000000, Mode(40)),
     ]
     for call in calls:
         require_raises(Unqualified, call, 'an unqualified expectation was silently generated')
@@ -305,19 +302,18 @@ def main():
     writeback_expectations.invalid_inputs()
     condition_count = condition_expectations.predicate_lattice() + condition_expectations.lane_lattice()
     condition_expectations.explicit_gaps()
-    packing_count, packing_refusals = packing_expectations.packing_lattice()
+    packing_count = packing_expectations.packing_lattice()
     seed_count = packing_expectations.seed_lattice()
     parallel_count = parallel_expectations.fixed_lattice() + parallel_expectations.floating_lattice()
     parallel_expectations.explicit_refusals()
     floating_count = floating_expectations.exact_lattice()
     unary_count = floating_expectations.unary_lattice()
-    parts_count, parts_refusals = floating_expectations.parts_lattice()
-    floating_expectations.explicit_gaps()
+    parts_count = floating_expectations.parts_lattice()
     shifter_count = shifter_expectations.bit_lattice() + shifter_expectations.leading_lattice()
     fifo_count = shifter_expectations.fifo_lattice() + shifter_expectations.pointer_lattice()
     unpack_count = shifter_expectations.unpack_lattice()
     shifter_expectations.explicit_gaps()
-    conversion_count, conversion_refusals = conversion_expectations.quotient_lattice()
+    conversion_count = conversion_expectations.quotient_lattice()
     multiplier_count = multiplier_expectations.product_lattice()
     lattice_count = rounding_lattice()
     explicit_gaps()
@@ -332,12 +328,11 @@ def main():
         arguments.output.write_text(json.dumps(payload, indent=2) + "\n")
     print(f"Validated {len(records)} numeric/conversion/accumulator anchors and "
           f"{lattice_count} rounding positions and {multiplier_count} limb-based multiplier cases, "
-          f"{conversion_count} signed-quotient conversions ({conversion_refusals} explicit refusals); "
+          f"{conversion_count} signed-quotient conversions; "
           f"{shifter_count} shifter, {fifo_count} FIFO, {unpack_count} unpack cases; "
-          f"{floating_count + unary_count + parts_count} full FP cases "
-          f"({parts_refusals} explicit FP refusals); "
+          f"{floating_count + unary_count + parts_count} full FP cases; "
           f"{parallel_count} multifunction cases; "
-          f"{packing_count} pack fields ({packing_refusals} refused rounding cases), "
+          f"{packing_count} pack fields, "
           f"{seed_count} seed special cases; "
           f"{condition_count} predicate/aggregation cases; "
           f"{writeback_count} bank/writeback cases ({writeback_refusals} refused priority ties); "
