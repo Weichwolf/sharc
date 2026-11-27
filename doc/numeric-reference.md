@@ -439,11 +439,29 @@ with old AV set. SS uses the old input sign XOR old AV in the extended form.
 The destination extension byte is zero. Unrelated status and sticky bits are
 preserved.
 
-FIFO deposit ORs into the old raw tail, rather than replacing it. Extract aligns
-the remaining bits to the top of the 64-bit FIFO; NU preserves the FIFO, pointer
-and SF. Pointer reads preserve SF and clear SZ/SV/SS. Pointer writes use seven
-bits, update SF at 32 and set SV above 64 without truncating to six bits. The
-lattice starts with SF consistent with the old pointer, including for NU.
+FIFO deposit preserves the occupied prefix and writes the incoming field at
+the old write pointer. It clears all other bits beyond the old pointer, even
+for a zero-length deposit. The PRM's OR pseudocode on page 11-87 omits that
+clearing step. Extract shifts the complete raw FIFO left. NU preserves storage,
+the pointer and SF. Pointer writes preserve raw FIFO bits. They use seven bits,
+update SF at 32 and set SV above 64. Reads preserve SF and clear SZ/SV/SS.
+
+The simulator matched 72 append/extract sequences, 22 pointer cases and 113
+of 117 defined operand-domain cases. The four differences were in the raw
+bits left behind by a 31-bit extract. To expose stored bits outside the logical
+prefix, fill the FIFO with `0x812345679abcdef0`, then set BFFWRP to 7. Apply
+BITDEP with length zero, or BITEXT (NU) with length zero. Set BFFWRP to 64 and
+extract two 32-bit words. The deposit leaves `0x8000000000000000`. The query
+preserves the full original bits. No expected raw result is supplied for
+prohibited lengths or attempts outside the available capacity or data.
+
+An isolated sweep of all extraction lengths from 0 through 32 confirmed the
+returned word, new pointer and occupied FIFO bits in 330 cases. For lengths
+of 8 through 31, the simulator can retain shifted copies of the original
+low bytes in the unoccupied tail. From `0x812345679abcdef0`, a 31-bit extract
+left `0xcd5e6f78006f7800` in the simulator. The reference follows the documented
+64-bit left shift, which leaves `0xcd5e6f7800000000`. Silicon behavior of
+the unoccupied bits remains unverified.
 FUNPACK uses all four exponent bits as finite short-format exponents, supports
 the short format's gradual underflow, and clears SZ/SV/SS even for signed zero.
 It ignores unrelated upper input bits and clears the result's extension byte.

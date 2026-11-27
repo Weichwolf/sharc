@@ -657,7 +657,7 @@ compound control forms are tracked in #27.
 ## S2 independent expectations (complete milestone, numerical gaps retained)
 
 `test/support/reference.py` supplies a separate exact integer/rational numeric
-model. `generate_expectations.py` checks 317 numeric/conversion/accumulator/shifter
+model. `generate_expectations.py` checks 318 numeric/conversion/accumulator/shifter
 anchors, 48,768 normal-range rounding positions and 27,648 limb-based multiplier
 cases and can emit deterministic machine-readable expectations without loading
 production code. Fixed ALU records include complete

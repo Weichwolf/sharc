@@ -82,8 +82,10 @@ LEADING = [
 FIFOS = [
     ("append", "deposit", 0xA000000000000000, 4, {"raw": 0x0000000B00, "length": 4},
      FifoResult(0xAB00000000000000, 8, None, 0, 0)),
-    ("append ORs old tail", "deposit", 0xFFFFFFFFFFFFFFFF, 0, {"raw": 0, "length": 1},
-     FifoResult(0xFFFFFFFFFFFFFFFF, 1, None, 0, 0)),
+    ("append ignores unoccupied bits", "deposit", 0xFFFFFFFFFFFFFFFF, 0, {"raw": 0, "length": 1},
+     FifoResult(0, 1, None, 0, 0)),
+    ("empty append clears the unoccupied tail", "deposit", 0x812345679ABCDEF0, 7, {"length": 0},
+     FifoResult(0x8000000000000000, 7, None, 0, 0)),
     ("extract and align", "extract", 0xAB00000000000000, 8, {"length": 4},
      FifoResult(0xB000000000000000, 4, 0x0000000A00, 0, 0)),
     ("query preserves FIFO and SF", "extract", 0xAB00000000000000, 40,
@@ -297,6 +299,7 @@ def fifo_lattice():
                 output = bits.copy()
                 updated, result = pointer, None
                 if operation == "deposit":
+                    output[pointer:] = [0] * (64 - pointer)
                     incoming = [int(char) for char in f"{0xB2468DF0:032b}"][-length:] if length else []
                     for index, bit in enumerate(incoming, start=pointer):
                         output[index] |= bit

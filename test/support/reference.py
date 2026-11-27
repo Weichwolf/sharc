@@ -686,6 +686,7 @@ def bit_fifo(operation: str, fifo: int, pointer: int, *, raw: int = 0,
         if operation == "deposit":
             if pointer + length > 64:
                 raise Unqualified("bit FIFO deposit exceeds available capacity")
+            fifo &= ~((1 << (64 - pointer)) - 1)
             pointer += length
             fifo |= (x & ((1 << length) - 1)) << (64 - pointer)
         else:
