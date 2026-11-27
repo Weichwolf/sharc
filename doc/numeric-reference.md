@@ -523,6 +523,16 @@ normal-word address using the `(LW)` qualifier. The addressed word used R5
 and the next word used R4 in SISD and SIMD. These observations concern the
 forced encoding, whose native lowering remains open.
 
+In a further 32 forced-long probes at an odd normal-word address, the CCES
+simulator rounded the address down to the preceding even word. It used the
+explicit register for that even word and the same-PE neighbor for the odd
+word. Both buses and explicit R/S registers matched in SISD and SIMD. With
+MODE2.U64MAE set it also raised STKYx.U64MA and IRPTL.IICDI with IICDI masked.
+The same two words transferred with monitoring clear. Programming Reference
+2.4, section 7-25 and Figure 7-9, describe an unaligned access across two
+successive rows. The data placement and timing of the odd-address form remain
+unverified on silicon.
+
 ## Register MODIFY and DAG interlocks
 
 In 64 authored type-7a probes, the CCES 2.12.1 ADSP-21489 functional simulator
