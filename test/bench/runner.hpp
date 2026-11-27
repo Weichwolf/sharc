@@ -126,16 +126,26 @@ struct Kernel {
   unsigned prepared_instructions;
 };
 
-template <class Reset, class Check, class Reference>
-void sample(Kernel kernel,
-            const sharc::NativeImage &native,
-            sharc::Core &core,
-            bool measure,
-            Reset reset,
-            Check check,
-            Reference reference) {
+struct OwnerStats {
+  std::uint64_t calls{}, horizons{}, requested{}, accepted{}, max_delay{}, total_delay{};
+};
+
+struct SampleRun {
+  sharc::RunResult result;
+  OwnerStats owner;
+};
+
+template <class Reset, class Check, class Reference, class Execute>
+void sample_execution(Kernel kernel,
+                      const sharc::NativeImage &native,
+                      bool measure,
+                      Reset reset,
+                      Check check,
+                      Reference reference,
+                      Execute execute,
+                      std::string_view schedule = {}) {
   constexpr unsigned repetitions = 3;
-  check(core.run(kernel.progress.instructions));
+  check(execute());
   (void)reference();
   const auto report = native.report();
   std::cout << R"({"kernel":)" << std::quoted(kernel.name) << R"(,"mode":)"
@@ -151,7 +161,9 @@ void sample(Kernel kernel,
             << ",\"native_bytes_per_prepared_instruction\":"
             << static_cast<double>(report.native_bytes) / kernel.prepared_instructions
             << ",\"guest_instructions\":" << kernel.progress.instructions
-            << ",\"guest_base_cycles\":" << kernel.progress.base_cycles << ",\"runs\":[";
+            << ",\"guest_base_cycles\":" << kernel.progress.base_cycles;
+  if (!schedule.empty()) { std::cout << ",\"schedule\":" << std::quoted(schedule); }
+  std::cout << ",\"runs\":[";
   std::unique_ptr<Counters> counters;
   if (measure) { counters = std::make_unique<Counters>(); }
   for (unsigned repeat = 0; repeat < (measure ? repetitions : 1); ++repeat) {
@@ -159,7 +171,7 @@ void sample(Kernel kernel,
     reset();
     if (counters) { counters->start(); }
     const auto start = Clock::now();
-    const auto result = core.run(kernel.progress.instructions);
+    const auto result = execute();
     const auto end = Clock::now();
     const auto counts = counters ? counters->stop() : Counts{};
     check(result);
@@ -168,8 +180,35 @@ void sample(Kernel kernel,
               << ",\"reference_nanoseconds\":" << native_time
               << ",\"host_instructions\":" << counter_value(measure, counts.instructions)
               << ",\"host_cycles\":" << counter_value(measure, counts.cycles)
-              << ",\"enabled\":" << counts.enabled << ",\"running\":" << counts.running << '}';
+              << ",\"enabled\":" << counts.enabled << ",\"running\":" << counts.running;
+    if (!schedule.empty()) {
+      const auto &owner = result.owner;
+      std::cout << ",\"owner_calls\":" << owner.calls << ",\"owner_horizons\":" << owner.horizons
+                << ",\"irq_requested\":" << owner.requested
+                << ",\"irq_accepted\":" << owner.accepted
+                << ",\"irq_max_delay\":" << owner.max_delay
+                << ",\"irq_total_delay\":" << owner.total_delay;
+    }
+    std::cout << '}';
   }
   std::cout << "]}\n";
+}
+
+template <class Reset, class Check, class Reference>
+void sample(Kernel kernel,
+            const sharc::NativeImage &native,
+            sharc::Core &core,
+            bool measure,
+            Reset reset,
+            Check check,
+            Reference reference) {
+  sample_execution(
+      kernel,
+      native,
+      measure,
+      reset,
+      [&](const SampleRun &run) { check(run.result); },
+      reference,
+      [&] { return SampleRun{.result = core.run(kernel.progress.instructions), .owner = {}}; });
 }
 } // namespace bench

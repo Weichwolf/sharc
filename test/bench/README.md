@@ -1,9 +1,32 @@
 # Common benchmarks
 
-K4 and K5 have checked Linux measurements. K1–K3, K6, macOS ARM64 and
+K1, K4, K5 and K6 have checked Linux results. K2, K3, macOS ARM64 and
 protected-page peripheral I/O remain open.
 
 ## Current Linux results
+
+### K1 and K6
+
+Medians of three unscaled runs on an Intel i5-1135G7 pinned to logical CPU 2,
+with Clang/LLVM 19.1.7. The preparation time and native size refer to the shared
+image, which is prepared once per numerical and memory mode.
+
+| Kernel | Schedule | Identity | Memory | Host inst./guest inst. | Host cycles/guest inst. | M guest inst./s | Guest/Clang O3 | Prepare s | Native bytes |
+|---|---|---|---|---:|---:|---:|---:|---:|---:|
+| K1 | continuous | Strict | exact | 121.130 | 32.813 | 109.96 | 51.02 | 27.260 | 1,420,189 |
+| K1 | bounded | Strict | exact | 128.054 | 35.359 | 102.17 | 56.84 | 27.260 | 1,420,189 |
+| K6 | interrupts | Strict | exact | 129.566 | 35.670 | 101.18 | 52.33 | 27.260 | 1,420,189 |
+| K1 | continuous | FastFP32 | exact | 121.130 | 33.985 | 106.21 | 48.32 | 28.850 | 1,420,189 |
+| K1 | bounded | FastFP32 | exact | 128.054 | 39.638 | 91.32 | 56.27 | 28.850 | 1,420,189 |
+| K6 | interrupts | FastFP32 | exact | 129.566 | 36.247 | 99.38 | 57.68 | 28.850 | 1,420,189 |
+| K1 | continuous | Strict | direct | 120.810 | 32.457 | 111.51 | 49.27 | 28.817 | 1,404,861 |
+| K1 | bounded | Strict | direct | 128.050 | 36.347 | 99.51 | 57.72 | 28.817 | 1,404,861 |
+| K6 | interrupts | Strict | direct | 129.585 | 38.168 | 94.80 | 56.82 | 28.817 | 1,404,861 |
+| K1 | continuous | FastFP32 | direct | 120.810 | 32.984 | 109.90 | 48.54 | 28.042 | 1,404,861 |
+| K1 | bounded | FastFP32 | direct | 128.050 | 35.673 | 101.43 | 56.94 | 28.042 | 1,404,861 |
+| K6 | interrupts | FastFP32 | direct | 129.585 | 36.229 | 99.90 | 56.81 | 28.042 | 1,404,861 |
+
+### K4 and K5
 
 Medians of three unscaled runs on an Intel i5-1135G7, pinned to logical CPU 3,
 with Clang/LLVM 19.1.7. K4 was measured for [PR #15](https://github.com/Weichwolf/sharc/pull/15)
@@ -50,10 +73,44 @@ by the measurement session before recording results.
 
 ## Workloads
 
+The authored [K1 FIR](k1.asm) runs the shared 64-tap Q1.31 definition for 256
+blocks of 1024 samples with continuous history. The host provides the input
+and its first 63 zero history words. The guest walks samples backward in DM
+and reads coefficients forward from a circular PM buffer. It primes the two
+operands and uses a one-word hardware loop for 63 parallel MAC and load
+packets. A final MAC, round-to-even and saturation produce each output word.
+An independent signed 64-bit C++ dot product checks every output against the
+contract SHA-256 `e0dd28045a3afa7150f68203e73f97539933139b0823efd64705cc1c63ea7462`.
+
+The FIR driver runs K1 continuously and with absolute bounds every 256 base
+cycles. K6 adds an IRQ2 request every 4096 base cycles and counts each accepted
+request in the guest. All three schedules use the same image within a given
+numerical and memory mode. K6 timing includes owner bounds, eligibility checks,
+steps taken during interrupt deferral and vector entry. The JSON reports calls,
+horizons, requests, accepted interrupts and the maximum and sum of acceptance
+delays in base cycles. Portable reference timing covers the same FIR arithmetic.
+
+```sh
+nice -n 10 cmake --build build --target sharc_k1_bench
+nice -n 10 ctest --test-dir build --output-on-failure -R '^bench_k1(_direct)?$'
+mkdir -p build/local
+nice -n 10 build/sharc_k1_bench --measure > build/local/fir-exact.jsonl
+nice -n 10 build/sharc_k1_bench --measure --direct > build/local/fir-direct.jsonl
+```
+
 | Kernel | Assembly | Unique guest instructions | Instructions retired | Base cycles | Output SHA-256 |
 |---|---|---:|---:|---:|---|
+| K1 | [k1.asm](k1.asm) | 18 | 19,661,570 | 20,710,143 | `e0dd28045a3afa7150f68203e73f97539933139b0823efd64705cc1c63ea7462` |
 | K4 | [k4.asm](k4.asm) | 61 | 18,874,369 | 39,845,886 | `490294093fdf6b9e10740daa992391bae19396c6e78bff448f035b4e7ca37f25` |
 | K5 | [k5.asm](k5.asm) | 13 | 14,682,625 | 23,071,742 | `e84b69ed409029f1af79718d2a57b8c0ab264a77e3979a939cb39b8087bdc589` |
+| K6 | [k1.asm](k1.asm) with IRQ2 | 20 | 19,671,704 | 20,755,746 | Same as K1 |
+
+K1 takes 80,899 owner calls with bounds alone. K6 requests and delivers 5,067
+IRQs in 81,078 absolute horizons plus 452 single-instruction calls while
+waiting for eligibility. The longest IRQ delay is three base cycles and the
+sum is 964. These counts agree across Strict, FastFP32, Exact and Direct.
+The native size denominator uses all 20 prepared guest sites for both kernels,
+including the IRQ2 handler.
 
 K4 starts at state 3 with accumulator `0x2468ace0` and executes 1,048,576
 transitions. The masked state selects one of eight DM table entries. The
