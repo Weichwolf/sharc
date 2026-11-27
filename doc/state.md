@@ -106,9 +106,11 @@ bindings. `set_registers` preserves hidden continuation when PC is unchanged;
 replacing PC starts a fresh declared entry and clears its pipeline history.
 Snapshots retain the preceding instruction's compute or BTF dependency, two
 recent physical DAG register-load tags and a taken classic delayed transfer's
-destination and slot phase. Cross-Core replay preserves the destination even
-when a slot changes a contributing DAG register. Mode-register writes and
-declared code transfers still need execution and snapshot qualification.
+destination and slot phase. They also retain the pending sample and age for
+conditions following an explicit ASTAT write. Cross-Core replay preserves
+the destination even when a slot changes a contributing DAG register.
+Mode-register writes and declared code transfers still need execution and
+snapshot qualification.
 
 For admitted DO forms, snapshots retain the PC-stack ownership of each
 hardware loop frame and its fetch decision. They also retain the pending

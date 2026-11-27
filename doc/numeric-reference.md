@@ -841,6 +841,33 @@ five-word loop turns measured 18 clocks in every case. Adding one or two
 NOPs before the DO added one or two clocks, consistent with Table A-10's
 zero read and effect latency for LCNTR.
 
+## Explicit arithmetic status writes
+
+The CCES 2.12.1 ADSP-21489 functional simulator ran 272 register, immediate,
+bit-operation and predicate probes, 108 focused interlock probes and 64
+memory load probes. An explicit ASTAT write is visible in raw readback at
+the next instruction. An adjacent predicate still uses the preceding flags
+when decode does not stall. With one intervening NOP, a conditional consumer
+uses the new flags and adds one clock. With two NOPs it uses the new flags
+without an extra clock. A masked writer produced no ASTAT interlock. In a
+parallel ADD packet, an adjacent non-branch predicate saw the compute flags
+before the explicit write, and an adjacent conditional branch added two
+clocks and used the new flags. The Core retains the pending predicate sample
+across bounds and snapshots.
+
+Another 48 probes checked unconditional ADD and ADDC with zero, one or two
+NOPs after an explicit write. The carry operand was available to ADDC at
+the next instruction, and neither operation added clocks.
+
+An absolute long load used the upper word and wrote the named ASTAT only.
+An indexed long load placed the low word in the named ASTAT and the high word
+in its peer. Both cases covered native long views and `(LW)` in normal views.
+The simulator accepted attempts to write SF and returned asymmetric reserved
+bits for ASTATx and ASTATy. The Core retains the FIFO-derived SF and masks the
+reserved bits consistently on both lanes, following Programming Reference
+2.4, Table A-6. The differing write masks and conditional-interlock timing
+await silicon confirmation.
+
 ## Fixed multiplier details
 
 The raw accumulator has 80 bits. Inputs use the upper 32 bits of each data

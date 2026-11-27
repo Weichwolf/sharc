@@ -413,6 +413,7 @@ struct Core::Impl {
     pointers[detail::interrupt_mask_slot] = &state.registers.imask;
     pointers[detail::interrupt_mask_pointer_slot] = &state.registers.imaskp;
     pointers[detail::extended_interrupt_slot] = &state.registers.lirptl;
+    pointers[detail::astat_effect_slot] = &astat_effect;
     pointers[detail::px_slot] = &state.registers.px;
     for (std::size_t reg = 0; reg < state.registers.ustat.size(); ++reg) {
       pointers[detail::ustat_slot + reg] = &state.registers.ustat[reg];
@@ -450,6 +451,7 @@ struct Core::Impl {
   void clear_continuation() noexcept {
     resume.reset();
     pipeline_history = 0;
+    astat_effect = 0;
     delayed_target = 0;
     loops = {};
   }
@@ -632,6 +634,7 @@ struct Core::Impl {
   detail::NativeCall native_call;
   std::vector<detail::HostView> views;
   std::uint32_t pipeline_history{};
+  std::uint64_t astat_effect{};
   std::uint64_t delayed_target{}; // Latched PC, next slot and optional loop fetch address.
   LoopPipeline loops;
   std::shared_ptr<const NativeImage::Impl> installed;
@@ -650,6 +653,7 @@ struct Snapshot::Impl {
   std::optional<Resume> resume;
   std::optional<PendingTransfer> transfer;
   std::uint32_t pipeline_history{};
+  std::uint64_t astat_effect{};
   std::uint64_t delayed_target{};
   LoopPipeline loops;
   std::vector<InterruptFrame> interrupt_frames;
@@ -1003,6 +1007,7 @@ Snapshot Core::save() const {
                      .resume = impl_->resume,
                      .transfer = impl_->transfer,
                      .pipeline_history = impl_->pipeline_history,
+                     .astat_effect = impl_->astat_effect,
                      .delayed_target = impl_->delayed_target,
                      .loops = impl_->loops,
                      .interrupt_frames = impl_->interrupt_frames});
@@ -1020,6 +1025,7 @@ void Core::restore(const Snapshot &snapshot) {
   impl_->resume = std::move(restored.resume);
   impl_->transfer = std::move(restored.transfer);
   impl_->pipeline_history = restored.pipeline_history;
+  impl_->astat_effect = restored.astat_effect;
   impl_->delayed_target = restored.delayed_target;
   impl_->loops = restored.loops;
   impl_->interrupt_frames = std::move(restored.interrupt_frames);

@@ -128,6 +128,8 @@ constexpr auto lcntr_register = static_cast<unsigned>(ControlRegister::lcntr);
 constexpr unsigned ureg_mask = 127, byte_mask = 255;
 constexpr unsigned history_older_mask = 0xff00;
 constexpr unsigned history_loop_setup = 1U << 16;
+constexpr unsigned history_astat_write = 1U << 17, history_astat_effect = 1U << 18;
+constexpr unsigned history_astat_mask = history_astat_write | history_astat_effect;
 constexpr unsigned history_dag_pair = 1U << 7;
 constexpr unsigned conditional_compute_type = 2;
 constexpr unsigned register_move_type = 5;
@@ -382,12 +384,12 @@ bool ordinary_ureg(unsigned reg) {
   return data_register(reg) || dag_register(reg) || paired_system_register(reg);
 }
 
-bool writable_ureg(unsigned reg) {
-  return ordinary_ureg(reg) || reg == px_register || reg == lcntr_register;
-}
-
 bool astat_register(unsigned reg) {
   return (reg & ~1U) == static_cast<unsigned>(ControlRegister::astat_x);
+}
+
+bool writable_ureg(unsigned reg) {
+  return ordinary_ureg(reg) || reg == px_register || reg == lcntr_register || astat_register(reg);
 }
 
 bool stky_register(unsigned reg) {
@@ -476,7 +478,7 @@ unsigned loaded_register(const Instruction &op) {
   }
   if (single_memory_transfer(op.type) || conditional_memory(op)) {
     const auto move = memory_move(op);
-    if (dag_memory_read(move)) { return move.reg; }
+    if (!move.write) { return move.reg; }
   }
   return 0;
 }
@@ -522,6 +524,19 @@ bool observes_not_lce(const Instruction &op) {
          (branch(op) || op.type == conditional_compute_type || op.type == immediate_shift_type ||
           conditional_memory(op) || op.type == register_move_type ||
           op.type == register_modify_type);
+}
+
+bool observes_astat_condition(const Instruction &op) {
+  return branch_condition(op) != true_condition && !observes_not_lce(op) &&
+         (branch(op) || conditional_memory(op) || op.type == conditional_compute_type ||
+          op.type == immediate_shift_type || op.type == register_move_type ||
+          op.type == register_modify_type);
+}
+
+bool writes_astat(const Instruction &op) {
+  return astat_register(loaded_register(op)) ||
+         (op.type == system_bit_type && astat_register(system_bit_register(op)) &&
+          !tests_system_bits(system_bit_operation(op)));
 }
 
 bool delayed(const Instruction &op) {
@@ -829,7 +844,8 @@ void validate_return(const Instruction &instruction, std::string_view identity) 
 void validate_memory_register(const Instruction &instruction, std::string_view identity) {
   const auto move = memory_move(instruction);
   if (data_register(move.reg) || paired_system_register(move.reg) || move.reg == px_register ||
-      move.reg == lcntr_register || (move.write && readable_control_register(move.reg))) {
+      move.reg == lcntr_register || astat_register(move.reg) ||
+      (move.write && readable_control_register(move.reg))) {
     return;
   }
   if (!dag_register(move.reg)) {
@@ -878,7 +894,8 @@ void validate_system_bit(const Instruction &op, std::string_view identity) {
     reject(op, identity, FaultReason::invalid_encoding, "reserved system bit operation or SREG");
   }
   const auto reg = system_bit_register(op);
-  if (!user_status(reg) && !(tests_system_bits(operation) && readable_control_register(reg))) {
+  if (!user_status(reg) && !astat_register(reg) &&
+      !(tests_system_bits(operation) && readable_control_register(reg))) {
     reject(op,
            identity,
            FaultReason::unsupported_instruction,
@@ -1042,7 +1059,8 @@ constexpr std::size_t interrupt_latch_value = pc_stack_depth_value + 1;
 constexpr std::size_t loop_grant_value = interrupt_latch_value + 1;
 constexpr std::size_t loop_remaining_value = loop_grant_value + 1;
 constexpr std::size_t tail_value = loop_remaining_value + 1;
-constexpr std::size_t dag_history_value = tail_value + 1;
+constexpr std::size_t astat_written_value = tail_value + 1;
+constexpr std::size_t dag_history_value = astat_written_value + 1;
 constexpr std::size_t index_value = dag_history_value + 1;
 constexpr std::size_t modifier_value = index_value + 16;
 constexpr std::size_t length_value = modifier_value + 16;
@@ -1404,6 +1422,21 @@ private:
                               vector(64, raw_extension_bits));
   }
 
+  llvm::Value *pending_astat(const Values &values, unsigned phase) {
+    return builder_.CreateIsNotNull(
+        builder_.CreateAnd(values[dag_history_value], builder_.getInt32(phase)));
+  }
+
+  llvm::Value *unit_admitted(const Values &values, BlockCost cost) {
+    auto *enough_instructions = builder_.CreateICmpUGE(values[instruction_remaining_value],
+                                                       builder_.getInt64(cost.instructions));
+    auto *enough_cycles =
+        builder_.CreateICmpUGE(values[cycle_remaining_value], builder_.getInt64(cost.cycles));
+    auto *clean_status = builder_.CreateNot(pending_astat(values, history_astat_mask));
+    return builder_.CreateAnd(builder_.CreateAnd(memory_admitted_, clean_status),
+                              builder_.CreateAnd(enough_instructions, enough_cycles));
+  }
+
   llvm::Type *state_type(std::size_t index) {
     if (index < status_value || index == fifo_value) { return vector_type(64); }
     if (index < instruction_remaining_value || index == fifo_pointer_value) {
@@ -1411,7 +1444,7 @@ private:
     }
     if (index >= accumulator_value) { return vector_type(accumulator_bits); }
     if (index == hazard_value) { return builder_.getIntNTy(hazard_bits); }
-    if (index == tail_value) { return builder_.getInt1Ty(); }
+    if (index == tail_value || index == astat_written_value) { return builder_.getInt1Ty(); }
     if (index >= dag_history_value || index == pc_stack_depth_value ||
         index == interrupt_latch_value) {
       return builder_.getInt32Ty();
@@ -1902,7 +1935,16 @@ llvm::Value *Lowering::condition(const Values &values, unsigned code) {
 
 llvm::Value *Lowering::condition(const Values &values, const Instruction &op) {
   const auto site = not_lce_.find(op.address);
-  if (site == not_lce_.end()) { return condition(values, branch_condition(op)); }
+  if (site == not_lce_.end()) {
+    if (!observes_astat_condition(op)) { return condition(values, branch_condition(op)); }
+    auto sample = values;
+    auto *early =
+        builder_.CreateAnd(pending_astat(values, history_astat_write),
+                           builder_.CreateICmpEQ(pipeline_stall(values, op), builder_.getInt64(0)));
+    auto *prior = builder_.CreateBitCast(load(64, astat_effect_slot), vector_type(32));
+    sample[status_value] = builder_.CreateSelect(early, prior, values[status_value]);
+    return condition(sample, branch_condition(op));
+  }
   auto *age = lce_age(load(64, counted_tail_slot_for(site->second)));
   age = builder_.CreateAdd(age, pipeline_stall(values, op));
   const auto limit = branch(op) ? lce_branch_age : lce_compute_age;
@@ -2158,9 +2200,7 @@ void Lowering::system_bit_instruction(Values &values, const Instruction &op) {
     case SystemBitOperation::toggle: updated = builder_.CreateXor(word, immediate); break;
     default: std::unreachable();
   }
-  auto *raw = builder_.CreateShl(builder_.CreateZExt(updated, vector_type(64)),
-                                 vector(64, raw_extension_bits));
-  write_system_register(reg, raw, selected);
+  write_register(values, reg, raw_words(updated), selected);
 }
 
 llvm::Value *Lowering::read_register(const Values &values, unsigned reg) {
@@ -2187,6 +2227,30 @@ void Lowering::write_register(Values &values,
                               unsigned reg,
                               llvm::Value *raw,
                               llvm::Value *selected) {
+  if (astat_register(reg)) {
+    auto *old = values[status_value];
+    auto *word = fixed_word(raw);
+    if ((reg & 1) != 0) {
+      word = builder_.CreateShuffleVector(word, {1, 0});
+      selected = builder_.CreateShuffleVector(selected, {1, 0});
+    }
+    auto *written =
+        builder_.CreateOr(builder_.CreateExtractElement(selected, builder_.getInt32(0)),
+                          builder_.CreateExtractElement(selected, builder_.getInt32(1)));
+    // A wide memory write can update both destinations in sequence. Retain
+    // the sample taken before the first selected destination.
+    auto *saved = builder_.CreateSelect(values[astat_written_value],
+                                        load(64, astat_effect_slot),
+                                        builder_.CreateBitCast(old, builder_.getInt64Ty()));
+    store(saved, astat_effect_slot);
+    values[astat_written_value] = builder_.CreateOr(values[astat_written_value], written);
+    constexpr std::uint32_t writable = 0xff043fff;
+    constexpr std::uint32_t fifo_flag = 1U << 14;
+    auto *update = builder_.CreateOr(builder_.CreateAnd(old, vector(32, fifo_flag)),
+                                     builder_.CreateAnd(word, vector(32, writable)));
+    values[status_value] = builder_.CreateSelect(selected, update, old);
+    return;
+  }
   if (dag_register(reg)) {
     const auto slot = index_value + dag_number(reg);
     auto *word = builder_.CreateTrunc(
@@ -2307,10 +2371,8 @@ llvm::Value *Lowering::pipeline_stall(const Values &values, const Instruction &o
     dependencies.push_back(16 + branch_modifier(op));
   }
   auto *previous = builder_.CreateAnd(values[dag_history_value], builder_.getInt32(byte_mask));
-  auto *older = values[dag_history_value];
-  if (!not_lce_.empty()) {
-    older = builder_.CreateAnd(older, builder_.getInt32(history_older_mask));
-  }
+  auto *older =
+      builder_.CreateAnd(values[dag_history_value], builder_.getInt32(history_older_mask));
   auto *earlier = builder_.CreateLShr(older, builder_.getInt32(8));
   llvm::Value *recent_match = builder_.getFalse();
   llvm::Value *earlier_match = builder_.getFalse();
@@ -2333,7 +2395,17 @@ llvm::Value *Lowering::pipeline_stall(const Values &values, const Instruction &o
         values[hazard_value],
         builder_.getIntN(hazard_bits, condition_hazard_mask(branch_condition(op))));
     auto *compute = builder_.CreateZExt(builder_.CreateIsNotNull(pending), builder_.getInt64Ty());
+    compute = builder_.CreateAdd(
+        compute,
+        builder_.CreateZExt(builder_.CreateAnd(builder_.CreateIsNotNull(pending),
+                                               pending_astat(values, history_astat_write)),
+                            builder_.getInt64Ty()));
     stall = builder_.CreateSelect(builder_.CreateICmpUGT(compute, stall), compute, stall);
+  }
+  if (observes_astat_condition(op)) {
+    auto *interlock =
+        builder_.CreateZExt(pending_astat(values, history_astat_effect), builder_.getInt64Ty());
+    stall = builder_.CreateBinaryIntrinsic(llvm::Intrinsic::umax, stall, interlock);
   }
   const auto lce = not_lce_.find(op.address);
   if (lce != not_lce_.end() && op.address == lce->second.start) {
@@ -2349,9 +2421,17 @@ void Lowering::retire_pipeline(Values &values, PipelineEffects effects) {
   auto *history =
       builder_.CreateAnd(builder_.CreateShl(values[dag_history_value], builder_.getInt32(8)),
                          builder_.getInt32(history_older_mask));
+  auto *effect =
+      builder_.CreateAnd(builder_.CreateShl(values[dag_history_value], builder_.getInt32(1)),
+                         builder_.getInt32(history_astat_effect));
+  history = builder_.CreateOr(history, effect);
   history = builder_.CreateSelect(
       builder_.CreateICmpEQ(stall, builder_.getInt64(0)), history, builder_.getInt32(0));
+  auto *write = builder_.CreateSelect(
+      values[astat_written_value], builder_.getInt32(history_astat_write), builder_.getInt32(0));
+  history = builder_.CreateOr(history, write);
   values[dag_history_value] = builder_.CreateOr(history, tag);
+  values[astat_written_value] = builder_.getFalse();
   values[extra_cycles_value] = builder_.CreateAdd(values[extra_cycles_value], stall);
 }
 
@@ -2909,6 +2989,7 @@ llvm::Value *Lowering::compute_condition(const Values &values, const Instruction
 }
 
 void Lowering::instruction(Values &values, const Instruction &op, bool partial) {
+  values[astat_written_value] = builder_.getFalse();
   if (loop_setup(op)) {
     loop_push(values, op, partial);
     values[hazard_value] = builder_.getIntN(hazard_bits, 0);
@@ -3747,7 +3828,8 @@ void Lowering::memory_writeback(Values &values,
   auto *view = operands.words[0].view;
   auto *raw = load_word(read[0], view);
   const bool loop_preload = move.reg == lcntr_register;
-  const bool system_pair = loop_preload || paired_system_register(move.reg);
+  const bool system_pair =
+      loop_preload || paired_system_register(move.reg) || astat_register(move.reg);
   const bool absolute_system = system_pair && move.addressing == MemoryAddressing::absolute;
   auto *wide = wide_memory_view(move, view);
   if (absolute_system) {
@@ -3756,7 +3838,7 @@ void Lowering::memory_writeback(Values &values,
   }
   write_memory_register(values, move.reg, raw, operands.selected[0]);
   if (loop_preload) { return; }
-  const auto implicit = complementary_register(move.reg);
+  const auto implicit = astat_register(move.reg) ? move.reg ^ 1 : complementary_register(move.reg);
   if (!operands.broadcast && !dag_register(move.reg) && operands.paired != builder_.getFalse()) {
     auto *other_lane =
         builder_.CreateAnd(operands.paired, builder_.CreateNot(operands.forced_pair));
@@ -5825,7 +5907,7 @@ void Lowering::plan_hardware_grants(const LoopMap &shapes) {
                   overlapping_short_tail(shape, fetch->second) ||
                   (shape.counted() && fetch->second.counted() &&
                    overlapping_tail(shape, fetch->second))) &&
-                 !modifies_index(op) && !dag_register(loaded_register(op)) &&
+                 !modifies_index(op) && !dag_register(loaded_register(op)) && !writes_astat(op) &&
                  !shift::fifo_transfer(op.compute);
         })) {
       continue;
@@ -6165,7 +6247,7 @@ void Lowering::plan_loops() {
     for (std::size_t i = start; i < end; ++i) {
       linear = linear && instructions_[i].address + 1 == instructions_[i + 1].address &&
                !branch(instructions_[i]) && !dag_register(loaded_register(instructions_[i])) &&
-               !shift::fifo_transfer(instructions_[i].compute);
+               !writes_astat(instructions_[i]) && !shift::fifo_transfer(instructions_[i].compute);
     }
     if (!linear) { continue; }
     const bool stall = conditional && (condition_hazard(instructions_[end - 1]) &
@@ -6284,7 +6366,15 @@ std::set<std::uint32_t> grant_successors(const Instruction &op) {
   return next;
 }
 
+unsigned grant_cycles(const Instruction &op, bool has_astat_writes) {
+  auto cycles = 1U;
+  if (memory_moves(op).count != 0 || modifies_index(op) || indirect_branch(op)) { cycles += 2; }
+  if (branch(op)) { cycles += branch_penalty + unsigned{branch_condition(op) != true_condition}; }
+  return cycles + unsigned{has_astat_writes && observes_astat_condition(op)};
+}
+
 std::vector<std::optional<BlockCost>> Lowering::unit_costs() const {
+  const bool has_astat_writes = std::ranges::any_of(instructions_, writes_astat);
   std::vector<std::optional<BlockCost>> result(instructions_.size());
   std::vector<unsigned> visited(instructions_.size());
   const std::function<std::optional<BlockCost>(std::size_t)> visit =
@@ -6293,7 +6383,6 @@ std::vector<std::optional<BlockCost>> Lowering::unit_costs() const {
     visited[i] = 1;
     const auto &op = instructions_[i];
     if (sequencer_boundary(op.address)) { return std::nullopt; }
-    const bool is_branch = branch(op);
     const auto next = grant_successors(op);
     BlockCost suffix{.instructions = 0, .cycles = 0};
     for (const auto address : next) {
@@ -6308,14 +6397,7 @@ std::vector<std::optional<BlockCost>> Lowering::unit_costs() const {
       suffix.cycles = std::max(suffix.cycles, cost->cycles);
     }
     ++suffix.instructions;
-    ++suffix.cycles;
-    if (memory_moves(op).count != 0 || modifies_index(op) || indirect_branch(op)) {
-      suffix.cycles += 2;
-    }
-    if (is_branch) {
-      suffix.cycles += branch_penalty;
-      if (((op.word >> condition_shift) & true_condition) != true_condition) { ++suffix.cycles; }
-    }
+    suffix.cycles += grant_cycles(op, has_astat_writes);
     visited[i] = 2;
     result[i] = suffix;
     return suffix;
@@ -6330,7 +6412,7 @@ std::vector<bool> Lowering::dead_alu_status() const {
   for (auto end = instructions_.size(); end != 0; --end) {
     const auto i = end - 1;
     const auto &op = instructions_[i];
-    if (costs_[i].instructions == 1 ||
+    if (costs_[i].instructions == 1 || writes_astat(op) ||
         (single_memory_transfer(op.type) && astat_register(memory_move(op).reg))) {
       overwritten = false;
     }
@@ -6389,12 +6471,7 @@ void Lowering::emit_instruction(std::size_t i,
         builder_.CreateAnd(builder_.CreateICmpEQ(values[dag_history_value], builder_.getInt32(0)),
                            builder_.CreateICmpNE(turns, builder_.getInt64(0))));
   } else if (grant.has_value()) {
-    admitted = builder_.CreateAnd(
-        memory_admitted_,
-        builder_.CreateAnd(builder_.CreateICmpUGE(values[instruction_remaining_value],
-                                                  builder_.getInt64(grant->instructions)),
-                           builder_.CreateICmpUGE(values[cycle_remaining_value],
-                                                  builder_.getInt64(grant->cycles))));
+    admitted = unit_admitted(values, *grant);
   }
   auto hot = values;
   // A fixed-cost loop grant proves that no incoming DAG load is pending.
@@ -6558,6 +6635,7 @@ void Lowering::emit() {
   initial[loop_grant_value] = builder_.getInt64(0);
   initial[loop_remaining_value] = builder_.getInt64(0);
   initial[tail_value] = builder_.getFalse();
+  initial[astat_written_value] = builder_.getFalse();
   auto *pipeline = function_->getArg(unit_pipeline);
   initial[hazard_value] = builder_.CreateTrunc(pipeline, builder_.getIntNTy(hazard_bits));
   initial[dag_history_value] = builder_.CreateLShr(pipeline, builder_.getInt32(hazard_bits));

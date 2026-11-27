@@ -120,6 +120,14 @@ word for absolute addressing and the lower word for indexed addressing. Both
 normal-word reads of a forced long pair must succeed before the register,
 parallel compute or index changes.
 
+Loads into ASTATx/y use separate explicit and complementary predicates in
+normal and short views. Indexed long loads deliver the low word to the named
+register and the high word to its peer when the explicit lane is selected.
+Absolute long loads use the high word and write only the named register.
+A forced long load in a normal view follows the same writeback rules after
+both reads. The register readback and conditional pipeline observe the
+result at different points.
+
 Combined PX can transfer all 64 bits through a long-word view or a forced
 long-word access to two successive normal words. Long-word broadcast selects
 the reversed halves if its implicit transfer is selected. For an unqualified

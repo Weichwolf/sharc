@@ -72,7 +72,8 @@ bool px_half(unsigned reg) {
 }
 
 bool has_peer(unsigned reg) {
-  return is_data(reg) || px_half(reg) || std::ranges::contains(ustat, reg);
+  return is_data(reg) || px_half(reg) || reg == astat_x_code || reg == astat_y_code ||
+         std::ranges::contains(ustat, reg);
 }
 
 unsigned data_bank(const sharc::Registers &state, unsigned reg) {
@@ -131,6 +132,13 @@ void write(sharc::Registers &state, unsigned reg, bool implicit, std::uint64_t r
     return;
   }
   const auto value = static_cast<std::uint32_t>(raw >> 8);
+  if (reg == astat_x_code || reg == astat_y_code) {
+    constexpr std::uint32_t writable = 0xff043fff;
+    constexpr std::uint32_t fifo_status = 1U << 14;
+    auto &lane = state.pe[(reg & 1) ^ unsigned{implicit}].astat;
+    lane = (lane & fifo_status) | (value & writable);
+    return;
+  }
   if (reg == lcntr_code) {
     state.lcntr = value;
     return;
@@ -414,6 +422,8 @@ void parallel_priority() {
                              Move{.source = px, .destination = ustat[0]},
                              Move{.source = ustat[3], .destination = px},
                              Move{.source = 0, .destination = lcntr_code},
+                             Move{.source = 0, .destination = astat_x_code},
+                             Move{.source = 0, .destination = astat_y_code},
                              Move{.source = 0x50, .destination = 0, .swap = true}};
   const auto exercise = [](const Move &move) {
     const std::array words{encoding(move) | add_r0_r2_r3};
@@ -482,7 +492,16 @@ void immediate_registers(unsigned quarter) {
 }
 
 void system_immediates() {
-  verify_immediates({ustat[0], ustat[1], ustat[2], ustat[3], px1, px2, px, lcntr_code});
+  verify_immediates({ustat[0],
+                     ustat[1],
+                     ustat[2],
+                     ustat[3],
+                     px1,
+                     px2,
+                     px,
+                     lcntr_code,
+                     astat_x_code,
+                     astat_y_code});
 }
 
 enum class UserBitAction : std::uint8_t { set, clear, toggle, test, compare };
@@ -507,6 +526,132 @@ std::uint64_t bit_word(UserBitAction action, unsigned reg, std::uint32_t mask) {
 
 std::uint64_t bit_word(UserBit bit) {
   return bit_word(bit.action, ustat[bit.port], bit.mask);
+}
+
+void astat_effect_sequence(sharc::ExecutionMode mode, bool raw_read, bool old_zero) {
+  constexpr std::uint32_t fifo_status = 1U << 14;
+  const auto new_status = unsigned{!old_zero};
+  constexpr auto conditional = Move{.source = 5, .destination = 4};
+  const auto next = raw_read ? encoding({.source = astat_x_code, .destination = 4}, true_condition)
+                             : encoding(conditional);
+  const std::array words{fixture::immediate(astat_x_code, new_status),
+                         next,
+                         encoding({.source = 5, .destination = 6}),
+                         encoding({.source = 5, .destination = 7})};
+  fixture::Program program(words);
+  const auto native = fixture::compile(program.code, mode);
+  sharc::Core core(program.memory(), mode);
+  sharc::Core replay(program.memory(), mode);
+  auto before = initial(unsigned{old_zero});
+  before.pe[0].astat |= fifo_status;
+  fixture::install(core, native, before);
+  (void)replay.install(native, fixture::Program::variant_id);
+  const auto beginning = core.save();
+  check(fixture::completed(core.run(1), 1, 1), "explicit ASTAT write did not retire");
+  check(core.registers().pe[0].astat == (fifo_status | new_status), "ASTAT write lost SF or AZ");
+  replay.restore(core.save());
+  const auto cycles = 4U;
+  check(fixture::completed(replay.run(3), 3, cycles), "ASTAT replay lost its pending timing");
+  auto expected = before;
+  const auto source = before.pe[0].data[0][5];
+  expected.pe[0].astat = fifo_status | new_status;
+  if (raw_read) {
+    expected.pe[0].data[0][4] = std::uint64_t{expected.pe[0].astat} << 8;
+  } else if (old_zero) {
+    expected.pe[0].data[0][4] = source;
+  }
+  if (!old_zero) {
+    expected.pe[0].data[0][6] = source;
+    expected.pe[0].data[0][7] = source;
+  }
+  fixture::boundary(expected, {.pc = base + 4, .clock = clock_seed + cycles + 1});
+  check(replay.registers() == expected, "ASTAT raw read and delayed predicate used the same flags");
+  core.restore(beginning);
+  check(fixture::completed(core.run(words.size()), words.size(), cycles + 1) &&
+            core.registers() == expected,
+        "ASTAT grant changed the architectural result or lost an interlock");
+  core.restore(beginning);
+  const auto now = core.state().progress.base_cycles;
+  check(fixture::completed(core.run_until(now + 3), 3, 4) && core.registers().pc == base + 3 &&
+            fixture::completed(core.run_until(now + 5), 1, 1) && core.registers() == expected,
+        "ASTAT cycle deadline did not retain the interlocked prefix");
+}
+
+enum class AstatBranchWriter : std::uint8_t { plain, parallel, late, masked };
+
+void astat_effect_branches(sharc::ExecutionMode mode, AstatBranchWriter writer) {
+  constexpr unsigned source = 7;
+  constexpr std::uint64_t add_r0_r2_r3 = 0x1023;
+  const bool parallel = writer == AstatBranchWriter::parallel;
+  const bool masked = writer == AstatBranchWriter::masked;
+  const bool intervening_nop = masked || writer == AstatBranchWriter::late;
+  const auto move = Move{.source = source, .destination = astat_x_code};
+  const auto write = encoding(move, masked ? 0U : true_condition);
+  constexpr auto target = base + 4;
+  constexpr std::uint64_t jump_eq = 0x060000000000 | target;
+  constexpr std::uint64_t nop = 0;
+  const std::array words{write | (parallel ? add_r0_r2_r3 : 0),
+                         intervening_nop ? nop : jump_eq,
+                         intervening_nop ? jump_eq : nop,
+                         nop,
+                         nop};
+  fixture::Program program(words);
+  const auto native = fixture::compile(program.code, mode);
+  sharc::Core core(program.memory(), mode);
+  auto before = initial(0);
+  before.pe[0].data[0][source] = 1U << 8;
+  fixture::install(core, native, before);
+  const auto instructions = intervening_nop ? 3U : 2U;
+  const bool taken = parallel || writer == AstatBranchWriter::late;
+  const auto cycles = taken ? 7U : instructions;
+  const auto successor = taken ? target : base + instructions;
+  check(fixture::completed(core.run(instructions), instructions, cycles) &&
+            core.registers().pc == successor,
+        "adjacent branch lost the ASTAT predicate age or parallel-compute interlock");
+}
+
+void astat_carry(sharc::ExecutionMode mode) {
+  constexpr unsigned carry = 8;
+  constexpr std::uint64_t add_with_carry = fixture::add(4, 1, 2) | (1ULL << 14);
+  const std::array words{fixture::immediate(astat_x_code, carry), add_with_carry};
+  fixture::Program program(words);
+  const auto native = fixture::compile(program.code, mode);
+  sharc::Core core(program.memory(), mode);
+  sharc::Registers before;
+  before.pc = base;
+  before.pe[0].data[0][1] = 1U << 8;
+  before.pe[0].data[0][2] = 2U << 8;
+  fixture::install(core, native, before);
+  check(fixture::completed(core.run(2), 2, 2) && core.registers().pe[0].data[0][4] == (4U << 8),
+        "ADDC consumed the delayed predicate sample instead of the new carry operand");
+}
+
+void astat_effects() {
+  for (const auto mode : fixture::numeric_modes) {
+    for (const bool raw_read : {false, true}) {
+      for (const bool old_zero : {false, true}) { astat_effect_sequence(mode, raw_read, old_zero); }
+    }
+    using enum AstatBranchWriter;
+    for (const auto writer : {plain, parallel, late, masked}) {
+      astat_effect_branches(mode, writer);
+    }
+    astat_carry(mode);
+    const std::array words{bit_word(UserBitAction::toggle, astat_x_code, 1),
+                           encoding({.source = 5, .destination = 4}),
+                           encoding({.source = 5, .destination = 6})};
+    fixture::Program program(words);
+    const auto native = fixture::compile(program.code, mode);
+    sharc::Core core(program.memory(), mode);
+    auto before = initial(4);
+    before.pe[1].astat = 1;
+    fixture::install(core, native, before);
+    check(fixture::completed(core.run(3), 3, 4) &&
+              core.registers().pe[0].data[0][6] == before.pe[0].data[0][5] &&
+              core.registers().pe[1].data[0][4] == before.pe[1].data[0][5] &&
+              core.registers().pe[0].data[0][4] == before.pe[0].data[0][4] &&
+              core.registers().pe[1].data[0][6] == before.pe[1].data[0][6],
+          "ASTAT bit toggle lost independent old and new SIMD predicates");
+  }
 }
 
 void expected_user_bits(sharc::Registers &state, UserBit bit, unsigned lanes) {
@@ -990,6 +1135,7 @@ void register_transfers() {
   for (unsigned quarter = 0; quarter < 4; ++quarter) { immediate_registers(quarter); }
   system_immediates();
   user_status_bits();
+  astat_effects();
   control_bit_reads();
   bit_flag_consumers();
   user_status_bit_refusals();

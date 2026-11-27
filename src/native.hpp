@@ -72,7 +72,8 @@ inline constexpr std::size_t flags_slot = mode_mask_slot + 1;
 inline constexpr std::size_t interrupt_mask_slot = flags_slot + 1;
 inline constexpr std::size_t interrupt_mask_pointer_slot = interrupt_mask_slot + 1;
 inline constexpr std::size_t extended_interrupt_slot = interrupt_mask_pointer_slot + 1;
-inline constexpr std::size_t register_pointer_count = extended_interrupt_slot + 1;
+inline constexpr std::size_t astat_effect_slot = extended_interrupt_slot + 1;
+inline constexpr std::size_t register_pointer_count = astat_effect_slot + 1;
 inline constexpr std::uint8_t owner_yield_event = 1;
 inline constexpr std::uint8_t code_write_event = 2;
 

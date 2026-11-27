@@ -764,10 +764,15 @@ written by type 5a, an immediate type 17a or a load in types 3a, 14a and 15a.
 Installed tests cover masked writes, a fault in a forced pair, and immediate
 use of the preload by a type 13a DO UNTIL LCE across public execution bounds.
 An in-loop write leaves the current frame's iteration count intact.
+ASTATx/y writes execute through types 3a, 5a, 14a, 15a and 17a and through
+BIT SET, CLR and TGL. Installed fixtures cover old operands in parallel
+compute, the independent SIMD predicates, narrow and wide memory loads, and
+the distinction between raw readback and predicate effect across a snapshot.
 Other system-register writes and their pipeline effects, dynamic sequencer
 register reads and unresolved event semantics remain open. See
 [the simulator probes](numeric-reference.md#control-register-read-operands)
-and [loop preload observations](numeric-reference.md#loop-preload-writes).
+and the observations on [loop preload](numeric-reference.md#loop-preload-writes)
+and [arithmetic status writes](numeric-reference.md#explicit-arithmetic-status-writes).
 
 Remaining system UREG transfers, DAG addressing variants and silicon
 confirmation of contended register writeback are tracked in #26. Remaining

@@ -991,6 +991,13 @@ struct SystemWord {
 void set_system_word(sharc::Registers &state, SystemWord transfer) {
   const auto [reg, word] = transfer;
   constexpr unsigned bits = 32;
+  if (reg == astat_x_port || reg == astat_y_port) {
+    constexpr std::uint32_t writable = 0xff043fff;
+    constexpr std::uint32_t fifo_status = 1U << 14;
+    auto &astat = state.pe[reg & 1].astat;
+    astat = (astat & fifo_status) | (word & writable);
+    return;
+  }
   if (reg == first_px_half || reg == second_px_half) {
     const auto shift = reg == first_px_half ? 0U : bits;
     state.px = (state.px & ~(px_word_mask << shift)) | (std::uint64_t{word} << shift);
@@ -1234,6 +1241,12 @@ void control_memory_stores(sharc::ExecutionMode mode) {
       RegisterMemoryCase{.form = immediate,
                          .space = program,
                          .view = normal_word,
+                         .reg = astat_y_port,
+                         .width = 4,
+                         .force = true},
+      RegisterMemoryCase{.form = immediate,
+                         .space = program,
+                         .view = normal_word,
                          .reg = imask_port,
                          .width = 4,
                          .force = true},
@@ -1244,7 +1257,9 @@ void control_memory_stores(sharc::ExecutionMode mode) {
       RegisterMemoryCase{
           .form = post, .space = program, .view = normal_word, .reg = mode1_port, .width = 4},
   };
-  for (const auto &item : cases) { system_memory_access(item, mode, true); }
+  for (const auto &item : cases) {
+    system_memory_access(item, mode, item.reg != astat_x_port && item.reg != astat_y_port);
+  }
 }
 
 void store_live_alu_status(sharc::ExecutionMode mode) {
