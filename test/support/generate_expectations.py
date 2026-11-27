@@ -123,7 +123,7 @@ FLOATING = [
     ("opposite infinities invalid", "add", 0x7F80000000, 0xFF80000000, Mode(40),
      FloatingResult(0xFFFFFFFFFF, invalid=True)),
     ("zero times infinity invalid", "mul", 0, 0x7F80000000, Mode(40),
-     FloatingResult(0xFFFFFFFFFF, invalid=True)),
+     FloatingResult(0x7FFFFFFFFF, invalid=True)),
     ("infinity is not finite overflow", "add", 0x7F80000000, 0x3F80000000, Mode(40),
      FloatingResult(0x7F80000000)),
 ]
@@ -189,11 +189,7 @@ def rounding_lattice():
 
 def explicit_gaps():
     calls = [
-        lambda: floating("add", 0x7FC0000000, 0, Mode(32)),
-        lambda: floating("add", 0x7F80000001, 0, Mode(32)),
         lambda: fixed("unimplemented", 0),
-        lambda: quantize(Fraction(1, 1 << 126) - Fraction(1, 1 << 158), Mode(40)),
-        lambda: quantize(Fraction(1, 1 << 126) - Fraction(1, 1 << 150), Mode(32)),
         lambda: fixed_from_float("fix", 0x7FC0000000, Mode(40), saturate=True),
         lambda: fixed_from_float("fix", 0x4EFFFFFFFF, Mode(40)),
         lambda: fixed_from_float("trunc", 0x7F80000000, Mode(40)),
@@ -281,10 +277,22 @@ inline constexpr std::array fixed_cases{
                     "} // namespace fixture\n")
 
 
+def floating_header(path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("""// SPDX-License-Identifier: GPL-3.0-only
+// Generated from the independent rational reference. No production imports.
+#pragma once
+#include <array>
+#include <cstdint>
+namespace fixture {
+""" + floating_expectations.installed_header() + "} // namespace fixture\n")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, help="write qualified numeric cases as JSON")
     parser.add_argument("--fixed-header", type=Path, help="write independent installed-image fixed expectations")
+    parser.add_argument("--floating-header", type=Path, help="write installed-image floating expectations")
     arguments = parser.parse_args()
     records = anchored_cases()
     for module in (multiplier_expectations, conversion_expectations, shifter_expectations,
@@ -301,8 +309,8 @@ def main():
     seed_count = packing_expectations.seed_lattice()
     parallel_count = parallel_expectations.fixed_lattice() + parallel_expectations.floating_lattice()
     parallel_expectations.explicit_refusals()
-    floating_count, floating_refusals = floating_expectations.exact_lattice()
-    unary_count, unary_refusals = floating_expectations.unary_lattice()
+    floating_count = floating_expectations.exact_lattice()
+    unary_count = floating_expectations.unary_lattice()
     parts_count, parts_refusals = floating_expectations.parts_lattice()
     floating_expectations.explicit_gaps()
     shifter_count = shifter_expectations.bit_lattice() + shifter_expectations.leading_lattice()
@@ -315,6 +323,8 @@ def main():
     explicit_gaps()
     if arguments.fixed_header:
         fixed_header(arguments.fixed_header)
+    if arguments.floating_header:
+        floating_header(arguments.floating_header)
     if arguments.output:
         payload = {"contract": "strict-numeric-foundation-v1", "isa_execution_coverage": False,
                    "cases": records}
@@ -325,7 +335,7 @@ def main():
           f"{conversion_count} signed-quotient conversions ({conversion_refusals} explicit refusals); "
           f"{shifter_count} shifter, {fifo_count} FIFO, {unpack_count} unpack cases; "
           f"{floating_count + unary_count + parts_count} full FP cases "
-          f"({floating_refusals + unary_refusals + parts_refusals} explicit FP refusals); "
+          f"({parts_refusals} explicit FP refusals); "
           f"{parallel_count} multifunction cases; "
           f"{packing_count} pack fields ({packing_refusals} refused rounding cases), "
           f"{seed_count} seed special cases; "

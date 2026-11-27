@@ -11,8 +11,8 @@ is claimed.
 | Classic 48-bit ISA | Every documented instruction class, condition, legal operand and parallel form | Partial: data/DAG transfers, fixed ALU/ROT, direct/indirect flow, normal-word pre-indexed and parallel post-indexed memory, immediate DAG modify/reverse, NOP |
 | VISA 16/32/48 | All compact encodings, fetch boundaries, PC units and mode transitions | Unimplemented |
 | Arithmetic and SIMD | PEx/PEy, fixed point, 32-/40-bit float, rounding, modes, flags and exceptions | Partial: fixed ALU, multiplier/MR, fixed multifunction, register-count ROT and bank/SIMD execution |
-| Strict numerical mode (default) | Exact guest 32-/40-bit behavior, RND32, conversion exceptions and native-path identity | Unimplemented |
-| FastFP32 numerical mode (opt-in) | Independent approximation expectations, rounding/flags, unchanged raw moves/integer behavior, separate translations | Unimplemented |
+| Strict numerical mode (default) | Exact guest 32-/40-bit behavior, RND32, conversion exceptions and native-path identity | Partial, see [single-function floating compute](#single-function-floating-compute) |
+| FastFP32 numerical mode (opt-in) | Independent approximation expectations, rounding/flags, unchanged raw moves/integer behavior, separate translations | Partial, see [single-function floating compute](#single-function-floating-compute) |
 | Parallel operations | Old operands, memory aliases, register exchanges and ordered partial effects | Partial: raw register moves/swaps and type 1a normal-word PM/DM with supported fixed compute |
 | Address generation and memory | Both DAGs, modulo/reverse addressing, PM/DM and physical view aliases | Partial: normal-word pre-indexing, immediate modify/reverse and DAG register-load dependencies |
 | Sequencer and control | Delayed flow, DO/loop endpoints, LR, stacks, reset and interrupts | Partial: classic direct/indirect transfers, hardware DO and admitted reentry, reset, declared maskable vectors, admitted RTI and IDLE |
@@ -109,8 +109,8 @@ a compute adds one interlock cycle, including when not taken (Programming
 Reference 2.4, 4-19–4-21 and 4-115–4-116). The preceding-compute history is SSA
 state, stored at exits and included in snapshots. Cycle bounds may cross the
 deadline to finish the current instruction; cycle credit cannot wrap under zero.
-External conditions refuse preparation. VISA, floating computation,
-timer evolution and remaining shifter and memory forms remain unimplemented.
+External conditions refuse preparation. VISA, timer evolution and remaining
+shifter and memory forms remain unimplemented.
 
 Single fixed multiplier computations include register and MR destinations,
 integer and fractional signedness combinations, MAC, MSUB, convergent rounding,
@@ -548,10 +548,42 @@ See the [current benchmark results](../test/bench/README.md) for inputs,
 independent references and unscaled Linux hardware counts. K1–K3, K6 and
 goal sanitizer qualification remain open.
 
+## Single-function floating compute
+
+Classic type 2a lowers floating ADD, SUB, their absolute forms, average,
+multiply, PASS, negate, ABS, RND, COMP, COPYSIGN, MIN, MAX and CLIP. Strict
+applies the guest rounding mode and RND32 boundary. FastFP32 rounds
+computational inputs and results to binary32 with the guest rounding direction.
+Both identities use the raw register file and leave guest MODE1 visible.
+
+`test/isa/floating.cpp` runs independently authored instruction fields and
+4,888 paired rational expectations, split evenly between Strict and FastFP32,
+through installed images. It checks full register state,
+arithmetic flags, comparison history, sticky flags, and progress for admitted
+blocks and partial bounds in SISD and SIMD, with alternate banks and separate
+lane predicates. A raw register move carries an extended midpoint between
+physical banks. A floating compare of that copy drives a conditional fixed
+PASS across the mode-specific precision boundary, and a later compare preserves
+CACC through an overwrite of the ordinary ALU flags. The sequence runs with upward
+host rounding and checks the unchanged host rounding mode. The preparation
+suite round-trips the Strict artifact and checks cross-mode refusal.
+
+The matrix verifies negative zero and NaN flags, RND32 and explicit RND
+classification and output widths, COMP history on unordered inputs, and the
+minimum-normal boundary. It distinguishes Strict RND32 truncation from
+FastFP32 operand rounding and handles extension-only NaN inputs in each mode.
+It verifies the signed invalid result from floating multiplication. The
+original operands and guest MODE1 retain their full contents. The observed
+Strict boundaries and their reproduction procedure are recorded in
+[numeric-reference.md](numeric-reference.md#adsp-21489-simulator-observations).
+Conversions, packing, seeds, floating multifunction execution and floating
+parallel-transfer qualification remain open. Floating-workload performance
+is tracked separately from the fixed K1–K6 identities.
+
 ## S2 independent expectations (complete milestone, numerical gaps retained)
 
 `test/support/reference.py` supplies a separate exact integer/rational numeric
-model. `generate_expectations.py` checks 279 numeric/conversion/accumulator/shifter
+model. `generate_expectations.py` checks 297 numeric/conversion/accumulator/shifter
 anchors, 48,768 normal-range rounding positions and 27,648 limb-based multiplier
 cases and can emit deterministic machine-readable expectations without loading
 production code. Fixed ALU records include complete
@@ -561,8 +593,8 @@ finite integer and saturated results with flags, including exponent-based AV and
 pre-rounded AUS; 10,972 signed-quotient comparisons and 1,828 required refusals
 cross-check both conversion instructions. Floating value-only records remain
 separate from new qualified complete ALU, compare, MANT/LOGB and multiply effects.
-The latter pass 29,956 independent full-result checks and 5,132 required refusals;
-unqualified negative-zero, NaN and MANT input-boundary status is not filled in.
+The latter pass 30,008 independent full-result checks and 5,080 required
+refusals for the unqualified MANT input boundary.
 Another 130,817 shifter, 15,449 bit FIFO and 65,536 short-float unpack cases use
 independent bit routing, bit lists and rational value checks. Scalar shifter
 expectations preserve unrelated flags and sticky bits. FIFO records refuse
@@ -597,10 +629,9 @@ each half has its own predicate. Authored ADD/swap expectations preserve old AZ
 selection and new ALU flags even when a swap replaces the ALU data result.
 This is expectation generation, not installed-image swap coverage.
 
-The S2 generation criterion is met; the model explicitly refuses unqualified NaN/near-underflow
-boundaries and conversion sentinel flags. Remaining exceptional floating status, computations,
-OR-shift status, complete FPACK, full conditional execution/bank composition and parallel memory
-ordering expectations are still required. See
+The S2 generation criterion is met. Remaining conversion and seed exceptions,
+OR-shift status, complete FPACK, full conditional execution/bank composition
+and parallel memory ordering expectations are still required. See
 [numeric-reference.md](numeric-reference.md) for the exact scope, source sections
 and gaps. Oracle validation is not installed-image ISA execution coverage. No
 complete numerical or profile acceptance follows from these oracle checks.

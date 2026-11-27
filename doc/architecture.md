@@ -180,6 +180,9 @@ execution and does not promise identical sound or a measured speedup.
   floating-point result to binary32, including operations that otherwise use
   40-bit precision. Specify rounding and conversions explicitly using the guest
   rules; do not inherit the compiler's unrestricted fast-math behavior.
+  Recognize a NaN before reducing the operand precision, including a payload
+  confined to the extension byte. Encode an invalid result with all binary32
+  exponent and fraction bits set, the instruction's sign, and zero extension.
 - Preserve raw 40-bit storage and transfers that do not perform floating-point
   computation. Do not truncate integer registers, instruction words, addresses,
   stacks or memory formats. Precision reduction happens at computational views,

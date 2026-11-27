@@ -267,11 +267,8 @@ class Operand:
 
 
 def operand(raw: int, mode: Mode) -> Operand:
-    original = Operand(raw)
     if mode.precision == 32:
-        if original.kind == "nan" and original.fraction < 256:
-            raise Unqualified("RND32 NaN classification confined to extension bits")
-        raw &= RAW_MASK ^ 255  # Strict RND32 truncates inputs; it does not round them.
+        raw = raw_word(raw) << 8
     return Operand(raw)
 
 
@@ -302,8 +299,10 @@ def quantize(value: Fraction, mode: Mode, *, negative_zero: bool = False,
     if exponent < -126:
         if exponent == -127 and mode.rounding == "nearest":
             minimum = power(-126)
-            if magnitude * power(scale) >= minimum - power(-126 - fraction_bits):
-                raise Unqualified("nearest rounding immediately below the minimum normal")
+            halfway = minimum - power(-127 - fraction_bits)
+            exact = magnitude * power(scale)
+            if exact >= halfway:
+                return FloatingResult(sign | 0x0080000000, underflow=exact == halfway)
         return FloatingResult(sign, underflow=True)
     quantum_exponent = exponent - fraction_bits
     significand = rounded_integer(magnitude * power(scale - quantum_exponent), mode.rounding)
@@ -323,10 +322,9 @@ def _overflow(sign: int, mode: Mode) -> FloatingResult:
     return FloatingResult(sign | (254 << 31) | fraction, overflow=True)
 
 
-def _invalid(mode: Mode) -> FloatingResult:
-    if mode.precision == 32:
-        raise Unqualified("RND32 canonical NaN extension bits require qualification")
-    return FloatingResult(RAW_MASK, invalid=True)
+def _invalid(mode: Mode, *, negative: bool = True) -> FloatingResult:
+    magnitude = ((1 << (mode.precision - 1)) - 1) << (40 - mode.precision)
+    return FloatingResult(magnitude | (SIGN if negative else 0), invalid=True)
 
 
 def floating(operation: str, left: int, right: int, mode: Mode) -> FloatingResult:
@@ -334,18 +332,20 @@ def floating(operation: str, left: int, right: int, mode: Mode) -> FloatingResul
     if operation not in ("add", "sub", "avg", "mul"):
         raise Unqualified(f"unmodeled floating operation: {operation}")
     x, y = operand(left, mode), operand(right, mode)
-    if "nan" in (x.kind, y.kind):
-        return _invalid(mode)
     if operation == "sub":
         y = Operand(y.raw ^ SIGN)
     if operation == "mul":
         negative = x.negative != y.negative
+        if "nan" in (x.kind, y.kind):
+            return _invalid(mode, negative=(x if x.kind == "nan" else y).negative)
         if "infinity" in (x.kind, y.kind):
             other = y if x.kind == "infinity" else x
             if other.kind != "infinity" and other.number() == 0:
-                return _invalid(mode)
+                return _invalid(mode, negative=negative)
             return FloatingResult(INFINITY | (SIGN if negative else 0))
         return quantize(x.number() * y.number(), mode, negative_zero=negative)
+    if "nan" in (x.kind, y.kind):
+        return _invalid(mode)
     if "infinity" in (x.kind, y.kind):
         if x.kind == y.kind and x.negative != y.negative:
             return _invalid(mode)
@@ -354,7 +354,10 @@ def floating(operation: str, left: int, right: int, mode: Mode) -> FloatingResul
     value = x.number() + y.number()
     if operation == "avg":
         value /= 2
-    return quantize(value, mode, negative_zero=x.negative and y.negative)
+    result = quantize(value, mode, negative_zero=x.negative and y.negative)
+    if result.underflow:
+        return FloatingResult(result.raw & SIGN, underflow=True)
+    return result
 
 
 def float_from_fixed(raw: int, mode: Mode, *, scale: int = 0) -> FloatingResult:
@@ -363,21 +366,14 @@ def float_from_fixed(raw: int, mode: Mode, *, scale: int = 0) -> FloatingResult:
 
 
 def float_round(raw: int, mode: Mode) -> FloatingResult:
-    # RND consumes the extension bits that it is asked to round (11-33).
-    x = Operand(raw)
+    # RND rounds the selected computational input view to binary32.
+    x = operand(raw, mode)
     destination = Mode(32, mode.rounding)
     if x.kind == "nan":
         return _invalid(destination)
     if x.kind == "infinity":
         return FloatingResult(x.raw)
     return quantize(x.number(), destination, negative_zero=x.negative)
-
-
-def _floating_negative(raw: int) -> bool:
-    value = Operand(raw)
-    if value.kind == "nan" or (value.kind == "zero" and value.negative):
-        raise Unqualified("floating negative status for NaN or negative zero requires qualification")
-    return value.negative
 
 
 def _floating_order(raw: int):
@@ -392,7 +388,7 @@ def _floating_effects(result: FloatingResult, astat: int, stky: int, *,
                       absolute: bool = False, input_sign: bool = False) -> IntegerResult:
     validate_flags(astat, stky)
     x = Operand(result.raw)
-    negative = False if absolute else _floating_negative(x.raw)
+    negative = x.negative and not (absolute or result.invalid)
     flags = AF | (AZ if x.kind == "zero" else 0)
     flags |= AN if negative else 0
     flags |= (AV if result.overflow else 0) | (AI if result.invalid else 0)
@@ -418,7 +414,7 @@ def floating_alu(operation: str, left: int, right: int = 0, *, mode: Mode,
         absolute = operation in ("absadd", "abssub")
         if absolute and not result.invalid:
             result = FloatingResult(result.raw & ~SIGN, result.overflow, result.underflow)
-        zero_sticky, overflow_sticky = True, operation != "avg"
+        zero_sticky, overflow_sticky = result.underflow, operation != "avg"
     elif operation == "float":
         result = float_from_fixed(left, mode, scale=0 if scale is None else scale)
         zero_sticky = overflow_sticky = scale is not None
@@ -457,7 +453,7 @@ def floating_alu(operation: str, left: int, right: int = 0, *, mode: Mode,
                         raw = (min if operation == "min" else max)((a, b), key=_floating_order)
                 result = FloatingResult(raw)
         absolute = operation == "abs"
-        input_sign = absolute and x.negative
+        input_sign = absolute and x.negative and x.kind != "nan"
         zero_sticky = operation == "scale"
     else:
         raise Unqualified(f"unmodeled floating ALU operation: {operation}")
@@ -471,7 +467,8 @@ def floating_compare(left: int, right: int, mode: Mode, *, astat: int = 0,
     validate_flags(astat, stky)
     x, y = operand(left, mode), operand(right, mode)
     if "nan" in (x.kind, y.kind):
-        raise Unqualified("unordered floating compare flags require qualification")
+        history = ((astat >> 1) & CACC) | (1 << 31)
+        return IntegerResult(None, (astat & ~(ALU_FLAGS | CACC)) | history | AF | AI, stky | AIS)
     a, b = _floating_order(x.raw), _floating_order(y.raw)
     return compare_result(a, b, astat, stky, floating_point=True)
 
@@ -733,10 +730,14 @@ def floating_seed(operation: str, raw: int, mode: Mode, *, astat: int = 0,
     if operation not in ("recips", "rsqrts"):
         raise Unqualified(f"unmodeled seed operation: {operation}")
     validate_flags(astat, stky)
+    if mode.precision == 32 and Operand(raw).kind == "nan" and (raw & (FRACTION_MASK ^ 255)) == 0:
+        raise Unqualified("seed classification with extension-only NaN requires qualification")
     x = operand(raw, mode)
     zero_input = x.kind in ("zero", "denormal")
     invalid = x.kind == "nan" or (operation == "rsqrts" and x.negative and not zero_input)
     if invalid:
+        if mode.precision == 32:
+            raise Unqualified("seed RND32 invalid result requires qualification")
         if operation == "recips" and x.negative:
             raise Unqualified("RECIPS negative NaN input AN requires qualification")
         result = _invalid(mode).raw
@@ -765,7 +766,7 @@ def floating_multiply(left: int, right: int, mode: Mode, *, astat: int = 0,
                       stky: int = 0) -> IntegerResult:
     validate_flags(astat, stky)
     result = floating("mul", left, right, mode)
-    flags = (MN if _floating_negative(result.raw) else 0)
+    flags = MN if result.raw & SIGN and not result.invalid else 0
     flags |= (MV if result.overflow else 0) | (MU if result.underflow else 0)
     flags |= MI if result.invalid else 0
     # Floating multiplication preserves every ALU bit, including AF.

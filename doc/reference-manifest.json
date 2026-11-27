@@ -63,6 +63,18 @@
       "provenance": "Cover, revision, part number, page count and type-6 fields agree with the official indexed PDF. Direct publisher download timed out; byte identity with the publisher is not verified. ADSP-214xx compatibility is stated in Programming Reference 2.4 section 1-10. Analysis-only reference, never a build input."
     }
   ],
+  "observation_tools": [
+    {
+      "title": "CrossCore Embedded Studio for Windows",
+      "file": "ADI_CrossCoreEmbeddedStudio-Rel2.12.1.exe",
+      "official_url": "https://download.analog.com/tools/CrossCoreEmbeddedStudio/Releases/Release_2.12.1/ADI_CrossCoreEmbeddedStudio-Rel2.12.1.exe",
+      "revision": "2.12.1, compiler SHARC 8.16.1.0 (June 4, 2024)",
+      "bytes": 908078480,
+      "sha256": "5ddace48646282549e0d2578ff28bd0b9ced9ab56ad5054b965ddc48dbec6870",
+      "scope": "Optional ADSP-21489 floating-point observation using the ADSP-214xx Family Simulator",
+      "redistributed": false
+    }
+  ],
   "online_references": [
     {
       "title": "ADSP-21483/21486/21487/21488/21489 SHARC Processor Datasheet",
