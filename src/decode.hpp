@@ -17,6 +17,9 @@ inline constexpr std::uint8_t short_instruction_bits = 16;
 inline constexpr std::uint32_t maximum_pc = 0xffffff;
 inline constexpr unsigned interrupt_source_count = 42;
 inline constexpr unsigned parallel_memory_type = 1;
+inline constexpr unsigned register_offset_memory_type = 3;
+inline constexpr unsigned immediate_offset_memory_type = 4;
+inline constexpr unsigned immediate_shift_type = 6;
 inline constexpr unsigned absolute_memory_type = 14;
 inline constexpr unsigned memory_move_type = 15;
 inline constexpr unsigned immediate_memory_store_type = 16;
@@ -54,10 +57,18 @@ constexpr bool single_memory_transfer(unsigned type) {
   return type >= absolute_memory_type && type <= immediate_memory_store_type;
 }
 
+constexpr bool conditional_memory(const Instruction &instruction) {
+  constexpr unsigned prefix_shift = 44;
+  return instruction.type == register_offset_memory_type ||
+         instruction.type == immediate_offset_memory_type ||
+         (instruction.type == immediate_shift_type && (instruction.word >> prefix_shift) == 8);
+}
+
 enum class MemoryAddressing : std::uint8_t { indexed_offset, absolute, postmodified };
 
 struct MemoryMove {
-  unsigned index{}, reg{}, lane{}, modifier{};
+  unsigned index{}, reg{}, lane{};
+  std::optional<unsigned> modifier = std::nullopt;
   MemorySpace space{};
   bool write{}, force_long{};
   MemoryAddressing addressing{};

@@ -186,6 +186,39 @@ Instruction instruction(std::span<const std::uint16_t> parcels,
                           .detail = std::move(message)});
 }
 
+namespace {
+MemoryMove conditional_memory_move(const Instruction &instruction) {
+  constexpr unsigned index_shift = 41;
+  constexpr unsigned modifier_shift = 38;
+  constexpr unsigned register_shift = 23;
+  constexpr unsigned address_operand_shift = 27;
+  constexpr unsigned immediate_write_shift = 39;
+  constexpr unsigned register_write_shift = 31;
+  constexpr unsigned force_long_shift = 30;
+  const auto field = [&](unsigned shift, unsigned mask) {
+    return static_cast<unsigned>((instruction.word >> shift) & mask);
+  };
+  const bool immediate = instruction.type == immediate_offset_memory_type;
+  const bool universal = instruction.type == register_offset_memory_type;
+  const bool program = field(immediate ? 40 : 32, 1) != 0;
+  const auto dag = program ? 8U : 0U;
+  const auto ureg = field(register_shift, universal ? 0x7f : 15);
+  const bool update =
+      instruction.type == immediate_shift_type || field(immediate ? 38 : 44, 1) != 0;
+  const auto offset = field(address_operand_shift, 63);
+  constexpr unsigned offset_sign = 32;
+  return {.index = field(index_shift, 7) + dag,
+          .reg = ureg & 15,
+          .lane = ureg < 16 ? 0U : 1U,
+          .modifier = immediate ? std::nullopt : std::optional{field(modifier_shift, 7) + dag},
+          .space = program ? MemorySpace::program : MemorySpace::data,
+          .write = field(immediate ? immediate_write_shift : register_write_shift, 1) != 0,
+          .force_long = universal && field(force_long_shift, 1) != 0,
+          .addressing = update ? MemoryAddressing::postmodified : MemoryAddressing::indexed_offset,
+          .address_operand = immediate ? ((offset ^ offset_sign) - offset_sign) : 0U};
+}
+} // namespace
+
 MemoryMove memory_move(const Instruction &instruction) {
   constexpr unsigned index_shift = 41;
   constexpr unsigned indexed_dag_shift = 44;
@@ -193,6 +226,7 @@ MemoryMove memory_move(const Instruction &instruction) {
   constexpr unsigned register_shift = 32;
   constexpr std::uint64_t memory_write = std::uint64_t{1} << 40;
   constexpr std::uint64_t forced_long = std::uint64_t{1} << 39;
+  if (conditional_memory(instruction)) { return conditional_memory_move(instruction); }
   if (instruction.type == immediate_memory_store_type) {
     constexpr unsigned dag_shift = 37;
     constexpr unsigned modifier_shift = 38;
@@ -221,7 +255,7 @@ MemoryMove memory_move(const Instruction &instruction) {
 }
 
 MemoryMoves memory_moves(const Instruction &instruction) {
-  if (single_memory_transfer(instruction.type)) {
+  if (single_memory_transfer(instruction.type) || conditional_memory(instruction)) {
     return {.transfers = {memory_move(instruction), {}}, .count = 1};
   }
   if (instruction.type != parallel_memory_type) { return {}; }

@@ -10,6 +10,9 @@
 
 namespace {
 constexpr unsigned full_width = 48, wide_width = 32;
+constexpr unsigned register_offset_type = 3;
+constexpr unsigned immediate_offset_type = 4;
+constexpr unsigned immediate_shift_type = 6;
 constexpr unsigned register_modify_type = 7;
 constexpr unsigned absolute_memory_type = 14;
 constexpr unsigned immediate_store_type = 16;
@@ -101,11 +104,13 @@ void formats() {
     check(fault.detail.starts_with(name), "wrong instruction class");
     if (item.bits == full_width) {
       const auto image = fixture::image(InstructionSet::isa, item.word);
-      if (item.type == 1 || item.type == 2 || item.type == 5 || item.type == 8 || item.type == 9 ||
+      if (item.type == 1 || item.type == 2 || item.type == register_offset_type ||
+          item.type == immediate_offset_type || item.type == 5 ||
+          item.type == immediate_shift_type || item.type == 8 || item.type == 9 ||
           item.type == register_modify_type || item.type == absolute_memory_type ||
           item.type == 15 || item.type == immediate_store_type ||
           item.type == immediate_move_type || item.type == index_modify_type ||
-          item.type == nop_type || item.type == idle_type || item.word == standalone_shift) {
+          item.type == nop_type || item.type == idle_type) {
         const auto semantic = Core::lower(image);
         check(!semantic.bitcode().empty() && !semantic.exports().empty(),
               "supported classic form has no semantic image");

@@ -47,15 +47,35 @@ and short-word differences observed in CCES.
 
 ## Address and lane behavior
 
-The address is I plus the instruction's 32-bit displacement. A type 15 transfer
-leaves I unchanged. Circular and bit-reverse post-modification do not apply to
-this pre-indexed operation. Programs must obey the manual's restriction that
-pre-indexing does not change the address space.
+Type 15 takes its address from I plus the instruction's 32-bit displacement.
+It leaves I unchanged. Circular and bit-reverse post-modification do not apply
+to this pre-indexed operation. Programs must obey the manual's restriction
+that pre-indexing does not change the address space.
 
 Type 14 takes the full unsigned address from the instruction. It leaves the
 DAGs unchanged and ignores their broadcast and bit-reverse settings. An
 explicit S register selects PEy first, with the complementary register used
 for a paired access.
+
+Classic type 3a selects a DAG modifier register, type 4a carries a signed
+six-bit modifier, and type 6 pairs an immediate shifter operation with a DAG
+register post-modification. Types 3a and 4a can pre-index without changing I,
+or access the old I and post-modify it once. Circular and bit-reverse settings
+apply to the post-modified form. The type-3a data-register forms can also
+select S registers and the long-word override.
+
+In conditional single-bus packets, SIMD predicates gate the explicit and
+complementary transfers independently. With explicit S, the PEx predicate
+still controls the explicit memory transfer. SISD broadcast copies an admitted
+read to both data files. An inactive transfer performs no permission check,
+callback or store check. The explicit address's declared view determines the
+stride even when only the complementary transfer is active. If that view is
+absent, the checked path can infer it from a unique normal word at offset one
+or short word at offset two. Two matching views are ambiguous and cause an
+explicit memory refusal. After at least one selected transfer completes and the
+packet has no fault, post-modification updates the shared index once. Compute
+and stores use the old operands, and an admitted load takes precedence over an
+aliased compute result.
 
 Type 1a transfers address DM using DAG1 and PM using DAG2. Both addresses use
 their old I. The packet updates each I once using the selected signed M from the

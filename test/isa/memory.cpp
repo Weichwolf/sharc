@@ -388,6 +388,236 @@ void forced_transfers(const ForcedForm &form, sharc::ExecutionMode mode) {
   }
 }
 
+struct PredicatedForm {
+  std::uint64_t dm_read, program_bit, store_bit;
+  unsigned destination, memory_register, explicit_lane;
+  int modifier;
+  bool postmodify, rotation;
+};
+
+constexpr std::uint64_t across_buses = 1ULL << 32;
+constexpr std::uint64_t store_direction = 1ULL << 31;
+constexpr std::uint64_t imm_program_bit = 1ULL << 40;
+constexpr std::uint64_t imm_write_bit = 1ULL << 39;
+constexpr std::array predicated_forms{
+    PredicatedForm{.dm_read = 0x52c002001612,
+                   .program_bit = across_buses,
+                   .store_bit = store_direction,
+                   .destination = 6,
+                   .memory_register = 4,
+                   .explicit_lane = 0,
+                   .modifier = 2,
+                   .postmodify = true,
+                   .rotation = false},
+    PredicatedForm{.dm_read = 0x42c002001612,
+                   .program_bit = across_buses,
+                   .store_bit = store_direction,
+                   .destination = 6,
+                   .memory_register = 4,
+                   .explicit_lane = 0,
+                   .modifier = -2,
+                   .postmodify = false,
+                   .rotation = false},
+    PredicatedForm{.dm_read = 0x624012001612,
+                   .program_bit = imm_program_bit,
+                   .store_bit = imm_write_bit,
+                   .destination = 6,
+                   .memory_register = 4,
+                   .explicit_lane = 0,
+                   .modifier = 2,
+                   .postmodify = true,
+                   .rotation = false},
+    PredicatedForm{.dm_read = 0x6201f2001612,
+                   .program_bit = imm_program_bit,
+                   .store_bit = imm_write_bit,
+                   .destination = 6,
+                   .memory_register = 4,
+                   .explicit_lane = 0,
+                   .modifier = -2,
+                   .postmodify = false,
+                   .rotation = false},
+    PredicatedForm{.dm_read = 0x82c002020161,
+                   .program_bit = across_buses,
+                   .store_bit = store_direction,
+                   .destination = 6,
+                   .memory_register = 4,
+                   .explicit_lane = 0,
+                   .modifier = 2,
+                   .postmodify = true,
+                   .rotation = true},
+    PredicatedForm{.dm_read = 0x52c02a001412,
+                   .program_bit = across_buses,
+                   .store_bit = store_direction,
+                   .destination = 4,
+                   .memory_register = 4,
+                   .explicit_lane = 1,
+                   .modifier = 2,
+                   .postmodify = true,
+                   .rotation = false},
+};
+
+struct PacketConfiguration {
+  unsigned index, flags, predicates;
+  bool write;
+};
+
+constexpr unsigned packet_index = 5;
+constexpr unsigned packet_bank = 1;
+constexpr unsigned packet_simd = 2;
+constexpr unsigned packet_broadcast = 4;
+constexpr unsigned packet_wrap = 8;
+
+sharc::Registers initial_packet(const PredicatedForm &form, const PacketConfiguration &config) {
+  const auto bank = config.flags & packet_bank;
+  const auto bit = config.index == 1 ? broadcast1_bit : broadcast9_bit;
+  const auto mode = (bank << low_data_bit) | (bank << dag_bank_bits[config.index]) |
+                    (static_cast<std::uint32_t>((config.flags & packet_simd) != 0) << simd_bit) |
+                    (static_cast<std::uint32_t>((config.flags & packet_broadcast) != 0) << bit);
+  auto state = initial({.index = config.index, .mode = mode});
+  state.dag[bank][config.index].index = ram_address + packet_index;
+  state.dag[bank][config.index].base = ram_address;
+  if ((config.flags & packet_wrap) != 0) {
+    state.dag[bank][config.index].base += packet_index - 1;
+    state.dag[bank][config.index].length = 2;
+  }
+  state.dag[bank][config.index + 2].modifier = static_cast<std::uint32_t>(form.modifier);
+  constexpr std::array<std::uint64_t, 2> left{17, 20};
+  constexpr std::array<std::uint64_t, 2> right{33, 36};
+  for (unsigned lane = 0; lane < state.pe.size(); ++lane) {
+    auto &pe = state.pe[lane];
+    pe.data[bank][1] = (left[lane] << byte_bits) | 1;
+    pe.data[bank][2] = (right[lane] << byte_bits) | 2;
+    pe.astat = old_status[lane] | ((config.predicates >> lane) & 1);
+  }
+  return state;
+}
+
+void expect_packet(sharc::Registers &state,
+                   std::vector<std::byte> &ram,
+                   const PredicatedForm &form,
+                   const PacketConfiguration &config) {
+  const auto bank = config.flags & packet_bank;
+  const bool broadcast = !config.write && (config.flags & packet_broadcast) != 0;
+  const bool simd = (config.flags & packet_simd) != 0;
+  const std::array original{state.pe[0].data[bank][form.memory_register],
+                            state.pe[1].data[bank][form.memory_register]};
+  const auto active = config.predicates & (simd ? 3U : 1U);
+  auto first = packet_index;
+  if (!form.postmodify) { first = static_cast<unsigned>(static_cast<int>(first) + form.modifier); }
+  const auto transfer = !simd && broadcast && active != 0 ? 3U : active;
+  constexpr std::array<std::uint64_t, 2> sums{50, 56};
+  constexpr std::array<std::uint64_t, 2> rotations{34, 40};
+  constexpr std::uint32_t alu_flags = 0x43f;
+  constexpr std::uint32_t shifter_flags = 0x3800;
+  for (unsigned lane = 0; lane < state.pe.size(); ++lane) {
+    if ((active & (1U << lane)) == 0) { continue; }
+    auto &pe = state.pe[lane];
+    pe.data[bank][form.destination] = (form.rotation ? rotations[lane] : sums[lane]) << byte_bits;
+    pe.astat &= ~(form.rotation ? shifter_flags : alu_flags);
+  }
+  for (unsigned lane = 0; lane < state.pe.size(); ++lane) {
+    if ((transfer & (1U << lane)) == 0) { continue; }
+    const auto address = first + (broadcast ? 0 : lane);
+    const auto physical = lane ^ form.explicit_lane;
+    if (config.write) {
+      put(ram, address, static_cast<std::uint32_t>(original[physical] >> byte_bits));
+    } else {
+      state.pe[physical].data[bank][form.memory_register] = std::uint64_t{words[address]}
+                                                            << byte_bits;
+    }
+  }
+  if (form.postmodify && active != 0 && (config.flags & packet_wrap) == 0) {
+    state.dag[bank][config.index].index += static_cast<std::uint32_t>(form.modifier);
+  }
+  fixture::boundary(state, {.pc = state.pc + 1, .clock = 1});
+}
+
+void predicated_packets(const PredicatedForm &form,
+                        sharc::MemorySpace space,
+                        sharc::ExecutionMode mode,
+                        bool write) {
+  constexpr unsigned capacity = 128;
+  constexpr unsigned configurations = 16;
+  constexpr unsigned predicate_count = 4;
+  const auto index = space == sharc::MemorySpace::data ? 1U : 9U;
+  const auto word = form.dm_read | (space == sharc::MemorySpace::program ? form.program_bit : 0) |
+                    (write ? form.store_bit : 0);
+  const std::array code{word, std::uint64_t{0}};
+  fixture::Program program(code);
+  auto region = fixture::normal_region(ram_address, words.size(), ram_id);
+  region.space = space;
+  region.byte_offset = offset;
+  region.byte_stride = stride;
+  program.code.variants.front().layout.regions.push_back(region);
+  const auto native = fixture::compile(program.code, mode);
+  std::vector<std::byte> ram(capacity, padding);
+  for (unsigned i = 0; i < words.size(); ++i) { put(ram, i, words[i]); }
+  const auto seed = ram;
+  sharc::Core core(program.memory(ram_id, ram), mode);
+  (void)core.install(native, fixture::Program::variant_id);
+  const auto beginning = core.save();
+  for (unsigned flags = 0; flags < configurations; ++flags) {
+    for (unsigned predicates = 0; predicates < predicate_count; ++predicates) {
+      const PacketConfiguration config{
+          .index = index, .flags = flags, .predicates = predicates, .write = write};
+      auto state = initial_packet(form, config);
+      auto expected_ram = seed;
+      expect_packet(state, expected_ram, form, config);
+      for (const bool cycles : {false, true}) {
+        core.restore(beginning);
+        core.set_registers(initial_packet(form, config));
+        std::ranges::copy(seed, ram.begin());
+        const auto count = cycles ? 1U : 2U;
+        const auto result = cycles ? core.run_until(count) : core.run(count);
+        auto final_state = state;
+        fixture::boundary(final_state, {.pc = fixture::code_address + count, .clock = count});
+        check(fixture::completed(result, count, count) && core.registers() == final_state &&
+                  ram == expected_ram,
+              "predicated memory packet lost a lane, old operand, priority, or index update");
+      }
+    }
+  }
+}
+
+void predicated_packets(sharc::ExecutionMode mode) {
+  constexpr std::array spaces{sharc::MemorySpace::data, sharc::MemorySpace::program};
+  constexpr std::array directions{false, true};
+  for (const auto &form : predicated_forms) {
+    for (const auto space : spaces) {
+      for (const bool write : directions) { predicated_packets(form, space, mode, write); }
+    }
+  }
+}
+
+void predicated_short_lane(sharc::ExecutionMode mode) {
+  constexpr std::uint64_t load = 0x52c002000000; // IF EQ R4 = DM(I1,M3).
+  constexpr unsigned short_sign = 1U << 14;
+  constexpr std::uint64_t signed_word = 0xffff9a8000;
+  const std::array code{load};
+  fixture::Program program(code);
+  program.code.variants.front().layout.regions.push_back({.view = sharc::MemoryView::short_word,
+                                                          .first = ram_address + 2,
+                                                          .count = 1,
+                                                          .storage_id = ram_id,
+                                                          .byte_stride = 2,
+                                                          .initialized = true});
+  constexpr std::array contents{std::byte{0x80}, std::byte{0x9a}};
+  auto ram = contents;
+  const auto native = fixture::compile(program.code, mode);
+  sharc::Core core(program.memory(ram_id, ram), mode);
+  auto expected = initial({.index = 1, .mode = (1U << simd_bit) | short_sign});
+  expected.pe[1].astat |= 1;
+  expected.dag[0][1].index = ram_address;
+  expected.dag[0][1].length = 0;
+  expected.dag[0][3].modifier = 1;
+  fixture::install(core, native, expected);
+  expected.pe[1].data[0][4] = signed_word;
+  ++expected.dag[0][1].index;
+  fixture::boundary(expected, {.pc = expected.pc + 1, .clock = 1});
+  check(fixture::completed(core.run(1), 1, 1) && core.registers() == expected,
+        "only the selected implicit short-word lane should transfer and sign-extend");
+}
+
 constexpr std::uint32_t immediate_payload = 0x765432ab;
 constexpr unsigned immediate_stride = 11;
 
@@ -475,6 +705,8 @@ void memory_access() {
   for (const auto mode : fixture::numeric_modes) {
     absolute_transfers(sharc::MemorySpace::data, mode);
     absolute_transfers(sharc::MemorySpace::program, mode);
+    predicated_packets(mode);
+    predicated_short_lane(mode);
     for (const auto space : {sharc::MemorySpace::data, sharc::MemorySpace::program}) {
       for (const bool indexed : {false, true}) {
         for (const bool odd : {false, true}) {

@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -824,6 +825,137 @@ void forced_store_io(sharc::ExecutionMode mode) {
         "forced long callback refusal lost ordered same-PE payloads or precise progress");
 }
 
+void predicated_store_io(sharc::ExecutionMode mode, unsigned mask) {
+  constexpr std::uint64_t store = 0x52c082001612; // IF EQ R6=R1+R2, DM(I1,M3)=R4.
+  constexpr std::array<std::uint64_t, 2> payload{0x12345678, 0xaabbccdd};
+  constexpr unsigned both = 3;
+  constexpr unsigned postmodify = 2;
+  const std::array words{store};
+  Program program(words);
+  auto &target = program.code.code.variants.front().layout.regions.back();
+  target.first = (mask & 1) != 0 ? ram_address : ram_address + 1;
+  target.count = static_cast<std::uint64_t>(std::popcount(mask));
+  target.initialized = false;
+  const auto native = fixture::compile(program.code.code, mode);
+  Peripheral device{.fault_on = mask == both ? 2U : 0U};
+  auto memory = program.code.memory();
+  memory.io = device.binding();
+  sharc::Core core(memory, mode);
+  device.core = &core;
+  auto before = initial();
+  before.mode1 = simd_bit;
+  before.dag[0][1].index = ram_address;
+  before.dag[0][3].modifier = postmodify;
+  for (unsigned lane = 0; lane < before.pe.size(); ++lane) {
+    auto &pe = before.pe[lane];
+    pe.astat = (mask >> lane) & 1;
+    pe.data[0][1] = 1U << word_shift;
+    pe.data[0][2] = 2U << word_shift;
+    pe.data[0][4] = (payload[lane] << word_shift) | 1;
+  }
+  fixture::install(core, native, before);
+  const auto result = core.run(1);
+  auto expected = before;
+  if (mask != both) {
+    if (mask != 0) {
+      const auto lane = mask == 1 ? 0U : 1U;
+      expected.pe[lane].data[0][6] = 3U << word_shift;
+      expected.pe[lane].astat = 0;
+      expected.dag[0][1].index += postmodify;
+    }
+    fixture::boundary(expected, {.pc = expected.pc + 1, .clock = 1});
+    check(fixture::completed(result, 1, 1),
+          "disabled predicated access faulted or skipped retirement");
+  } else {
+    check(result.has_fault && result.fault.reason == sharc::FaultReason::access_fault &&
+              result.fault.instruction == store && result.progress == sharc::Progress{} &&
+              result.fault.detail.contains(std::to_string(ram_address + 1)) && device.words[1] == 0,
+          "predicated implicit refusal lost its instruction or earlier store");
+  }
+  check(core.registers() == expected && device.calls == target.count,
+        "predicated store changed masked state or communicated a masked lane");
+  unsigned call{};
+  for (unsigned lane = 0; lane < payload.size(); ++lane) {
+    if ((mask & (1U << lane)) == 0) { continue; }
+    const auto stored = mask == both && lane != 0 ? 0 : payload[lane];
+    check(device.trace[call++] == Peripheral::Access{.space = sharc::MemorySpace::data,
+                                                     .address = ram_address + lane,
+                                                     .word = payload[lane],
+                                                     .writing = true} &&
+              device.words[lane] == stored,
+          "predicated store lost the selected old operand or callback order");
+  }
+}
+
+void predicated_fifo_refusal(sharc::ExecutionMode mode) {
+  // IF EQ R6 = BITEXT 1, DM(I1,M3) = R4.
+  constexpr std::uint64_t store = 0x82c082140160;
+  const std::array words{store};
+  Program program(words);
+  const auto native = fixture::compile(program.code.code, mode);
+  sharc::Core core(program.memory(), mode);
+  auto before = initial();
+  before.mode1 = simd_bit;
+  before.dag[0][1].index = ram_address;
+  before.dag[0][3].modifier = 2;
+  before.pe[1].astat = 1;
+  before.pe[1].data[0][4] = 1U << word_shift;
+  fixture::install(core, native, before);
+  const auto result = core.run(1);
+  check(result.has_fault && result.fault.reason == sharc::FaultReason::unsupported_feature &&
+            result.fault.instruction == store && result.fault.detail.contains("bit FIFO") &&
+            result.progress == sharc::Progress{} && core.registers() == before &&
+            program.ram == initial_ram,
+        "invalid type-6 FIFO operation committed the selected store or index update");
+}
+
+void predicated_modifier_interlock(sharc::ExecutionMode mode) {
+  constexpr unsigned m3 = 0x23;
+  constexpr std::uint64_t load = 0x42c002000000; // IF EQ R4 = DM(M3,I1).
+  constexpr std::uint64_t loaded_word = 0x8877665500;
+  const std::array words{fixture::immediate(m3, 1), load};
+  Program program(words);
+  const auto native = fixture::compile(program.code.code, mode);
+  sharc::Core core(program.memory(), mode);
+  auto expected = initial();
+  expected.dag[0][1].index = ram_address;
+  expected.pe[0].astat = 1;
+  fixture::install(core, native, expected);
+  const auto result = core.run(2);
+  expected.dag[0][3].modifier = 1;
+  expected.pe[0].data[0][4] = loaded_word;
+  fixture::boundary(expected, {.pc = expected.pc + 2, .clock = 4});
+  check(fixture::completed(result, 2, 4) && core.registers() == expected,
+        "pre-modified access missed its M-register interlock or used the old address");
+}
+
+void predicated_forced_pair(sharc::ExecutionMode mode) {
+  // IF EQ R6 = R1 + R2, R5 = DM(I1,M3)(LW).
+  constexpr std::uint64_t load = 0x52c042801612;
+  constexpr std::uint64_t low = 0x4433221100;
+  constexpr std::uint64_t high = 0x8877665500;
+  const std::array words{load};
+  Program program(words);
+  const auto native = fixture::compile(program.code.code, mode);
+  sharc::Core core(program.memory(), mode);
+  auto expected = initial();
+  expected.mode1 = simd_bit;
+  expected.pe[0].astat = 1;
+  expected.dag[0][1].index = ram_address;
+  expected.dag[0][3].modifier = 2;
+  expected.pe[0].data[0][1] = 1U << word_shift;
+  expected.pe[0].data[0][2] = 2U << word_shift;
+  fixture::install(core, native, expected);
+  expected.pe[0].data[0][5] = low;
+  expected.pe[0].data[0][4] = high;
+  expected.pe[0].data[0][6] = 3U << word_shift;
+  expected.pe[0].astat = 0;
+  expected.dag[0][1].index += 2;
+  fixture::boundary(expected, {.pc = expected.pc + 1, .clock = 1});
+  check(fixture::completed(core.run(1), 1, 1) && core.registers() == expected,
+        "selected forced-long packet lost its same-PE pair or retired the masked lane");
+}
+
 constexpr std::uint64_t fixed_parallel_add = 0x34c89a001401;
 constexpr std::uint64_t floating_parallel_add = 0x34c89a081401;
 
@@ -1503,6 +1635,10 @@ int main() {
     for (const auto mode : fixture::numeric_modes) {
       immediate_store_io(mode);
       forced_store_io(mode);
+      for (unsigned mask = 0; mask < 4; ++mask) { predicated_store_io(mode, mask); }
+      predicated_fifo_refusal(mode);
+      predicated_modifier_interlock(mode);
+      predicated_forced_pair(mode);
       parallel_io(mode, floating_parallel_add);
       parallel_refusal(mode, floating_parallel_add);
       parallel_fifo_refusal(mode);

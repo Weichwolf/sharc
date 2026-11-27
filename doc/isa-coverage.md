@@ -13,7 +13,7 @@ is claimed.
 | Arithmetic and SIMD | PEx/PEy, fixed point, 32-/40-bit float, rounding, modes, flags and exceptions | Partial: fixed and floating arithmetic and multifunction compute, shifter and FIFO, physical banks and lane predicates |
 | Strict numerical mode (default) | Exact guest 32-/40-bit behavior, RND32, conversion exceptions and native-path identity | Partial, see [single-function floating compute](#single-function-floating-compute) |
 | FastFP32 numerical mode (opt-in) | Independent approximation expectations, rounding/flags, unchanged raw moves/integer behavior, separate translations | Partial, see [single-function floating compute](#single-function-floating-compute) |
-| Parallel operations | Old operands, memory aliases, register exchanges and ordered partial effects | Partial: raw register moves/swaps and type 1a PM/DM with supported compute |
+| Parallel operations | Old operands, memory aliases, register exchanges and ordered partial effects | Partial: raw register moves/swaps, type 1a PM/DM, and predicated single-bus data-register packets with supported compute |
 | Address generation and memory | Both DAGs, modulo/reverse addressing, PM/DM and physical view aliases | Partial: normal-word indexed transfers, shared DAG updates, circular and bit-reverse addressing, and DAG load dependencies |
 | Sequencer and control | Delayed flow, DO/loop endpoints, LR, stacks, reset and interrupts | Partial: classic direct/indirect transfers, hardware DO and admitted reentry, reset, declared maskable vectors, admitted RTI and IDLE |
 | Chip-profile boundaries | ADSP-21489 memory/vector parameters and explicit I/O ownership | Partial: declared layouts, vectors and I/O. Timer and unresolved exceptions remain open |
@@ -464,9 +464,9 @@ positions, non-writing BTST, the input AV and sign for EXP (EX), and register
 and standalone immediate field operands. The field cases check the DATAEX
 extension, empty fields, exactly full and off-scale fields, sign extension and
 OR with the old destination. Both PE predicates, physical banks and full raw
-writeback are checked at instruction and cycle boundaries. Parallel
-immediate-shifter memory forms remain open. See `encoding.md` for
-standalone-prefix evidence.
+writeback are checked at instruction and cycle boundaries. Type 6 also lowers
+the immediate shifter with a simultaneous data-register transfer. See
+`encoding.md` for the two type-6 formats.
 
 Classic BITDEP, BITEXT, BITEXT (NU) and both BFFWRP directions run through
 installed images in both numerical modes. The paired fixtures cover register
@@ -689,8 +689,21 @@ and separate internal memory blocks. Silicon confirmation of the conflicting
 loads remains open. Both reference observations are recorded in
 [numeric-reference.md](numeric-reference.md#parallel-arithmetic-and-lane-expectations).
 
-General classic single-bus compute-and-memory forms (types 3a and 4a),
-remaining forced long-word UREG forms, DAG addressing variants and silicon
+Classic type 3a data-register transfers, signed six-bit type 4a transfers and
+type 6 transfers with immediate shift run with supported compute in installed
+images in both numerical modes. The fixtures check both buses, reads and
+writes, register and immediate pre-indexing and post-modification, circular
+wrap, SISD and SIMD predicates, separate data and DAG banks, broadcast and
+explicit S registers. Computation and stores use the old operands. Loads
+write back after compute and take priority when they share its destination.
+The memory tests also check an implicit-only short-word load, a selected
+forced normal-word pair in one PE, the pre-index modifier interlock, selected
+I/O callbacks, ordered refusal and precise FIFO faults before a parallel store.
+The core follows the manual for type-6 lane selection and SISD broadcast.
+See [the simulator observations](numeric-reference.md#predicated-single-bus-transfers)
+for the cases where CCES diverges.
+
+Non-data UREG transfers, remaining DAG addressing variants and silicon
 confirmation of contended register writeback are tracked in #26. Remaining
 compound control forms are tracked in #27.
 

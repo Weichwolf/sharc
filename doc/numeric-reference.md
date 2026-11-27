@@ -557,6 +557,23 @@ both lanes, including both broadcast destinations. This accounts for 12 of
 Programming Reference 2.4, section 9-26, specifies independent selection for
 the entire type-6 instruction. The discrepancy remains unverified on silicon.
 
+Another 32 type-3 probes used an explicit S4 read or store. Across both buses
+in SISD and SIMD, the PEx condition controlled the explicit S4 transfer and
+the PEy condition controlled the complementary R4 transfer. The compute
+result still used each PE's condition and data file. Sixteen type-3 and
+type-4 circular-address probes used I = B + 1, L = 2 and an offset of +2.
+Pre-indexing accessed B + 3 and left I unchanged with CBUFEN clear or set.
+Post-modification accessed the old I, then left I at B + 3 with CBUFEN clear
+or B + 1 with CBUFEN set. The observations agreed on PM and DM.
+
+Another 24 SISD broadcast probes separated the two stored EQ flags. Type 3
+required PEx EQ for the read and both EQ flags for the complementary load.
+Type 4 admitted a complementary load and PEy compute with PEy EQ alone.
+Type 6 admitted PEy compute and broadcast to both data files when either
+EQ flag was true. The core follows the documented broadcast examples in
+sections 9-16, 9-21 and 9-27: the admitted PEx read loads both files in SISD
+and compute runs on PEx. The differing simulator cases are unverified on silicon.
+
 ## Register MODIFY and DAG interlocks
 
 In 64 authored type-7a probes, the CCES 2.12.1 ADSP-21489 functional simulator

@@ -68,6 +68,15 @@ places I in bits 43:41, M in 40:38, the DAG selector in bit 37 and the immediate
 in bits 31:0. CCES assembly of authored probes left bits 36:32 clear. Classic
 preparation rejects those five reserved bits on type 16a.
 
+Classic types 3a, 4a and 6 place I in bits 43:41. Types 3a and 6 select M in
+40:38, the bus in 32 and the direction in 31. Type 3a uses bit 44 for
+post-modification, bit 30 for the long-word override and 29:23 for UREG.
+Type 4a puts the bus, direction and post-modification in bits 40:38 and
+the signed six-bit displacement in 32:27. Type 6 always post-modifies I.
+Types 4a and 6 both select the transfer data register in 26:23. The type-6
+memory form uses the `0x8` prefix in bits 47:44 and retains the separate
+immediate shifter fields.
+
 The 1001 VISA prefix uses additional discriminator bits to separate full-width
 immediate stores, compact immediate stores/offset transfers and short transfers.
 The optional-compute marker is tested only in the families that define it;
