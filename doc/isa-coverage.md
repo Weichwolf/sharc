@@ -565,6 +565,10 @@ mode-specific precision boundary, and a later compare preserves CACC through
 an overwrite of the ordinary ALU flags. The preparation suite round-trips the
 Strict artifact and checks cross-mode refusal.
 
+FastFP32's absolute forms check binary32 invalid results from ordinary and
+extension-only NaN inputs, including the documented AN/AS/AI effects. The
+original operands and guest MODE1 retain their full contents.
+
 The matrix omits cases for which the independent model refuses a full result.
 These include some signed-zero and NaN flags, RND32 NaN storage and
 classification, and the threshold just below minimum normal. See

@@ -66,6 +66,10 @@ private:
 
   [[nodiscard]] llvm::Constant *no() const { return constant(1, 0); }
 
+  [[nodiscard]] llvm::Constant *invalid_result() const {
+    return word(mode_.fast_fp32 ? canonical_nan & narrow_mask : canonical_nan);
+  }
+
   llvm::Value *flag(llvm::Value *predicate, std::uint32_t mask);
   Operand unpack(llvm::Value *raw);
   Operand operand(llvm::Value *raw);
@@ -145,7 +149,7 @@ Number Floating::round_single(llvm::Value *raw) {
   auto *finite = ir_.CreateICmpULT(original.magnitude, word(infinity));
   auto *overflow = ir_.CreateAnd(finite, ir_.CreateICmpEQ(rounded, word(infinity)));
   auto *value = ir_.CreateOr(rounded, original.sign);
-  return {.raw = ir_.CreateSelect(original.nan, word(canonical_nan), value),
+  return {.raw = ir_.CreateSelect(original.nan, invalid_result(), value),
           .overflow = overflow,
           .underflow = no(),
           .invalid = original.nan};
@@ -306,7 +310,7 @@ Number Floating::unary(FloatingOp operation, const Operand &value) {
 
 FloatingEffects
 Floating::effects(FloatingOp operation, const Number &number, const FloatingInputs &inputs) {
-  auto *raw = ir_.CreateSelect(number.invalid, word(canonical_nan), number.raw);
+  auto *raw = ir_.CreateSelect(number.invalid, invalid_result(), number.raw);
   auto *magnitude = ir_.CreateAnd(raw, word(magnitude_mask));
   auto *zero = ir_.CreateICmpEQ(magnitude, word(0));
   auto *sign = ir_.CreateICmpNE(ir_.CreateAnd(raw, word(sign_mask)), word(0));

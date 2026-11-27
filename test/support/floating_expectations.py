@@ -2,7 +2,7 @@
 """Full scalar FP anchors, exact dyadic arithmetic and raw-field cross-checks."""
 
 from itertools import product as cartesian_product
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from fractions import Fraction
 
 from expectation_check import anchor, require, require_raises
@@ -264,11 +264,13 @@ def installed_header():
               "copysign": 0x0e0000, "min": 0x0e1000, "max": 0x0e2000, "clip": 0x0e3000,
               "mul": 0x130000}
     unary = {"pass", "neg", "round", "abs"}
+    absolute = {"abs", "absadd", "abssub"}
     edges = [(0x3f800000ff, 0), (0x3f80000180, 0x3380000000),
              (0x3f80000000, 0xbf80000000), (0x3f80000000, 0x0080000000),
              (0x7f7fffffff, 0x7f7fffffff), (0x7f7fffffff, 0x4000000000),
              (0x0080000000, 0x3f00000000), (0x0080000000, 0x8080000000),
-             (0x7f80000000, 0x3f80000000), (0x0000000001, 0x4000000000)]
+             (0x7f80000000, 0x3f80000000), (0x0000000001, 0x4000000000),
+             (0x7fc0000000, 0x3f80000000), (0x7f80000001, 0xbf80000000)]
     # Vary significands and alignment distances near and beyond both boundaries.
     for index in range(24):
         top = (0x4a + index) << 31
@@ -294,6 +296,15 @@ def installed_header():
             return floating_multiply(left, right, mode, astat=astat, stky=stky)
         if operation == "cmp":
             return floating_compare(left, right, mode, astat=astat, stky=stky)
+        if fast and operation in absolute:
+            inputs = (left,) if operation == "abs" else (left, right)
+            if any(Operand(raw).kind in ("nan", "infinity") for raw in inputs):
+                # The absolute forms specify AN directly. Reuse the qualified
+                # invalid flags and encode an invalid result in the binary32 view.
+                expected = floating_alu(operation, left, right, mode=Mode(40, mode.rounding),
+                                        astat=astat, stky=stky)
+                if Operand(expected.raw).kind == "nan":
+                    return replace(expected, raw=0xffffffff00)
         return floating_alu(operation, left, right, mode=mode, astat=astat, stky=stky)
 
     def array(values):
@@ -301,7 +312,7 @@ def installed_header():
 
     rows = []
     for operation, field in fields.items():
-        pairs = [(x, 0) for x, _ in edges[:12]] if operation in unary else edges
+        pairs = [(x, 0) for x, _ in edges] if operation in unary else edges
         for index, (left, right) in enumerate(dict.fromkeys(anchors[operation] + pairs)):
             for fast, rnd32, truncate in cartesian_product((False, True), repeat=3):
                 mode = Mode(32 if fast or rnd32 else 40, "zero" if truncate else "nearest")
