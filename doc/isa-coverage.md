@@ -799,9 +799,14 @@ and 15a loads. Installed fixtures cover long counted-loop replacement on
 both sides of the fetch sample, an inner pop exposing the outer frame,
 snapshot replay, the DAG stall at the sample, and PEx selection of the
 shared counter. Absolute long-word loads use the upper word and leave
-LADDR unchanged. Writes into buffered counted loops, indexed wide loads
-that also target an occupied LADDR, and cache-dependent PM timing at the
-sample fail explicitly. See [current loop counter writes](numeric-reference.md#current-loop-counter-writes).
+LADDR unchanged. Writes into buffered counted loops and cache-dependent
+PM timing at the sample fail explicitly. See
+[current loop counter writes](numeric-reference.md#current-loop-counter-writes).
+LADDR accepts the same register and memory forms on empty or manually
+occupied frames. Installed fixtures check PEx selection, both memory
+buses, and paired writes to LADDR and CURLCNTR in indexed wide loads.
+Writes targeting a sequencer-owned LADDR fail explicitly. See
+[loop address stack writes](numeric-reference.md#loop-address-stack-write-observations).
 Other system-register writes and their pipeline effects, FADDR/DADDR
 reads and unresolved event semantics remain open. See
 [the simulator probes](numeric-reference.md#control-register-read-operands)

@@ -1100,8 +1100,8 @@ the written word in an arithmetic DO and on a manually occupied stack,
 without changing LCNTR or the arithmetic termination condition. The core
 preserves that raw readback. Silicon behavior remains open where the
 Programming Reference, p. 4-50, says writes outside a counted DO have no
-effect. Buffered short counted loops, indexed wide loads also writing a
-live LADDR, and competing refill or asynchronous events remain open.
+effect. Buffered short counted loops, writes to a sequencer-owned LADDR,
+and competing refill or asynchronous events remain open.
 
 ## Loop address stack write observations
 
@@ -1117,8 +1117,29 @@ preserved CURLCNTR. Indexed wide loads placed the low word in LADDR and
 the high word in CURLCNTR, with both native long views and `(LW)`. Indexed
 narrow loads used the addressed word. A post-modifying load updated its
 index when either PE was selected and wrote the stack only for PEx.
-The probes used a manually occupied stack with no reachable endpoint.
-Changing a live endpoint or termination condition still needs qualification.
+Another 24 probes named CURLCNTR in the same wide addressing forms and
+confirmed the inverse indexed pair. The probes used a manually occupied
+stack with no reachable endpoint. Installed fixtures use PX1 for the
+combined PX source following the manual's general system-register rule.
+
+In another 54 authored probes, a 13-word counted DO wrote its end word
+with the same count termination code. Rewriting the same endpoint at
+the sampled sites preserved the loop. When writing `E-2` at the original
+`E-7` or earlier, the loop repeated from the new endpoint. Writing `E-2`
+at `E-6` or `E-5` missed the new fetch sample and displaced the old one.
+Execution fell through with the original counter and a live frame for
+the new address. Extending to `E+2` at `E-5` or earlier used the new
+endpoint for all repeats. At `E-4` or `E-3`, the sample had already
+committed the old endpoint for the current pass. Repeating used the
+replacement on the next pass.
+
+Sixteen arithmetic DO probes retained the endpoint and switched between
+EQ and NE. Both switches reached the condition sample when written at
+`E-3` or earlier. A write at `E-2` or later left the original condition
+in effect for that pass. These observations distinguish the fetch sample
+for an endpoint from the later decode sample for its arithmetic condition.
+The core explicitly refuses writes to a sequencer-owned frame until it
+can preserve both samples when the frame is edited.
 
 ## Fixed multiplier details
 

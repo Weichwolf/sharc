@@ -413,8 +413,7 @@ bool stack_register(unsigned reg) {
 }
 
 bool writable_ureg(unsigned reg) {
-  return ordinary_ureg(reg) || reg == px_register || reg == lcntr_register ||
-         reg == pcstk_register || reg == pcstkp_register || reg == curlcntr_register ||
+  return ordinary_ureg(reg) || reg == px_register || reg == lcntr_register || stack_register(reg) ||
          lane_status_register(reg);
 }
 
@@ -489,8 +488,7 @@ bool dag_memory_read(const MemoryMove &move) {
 }
 
 bool unpaired_control_load(unsigned reg) {
-  return reg == lcntr_register || reg == pcstk_register || reg == pcstkp_register ||
-         reg == curlcntr_register;
+  return reg == lcntr_register || stack_register(reg);
 }
 
 bool selects_packed_view(const MemoryMove &move) {
@@ -1904,6 +1902,11 @@ private:
                                     llvm::Value *enabled,
                                     bool partial);
   void guard_loop_counter_write(const Values &values, const Instruction &op, bool partial);
+  void guard_loop_address_write(const Values &values,
+                                const Instruction &op,
+                                llvm::Value *selected,
+                                bool partial);
+  llvm::Value *loop_address_frame_live();
   void age_loop_counter_write(const Values &values,
                               const Instruction &op,
                               llvm::Value *stall,
@@ -2460,17 +2463,22 @@ void Lowering::write_register(Values &values,
     write_lane_status(values, reg, fixed_word(raw), selected);
     return;
   }
-  if (reg == curlcntr_register) {
-    auto *depth = builder_.CreateZExt(load(8, loop_counter_depth_slot), builder_.getInt32Ty());
+  if (reg == laddr_register || reg == curlcntr_register) {
+    const bool counter = reg == curlcntr_register;
+    auto *depth =
+        builder_.CreateZExt(load(8, counter ? loop_counter_depth_slot : loop_address_depth_slot),
+                            builder_.getInt32Ty());
     auto *word = builder_.CreateExtractElement(fixed_word(raw), builder_.getInt32(0));
-    loop_count_written_ =
+    auto *enabled =
         builder_.CreateAnd(builder_.CreateIsNotNull(depth),
                            builder_.CreateExtractElement(selected, builder_.getInt32(0)));
+    if (counter) { loop_count_written_ = enabled; }
     optional_memory(
-        loop_count_written_,
+        enabled,
         [&] {
           auto *index = builder_.CreateSub(depth, builder_.getInt32(1));
-          return builder_.CreateStore(word, loop_cell(loop_counter_slot, index));
+          auto *cell = loop_cell(counter ? loop_counter_slot : loop_address_slot, index);
+          return builder_.CreateStore(word, cell);
         },
         nullptr);
     return;
@@ -3271,6 +3279,9 @@ void Lowering::instruction(Values &values, const Instruction &op, bool partial) 
   if (loaded_register(op) == pcstkp_register) {
     guard_pc_stack_pointer_write(values, op, scalar_move_condition(values, op), partial);
   }
+  if (loaded_register(op) == laddr_register) {
+    guard_loop_address_write(values, op, scalar_move_condition(values, op), partial);
+  }
   if (loaded_register(op) == curlcntr_register) { guard_loop_counter_write(values, op, partial); }
   if (clock_reads_.contains(op.address)) {
     // Clock readers run after the preceding instructions have been charged.
@@ -3559,14 +3570,8 @@ void Lowering::memory_instruction(Values &values, const Instruction &op, bool pa
       move.addressing != MemoryAddressing::absolute) {
     auto *wide = wide_memory_view(move, operands.words[0].view);
     if (wide != builder_.getFalse()) {
-      auto *occupied = builder_.CreateIsNotNull(load(8, loop_address_depth_slot));
-      auto *writes_address =
-          builder_.CreateAnd(occupied, builder_.CreateAnd(wide, operands.selected[0]));
-      instruction_guard(values,
-                        op,
-                        builder_.CreateNot(writes_address),
-                        partial,
-                        NativeExit::unsupported_loop_stack_wide_load);
+      auto *writes_address = builder_.CreateAnd(wide, operands.selected[0]);
+      guard_loop_address_write(values, op, writes_address, partial);
     }
   }
   const auto read = memory_transfer(values, op, move, operands);
@@ -4151,7 +4156,7 @@ void Lowering::memory_writeback(Values &values,
   }
   write_memory_register(values, move.reg, raw, operands.selected[0]);
   if (unpaired) {
-    if ((move.reg == pcstk_register || move.reg == pcstkp_register) && !absolute_system) {
+    if (stack_register(move.reg) && !absolute_system) {
       auto *neighbor_enabled = builder_.CreateAnd(wide, operands.selected[0]);
       auto *neighbor_raw =
           load_word(high_memory_word(operands, read), view_tag(MemoryView::normal_word));
@@ -4236,11 +4241,7 @@ void Lowering::guard_loop_counter_write(const Values &values, const Instruction 
     short_counter = builder_.CreateOr(short_counter, same);
   }
   if (short_counter == nullptr) { return; }
-  auto *depth = builder_.CreateZExt(load(8, loop_address_depth_slot), builder_.getInt32Ty());
-  auto *metadata = stack_top(depth, loop_frames_slot, builder_.getInt32(0));
-  auto *live =
-      builder_.CreateIsNotNull(builder_.CreateAnd(metadata, builder_.getInt32(loop_frame_live)));
-  auto *buffered = builder_.CreateAnd(short_counter, live);
+  auto *buffered = builder_.CreateAnd(short_counter, loop_address_frame_live());
   const auto short_body = short_bodies_.find(op.address);
   if (short_body != short_bodies_.end() && short_body->second.counted()) {
     buffered =
@@ -4249,6 +4250,21 @@ void Lowering::guard_loop_counter_write(const Values &values, const Instruction 
   auto *refused = builder_.CreateAnd(buffered, scalar_move_condition(values, op));
   instruction_guard(
       values, op, builder_.CreateNot(refused), partial, NativeExit::unsupported_loop_counter_write);
+}
+
+llvm::Value *Lowering::loop_address_frame_live() {
+  auto *depth = builder_.CreateZExt(load(8, loop_address_depth_slot), builder_.getInt32Ty());
+  auto *metadata = stack_top(depth, loop_frames_slot, builder_.getInt32(0));
+  return builder_.CreateIsNotNull(builder_.CreateAnd(metadata, builder_.getInt32(loop_frame_live)));
+}
+
+void Lowering::guard_loop_address_write(const Values &values,
+                                        const Instruction &op,
+                                        llvm::Value *selected,
+                                        bool partial) {
+  auto *refused = builder_.CreateAnd(loop_address_frame_live(), selected);
+  instruction_guard(
+      values, op, builder_.CreateNot(refused), partial, NativeExit::unsupported_loop_address_write);
 }
 
 void Lowering::age_loop_counter_write(const Values &values,
@@ -6431,10 +6447,8 @@ void Lowering::plan_hardware_grants(const LoopMap &shapes) {
                   (shape.counted() && fetch->second.counted() &&
                    overlapping_tail(shape, fetch->second))) &&
                  !modifies_index(op) && !dag_register(loaded_register(op)) && !writes_astat(op) &&
-                 loaded_register(op) != pcstk_register &&
-                 loaded_register(op) != curlcntr_register && !writes_stack_pointer(op) &&
-                 !reads_emuclk(op) && !stack_register(data_source_register(op)) &&
-                 !shift::fifo_transfer(op.compute);
+                 !stack_register(loaded_register(op)) && !reads_emuclk(op) &&
+                 !stack_register(data_source_register(op)) && !shift::fifo_transfer(op.compute);
         })) {
       continue;
     }
@@ -6773,10 +6787,9 @@ void Lowering::plan_loops() {
     for (std::size_t i = start; i < end; ++i) {
       linear = linear && instructions_[i].address + 1 == instructions_[i + 1].address &&
                !branch(instructions_[i]) && !dag_register(loaded_register(instructions_[i])) &&
-               loaded_register(instructions_[i]) != pcstk_register &&
-               loaded_register(instructions_[i]) != curlcntr_register &&
-               !writes_stack_pointer(instructions_[i]) && !writes_astat(instructions_[i]) &&
-               !reads_emuclk(instructions_[i]) && !shift::fifo_transfer(instructions_[i].compute);
+               !stack_register(loaded_register(instructions_[i])) &&
+               !writes_astat(instructions_[i]) && !reads_emuclk(instructions_[i]) &&
+               !shift::fifo_transfer(instructions_[i].compute);
     }
     if (!linear) { continue; }
     const bool stall = conditional && (condition_hazard(instructions_[end - 1]) &

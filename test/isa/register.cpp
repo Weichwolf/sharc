@@ -548,6 +548,55 @@ void pc_stack_writes() {
   }
 }
 
+constexpr std::uint32_t loop_address_immediate = 0xef123456;
+
+void verify_loop_address_write(sharc::Core &core, bool occupied, unsigned predicate) {
+  constexpr std::uint32_t original = 0x00456789;
+  constexpr std::uint32_t from_r6 = 0x00543210;
+  constexpr std::uint32_t from_px1 = 0x00654321;
+  constexpr std::uint64_t raw_px = 0x0076543200000000 | from_px1;
+  sharc::Registers expected;
+  expected.pc = base;
+  expected.loop_address_depth = expected.loop_counter_depth = occupied ? 2 : 0;
+  expected.loop_address_stack[0] = base;
+  expected.loop_address_stack[1] = original;
+  expected.loop_counter_stack[1] = 3;
+  expected.mode1 = 1U << simd_bit;
+  expected.pe[0].astat = predicate & 1;
+  expected.pe[1].astat = predicate >> 1;
+  expected.pe[0].data[0][6] = (std::uint64_t{from_r6} << 8) | extension;
+  expected.px = raw_px;
+  core.set_registers(expected);
+  const auto after_register = (predicate & 1) != 0 ? from_r6 : original;
+  for (auto &pe : expected.pe) {
+    pe.data[0][4] = std::uint64_t{occupied ? after_register : empty_loop_stack} << 8;
+    pe.data[0][5] = std::uint64_t{occupied ? loop_address_immediate : empty_loop_stack} << 8;
+  }
+  if (occupied) { expected.loop_address_stack[1] = from_px1; }
+  fixture::boundary(expected, {.pc = base + 5, .clock = 5});
+  check(fixture::completed(core.run(5), 5, 5) && core.registers() == expected,
+        "an LADDR write lost the selected stack cell, X predicate or PX1 source");
+}
+
+void loop_address_writes() {
+  const std::array words{encoding({.source = 6, .destination = laddr_code}),
+                         encoding({.source = laddr_code, .destination = 4}, true_condition),
+                         fixture::immediate(laddr_code, loop_address_immediate),
+                         encoding({.source = laddr_code, .destination = 5}, true_condition),
+                         encoding({.source = px, .destination = laddr_code}, true_condition)};
+  fixture::Program program(words);
+  for (const auto mode : fixture::numeric_modes) {
+    const auto native = fixture::compile(program.code, mode);
+    sharc::Core core(program.memory(), mode);
+    (void)core.install(native, fixture::Program::variant_id);
+    for (const bool occupied : {false, true}) {
+      for (unsigned predicate = 0; predicate < 4; ++predicate) {
+        verify_loop_address_write(core, occupied, predicate);
+      }
+    }
+  }
+}
+
 void pc_stack_pointer_latency() {
   constexpr std::uint32_t first_cell = 0x1081001;
   constexpr std::uint32_t third_cell = 0x2081003;
@@ -1752,6 +1801,7 @@ void register_transfers() {
   emulation_clock_short_loop();
   sequencer_register_reads();
   pc_stack_writes();
+  loop_address_writes();
   pc_stack_pointer_latency();
   for (unsigned gap = 0; gap < 3; ++gap) { pc_stack_pointer_rts(gap); }
   pc_stack_pointer_in_delayed_return();
@@ -1760,6 +1810,7 @@ void register_transfers() {
   rewrite_delayed_return(false);
   refuse_unimplemented_loop_stack_write(pcstk_code);
   refuse_unimplemented_loop_stack_write(pcstkp_code);
+  refuse_unimplemented_loop_stack_write(laddr_code);
   pc_and_stack_in_delay_slots();
   loop_register_reads();
   loop_counter_writes();

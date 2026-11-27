@@ -523,8 +523,8 @@ struct Core::Impl {
         break;
       case detail::NativeExit::unsupported_loop_counter_write:
       case detail::NativeExit::unsupported_pm_loop_counter_write:
-      case detail::NativeExit::unsupported_loop_stack_wide_load: {
-        const char *message = "indexed long-word CURLCNTR load also writes LADDR";
+      case detail::NativeExit::unsupported_loop_address_write: {
+        const char *message = "LADDR write to a sequencer-owned DO frame";
         if (reason == detail::NativeExit::unsupported_loop_counter_write) {
           message = "CURLCNTR write to a buffered counted DO";
         } else if (reason == detail::NativeExit::unsupported_pm_loop_counter_write) {

@@ -193,7 +193,7 @@ enum class NativeExit : std::uint8_t {
   unsupported_pc_stack_pointer_write,
   unsupported_loop_counter_write,
   unsupported_pm_loop_counter_write,
-  unsupported_loop_stack_wide_load
+  unsupported_loop_address_write
 };
 using NativeEntry = void (*)(void **, std::uint64_t *);
 using RegisterPointers = std::vector<void *>;

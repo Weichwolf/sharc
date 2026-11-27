@@ -1449,14 +1449,60 @@ void load_pc_stack_words(sharc::ExecutionMode mode) {
 }
 
 constexpr unsigned loop_counter_port = 0x67;
+constexpr unsigned loop_address_port = 0x66;
 
-void load_loop_counter(sharc::ExecutionMode mode, RegisterMemoryCase move) {
+void verify_loop_stack_load(sharc::Core &core, RegisterMemoryCase move, unsigned predicate) {
   constexpr std::uint32_t lower_count = 0x76543210;
   constexpr std::uint32_t preload = 0x11223344;
   constexpr std::uint32_t short_mask = 0xffff;
   constexpr unsigned modifier = 2;
   const auto dm = move.space == sharc::MemorySpace::data;
   const unsigned index = dm ? 1U : 9U;
+  const auto post = move.form == RegisterMemoryForm::post;
+  const auto pre = move.form == RegisterMemoryForm::pre;
+  const auto absolute = move.form == RegisterMemoryForm::absolute;
+  const auto conditional = post || pre;
+  const auto wide = system_memory_wide(move);
+  const auto initial_index =
+      ram_address + (pre || move.form == RegisterMemoryForm::immediate ? 0U : dag_cell);
+  const auto word = wide && absolute ? dag_high_word : dag_low_word;
+  const auto loaded_word = move.view == sharc::MemoryView::short_word ? word & short_mask : word;
+  sharc::Registers expected;
+  expected.pc = fixture::code_address;
+  expected.loop_address_depth = expected.loop_counter_depth = 2;
+  expected.loop_counter_stack[0] = lower_count;
+  expected.loop_counter_stack[1] = 3;
+  expected.loop_address_stack[0] = fixture::code_address;
+  expected.loop_address_stack[1] = fixture::code_address + 1;
+  expected.lcntr = preload;
+  expected.mode1 = 1U << simd_bit;
+  expected.pe[0].astat = predicate & 1;
+  expected.pe[1].astat = predicate >> 1;
+  expected.dag[0][index].index = initial_index;
+  expected.dag[0][index + modifier].modifier = modifier;
+  core.set_registers(expected);
+  if (!conditional || (predicate & 1) != 0) {
+    const auto counter = move.reg == loop_counter_port;
+    auto &named = counter ? expected.loop_counter_stack[1] : expected.loop_address_stack[1];
+    auto &peer = counter ? expected.loop_address_stack[1] : expected.loop_counter_stack[1];
+    named = loaded_word;
+    if (wide && !absolute) { peer = dag_high_word; }
+  }
+  if (post && predicate != 0) { expected.dag[0][index].index += modifier; }
+  const auto report = core.run(1);
+  const auto actual = core.registers();
+  fixture::boundary(expected, {.pc = fixture::code_address + 1, .clock = 1});
+  if (!dm) {
+    expected.emuclk = actual.emuclk;
+    expected.faddr = actual.faddr;
+    expected.daddr = actual.daddr;
+  }
+  check(!report.has_fault && report.progress.instructions == 1 && actual == expected,
+        "the loop stack load lost a word, selected frame, predicate or DAG update");
+}
+
+void load_loop_stack_word(sharc::ExecutionMode mode, RegisterMemoryCase move) {
+  const unsigned index = move.space == sharc::MemorySpace::data ? 1U : 9U;
   const std::array<std::uint64_t, 2> words{register_memory_encoding(move, index, false), 0};
   fixture::Program program(words);
   program.code.variants.front().layout.regions.push_back({.space = move.space,
@@ -1471,42 +1517,12 @@ void load_loop_counter(sharc::ExecutionMode mode, RegisterMemoryCase move) {
   const auto native = fixture::compile(program.code, mode);
   sharc::Core core(program.memory(ram_id, ram), mode);
   (void)core.install(native, fixture::Program::variant_id);
-  const auto post = move.form == RegisterMemoryForm::post;
-  const auto wide = system_memory_wide(move);
-  for (unsigned predicate = 0; predicate < (post ? 4U : 1U); ++predicate) {
-    sharc::Registers expected;
-    expected.pc = fixture::code_address;
-    expected.loop_address_depth = expected.loop_counter_depth = 2;
-    expected.loop_counter_stack[0] = lower_count;
-    expected.loop_counter_stack[1] = 3;
-    expected.lcntr = preload;
-    expected.mode1 = 1U << simd_bit;
-    expected.pe[0].astat = predicate & 1;
-    expected.pe[1].astat = predicate >> 1;
-    expected.dag[0][index].index =
-        ram_address + (move.form == RegisterMemoryForm::immediate ? 0U : dag_cell);
-    expected.dag[0][index + modifier].modifier = modifier;
-    core.set_registers(expected);
-    if (!post || (predicate & 1) != 0) {
-      const auto word = wide ? dag_high_word : dag_low_word;
-      expected.loop_counter_stack[1] =
-          move.view == sharc::MemoryView::short_word ? word & short_mask : word;
-    }
-    if (post && predicate != 0) { expected.dag[0][index].index += modifier; }
-    const auto report = core.run(1);
-    const auto actual = core.registers();
-    fixture::boundary(expected, {.pc = fixture::code_address + 1, .clock = 1});
-    if (!dm) {
-      expected.emuclk = actual.emuclk;
-      expected.faddr = actual.faddr;
-      expected.daddr = actual.daddr;
-    }
-    check(!report.has_fault && report.progress.instructions == 1 && actual == expected,
-          "the CURLCNTR load lost its word, selected frame, predicate or DAG update");
+  for (unsigned predicate = 0; predicate < 4; ++predicate) {
+    verify_loop_stack_load(core, move, predicate);
   }
 }
 
-void load_loop_counter_words(sharc::ExecutionMode mode) {
+void load_loop_stack_words(sharc::ExecutionMode mode) {
   using enum RegisterMemoryForm;
   using enum sharc::MemorySpace;
   using enum sharc::MemoryView;
@@ -1538,8 +1554,21 @@ void load_loop_counter_words(sharc::ExecutionMode mode) {
                          .space = program,
                          .view = normal_word,
                          .reg = loop_counter_port,
-                         .width = 4}};
-  for (const auto probe : probes) { load_loop_counter(mode, probe); }
+                         .width = 4},
+      RegisterMemoryCase{
+          .form = post, .space = data, .view = long_word, .reg = loop_counter_port, .width = 8},
+      RegisterMemoryCase{.form = pre,
+                         .space = program,
+                         .view = normal_word,
+                         .reg = loop_counter_port,
+                         .width = 4,
+                         .force = true}};
+  for (auto probe : probes) {
+    for (const auto port : {loop_address_port, loop_counter_port}) {
+      probe.reg = port;
+      load_loop_stack_word(mode, probe);
+    }
+  }
 }
 
 void sample_loop_count_after_memory_interlock(sharc::ExecutionMode mode, sharc::MemorySpace space) {
@@ -1774,7 +1803,7 @@ void memory_access() {
     control_memory_access(mode);
     store_sequencer_registers(mode);
     load_pc_stack_words(mode);
-    load_loop_counter_words(mode);
+    load_loop_stack_words(mode);
     sample_loop_count_after_memory_interlock(mode, sharc::MemorySpace::data);
     sample_loop_count_after_memory_interlock(mode, sharc::MemorySpace::program);
     store_emulation_clock(mode);
