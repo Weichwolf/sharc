@@ -59,12 +59,17 @@ constexpr unsigned bit_and = 0x40, bit_or = 0x41, bit_xor = 0x42, bit_not = 0x43
 constexpr unsigned minimum = 0x61, maximum = 0x62, clip = 0x63, dual_add_subtract = 0x70;
 } // namespace alu
 
+namespace shift {
+constexpr unsigned logical = 0x00, arithmetic = 0x04, rotate = 0x08;
+constexpr unsigned logical_or = 0x20, arithmetic_or = 0x24;
+constexpr std::array opcodes{logical, arithmetic, rotate, logical_or, arithmetic_or};
+} // namespace shift
+
 constexpr unsigned shadow_register_first = 0x50;
 constexpr unsigned system_register_first = 0x60;
 constexpr unsigned ureg_mask = 127, byte_mask = 255;
 constexpr unsigned history_older_mask = 0xff00;
 constexpr unsigned history_loop_setup = 1U << 16;
-constexpr unsigned rotate_opcode = 0x08;
 constexpr unsigned conditional_compute_type = 2;
 constexpr unsigned immediate_shift_type = 6;
 constexpr unsigned register_move_type = 5;
@@ -223,7 +228,7 @@ bool supported_compute(const Compute &compute) {
          (compute.kind == ComputeKind::alu &&
           std::ranges::find(fixed_operations, compute.opcode) != fixed_operations.end()) ||
          ((compute.kind == ComputeKind::shifter || compute.kind == ComputeKind::shift_immediate) &&
-          compute.opcode == rotate_opcode);
+          std::ranges::find(shift::opcodes, compute.opcode) != shift::opcodes.end());
 }
 
 struct IndexModify {
@@ -1166,7 +1171,7 @@ private:
   void spill_accumulator(unsigned bank, llvm::Value *value);
   void write_accumulator(Values &values, unsigned bank, llvm::Value *value, llvm::Value *selected);
   FixedResult word_step(llvm::Value *input, bool decrement);
-  Arithmetic rotation(const Values &values, const Compute &compute);
+  Arithmetic shifting(const Values &values, const Compute &compute);
   Arithmetic status_result(const Values &values,
                            const FixedResult &result,
                            llvm::Value *x,
@@ -1871,24 +1876,55 @@ void Lowering::retire_pipeline(Values &values, PipelineEffects effects) {
   values[extra_cycles_value] = builder_.CreateAdd(values[extra_cycles_value], stall);
 }
 
-Arithmetic Lowering::rotation(const Values &values, const Compute &compute) {
+Arithmetic Lowering::shifting(const Values &values, const Compute &compute) {
   constexpr std::uint32_t shifter_flags = 0x3800;
   constexpr std::uint32_t shifter_zero = 0x1000;
+  constexpr std::uint32_t shifter_overflow = 0x800;
   const auto word = [&](unsigned reg) {
     return builder_.CreateTrunc(builder_.CreateLShr(values[reg], vector(64, raw_extension_bits)),
                                 vector_type(32));
   };
   auto *source = word(compute.inputs[0]);
-  // Funnel rotation reduces modulo 32, including signed byte counts.
   auto *count = compute.kind == ComputeKind::shift_immediate
-                    ? vector(32, compute.immediate & byte_mask)
+                    ? builder_.CreateSExt(vector(8, compute.immediate & byte_mask), vector_type(32))
                     : word(compute.inputs[1]);
-  auto *result =
-      builder_.CreateIntrinsic(llvm::Intrinsic::fshl, {vector_type(32)}, {source, source, count});
+  llvm::Value *result{};
+  llvm::Value *overflow = vector(1, 0);
+  if (compute.opcode == shift::rotate) {
+    result =
+        builder_.CreateIntrinsic(llvm::Intrinsic::fshl, {vector_type(32)}, {source, source, count});
+  } else {
+    const bool arithmetic =
+        compute.opcode == shift::arithmetic || compute.opcode == shift::arithmetic_or;
+    auto *wide_type = vector_type(64);
+    auto *left = builder_.CreateICmpSGT(count, vector(32, 0));
+    auto *magnitude = builder_.CreateSelect(left, count, builder_.CreateNeg(count));
+    // Unsigned clamping also handles the two's-complement magnitude of INT32_MIN.
+    auto *bounded =
+        builder_.CreateBinaryIntrinsic(llvm::Intrinsic::umin, magnitude, vector(32, 32));
+    auto *distance = builder_.CreateZExt(bounded, wide_type);
+    auto *wide = arithmetic ? builder_.CreateSExt(source, wide_type)
+                            : builder_.CreateZExt(source, wide_type);
+    auto *up = builder_.CreateShl(wide, distance);
+    auto *down =
+        arithmetic ? builder_.CreateAShr(wide, distance) : builder_.CreateLShr(wide, distance);
+    result = builder_.CreateTrunc(builder_.CreateSelect(left, up, down), vector_type(32));
+    overflow = left;
+    if (arithmetic) {
+      overflow = builder_.CreateAnd(
+          left, builder_.CreateICmpNE(up, builder_.CreateSExt(result, wide_type)));
+    }
+    if (compute.opcode == shift::logical_or || compute.opcode == shift::arithmetic_or) {
+      result = builder_.CreateOr(result, word(compute.outputs[0]));
+    }
+    if (compute.opcode == shift::arithmetic_or) {
+      overflow = builder_.CreateOr(overflow, builder_.CreateICmpSGE(count, vector(32, 32)));
+    }
+  }
   auto *zero = builder_.CreateICmpEQ(result, vector(32, 0));
-  auto *status =
-      builder_.CreateOr(builder_.CreateAnd(values[status_value], vector(32, ~shifter_flags)),
-                        flag(zero, shifter_zero));
+  auto *status = builder_.CreateOr(
+      builder_.CreateAnd(values[status_value], vector(32, ~shifter_flags)),
+      builder_.CreateOr(flag(zero, shifter_zero), flag(overflow, shifter_overflow)));
   auto *raw = builder_.CreateShl(builder_.CreateZExt(result, vector_type(64)),
                                  vector(64, raw_extension_bits));
   return {.raw = raw, .status = status, .sticky = values[sticky_value]};
@@ -2155,7 +2191,7 @@ void Lowering::compute_instruction(Values &values,
     result.sticky = builder_.CreateOr(result.sticky, difference.sticky);
     write_register(values, compute.outputs[1], difference.raw, selected);
   } else if (compute.kind == ComputeKind::shifter || compute.kind == ComputeKind::shift_immediate) {
-    result = rotation(before, compute);
+    result = shifting(before, compute);
   } else if (fixed_multiplier(compute)) {
     result = multiplier(values, compute, selected);
   } else if (fixed_multifunction(compute) || floating_multifunction(compute)) {

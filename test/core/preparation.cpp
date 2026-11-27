@@ -45,6 +45,7 @@ void formats() {
   };
 
   // Synthetic field combinations cover every documented top-level format.
+  constexpr std::uint64_t standalone_shift = 0x020000001123;
   constexpr std::array cases{Format{.word = 0x200000001123, .type = 1, .bits = 48},
                              Format{.word = 0x2000003f0000, .type = 1, .bits = 32},
                              Format{.word = 0x013e00001123, .type = 2, .bits = 48},
@@ -58,7 +59,7 @@ void formats() {
                              Format{.word = 0x700000001123, .type = 5, .bits = 48},
                              Format{.word = 0x7000003f0000, .type = 5, .bits = 32},
                              Format{.word = 0x800000001123, .type = 6, .bits = 48},
-                             Format{.word = 0x020000001123, .type = 6, .bits = 48},
+                             Format{.word = standalone_shift, .type = 6, .bits = 48},
                              Format{.word = 0x040000001123, .type = 7, .bits = 48},
                              Format{.word = 0x0400003f0000, .type = 7, .bits = 32},
                              Format{.word = 0x063e00000100, .type = 8, .bits = 48},
@@ -99,7 +100,7 @@ void formats() {
       const auto image = fixture::image(InstructionSet::isa, item.word);
       if (item.type == 1 || item.type == 2 || item.type == 5 || item.type == 8 || item.type == 9 ||
           item.type == 15 || item.type == immediate_move_type || item.type == index_modify_type ||
-          item.type == nop_type || item.type == idle_type) {
+          item.type == nop_type || item.type == idle_type || item.word == standalone_shift) {
         const auto semantic = Core::lower(image);
         check(!semantic.bitcode().empty() && !semantic.exports().empty(),
               "supported classic form has no semantic image");
@@ -261,9 +262,9 @@ void identities() {
   const auto seed = Core::lower(seed_image);
   check(seed.identity() == Core::load(seed_image, {}, seed.artifact()).identity(),
         "floating seed table failed artifact load");
-  constexpr std::uint64_t logical_shift = 0x013e00200123;
+  constexpr std::uint64_t compiler_jump = 0x180400000123;
   fixture::throws<sharc::PreparationError>(
-      [&] { (void)Core::compile(fixture::image(InstructionSet::isa, logical_shift)); },
+      [&] { (void)Core::compile(fixture::image(InstructionSet::isa, compiler_jump)); },
       "compile bypassed unsupported lowering");
   fixture::throws<sharc::PreparationError>([&] { (void)Core::load(image, {}, {}); },
                                            "empty artifact accepted");

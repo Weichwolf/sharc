@@ -16,6 +16,11 @@ SHIFTS = [
     ("left zero still sets SV", "lshift", 0, 1, IntegerResult(0, 0x1800, 0)),
     ("logical right", "lshift", 0x8000000000, -1, IntegerResult(0x4000000000, 0, 0)),
     ("arithmetic right", "ashift", 0x8000000000, -1, IntegerResult(0xC000000000, 0, 0)),
+    ("arithmetic left reaches the negative rail", "ashift", 0xFFFFFFFF00, 31,
+     IntegerResult(0x8000000000, 0, 0)),
+    ("arithmetic left changes the sign", "ashift", 0x4000000000, 1,
+     IntegerResult(0x8000000000, 0x800, 0)),
+    ("arithmetic zero beyond the word", "ashift", 0, 32, IntegerResult(0, 0x1000, 0)),
     ("off-scale arithmetic right", "ashift", 0x8000000000, -0x80000000,
      IntegerResult(0xFFFFFFFF00, 0, 0)),
     ("off-scale logical right", "lshift", 0xFFFFFFFF00, -0x80000000, IntegerResult(0, 0x1000, 0)),
@@ -132,10 +137,12 @@ def bit_lattice():
     for word in words:
         bits = [int(char) for char in f"{word:032b}"[::-1]]
         for amount in (*range(-128, 128), -0x80000000, 0x7FFFFFFF):
-            for operation in ("lshift", "ashift", "rot", "bclr", "bset", "btgl", "btst"):
+            for operation in ("lshift", "lshift_or", "ashift", "ashift_or", "rot", "bclr", "bset", "btgl", "btst"):
                 if operation == "btst" and amount < 0:
                     continue
-                if operation in ("lshift", "ashift", "rot"):
+                old_destination = 0
+                if operation in ("lshift", "lshift_or", "ashift", "ashift_or", "rot"):
+                    arithmetic = operation.startswith("ashift")
                     output = []
                     for target in range(32):
                         source = target - amount
@@ -143,8 +150,16 @@ def bit_lattice():
                             output.append(bits[source % 32])
                         else:
                             output.append(bits[source] if 0 <= source < 32 else
-                                          bits[31] if source >= 32 and operation == "ashift" else 0)
+                                          bits[31] if source >= 32 and arithmetic else 0)
                     sv = operation != "rot" and amount > 0
+                    if arithmetic and amount > 0:
+                        sv = ((any(bits) or operation == "ashift_or") if amount >= 32 else
+                              any(bit != bits[31] for bit in bits[31 - amount:]))
+                    if operation.endswith("_or"):
+                        old_bits = [int(index % 3 == 0) for index in range(32)]
+                        output = [bit | old for bit, old in zip(output, old_bits, strict=True)]
+                        old_destination = 255 + sum(bit * 2**(index + 8)
+                                                    for index, bit in enumerate(old_bits))
                 else:
                     output = bits.copy() if operation != "btst" else [0] * 32
                     if 0 <= amount < 32:
@@ -154,7 +169,8 @@ def bit_lattice():
                 value = sum(bit * 2**index for index, bit in enumerate(output))
                 flags = 0xFFFFC7FF | (int(sv) << 11) | (int(not any(output)) << 12)
                 expected = IntegerResult(None if operation == "btst" else value * 256, flags, 0x55)
-                require(shift(operation, word * 256 + 255, amount, astat=0xFFFFFFFF, stky=0x55),
+                require(shift(operation, word * 256 + 255, amount, old_destination=old_destination,
+                              astat=0xFFFFFFFF, stky=0x55),
                         expected, (operation, word, amount))
                 count += 1
         for position, length, sign_extend in cartesian_product(range(64), range(64), (False, True)):

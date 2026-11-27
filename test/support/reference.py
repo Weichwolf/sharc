@@ -579,21 +579,29 @@ def _shifter_result(value: int, astat: int, stky: int, *, overflow: bool = False
     return IntegerResult(value << 8 if write else None, (astat & ~SHIFTER_FLAGS) | flags, stky)
 
 
-def shift(operation: str, raw: int, amount: int, *, astat: int = 0,
-          stky: int = 0) -> IntegerResult:
+def shift(operation: str, raw: int, amount: int, *, old_destination: int = 0,
+          astat: int = 0, stky: int = 0) -> IntegerResult:
     """Normalized signed shift/bit position; operand projection is preparation's job."""
     if not isinstance(amount, int) or not -(1 << 31) <= amount < 1 << 31:
         raise ValueError("shift amount must be a signed 32-bit integer")
     x = raw_word(raw)
     overflow = False
-    if operation in ("lshift", "ashift"):
-        overflow = amount > 0  # Independent of whether any nonzero bit is lost.
+    if operation in ("lshift", "lshift_or", "ashift", "ashift_or"):
+        arithmetic = operation.startswith("ashift")
+        source = signed(x) if arithmetic else x
+        overflow = amount > 0
+        if arithmetic and overflow:
+            mathematical = source * 2**min(amount, 32)
+            overflow = mathematical != signed(mathematical)
+            overflow |= operation == "ashift_or" and amount >= 32
         if amount >= 32:
             value = 0
         elif amount >= 0:
             value = x << amount
         else:
-            value = (signed(x) if operation == "ashift" else x) >> min(-amount, 32)
+            value = source >> min(-amount, 32)
+        if operation.endswith("_or"):
+            value |= raw_word(old_destination)
     elif operation == "rot":
         count = amount % 32
         value = (x << count) | (x >> (32 - count))

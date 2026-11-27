@@ -78,7 +78,7 @@ reference checks numeric bounds; their expected underflow uses a magnitude test.
 Another 12,800 conversions compare against signed quotient/remainder arithmetic
 over both precisions, signs, mode-bit values, instructions and saturation choices,
 ten exponents, eight fraction patterns and five scales.
-Another 130,817 shifter cases route individual bits and count textual prefixes;
+Another 133,397 shifter cases route individual bits and count textual prefixes;
 15,449 FIFO cases use bit lists instead of register shifts, covering every legal
 pointer/length combination for three data patterns, including no-update queries.
 They also check all 128 pointer reads and all low-byte pointer-write patterns
@@ -402,14 +402,24 @@ floor produces minus one. Unrelated ASTAT bits and old sticky bits survive.
 
 ## Shifter and bit FIFO details
 
-Chapter 11-58 through 11-91 supplies the scalar effects. Shift amounts and field
-positions/lengths are normalized mathematical inputs here; this reference does
-not decode the register/immediate encoding or establish the register amount's
-significant-bit selection. Positive logical/arithmetic shifts set SV even if no
-nonzero bits are lost. Large magnitudes are bounded before shifting so a signed
-32-bit extreme cannot allocate excessive oracle storage. Rotations wrap modulo
-32. Bit modifications outside the word preserve the data; their SV uses the
-instruction-specific greater-than-31 predicate. BTST writes no data register.
+Chapter 11-58 through 11-91 supplies the scalar effects. LSHIFT and ASHIFT take
+the whole signed 32-bit fixed field of a register count or a signed eight-bit
+immediate. Positive LSHIFT sets SV even when the source is zero. For positive
+ASHIFT, the ADSP-21489 simulator sets SV when the mathematical result exceeds
+the signed 32-bit range. OR-ASHIFT also sets SV for any left count of 32 or
+more. This differs from the unconditional positive-count ASHIFT rule listed
+on pages 11-61 and 11-62. OR forms derive SZ from the combined result and read
+the old destination. The simulator matched these results and flags in 360
+mixed shift probes and 528 arithmetic follow-ups. To repeat the boundary probes,
+shift zero, `0x40000000`, `0x80000000` and `0xffffffff` by `-32`, `0`, `1`, `31`
+and `32` in each form. For the OR forms repeat with zero and nonzero old
+destinations. Capture the raw destination, ASTAT and STKY. Probe full register
+counts with `-2147483648`, `256` and `2147483647`.
+
+Large magnitudes are bounded before shifting so a signed 32-bit extreme cannot
+allocate excessive oracle storage. Rotations wrap modulo 32. Bit modifications
+outside the word preserve the data. Their SV uses the instruction-specific
+greater-than-31 predicate. BTST writes no data register.
 
 FDEP/FEXT use unsigned six-bit position/length inputs. Cross-boundary fields set
 SV even when discarded bits are zero. Sign extension applies only if the field's

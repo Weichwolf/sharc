@@ -445,10 +445,19 @@ zero/full words and every source bit, source/destination aliases, distinct
 physical read/write banks, SISD/SIMD predicates, raw extensions, flags and sticky
 preservation under all bank/SIMD/ALUSAT/RND32 selections, both numerical modes
 and whole-unit runs against instruction/cycle prefixes with snapshot replay.
-Both count forms check
-the shifter-condition branch interlock. Nonzero unused/DATAEX fields, other
-immediate shifter operations, parallel memory forms and full shifter qualification
-remain open. See `encoding.md` for standalone-prefix reference evidence.
+Both count forms check the shifter-condition branch interlock.
+
+Classic LSHIFT and ASHIFT, including their OR forms, lower the full signed
+register count and standalone signed-byte immediate. Installed fixtures in
+`test/isa/rotate.cpp` exercise the signed extrema, both edges of the word,
+arithmetic sign fill, source/destination aliases, old OR data, raw writeback,
+lane-local predicates, bank selection and shifter flags in both numerical
+modes. The native results are checked against independent bit routing and
+leading-sign counts at instruction and cycle boundaries. The simulator-backed
+ASHIFT overflow rules are recorded in
+[numeric-reference.md](numeric-reference.md#shifter-and-bit-fifo-details).
+Other numeric shifter families, extended DATAEX fields and parallel immediate
+shift/memory forms remain open. See `encoding.md` for standalone-prefix evidence.
 
 Classic type 15 transfers use direct normal-word PM/DM layouts, pre-indexed
 32-bit displacements, physical DAG/data banks, explicit R/S registers, SIMD and
@@ -639,7 +648,7 @@ compound control forms are tracked in #27.
 ## S2 independent expectations (complete milestone, numerical gaps retained)
 
 `test/support/reference.py` supplies a separate exact integer/rational numeric
-model. `generate_expectations.py` checks 311 numeric/conversion/accumulator/shifter
+model. `generate_expectations.py` checks 314 numeric/conversion/accumulator/shifter
 anchors, 48,768 normal-range rounding positions and 27,648 limb-based multiplier
 cases and can emit deterministic machine-readable expectations without loading
 production code. Fixed ALU records include complete
@@ -650,7 +659,7 @@ checks and pre-round AUS. 12,800 signed-quotient comparisons cross-check both
 conversion instructions. Floating value-only records remain
 separate from new qualified complete ALU, compare, MANT/LOGB and multiply effects.
 The latter pass 35,088 independent full-result checks.
-Another 130,817 shifter, 15,449 bit FIFO and 65,536 short-float unpack cases use
+Another 133,397 shifter, 15,449 bit FIFO and 65,536 short-float unpack cases use
 independent bit routing, bit lists and rational value checks. Scalar shifter
 expectations preserve unrelated flags and sticky bits. FIFO records refuse
 undefined data/pointer results rather than supplying a guessed complete state.
