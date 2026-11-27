@@ -1048,8 +1048,82 @@ void refused_combined_px(sharc::ExecutionMode mode, bool force) {
   check(result.has_fault && result.fault.reason == reason && result.fault.instruction == words[0] &&
             result.progress == sharc::Progress{} && core.registers() == before &&
             device.calls == (force ? 2U : 0U) &&
-            (force || result.fault.detail.contains("combined PX requires a long-word access")),
+            (force || result.fault.detail.contains("combined PX requires")),
         "unsupported width or second callback changed combined PX prematurely");
+}
+
+struct PxShortIo {
+  std::array<std::uint64_t, 3> cells{0x65018dbb, 0x728eac24, 0x03bb3636};
+  unsigned calls{};
+
+  bool access(sharc::MemorySpace space,
+              sharc::MemoryView view,
+              std::uint32_t address,
+              std::uint64_t &word,
+              bool write) noexcept {
+    const auto cell = calls++;
+    if (space != sharc::MemorySpace::data || view != sharc::MemoryView::short_word ||
+        address != ram_address + cell || cell >= cells.size() - 1) {
+      return false;
+    }
+    if (write) {
+      cells[cell] = word;
+    } else {
+      word = cells[cell];
+    }
+    return true;
+  }
+};
+
+void short_px_third_callback_refusal(sharc::ExecutionMode mode, bool write) {
+  constexpr std::uint64_t load = 0x52c035801612; // IF EQ R6=R1+R2, PX=DM(I1,M3).
+  constexpr std::uint64_t write_bit = 1ULL << 31;
+  const std::array words{load | (write ? write_bit : 0)};
+  Program program(words);
+  auto &region = program.code.code.variants.front().layout.regions.back();
+  region.view = sharc::MemoryView::short_word;
+  region.count = 3;
+  region.initialized = false;
+  const auto native = fixture::compile(program.code.code, mode);
+  PxShortIo io;
+  auto memory = program.code.memory();
+  memory.io = {
+      .owner = &io,
+      .read =
+          [](void *owner,
+             sharc::MemorySpace space,
+             sharc::MemoryView view,
+             std::uint32_t address,
+             std::uint64_t &word) noexcept {
+            return static_cast<PxShortIo *>(owner)->access(space, view, address, word, false);
+          },
+      .write =
+          [](void *owner,
+             sharc::MemorySpace space,
+             sharc::MemoryView view,
+             std::uint32_t address,
+             const std::uint64_t value) noexcept {
+            auto word = value;
+            return static_cast<PxShortIo *>(owner)->access(space, view, address, word, true);
+          }};
+  sharc::Core core(memory, mode);
+  auto before = initial();
+  before.mode1 = simd_bit;
+  before.pe[write ? 1U : 0U].astat = 1;
+  before.dag[0][1].index = ram_address;
+  before.dag[0][3].modifier = 4;
+  constexpr std::uint64_t px_seed = 0xe765dd80e3f0aa14;
+  before.px = px_seed;
+  fixture::install(core, native, before);
+  const auto old_cells = io.cells;
+  const auto result = core.run(1);
+  constexpr std::array<std::uint64_t, 3> stored{0xe3f0, 0xdd80, 0x03bb3636};
+  check(result.has_fault && result.fault.reason == sharc::FaultReason::access_fault &&
+            result.fault.instruction == words[0] && result.progress == sharc::Progress{} &&
+            result.fault.detail.contains(std::to_string(ram_address + 2)) &&
+            io.calls == io.cells.size() && io.cells == (write ? stored : old_cells) &&
+            core.registers() == before,
+        "third PX short-word callback fault lost prior stores or changed processor state");
 }
 
 constexpr std::uint64_t fixed_parallel_add = 0x34c89a001401;
@@ -1536,6 +1610,43 @@ void rewrite_and_resume() {
   }
 }
 
+void packed_px_code_alias() {
+  constexpr std::uint64_t store = 0x116b00000000 | ram_address; // DM(address)=PX.
+  constexpr std::uint64_t px_padding = 0xabcd;
+  constexpr unsigned px_shift = 16;
+  CodeWriter writer(store);
+  auto &program = writer.program;
+  auto &ordinary = program.code.variants.front().layout.regions.back();
+  ordinary.byte_offset = 0;
+  auto packed = ordinary;
+  packed.view = sharc::MemoryView::packed_48;
+  packed.byte_offset = CodeWriter::offset;
+  packed.byte_stride = fixture::Program::word_bytes;
+  program.code.variants.front().layout.regions.push_back(packed);
+  writer.allow();
+  const auto native = sharc::Core::compile(program.code);
+  sharc::Core core(program.memory());
+  auto before = initial();
+  before.px = (fixture::immediate(1, CodeWriter::before) << px_shift) | px_padding;
+  fixture::install(core, native, before);
+  const auto original = program.bytes;
+  check(fixture::completed(core.run(2), 2, 2) && program.bytes == original,
+        "unchanged packed PX store used the ordinary alias for code admission");
+
+  before.px = (fixture::immediate(1, CodeWriter::after) << px_shift) | px_padding;
+  core.set_registers(before);
+  const auto result = core.run(2);
+  check(result.execution == sharc::ExecutionState::code_transfer && !result.has_fault &&
+            result.progress.instructions == 1 && core.registers().pc == CodeWriter::next &&
+            fixture::get_word(program.bytes.data()) == static_cast<std::uint32_t>(store) &&
+            fixture::get_word(program.bytes.data() + CodeWriter::offset) == CodeWriter::after,
+        "packed PX store executed the old successor or wrote through the ordinary alias");
+  (void)core.install(native, CodeWriter::replacement_variant);
+  check(fixture::completed(core.run(1), 1, 1) &&
+            core.registers().pe[0].data[0][1] == (CodeWriter::after << word_shift),
+        "packed PX store could not resume the declared replacement image");
+}
+
 void rewrite_without_target() {
   CodeWriter writer(store_r0);
   writer.allow(CodeWriter::next + 1);
@@ -1736,6 +1847,7 @@ int main() {
       predicated_modifier_interlock(mode);
       predicated_forced_pair(mode);
       forced_dag_load_refusal(mode);
+      for (const bool write : {false, true}) { short_px_third_callback_refusal(mode, write); }
       for (const bool force : {false, true}) {
         refused_combined_px(mode, force);
         for (const bool write : {false, true}) { predicated_wide_implicit(mode, force, write); }
@@ -1754,6 +1866,7 @@ int main() {
     rewrite_without_target();
     code_padding_store();
     rewrite_before_io_fault();
+    packed_px_code_alias();
     rewrite_inside_delay(true);
     rewrite_inside_delay(false);
     refused_code_store(CodeStorage::callback);

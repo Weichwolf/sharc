@@ -174,15 +174,19 @@ void validate_memory_layout(const CodeVariant &variant, std::string_view identit
              a.first,
              "memory layout exceeds address space");
     }
-    const bool instruction = a.view == MemoryView::instruction;
+    const auto view_group = [](MemoryView view) {
+      return view == MemoryView::instruction || view == MemoryView::packed_48
+                 ? view
+                 : MemoryView::normal_word;
+    };
     for (std::size_t j = i + 1; j < regions.size(); ++j) {
       const auto &b = regions[j];
-      if (instruction == (b.view == MemoryView::instruction) && overlaps(a, b)) {
+      if (view_group(a.view) == view_group(b.view) && overlaps(a, b)) {
         refuse(FaultReason::invalid_image,
                identity,
                variant.id,
                a.first,
-               instruction ? "ambiguous instruction memory views" : "ambiguous data memory views");
+               "ambiguous memory views for the same access");
       }
     }
   }
@@ -253,10 +257,11 @@ bool aliases_code(const CodeVariant &variant, std::size_t region) {
 bool changes_code(const CodeVariant &variant,
                   std::uint64_t payload,
                   MemorySpace space,
+                  MemoryView view,
                   std::uint32_t address) noexcept {
   const auto &regions = variant.layout.regions;
   const auto data = std::ranges::find_if(regions, [&](const RegionLayout &layout) {
-    return layout.space == space && layout.view != MemoryView::instruction && layout.initialized &&
+    return layout.space == space && layout.view == view && layout.initialized &&
            address >= layout.first && std::uint64_t{address} - layout.first < layout.count;
   });
   if (data == regions.end()) { return false; }

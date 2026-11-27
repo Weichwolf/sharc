@@ -475,7 +475,7 @@ struct Core::Impl {
         if (reason == detail::NativeExit::code_alias) {
           message = ": store may alias prepared instruction storage";
         } else if (reason == detail::NativeExit::unsupported_memory_width) {
-          message = ": combined PX requires a long-word access";
+          message = ": combined PX requires a short, packed 48-bit or long-word access";
         }
         result = fail(reason == detail::NativeExit::access_fault ? FaultReason::access_fault
                                                                  : FaultReason::unsupported_feature,
@@ -591,8 +591,9 @@ struct Core::Impl {
   static std::uint32_t check_code_write(const Impl &core,
                                         std::uint64_t payload,
                                         MemorySpace space,
+                                        MemoryView view,
                                         std::uint32_t address) noexcept {
-    return detail::changes_code(*core.installed_variant(), payload, space, address)
+    return detail::changes_code(*core.installed_variant(), payload, space, view, address)
                ? detail::code_write_event
                : 0U;
   }

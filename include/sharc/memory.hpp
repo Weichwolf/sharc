@@ -9,7 +9,14 @@
 
 namespace sharc {
 enum class MemorySpace : std::uint8_t { program, data };
-enum class MemoryView : std::uint8_t { short_word, normal_word, long_word, instruction, extended };
+enum class MemoryView : std::uint8_t {
+  short_word,
+  normal_word,
+  long_word,
+  instruction,
+  extended,
+  packed_48 // Combined PX normal-address access, with its own six-byte layout.
+};
 
 // Callbacks execute synchronously on the Core owner. False means an access fault.
 struct Io {

@@ -679,6 +679,20 @@ in SISD, the same simulator behavior seen for the Type 3a data-register
 broadcast probes. The lowering uses the documented SISD broadcast rule and
 the documented two-word store for the paired absolute form.
 
+A further 240 combined-PX probes used both buses, absolute, immediate-indexed
+and register pre-/post-modified forms, and distinct data at the two- and
+three-column aliases. The 144 unqualified short-address samples matched
+three successive short cells at even and odd addresses. The 88 normal-address
+samples used the three-column layout regardless of the tested SYSCTL.IMDW
+setting. In SIMD without broadcast, only PEx admitted a read. Broadcast
+permitted either selected lane to load the same 48 bits. Either lane admitted
+a store, and a post-modified index advanced once. In eight further probes,
+the simulator used four short cells with `(LW)`, the discrepancy also seen
+with short-address data and DAG register moves. The core applies the override
+only to normal-word accesses, following Programming Reference 2.4, section
+6-8. The functional simulator results establish the observed data placement.
+Silicon timing remains open.
+
 A further 48 indexed long-word broadcast probes covered USTAT1, PX1 and
 combined PX at natural and forced addresses. With only PEx selected, each
 named register received the low word and its peer received the high word.

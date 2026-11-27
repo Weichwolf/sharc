@@ -714,6 +714,9 @@ constexpr std::uint32_t dag_low_word = 0xf0e19a80;
 constexpr std::uint32_t dag_high_word = 0x12345678;
 constexpr std::uint32_t dag_store_low = 0xbd868ac3;
 constexpr std::uint32_t dag_store_high = 0x36bdf0a1;
+constexpr unsigned combined_px = 0x6b;
+constexpr unsigned short_bits = 16;
+constexpr std::uint64_t px48_memory_word = 0x89ab76543210;
 
 std::uint64_t register_memory_encoding(const RegisterMemoryCase &item, unsigned index, bool write) {
   switch (item.form) {
@@ -762,9 +765,27 @@ void put_register_word(std::vector<std::byte> &ram,
   }
 }
 
+bool narrow_px(const RegisterMemoryCase &item) {
+  return item.reg == combined_px &&
+         (item.view == sharc::MemoryView::short_word || item.view == sharc::MemoryView::packed_48);
+}
+
+void put_px48(std::vector<std::byte> &ram, const RegisterMemoryCase &item, std::uint64_t word) {
+  constexpr unsigned cells = 3;
+  if (item.view == sharc::MemoryView::short_word) {
+    for (unsigned cell = 0; cell < cells; ++cell) {
+      put_register_word(ram, dag_cell + cell, item, word >> (short_bits * cell));
+    }
+  } else {
+    put_register_word(ram, dag_cell, item, word);
+  }
+}
+
 std::vector<std::byte> register_memory_seed(const RegisterMemoryCase &item) {
   std::vector<std::byte> ram(offset + (dag_capture_count * immediate_stride), padding);
-  if (item.view == sharc::MemoryView::long_word) {
+  if (narrow_px(item)) {
+    put_px48(ram, item, px48_memory_word);
+  } else if (item.view == sharc::MemoryView::long_word) {
     constexpr std::uint64_t word = (std::uint64_t{dag_high_word} << 32) | dag_low_word;
     put_register_word(ram, dag_cell, item, word);
   } else if (item.view == sharc::MemoryView::extended) {
@@ -936,7 +957,7 @@ void dag_memory_access(sharc::ExecutionMode mode) {
   for (const auto &item : cases) { dag_memory_access(item, mode); }
 }
 
-constexpr unsigned combined_px = 0x6b, first_px_half = 0x6c, second_px_half = 0x6d;
+constexpr unsigned first_px_half = 0x6c, second_px_half = 0x6d;
 constexpr std::array user_status_ports{0x70U, 0x71U, 0x7eU, 0x7fU};
 constexpr std::uint64_t px_word_mask = 0xffffffff;
 constexpr std::array<std::uint32_t, 4> system_status_seed{
@@ -975,6 +996,10 @@ void expect_system_store(const sharc::Registers &state,
                          const RegisterMemoryCase &item,
                          unsigned active) {
   if (active == 0) { return; }
+  if (narrow_px(item)) {
+    put_px48(ram, item, state.px >> short_bits);
+    return;
+  }
   const auto explicit_reg = item.reg == combined_px ? first_px_half : item.reg;
   const auto first = system_word(state, explicit_reg);
   const auto second = system_word(state, explicit_reg ^ 1);
@@ -994,6 +1019,10 @@ void expect_system_load(sharc::Registers &state,
                         const RegisterMemoryCase &item,
                         unsigned active,
                         bool broadcast) {
+  if (narrow_px(item)) {
+    if (broadcast ? active != 0 : (active & 1) != 0) { state.px = px48_memory_word << short_bits; }
+    return;
+  }
   const auto explicit_reg = item.reg == combined_px ? first_px_half : item.reg;
   if (system_memory_wide(item)) {
     if (item.form == RegisterMemoryForm::absolute && item.reg != combined_px) {
@@ -1081,6 +1110,14 @@ void system_memory_access(const RegisterMemoryCase &item, sharc::ExecutionMode m
   fixture::Program program(words);
   auto &variant = program.code.variants.front();
   variant.entries.push_back(fixture::code_address + 2);
+  if (item.view == sharc::MemoryView::packed_48) {
+    variant.layout.regions.push_back({.space = item.space,
+                                      .first = ram_address,
+                                      .count = dag_capture_count,
+                                      .storage_id = ram_id,
+                                      .byte_stride = immediate_stride,
+                                      .initialized = true});
+  }
   variant.layout.regions.push_back({.space = item.space,
                                     .view = item.view,
                                     .first = ram_address,
@@ -1154,6 +1191,21 @@ void system_memory_access(sharc::ExecutionMode mode) {
                          .force = true},
   };
   for (const auto &item : cases) { system_memory_access(item, mode); }
+  for (const auto bus : {data, program}) {
+    for (const auto form : {absolute, immediate, pre, post}) {
+      system_memory_access(
+          {.form = form, .space = bus, .view = short_word, .reg = combined_px, .width = 2}, mode);
+      system_memory_access(
+          {.form = form, .space = bus, .view = packed_48, .reg = combined_px, .width = 6}, mode);
+    }
+    system_memory_access({.form = post,
+                          .space = bus,
+                          .view = short_word,
+                          .reg = combined_px,
+                          .width = 2,
+                          .force = true},
+                         mode);
+  }
 }
 } // namespace
 

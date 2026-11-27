@@ -10,12 +10,15 @@ Reference 2.4, sections 2-6–2-13, 4-110, 6-10–6-31, 7-36–7-40, 9-7–9-9,
 ## Layout and storage
 
 A region in the instruction's program or data address space selects the view and
-permissions. Data views must be disjoint within each space, as must instruction
-views. An instruction view may alias a data view. Zero-length regions contribute
-no addresses. A region must fit the 32-bit address space.
+permissions. Instruction-fetch views, packed 48-bit data views and ordinary data
+views are each disjoint within their own group and address space. For example,
+one address can select three views for a classic instruction fetch, a combined
+PX move and a normal 32-bit data move. Zero-length regions contribute no
+addresses. A region must fit the 32-bit address space.
 
-Values are serialized little-endian. One short, normal, long, extended or
-instruction word occupies 2, 4, 8, 5 or 6 bytes respectively. The address selects
+Values are serialized little-endian. Short, normal, long and extended words
+occupy 2, 4, 8 and 5 bytes respectively. Packed 48-bit data and classic
+instruction words occupy 6 bytes. The address selects
 `byte_offset + (address - first) * byte_stride` in the lent storage id. An
 initialized data region needs a stride at least as large as its word width and
 storage for its entire declared range. Padding and unaligned byte offsets are
@@ -102,9 +105,21 @@ this form, so silicon confirmation remains open for both register classes.
 
 Combined PX can transfer all 64 bits through a long-word view or a forced
 long-word access to two successive normal words. Long-word broadcast selects
-the reversed halves if its implicit transfer is selected. Narrow combined-PX
-transfers require further qualification and report an unsupported memory access
-before invoking I/O or changing either half.
+the reversed halves if its implicit transfer is selected. For an unqualified
+move at a normal-word address, declare a `MemoryView::packed_48` layout for
+the three-column access, alongside any ordinary layout at the same addresses.
+The packed access takes PX bits 63:16 as a six-byte payload and clears the
+low 16 bits on a load. At a short-word address, three consecutive 16-bit
+cells hold the same payload, with the lowest address supplying bits 31:16.
+The `(LW)` override applies to normal-word layouts. Masked reads have no
+memory effects. A 48-bit load needs PEx or an enabled broadcast selected
+by PEy. Either selected lane permits a store of the complete payload. A
+post-modifying transfer updates the shared index once if either lane is selected.
+Checked short-word callbacks run in address order and report the faulting
+cell. A refused callback keeps the instruction from retiring. Successful
+earlier stores remain visible, and the register, compute and index effects
+wait for the whole transfer. Code coherence checks use the selected physical
+view, including for a packed layout that aliases executable storage.
 
 Type 1a transfers address DM using DAG1 and PM using DAG2. Both addresses use
 their old I. The packet updates each I once using the selected signed M from the

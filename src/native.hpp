@@ -221,6 +221,7 @@ direct_memory(const PreparedImage &image, std::uint32_t variant, const Memory &m
 [[nodiscard]] bool changes_code(const CodeVariant &variant,
                                 std::uint64_t payload,
                                 MemorySpace space,
+                                MemoryView view,
                                 std::uint32_t address) noexcept;
 
 [[nodiscard]] constexpr unsigned memory_bytes(MemoryView view) {
@@ -230,6 +231,7 @@ direct_memory(const PreparedImage &image, std::uint32_t variant, const Memory &m
     case MemoryView::long_word: return 8;
     case MemoryView::instruction: return 6;
     case MemoryView::extended: return 5;
+    case MemoryView::packed_48: return 6;
   }
   return 0;
 }
