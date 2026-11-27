@@ -118,6 +118,26 @@ void apply(const sharc::Registers &before, Move move, sharc::Registers &state) {
   const bool x = (before.pe[0].astat & 1) != 0;
   const bool y = (before.pe[1].astat & 1) != 0;
   const bool simd = (before.mode1 & (1U << simd_bit)) != 0;
+  if (move.source == px && !is_data(move.destination)) {
+    if (x) {
+      const auto low = static_cast<std::uint32_t>(before.px);
+      write(state, move.destination, false, std::uint64_t{low} << 8);
+    }
+    return;
+  }
+  if (move.destination == px && !is_data(move.source)) {
+    if (x) {
+      constexpr std::uint64_t half_radix = 0x100000000;
+      const auto *const reg = std::ranges::find(ustat, move.source);
+      if (reg == ustat.end()) {
+        state.px = (half_radix + 1) * dag(before, move.source);
+      } else {
+        const auto pos = static_cast<std::size_t>(reg - ustat.begin());
+        state.px = before.ustat[pos] + (half_radix * before.ustat[pos ^ 1]);
+      }
+    }
+    return;
+  }
   if (x) { write(state, move.destination, false, read(before, move.source, false)); }
   if (move.swap) {
     if (simd ? y : x) { write(state, move.source, false, read(before, move.destination, false)); }
@@ -234,6 +254,23 @@ void system_moves() {
   verify_moves(moves);
 }
 
+void combined_px_moves() {
+  for (unsigned quarter = 0; quarter < 4; ++quarter) {
+    std::vector<Move> from_px;
+    std::vector<Move> to_px;
+    const auto base_index = quarter * 4;
+    for (unsigned field = 1; field <= 4; ++field) {
+      const auto dag_reg = (field * 16) + base_index;
+      from_px.push_back({.source = px, .destination = dag_reg + 1});
+      to_px.push_back({.source = dag_reg, .destination = px});
+    }
+    from_px.push_back({.source = px, .destination = ustat[quarter]});
+    to_px.push_back({.source = ustat[quarter], .destination = px});
+    verify_moves(from_px);
+    verify_moves(to_px);
+  }
+}
+
 void verify_parallel(sharc::Core &core, Move move, unsigned configuration) {
   constexpr std::uint64_t positive_rail = 0x7fffffff00;
   constexpr std::uint64_t negative_rail = 0x8000000000;
@@ -268,6 +305,8 @@ void parallel_priority() {
                              Move{.source = 0x18, .destination = 0},
                              Move{.source = ustat[0], .destination = 0},
                              Move{.source = 0, .destination = px2},
+                             Move{.source = px, .destination = ustat[0]},
+                             Move{.source = ustat[3], .destination = px},
                              Move{.source = 0x50, .destination = 0, .swap = true}};
   for (const auto &move : moves) {
     const std::array words{encoding(move) | add_r0_r2_r3};
@@ -342,7 +381,7 @@ constexpr std::uint32_t dependency_word = 0x89abcdef;
 
 struct DependencyCase {
   unsigned destination{}, gap{};
-  bool memory{}, selected{true}, parallel{};
+  bool memory{}, selected{true}, parallel{}, combined_px{};
 };
 
 std::uint32_t dependency_value(DependencyCase input) {
@@ -357,6 +396,11 @@ std::vector<sharc::Registers> dependency_states(DependencyCase input) {
   expected.dag[0][8].index = base + 5;
   expected.dag[0][8].modifier = 0;
   expected.pe[0].data[0][0] = (std::uint64_t{value} << 8) | extension;
+  if (input.combined_px) {
+    constexpr std::uint64_t unrelated_px2 = 0xabcdefff00000000;
+    expected.dag[0][8].index = base + 4;
+    expected.px = unrelated_px2 | value;
+  }
   expected.pe[0].data[0][2] = 0;
   expected.pe[0].data[0][3] = 0;
   std::vector states{expected};
@@ -422,10 +466,10 @@ void dependency_case(DependencyCase input) {
   constexpr std::uint64_t jump_m8_i8 = 0x083e00000000;
   constexpr std::uint64_t load_r1_i0 = 0xa00100000000;
   constexpr std::uint64_t add_r1_r2_r3 = 0x1123;
-  const Move move{.source = 0, .destination = input.destination};
+  const Move move{.source = input.combined_px ? px : 0, .destination = input.destination};
   const auto value = dependency_value(input);
   const auto loader =
-      (input.gap & 1) != 0 && !input.parallel && input.selected
+      (input.gap & 1) != 0 && !input.parallel && input.selected && !input.combined_px
           ? fixture::immediate(input.destination, value)
           : encoding(move, input.selected ? 31U : 0U) | (input.parallel ? add_r1_r2_r3 : 0);
   std::vector<std::uint64_t> words{loader};
@@ -542,6 +586,7 @@ void dependencies() {
   }
   dependency_case({.destination = i8_code, .selected = false});
   dependency_case({.destination = i8_code, .parallel = true});
+  dependency_case({.destination = i8_code, .combined_px = true});
 }
 
 } // namespace
@@ -550,6 +595,7 @@ namespace fixture {
 void register_transfers() {
   raw_moves();
   system_moves();
+  combined_px_moves();
   parallel_priority();
   for (unsigned quarter = 0; quarter < 4; ++quarter) { immediate_registers(quarter); }
   system_immediates();

@@ -667,8 +667,12 @@ named register. The absolute-versus-indexed data placement still requires
 independent confirmation.
 
 Combined PX moved its low and high halves as one long word for both kinds
-of long-word addressing. Narrow combined-PX transfers behaved differently
-from the single-half transfers and varied with the form and broadcast mode.
+of long-word addressing. In eight SIMD short-address post-modify probes,
+the low, middle and high 16-bit cells at successive short addresses mapped
+to PX bits 31:16, 47:32 and 63:48. Loads cleared bits 15:0 and required PEx.
+Either lane admitted a store of all three cells. The fourth cell retained
+its original value, and either active lane triggered one post-modification.
+The short-address probes used DM and broadcast disabled.
 The normal-word broadcast probes for USTAT1 and PX1 followed independent
 lane selection in SIMD and required both stored EQ flags to update the peer
 in SISD, the same simulator behavior seen for the Type 3a data-register
@@ -692,9 +696,16 @@ An immediate write to combined PX duplicates the immediate in both halves.
 The other 84 cases moved between combined PX and USTAT, a PX half or a
 DAG register. The assembled words use the ordinary type-5a combined PX
 operand in both directions. CCES placed the source in the high half and
-zeroed the low half for `PX = USTAT1` and `PX = I12`, while section 2-16
-describes two status words or a duplicated DAG word. The core leaves the
-unresolved combined-PX/UREG projections explicit during preparation.
+zeroed the low half for `PX = USTAT1` and `PX = I12`. The simulator also
+read PX2 for the reverse moves and performed an implicit USTAT write if
+only PEy was selected. The core follows Programming Reference 2.4, pages
+2-16–2-17 and 4-101–4-103, for combined PX with USTAT or DAG registers.
+A write to PX places the named USTAT in PX1 and its complement in PX2,
+or duplicates the DAG word. The reverse transfer copies PX1 to the named
+destination only. PEx gates the whole transfer. These choices are covered
+by installed-image tests. Silicon confirmation remains open. Combined-PX
+moves to or from its own halves still require reference or silicon evidence
+and remain refused during preparation.
 
 ## Register MODIFY and DAG interlocks
 

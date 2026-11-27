@@ -708,8 +708,9 @@ void validate_register_move(const Instruction &instruction, std::string_view ide
     reject(instruction, identity, FaultReason::invalid_encoding, "reserved register-swap bits");
   }
   const bool ordinary = ordinary_ureg(move.source) && ordinary_ureg(move.destination);
-  const bool exchange = (move.source == px_register && data_register(move.destination)) ||
-                        (data_register(move.source) && move.destination == px_register);
+  const auto peer = move.source == px_register ? move.destination : move.source;
+  const bool exchange = (move.source == px_register || move.destination == px_register) &&
+                        ordinary_ureg(peer) && !px_half(peer);
   if ((!ordinary && !exchange) || !supported_compute(instruction.compute)) {
     reject(instruction,
            identity,
@@ -2064,6 +2065,27 @@ void Lowering::write_register(Values &values,
 void Lowering::register_instruction(Values &values, const Instruction &op, const Values &before) {
   const auto move = register_move(op);
   auto *selected = condition(before, op);
+  if (move.source == px_register && !data_register(move.destination)) {
+    // The combined-register exception takes PX1, even for a paired USTAT destination.
+    auto *x = builder_.CreateExtractElement(selected, builder_.getInt32(0));
+    auto *low = builder_.CreateTrunc(load(64, px_slot), builder_.getInt32Ty());
+    auto *raw = builder_.CreateShl(builder_.CreateZExt(low, builder_.getInt64Ty()),
+                                   builder_.getInt64(raw_extension_bits));
+    write_register(values, move.destination, pair(raw, raw, 64), pair(x, builder_.getFalse(), 1));
+    return;
+  }
+  if (move.destination == px_register && !data_register(move.source)) {
+    constexpr unsigned half_bits = 32;
+    // read_register places the named USTAT first and its complement second.
+    // Both elements contain the same word for a DAG source.
+    auto *words =
+        builder_.CreateLShr(read_register(before, move.source), vector(64, raw_extension_bits));
+    auto *low = builder_.CreateExtractElement(words, builder_.getInt32(0));
+    auto *high = builder_.CreateExtractElement(words, builder_.getInt32(1));
+    auto *x = builder_.CreateExtractElement(selected, builder_.getInt32(0));
+    write_px(builder_.CreateOr(low, builder_.CreateShl(high, builder_.getInt64(half_bits))), x);
+    return;
+  }
   if (!move.swap) {
     write_register(values, move.destination, read_register(before, move.source), selected);
     return;

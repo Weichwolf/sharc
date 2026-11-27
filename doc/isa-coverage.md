@@ -726,13 +726,16 @@ the additional PM access clock in the probe, is recorded separately in
 
 USTAT1–4 and PX1/PX2 support classic register and immediate moves and
 types 3a, 14a and 15a memory transfers. Combined PX supports its raw40
-register moves with R/S, immediate replication and full long-word memory
-transfers. Installed fixtures cover independent predicates, register aliases,
-old sources in parallel compute, both buses, long-word broadcast order and
-precise refusal if a forced load's second callback fails. Combined-PX moves
-with other UREGs and narrow combined-PX memory transfers remain open. See
+register moves with R/S, the documented USTAT pair and DAG word transfers,
+immediate replication and full long-word memory transfers. Installed fixtures
+cover independent predicates, register aliases, old sources in parallel compute,
+all four physical DAG bank selectors, a dependent DAG2 jump across bounds and
+snapshot replay, both buses, long-word broadcast order and precise refusal if a
+forced load's second callback fails. Combined-PX moves involving the individual
+PX halves or other system UREGs, and narrow combined-PX memory transfers, remain
+open. See
 [the register and memory observations](numeric-reference.md#user-status-and-bus-exchange-registers-as-memory-operands)
-for the absolute long-word store discrepancy and other pending projections.
+for the simulator differences in absolute long-word stores and register moves.
 
 Other system UREG transfers, DAG addressing variants and silicon confirmation
 of contended register writeback are tracked in #26. Remaining compound control
