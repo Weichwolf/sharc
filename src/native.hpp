@@ -95,6 +95,15 @@ inline constexpr std::uint64_t counted_loop_tail = 1ULL << 49;
 inline constexpr std::uint64_t loop_call_live = 1ULL << 63;
 inline constexpr std::uint32_t pc_call_tag = 1U << 24;
 inline constexpr std::uint32_t pc_sequencer_tag = 1U << 25;
+inline constexpr unsigned pc_stack_pointer_bits = 5;
+inline constexpr std::uint32_t pc_stack_pointer_mask = (1U << pc_stack_pointer_bits) - 1;
+// Bits in the packed native pipeline word, following the DAG and ASTAT history.
+inline constexpr unsigned pending_pc_stack_shift = 21;
+inline constexpr unsigned prior_pc_stack_shift = pending_pc_stack_shift + pc_stack_pointer_bits + 1;
+inline constexpr std::uint32_t pending_pc_stack_valid = 1U << pc_stack_pointer_bits;
+inline constexpr std::uint32_t pending_pc_stack_mask =
+    (pending_pc_stack_valid | pc_stack_pointer_mask) << pending_pc_stack_shift;
+inline constexpr std::uint32_t prior_pc_stack_mask = pc_stack_pointer_mask << prior_pc_stack_shift;
 inline constexpr std::uint32_t interrupt_status_frame = 1U << 8;
 
 enum ShortLoopWord : std::uint8_t {
@@ -180,7 +189,7 @@ enum class NativeExit : std::uint8_t {
   invalid_fifo,
   unsupported_memory_width,
   unsupported_pc_stack_write,
-  unsupported_pc_stack_wide_load
+  unsupported_pc_stack_pointer_write
 };
 using NativeEntry = void (*)(void **, std::uint64_t *);
 using RegisterPointers = std::vector<void *>;

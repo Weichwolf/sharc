@@ -548,6 +548,132 @@ void pc_stack_writes() {
   }
 }
 
+void pc_stack_pointer_latency() {
+  constexpr std::uint32_t first_cell = 0x1081001;
+  constexpr std::uint32_t third_cell = 0x2081003;
+  constexpr std::uint32_t high_bits = 0xc0000000;
+  constexpr std::uint32_t full_flag = 1U << 21;
+  constexpr std::uint32_t empty_flag = 1U << 22;
+  constexpr std::uint32_t stack_interrupt = 1U << 3;
+  constexpr auto capacity = sharc::Registers::pc_stack_capacity;
+  constexpr std::uint64_t raw_shift = 8;
+  const std::array words{encoding({.source = 6, .destination = pcstkp_code}),
+                         encoding({.source = pcstk_code, .destination = 4}, true_condition),
+                         encoding({.source = pcstkp_code, .destination = 5}, true_condition)};
+  fixture::Program program(words);
+  for (const auto mode : fixture::numeric_modes) {
+    const auto native = fixture::compile(program.code, mode);
+    sharc::Core core(program.memory(), mode);
+    sharc::Core replay(program.memory(), mode);
+    (void)core.install(native, fixture::Program::variant_id);
+    (void)replay.install(native, fixture::Program::variant_id);
+    for (const auto target : {0U, 1U, 29U, 30U, 31U}) {
+      sharc::Registers expected;
+      expected.pc = base;
+      expected.mode1 = 1U << simd_bit;
+      expected.pc_stack_pointer = 3;
+      expected.pc_stack[0] = first_cell;
+      expected.pc_stack[2] = third_cell;
+      expected.pe[0].astat = 1;
+      expected.pe[0].data[0][6] = std::uint64_t{high_bits | target} << raw_shift;
+      core.set_registers(expected);
+      const auto start = core.save();
+      fixture::boundary(expected, {.pc = base + 1, .clock = 1});
+      check(fixture::completed(core.run(1), 1, 1) && core.registers() == expected,
+            "the PCSTKP write took effect before the following execute cycle");
+      replay.restore(core.save());
+      expected.pc_stack_pointer = static_cast<std::uint8_t>(target);
+      expected.pe[0].stky = (target == 0 ? empty_flag : 0) | (target >= capacity ? full_flag : 0);
+      expected.irptl = target == capacity - 1 ? stack_interrupt : 0;
+      for (auto &pe : expected.pe) {
+        pe.data[0][4] = std::uint64_t{third_cell} << raw_shift;
+        pe.data[0][5] = std::uint64_t{target} << raw_shift;
+      }
+      fixture::boundary(expected, {.pc = base + 3, .clock = 3});
+      const auto deadline = replay.state().progress.base_cycles + 2;
+      check(fixture::completed(replay.run_until(deadline), 2, 2) && replay.registers() == expected,
+            "the PCSTKP effect lost the old top, new depth, stack flags, or interrupt latch");
+      core.restore(start);
+      check(fixture::completed(core.run(3), 3, 3) && core.registers() == expected,
+            "continuous PCSTKP execution differed from snapshot replay");
+    }
+  }
+}
+
+void pc_stack_pointer_rts(unsigned gap) {
+  constexpr std::uint64_t rts = 0x0a3e00000000;
+  constexpr auto low = base + 5;
+  constexpr auto high = base + 6;
+  std::array<std::uint64_t, 7> words{fixture::immediate(pcstkp_code, 1)};
+  words[gap + 1] = rts;
+  fixture::Program program(words);
+  program.code.variants.front().entries.insert(program.code.variants.front().entries.end(),
+                                               {low, high});
+  for (const auto mode : fixture::numeric_modes) {
+    const auto native = fixture::compile(program.code, mode);
+    sharc::Core core(program.memory(), mode);
+    sharc::Registers initial;
+    initial.pc = base;
+    initial.pc_stack_pointer = 3;
+    initial.pc_stack[0] = low;
+    initial.pc_stack[2] = high;
+    fixture::install(core, native, initial);
+    const auto count = gap + 2;
+    check(fixture::completed(core.run(count), count, count + 3),
+          "PCSTKP followed by RTS failed to retire");
+    const auto result = core.registers();
+    check(result.pc == (gap < 2 ? high : low) && result.pc_stack_pointer == unsigned{gap == 0} &&
+              result.pc_stack == initial.pc_stack,
+          "RTS used the wrong target sample or popped the wrong pointer");
+  }
+}
+
+void pc_stack_pointer_in_delayed_return() {
+  constexpr std::uint64_t rts_db = 0x0a3e04000000;
+  constexpr auto target = base + 6;
+  const std::array<std::uint64_t, 7> words{
+      rts_db,
+      0,
+      fixture::immediate(pcstkp_code, 1),
+      0,
+      0,
+      0,
+      encoding({.source = pcstkp_code, .destination = 4}, true_condition)};
+  fixture::Program program(words);
+  program.code.variants.front().entries.push_back(target);
+  const auto native = fixture::compile(program.code, sharc::ExecutionMode::strict);
+  sharc::Core core(program.memory());
+  sharc::Registers initial;
+  initial.pc = base;
+  initial.pc_stack_pointer = 3;
+  initial.pc_stack[2] = target;
+  fixture::install(core, native, initial);
+  check(fixture::completed(core.run(3), 3, 4) && core.registers().pc == target &&
+            core.registers().pc_stack_pointer == 1,
+        "the return refill failed to mature the second-slot PCSTKP write");
+  check(fixture::completed(core.run(1), 1, 1) && core.registers().pe[0].data[0][4] == 1U << 8,
+        "a declared return entry lost the stack-pointer continuation");
+}
+
+void pc_stack_pointer_before_do() {
+  constexpr std::uint64_t two_turns = 0x0c0002000007;
+  const std::array<std::uint64_t, 10> words{
+      fixture::immediate(pcstkp_code, 1),
+      two_turns,
+      encoding({.source = pcstkp_code, .destination = 4}, true_condition)};
+  fixture::Program program(words);
+  const auto native = fixture::compile(program.code, sharc::ExecutionMode::strict);
+  sharc::Core core(program.memory());
+  sharc::Registers initial;
+  initial.pc = base;
+  initial.pc_stack_pointer = 3;
+  fixture::install(core, native, initial);
+  constexpr unsigned count = 16;
+  check(fixture::completed(core.run(count), count, count) &&
+            core.registers().pc_stack_pointer == 1 && core.registers().pe[0].data[0][4] == 2U << 8,
+        "DO did not create and remove its frame above the forwarded stack depth");
+}
+
 void rewrite_delayed_return(bool first_slot) {
   constexpr std::uint64_t call_db = 0x06be04000000;
   constexpr std::uint64_t rts = 0x0a3e00000000;
@@ -590,9 +716,9 @@ void rewrite_delayed_return(bool first_slot) {
   }
 }
 
-void refuse_unimplemented_loop_stack_write() {
+void refuse_unimplemented_loop_stack_write(unsigned reg) {
   constexpr std::uint64_t do_three = 0x0c0003000007;
-  const auto write = fixture::immediate(pcstk_code, base + 2);
+  const auto write = fixture::immediate(reg, base + 2);
   const std::array<std::uint64_t, 9> words{do_three, write};
   fixture::Program program(words);
   const auto native = fixture::compile(program.code, sharc::ExecutionMode::strict);
@@ -607,7 +733,7 @@ void refuse_unimplemented_loop_stack_write() {
             result.progress == sharc::Progress{.instructions = 1, .base_cycles = 1} &&
             state.pc_stack_pointer == 1 && state.pc_stack[0] == base + 1 &&
             state.loop_address_depth == 1,
-        "an unsupported PCSTK write changed a live DO frame or lost the exact prefix");
+        "an unsupported stack write changed a live DO frame or lost the exact prefix");
 }
 
 void pc_and_stack_in_delay_slots() {
@@ -1509,9 +1635,14 @@ void register_transfers() {
   emulation_clock_short_loop();
   sequencer_register_reads();
   pc_stack_writes();
+  pc_stack_pointer_latency();
+  for (unsigned gap = 0; gap < 3; ++gap) { pc_stack_pointer_rts(gap); }
+  pc_stack_pointer_in_delayed_return();
+  pc_stack_pointer_before_do();
   rewrite_delayed_return(true);
   rewrite_delayed_return(false);
-  refuse_unimplemented_loop_stack_write();
+  refuse_unimplemented_loop_stack_write(pcstk_code);
+  refuse_unimplemented_loop_stack_write(pcstkp_code);
   pc_and_stack_in_delay_slots();
   loop_register_reads();
   combined_px_moves();

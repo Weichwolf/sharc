@@ -1015,8 +1015,7 @@ case that left PCSTK unchanged.
 Absolute long-word loads used the upper word for PCSTK and kept PCSTKP.
 Indexed long-word loads also wrote PCSTKP from the upper word when PEx
 was selected. This held on both buses and for a long-word view and the
-`(LW)` normal-word override. The Core currently refuses that indexed
-form when it would write PCSTKP. The simulator took PX2 for the combined
+`(LW)` normal-word override. The simulator took PX2 for the combined
 `PCSTK = PX` source. The Core uses the PX1 rule for DAG and system
 registers from Programming Reference 2.4, p. 2-16. Silicon readback of
 the combined PX source and the 26-bit PCSTK tags remains unverified.
@@ -1028,6 +1027,47 @@ address. The first slot could read the original return address before
 the second slot replaced it. With PCSTKP at zero or 31, the simulator
 returned its empty PCSTK value and ignored the write. The Core uses
 `0x03ffffff` for the empty projection and keeps the stored cells.
+
+### PC stack pointer writes
+
+In 171 CCES 2.12.1 timing probes a register or immediate write to PCSTKP
+left the old pointer, top word and PCFL/PCEM visible to the immediately
+following ordinary read. A read after a NOP saw the new values. The
+write used five bits and kept the physical cells when reducing or
+increasing the depth. Writing 29 set SOVFI, including a repeat write
+after clearing the latch. Writing 30 or 31 set PCFL. The simulator
+allowed a later write after explicitly setting 31. The Core treats
+31 as overflow and ignores the write under Programming Reference 2.4,
+pp. 4-13 and A-11. Silicon behavior after an explicit write of 31
+remains unverified.
+
+In 26 flow probes an adjacent CALL and a PCSTK destination used the
+forwarded depth. An ordinary PCSTK or PCSTKP source still used the old
+depth. The self transfer `PCSTKP = PCSTKP` used the forwarded depth.
+A data store interlocked by a recent DAG load also saw the new
+pointer. RTS and RTS (DB) selected the old return word with zero or
+one intervening NOP. With one NOP the pop operated on the new depth.
+After two NOPs, both the target and pop used the new depth.
+Three follow-up probes checked the counted DO push and the first
+target instruction after a write in the second delay slot of JUMP or
+RTS. DO pushed above the forwarded depth. In both delayed forms the
+target's first read saw the new pointer.
+
+In 72 memory probes, an absolute long-word load used the upper word
+for the named port and left its neighbor untouched. An indexed
+long-word load used the low word for the named port and the high word
+for its neighbor, including when PCSTKP was named. PCSTK wrote the
+current top cell while the PCSTKP change remained pending. These
+results held for native long-word addressing and the `(LW)` override
+on both buses. On a PEy-only conditional indexed load, the index
+advanced and both stack ports retained their values.
+
+Nine repeat-site samples compared DM, PM and PM with `(LW)`. In both
+PM forms the cold visit added one clock and the next instruction read
+the new pointer. Both warm visits kept the old pointer for that read,
+as did all three DM visits. The memory transfers are lowered. Aging the
+pending pointer on the cold PM fetch stall remains part of the
+instruction-cache timing work.
 
 ## Fixed multiplier details
 

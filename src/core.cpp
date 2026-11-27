@@ -293,6 +293,14 @@ constexpr std::uint32_t pc_stack_empty = 1U << 22;
 constexpr std::uint32_t status_stack_empty = 1U << 24;
 constexpr std::uint32_t timer_enable = 1U << 5;
 constexpr unsigned vector_refill_cycles = 4;
+
+std::uint8_t pc_depth_after_pending_write(const Registers &registers,
+                                          std::uint32_t pipeline) noexcept {
+  if ((pipeline & detail::pending_pc_stack_mask) == 0) { return registers.pc_stack_pointer; }
+  return static_cast<std::uint8_t>((pipeline >> detail::pending_pc_stack_shift) &
+                                   detail::pc_stack_pointer_mask);
+}
+
 constexpr unsigned lirptl_enable_shift = 10;
 constexpr unsigned lirptl_pointer_shift = 20;
 
@@ -498,11 +506,11 @@ struct Core::Impl {
                       "PC stack underflow, overflow or tagged continuation is not implemented");
         break;
       case detail::NativeExit::unsupported_pc_stack_write:
-      case detail::NativeExit::unsupported_pc_stack_wide_load:
+      case detail::NativeExit::unsupported_pc_stack_pointer_write:
         result = fail(FaultReason::unsupported_feature,
                       reason == detail::NativeExit::unsupported_pc_stack_write
                           ? "PCSTK write to a sequencer-owned frame"
-                          : "indexed long-word PCSTK load also writes PCSTKP");
+                          : "PCSTKP write while the sequencer owns stack frames");
         result.fault.instruction = control[detail::fault_instruction];
         result.fault.instruction_bits = detail::full_instruction_bits;
         state.fault = result.fault;
@@ -574,15 +582,24 @@ struct Core::Impl {
            });
   }
 
-  [[nodiscard]] bool entry_allowed() const {
-    if (continuing()) { return true; }
-    if (delayed_target != 0 || loops.active()) { return false; }
+  [[nodiscard]] bool has_stack_pointer_history() const noexcept {
+    constexpr auto stack_history = detail::pending_pc_stack_mask | detail::prior_pc_stack_mask;
+    return (pipeline_history & stack_history) != 0;
+  }
+
+  [[nodiscard]] bool declared_root() const {
     const auto *code = installed_variant();
     return code != nullptr &&
            (std::ranges::find(code->entries, state.registers.pc) != code->entries.end() ||
             std::ranges::any_of(code->interrupt_vectors, [&](const auto &request) {
               return request.vector == state.registers.pc;
             }));
+  }
+
+  [[nodiscard]] bool entry_allowed() const {
+    if (continuing()) { return true; }
+    return delayed_target == 0 && !loops.active() && !has_stack_pointer_history() &&
+           declared_root();
   }
 
   [[nodiscard]] std::optional<std::size_t> prepared_unit() const {
@@ -840,7 +857,8 @@ bool Core::interrupt_ready(const InterruptRequest &request) const noexcept {
       request.source < first_maskable || request.source == reserved ||
       request.source >= detail::interrupt_source_count ||
       (registers.mode1 & interrupt_enable) == 0 ||
-      registers.pc_stack_pointer >= Registers::pc_stack_capacity ||
+      pc_depth_after_pending_write(registers, impl_->pipeline_history) >=
+          Registers::pc_stack_capacity ||
       (saves_interrupt_status(request.source) &&
        registers.status_depth >= registers.status_stack.size()) ||
       !interrupt_line(request.source).enabled(registers) || !impl_->declared_interrupt(request) ||
@@ -875,6 +893,12 @@ void Core::interrupt(const InterruptRequest &request) {
   }
   auto &state = impl_->state;
   auto &registers = state.registers;
+  if ((impl_->pipeline_history & detail::pending_pc_stack_mask) != 0) {
+    registers.pc_stack_pointer = pc_depth_after_pending_write(registers, impl_->pipeline_history);
+    if (registers.pc_stack_pointer == Registers::pc_stack_capacity - 1) {
+      registers.irptl |= stack_overflow_interrupt;
+    }
+  }
   const auto next_depth = static_cast<std::uint8_t>(registers.pc_stack_pointer + 1);
   impl_->interrupt_frames.push_back({.resume = impl_->resume,
                                      .loops = impl_->loops,
@@ -1120,7 +1144,13 @@ bool Core::Impl::continue_after(detail::NativeExit reason) {
       interrupt_line(interrupt_frames.back().source).set_service(state.registers, false);
       return true;
     case detail::NativeExit::indirect:
-    case detail::NativeExit::returned: resume.reset(); return true;
+    case detail::NativeExit::returned:
+      if (resume && has_stack_pointer_history() && declared_root()) {
+        resume->entry = resume->address;
+      } else {
+        resume.reset();
+      }
+      return true;
     case detail::NativeExit::sleeping: enter_idle(); return false;
     default: return false;
   }

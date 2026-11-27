@@ -109,6 +109,13 @@ recent physical DAG register-load tags and a taken classic delayed transfer's
 destination and slot phase. They also retain the pending sample and age for
 conditions following an explicit ASTAT write. Cross-Core replay preserves
 the destination even when a slot changes a contributing DAG register.
+The history also retains a pending PCSTKP update and the older stack depth
+used to sample the next return. A declared variant transition carries that
+history into the destination. An unrelated prepared entry cannot consume a
+live stack-pointer continuation.
+Owner-delivered interrupt entry uses the depth reached during vector refill
+for the interrupt push. Native replay covers this ordering. Its overlap
+with interrupt recognition remains unverified on silicon.
 Mode-register writes and declared code transfers still need execution and
 snapshot qualification.
 

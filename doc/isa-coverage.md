@@ -785,9 +785,15 @@ PCSTK accepts type 5a and 17a writes and types 3a, 14a and 15a loads
 in the qualified views. Native fixtures check the shared X predicate,
 the 26-bit raw value, empty and overflowed pointers, absolute long-word
 selection and snapshot replay after replacing the return address in either
-CALL delay slot. Writes to sequencer-owned frames and indexed long-word
-loads that would also write PCSTKP fail explicitly.
+CALL delay slot. Writes to sequencer-owned top cells fail explicitly.
 See [PC stack top writes](numeric-reference.md#pc-stack-top-writes).
+PCSTKP accepts the same register and memory forms. Indexed long-word
+loads can update both ports. The core retains the pending five-bit write
+across public bounds and snapshots and uses the older return address
+for the qualified RTS sequences. Writes while a loop or interrupt owns
+stack frames still fail explicitly. The cold PM fetch stall can age the
+pending pointer sooner and remains open with instruction-cache timing.
+See [PC stack pointer writes](numeric-reference.md#pc-stack-pointer-writes).
 Other system-register writes and their pipeline effects, FADDR/DADDR
 reads and unresolved event semantics remain open. See
 [the simulator probes](numeric-reference.md#control-register-read-operands)

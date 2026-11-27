@@ -25,6 +25,38 @@ constexpr std::uint64_t after_inner_return = 18;
 constexpr std::uint64_t after_outer_return = 22;
 constexpr std::uint64_t asleep = 24;
 
+void irq_during_pc_stack_write() {
+  constexpr unsigned pcstkp = 0x65;
+  constexpr auto full = sharc::Registers::pc_stack_capacity;
+  const std::array<std::uint64_t, 2> main{fixture::immediate(pcstkp, 1), 0};
+  const std::array handler{rti};
+  fixture::Program program(main);
+  program.add_span(irq2.vector, handler);
+  program.code.variants.front().interrupt_vectors = {irq2};
+  const auto native = sharc::Core::compile(program.code);
+  sharc::Core core(program.memory());
+  sharc::Registers initial;
+  initial.pc = base;
+  initial.pc_stack_pointer = full;
+  initial.mode1 = interrupt_enable;
+  initial.imask = irq2_mask;
+  fixture::install(core, native, initial);
+  check(!core.interrupt_ready(irq2) && fixture::completed(core.run(1), 1, 1) &&
+            core.registers().pc_stack_pointer == full && core.interrupt_ready(irq2),
+        "IRQ admission during PCSTKP latency used the old full stack");
+  const auto pending = core.save();
+  core.interrupt(irq2);
+  const auto entered = core.state();
+  check(entered.registers.pc_stack_pointer == 2 &&
+            entered.registers.pc_stack[1] == (irq_tag | (base + 1)),
+        "an interrupt during PCSTKP latency pushed on the wrong stack cell");
+  core.restore(pending);
+  core.interrupt(irq2);
+  check(core.state() == entered && fixture::completed(core.run(1), 1, 4) &&
+            core.registers().pc == base + 1 && core.registers().pc_stack_pointer == 1,
+        "IRQ entry or RTI lost the pending pointer change after snapshot replay");
+}
+
 void nested_service(sharc::Core &core,
                     const sharc::NativeImage &native,
                     fixture::Program &program,
@@ -547,6 +579,7 @@ int main() {
       irq_shadow_after_arithmetic_abort(mode);
     }
     irq_stack_limits();
+    irq_during_pc_stack_write();
     irq_conditional_return();
     irq_shadow_after_do();
     irq_shadow_after_short_count_expires();

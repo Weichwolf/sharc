@@ -1330,22 +1330,74 @@ void store_sequencer_registers(sharc::ExecutionMode mode) {
         "sequencer stores lost the execute address or unpaired stack word");
 }
 
-void load_pc_stack_word(sharc::ExecutionMode mode,
-                        RegisterMemoryForm form,
-                        sharc::MemorySpace space,
-                        sharc::MemoryView view,
-                        unsigned width,
-                        bool force = false) {
-  constexpr unsigned pcstk = 0x64;
-  constexpr std::uint32_t lower_stack_word = 0x89000;
+constexpr unsigned stack_top_port = 0x64, stack_pointer_port = 0x65;
+constexpr std::uint32_t stack_low_word = 0xf0e19a81, stack_high_word = 0x12345662;
+
+void finish_pc_stack_load(sharc::Core &core, sharc::Registers &expected, bool dm) {
+  const auto count = dm ? 1U : 2U;
+  const auto result = core.run(count);
+  const auto actual = core.registers();
+  fixture::boundary(expected, {.pc = fixture::code_address + 2, .clock = 2});
+  if (!dm) {
+    // The PM case checks the completed transfer while conflict-cache timing is open.
+    expected.emuclk = actual.emuclk;
+    expected.faddr = actual.faddr;
+    expected.daddr = actual.daddr;
+  }
+  check(!result.has_fault && result.progress.instructions == count && actual == expected,
+        "the delayed pointer update selected the wrong half of the memory payload");
+}
+
+void verify_pc_stack_load(sharc::Core &core, RegisterMemoryCase move, unsigned predicate) {
+  constexpr std::uint32_t lower_stack_word = 0x089000;
   constexpr std::uint32_t original_top = 0x1876543;
-  const RegisterMemoryCase move{
-      .form = form, .space = space, .view = view, .reg = pcstk, .width = width, .force = force};
-  const unsigned index = space == sharc::MemorySpace::data ? 1U : 9U;
-  const std::array words{register_memory_encoding(move, index, false)};
+  constexpr std::uint32_t stack_word_mask = 0x03ffffff;
+  constexpr std::uint32_t short_word_mask = 0xffff;
+  constexpr std::uint32_t depth_mask = 31;
+  const unsigned index = move.space == sharc::MemorySpace::data ? 1U : 9U;
+  sharc::Registers expected;
+  expected.pc = fixture::code_address;
+  expected.pc_stack_pointer = 3;
+  expected.pc_stack[0] = lower_stack_word;
+  expected.pc_stack[2] = original_top;
+  expected.mode1 = 1U << simd_bit;
+  expected.pe[0].astat = predicate & 1;
+  expected.pe[1].astat = predicate >> 1;
+  expected.dag[0][index].index =
+      ram_address + (move.form == RegisterMemoryForm::immediate ? 0U : dag_cell);
+  expected.dag[0][index + 2].modifier = 2;
+  core.set_registers(expected);
+  const bool post = move.form == RegisterMemoryForm::post;
+  const bool selected = !post || (predicate & 1) != 0;
+  const bool wide = move.view == sharc::MemoryView::long_word || move.force;
+  const bool absolute = move.form == RegisterMemoryForm::absolute;
+  const bool paired = wide && !absolute;
+  if (selected && (move.reg == stack_top_port || paired)) {
+    const auto word =
+        wide && (absolute || move.reg == stack_pointer_port) ? stack_high_word : stack_low_word;
+    expected.pc_stack[2] = word & (move.width == 2 ? short_word_mask : stack_word_mask);
+  }
+  if (post && predicate != 0) { expected.dag[0][index].index += 2; }
+  const bool dm = move.space == sharc::MemorySpace::data;
+  if (dm) {
+    fixture::boundary(expected, {.pc = fixture::code_address + 1, .clock = 1});
+    check(fixture::completed(core.run(1), 1, 1) && core.registers() == expected,
+          "the DM stack load used the wrong word, predicate, address update, or pointer latency");
+  }
+  if (selected && (move.reg == stack_pointer_port || paired)) {
+    const auto word =
+        wide && (absolute || move.reg == stack_top_port) ? stack_high_word : stack_low_word;
+    expected.pc_stack_pointer = static_cast<std::uint8_t>(word & depth_mask);
+  }
+  finish_pc_stack_load(core, expected, dm);
+}
+
+void load_pc_stack_word(sharc::ExecutionMode mode, RegisterMemoryCase move) {
+  const unsigned index = move.space == sharc::MemorySpace::data ? 1U : 9U;
+  const std::array<std::uint64_t, 2> words{register_memory_encoding(move, index, false), 0};
   fixture::Program program(words);
-  program.code.variants.front().layout.regions.push_back({.space = space,
-                                                          .view = view,
+  program.code.variants.front().layout.regions.push_back({.space = move.space,
+                                                          .view = move.view,
                                                           .first = ram_address,
                                                           .count = dag_capture_count,
                                                           .storage_id = ram_id,
@@ -1353,43 +1405,14 @@ void load_pc_stack_word(sharc::ExecutionMode mode,
                                                           .byte_stride = immediate_stride,
                                                           .initialized = true});
   auto ram = register_memory_seed(move);
+  constexpr auto data = (std::uint64_t{stack_high_word} << 32) | stack_low_word;
+  put_register_word(ram, dag_cell, move, data);
+  if (move.force) { put_register_word(ram, dag_cell + 1, move, stack_high_word); }
   const auto native = fixture::compile(program.code, mode);
   sharc::Core core(program.memory(ram_id, ram), mode);
   (void)core.install(native, fixture::Program::variant_id);
   for (unsigned predicate = 0; predicate < 4; ++predicate) {
-    sharc::Registers expected;
-    expected.pc = fixture::code_address;
-    expected.pc_stack_pointer = 2;
-    expected.pc_stack[0] = lower_stack_word;
-    expected.pc_stack[1] = original_top;
-    expected.mode1 = 1U << simd_bit;
-    expected.pe[0].astat = predicate & 1;
-    expected.pe[1].astat = predicate >> 1;
-    expected.dag[0][index].index =
-        ram_address + (form == RegisterMemoryForm::immediate ? 0U : dag_cell);
-    expected.dag[0][index + 2].modifier = 2;
-    core.set_registers(expected);
-    const bool post = form == RegisterMemoryForm::post;
-    const bool selected = !post || (predicate & 1) != 0;
-    const bool wide = width == 8 || force;
-    const auto result = core.run(1);
-    if (selected && wide && form != RegisterMemoryForm::absolute) {
-      check(result.has_fault && result.fault.reason == sharc::FaultReason::unsupported_feature &&
-                result.fault.instruction == words.front() && result.progress == sharc::Progress{} &&
-                core.registers() == expected,
-            "an unimplemented paired PCSTKP load changed the PC stack or address");
-      return;
-    }
-    if (selected) {
-      constexpr std::uint32_t stack_word_mask = 0x03ffffff;
-      constexpr std::uint32_t short_word_mask = 0xffff;
-      const auto payload = wide ? dag_high_word : dag_low_word;
-      expected.pc_stack[1] = payload & (width == 2 ? short_word_mask : stack_word_mask);
-    }
-    if (post && predicate != 0) { expected.dag[0][index].index += 2; }
-    fixture::boundary(expected, {.pc = fixture::code_address + 1, .clock = 1});
-    check(fixture::completed(result, 1, 1) && core.registers() == expected,
-          "a PCSTK load selected the wrong word, peer, predicate or address update");
+    verify_pc_stack_load(core, move, predicate);
   }
 }
 
@@ -1397,14 +1420,32 @@ void load_pc_stack_words(sharc::ExecutionMode mode) {
   using enum RegisterMemoryForm;
   using enum sharc::MemorySpace;
   using enum sharc::MemoryView;
-  load_pc_stack_word(mode, absolute, data, normal_word, 4);
-  load_pc_stack_word(mode, absolute, program, long_word, 8);
-  load_pc_stack_word(mode, absolute, data, normal_word, 4, true);
-  load_pc_stack_word(mode, immediate, program, normal_word, 4);
-  load_pc_stack_word(mode, post, data, short_word, 2);
-  load_pc_stack_word(mode, post, program, normal_word, 4);
-  load_pc_stack_word(mode, post, data, long_word, 8);
-  load_pc_stack_word(mode, post, program, normal_word, 4, true);
+  for (const auto reg : {stack_top_port, stack_pointer_port}) {
+    const std::array probes{
+        RegisterMemoryCase{
+            .form = absolute, .space = data, .view = normal_word, .reg = reg, .width = 4},
+        RegisterMemoryCase{
+            .form = absolute, .space = program, .view = long_word, .reg = reg, .width = 8},
+        RegisterMemoryCase{.form = absolute,
+                           .space = data,
+                           .view = normal_word,
+                           .reg = reg,
+                           .width = 4,
+                           .force = true},
+        RegisterMemoryCase{
+            .form = immediate, .space = program, .view = normal_word, .reg = reg, .width = 4},
+        RegisterMemoryCase{.form = post, .space = data, .view = short_word, .reg = reg, .width = 2},
+        RegisterMemoryCase{
+            .form = post, .space = program, .view = normal_word, .reg = reg, .width = 4},
+        RegisterMemoryCase{.form = post, .space = data, .view = long_word, .reg = reg, .width = 8},
+        RegisterMemoryCase{.form = post,
+                           .space = program,
+                           .view = normal_word,
+                           .reg = reg,
+                           .width = 4,
+                           .force = true}};
+    for (const auto probe : probes) { load_pc_stack_word(mode, probe); }
+  }
 }
 
 void store_emulation_clock(sharc::ExecutionMode mode) {

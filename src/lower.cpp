@@ -166,6 +166,10 @@ constexpr unsigned immediate_register_shift = 32;
 constexpr unsigned raw_extension_bits = 8;
 constexpr std::uint32_t bit_test_flag = 1U << 18;
 constexpr unsigned compute_hazard = 1, bit_test_hazard = 2, hazard_bits = 2;
+constexpr unsigned pc_stack_history_shift = pending_pc_stack_shift - hazard_bits;
+constexpr unsigned prior_pc_stack_history_shift = prior_pc_stack_shift - hazard_bits;
+constexpr std::uint32_t pc_stack_history_mask = pending_pc_stack_mask >> hazard_bits;
+constexpr std::uint32_t prior_pc_stack_history_mask = prior_pc_stack_mask >> hazard_bits;
 constexpr unsigned loop_opcode_shift = 40;
 constexpr unsigned immediate_count_shift = 24;
 constexpr unsigned loop_count_register_opcode = 0x0d;
@@ -410,7 +414,7 @@ bool stack_register(unsigned reg) {
 
 bool writable_ureg(unsigned reg) {
   return ordinary_ureg(reg) || reg == px_register || reg == lcntr_register ||
-         reg == pcstk_register || lane_status_register(reg);
+         reg == pcstk_register || reg == pcstkp_register || lane_status_register(reg);
 }
 
 std::optional<std::size_t> scalar_control_slot(unsigned reg) {
@@ -484,7 +488,7 @@ bool dag_memory_read(const MemoryMove &move) {
 }
 
 bool unpaired_control_load(unsigned reg) {
-  return reg == lcntr_register || reg == pcstk_register;
+  return reg == lcntr_register || reg == pcstk_register || reg == pcstkp_register;
 }
 
 bool selects_packed_view(const MemoryMove &move) {
@@ -507,6 +511,13 @@ unsigned loaded_register(const Instruction &op) {
     if (!move.write) { return move.reg; }
   }
   return 0;
+}
+
+bool writes_stack_pointer(const Instruction &op) {
+  const auto reg = loaded_register(op);
+  if (reg == pcstkp_register) { return true; }
+  return reg == pcstk_register && (single_memory_transfer(op.type) || conditional_memory(op)) &&
+         memory_move(op).addressing != MemoryAddressing::absolute;
 }
 
 bool branch(const Instruction &op) {
@@ -1336,11 +1347,13 @@ public:
            bool code_transitions,
            std::vector<Instruction> instructions,
            const NativeUnit &unit,
-           const LoopPlan &loops)
+           const LoopPlan &loops,
+           bool stack_pointer_effects)
       : module_(module),
         memory_mode_(options.memory_mode),
         execution_mode_(options.mode),
         code_transitions_(code_transitions),
+        stack_pointer_effects_(stack_pointer_effects),
         abi_(abi),
         linked_io_(linked_io),
         unit_(unit),
@@ -1866,7 +1879,15 @@ private:
   llvm::Value *read_stack_register(const Values &values, unsigned reg);
   llvm::Value *pc_stack_depth(const Values &values);
   llvm::Value *pc_stack_top_present(llvm::Value *depth);
+  llvm::Value *pending_pc_stack(const Values &values);
+  llvm::Value *forwarded_pc_stack_depth(const Values &values);
+  void apply_pc_stack_pointer(Values &values, llvm::Value *enabled);
+  void apply_pc_stack_stall(Values &values, llvm::Value *stall);
   void guard_pc_stack_write(const Values &values, const Instruction &op, bool partial);
+  void guard_pc_stack_pointer_write(const Values &values,
+                                    const Instruction &op,
+                                    llvm::Value *enabled,
+                                    bool partial);
   llvm::Value *stack_top(llvm::Value *depth, std::size_t slot, llvm::ConstantInt *empty_value);
   void write_register(Values &values, unsigned reg, llvm::Value *raw, llvm::Value *selected);
   void write_lane_status(Values &values, unsigned reg, llvm::Value *words, llvm::Value *selected);
@@ -1892,6 +1913,7 @@ private:
   ExecutionMode execution_mode_;
   bool runtime_io_{};
   bool code_transitions_{}, code_storage_known_{};
+  bool stack_pointer_effects_{};
   std::array<bool, 2> code_alias_buses_{};
   const NativeAbi &abi_;
   LinkedIoCallbacks linked_io_;
@@ -1929,6 +1951,7 @@ private:
   std::map<std::pair<std::uint32_t, MemorySpace>, MemoryPlan> memory_plan_;
   llvm::Value *memory_admitted_{};
   llvm::Value *clock_sample_{};
+  llvm::Value *pc_stack_write_{};
   std::set<unsigned> written_;
   std::set<unsigned> y_written_;
   std::array<bool, accumulator_banks> accumulator_written_{};
@@ -2270,6 +2293,48 @@ llvm::Value *Lowering::pc_stack_top_present(llvm::Value *depth) {
   return builder_.CreateICmpULT(index, builder_.getInt32(Registers::pc_stack_capacity));
 }
 
+llvm::Value *Lowering::pending_pc_stack(const Values &values) {
+  return builder_.CreateLShr(
+      builder_.CreateAnd(values[dag_history_value], builder_.getInt32(pc_stack_history_mask)),
+      builder_.getInt32(pc_stack_history_shift));
+}
+
+llvm::Value *Lowering::forwarded_pc_stack_depth(const Values &values) {
+  auto *depth = pc_stack_depth(values);
+  if (!stack_pointer_effects_) { return depth; }
+  auto *pending = pending_pc_stack(values);
+  return builder_.CreateSelect(
+      builder_.CreateIsNotNull(pending),
+      builder_.CreateAnd(pending, builder_.getInt32(pc_stack_pointer_mask)),
+      depth);
+}
+
+void Lowering::apply_pc_stack_pointer(Values &values, llvm::Value *enabled) {
+  if (!stack_pointer_effects_) { return; }
+  auto *pending = pending_pc_stack(values);
+  auto *apply = builder_.CreateAnd(enabled, builder_.CreateIsNotNull(pending));
+  auto *depth = builder_.CreateAnd(pending, builder_.getInt32(pc_stack_pointer_mask));
+  auto *old_sticky = values[sticky_value];
+  values[pc_stack_depth_value] = builder_.CreateSelect(apply, depth, values[pc_stack_depth_value]);
+  stack_status(values);
+  values[sticky_value] = builder_.CreateSelect(apply, values[sticky_value], old_sticky);
+  constexpr unsigned almost_full = Registers::pc_stack_capacity - 1;
+  constexpr std::uint32_t stack_overflow_interrupt = 1U << 3;
+  auto *requests_overflow =
+      builder_.CreateAnd(apply, builder_.CreateICmpEQ(depth, builder_.getInt32(almost_full)));
+  values[interrupt_latch_value] = builder_.CreateOr(
+      values[interrupt_latch_value],
+      builder_.CreateSelect(
+          requests_overflow, builder_.getInt32(stack_overflow_interrupt), builder_.getInt32(0)));
+  auto *history = values[dag_history_value];
+  values[dag_history_value] = builder_.CreateSelect(
+      apply, builder_.CreateAnd(history, builder_.getInt32(~pc_stack_history_mask)), history);
+}
+
+void Lowering::apply_pc_stack_stall(Values &values, llvm::Value *stall) {
+  if (stack_pointer_effects_) { apply_pc_stack_pointer(values, builder_.CreateIsNotNull(stall)); }
+}
+
 llvm::Value *Lowering::read_stack_register(const Values &values, unsigned reg) {
   if (reg == pcstk_register || reg == pcstkp_register) {
     auto *depth = pc_stack_depth(values);
@@ -2370,8 +2435,21 @@ void Lowering::write_register(Values &values,
     write_lane_status(values, reg, fixed_word(raw), selected);
     return;
   }
+  if (reg == pcstkp_register) {
+    auto *first = builder_.getInt32(0);
+    auto *word = builder_.CreateExtractElement(fixed_word(raw), first);
+    auto *depth = forwarded_pc_stack_depth(values);
+    auto *enabled =
+        builder_.CreateAnd(builder_.CreateExtractElement(selected, first),
+                           builder_.CreateICmpNE(depth, builder_.getInt32(pc_stack_pointer_mask)));
+    auto *request =
+        builder_.CreateOr(builder_.CreateAnd(word, builder_.getInt32(pc_stack_pointer_mask)),
+                          builder_.getInt32(pending_pc_stack_valid));
+    pc_stack_write_ = builder_.CreateSelect(enabled, request, builder_.getInt32(0));
+    return;
+  }
   if (reg == pcstk_register) {
-    auto *depth = pc_stack_depth(values);
+    auto *depth = forwarded_pc_stack_depth(values);
     auto *first = builder_.getInt32(0);
     auto *enabled = builder_.CreateAnd(builder_.CreateExtractElement(selected, first),
                                        pc_stack_top_present(depth));
@@ -2414,6 +2492,12 @@ void Lowering::register_instruction(Values &values, const Instruction &op, const
   const auto move = register_move(op);
   if (move.source == px_register && move.destination == px_register) { return; }
   auto *selected = condition(before, op);
+  if (move.source == pcstkp_register && move.destination == pcstkp_register) {
+    // The pointer write port forwards a pending value to itself.
+    auto *depth = forwarded_pc_stack_depth(before);
+    write_register(values, move.destination, raw_words(pair(depth, depth, 32)), selected);
+    return;
+  }
   if (move.source == px_register &&
       (dag_register(move.destination) || user_status(move.destination) ||
        unpaired_control_load(move.destination))) {
@@ -2566,6 +2650,19 @@ void Lowering::retire_pipeline(Values &values, PipelineEffects effects) {
   auto *write = builder_.CreateSelect(
       values[astat_written_value], builder_.getInt32(history_astat_write), builder_.getInt32(0));
   history = builder_.CreateOr(history, write);
+  if (stack_pointer_effects_) {
+    auto *pending = builder_.CreateIsNotNull(pending_pc_stack(values));
+    auto *old_depth = builder_.CreateAdd(values[pc_stack_depth_value], builder_.getInt32(1));
+    auto *prior = builder_.CreateSelect(pending, old_depth, builder_.getInt32(0));
+    history = builder_.CreateOr(
+        history, builder_.CreateShl(prior, builder_.getInt32(prior_pc_stack_history_shift)));
+    apply_pc_stack_pointer(values, pending);
+    if (pc_stack_write_ != nullptr) {
+      history = builder_.CreateOr(
+          history, builder_.CreateShl(pc_stack_write_, builder_.getInt32(pc_stack_history_shift)));
+      pc_stack_write_ = nullptr;
+    }
+  }
   values[dag_history_value] = builder_.CreateOr(history, tag);
   values[astat_written_value] = builder_.getFalse();
   values[extra_cycles_value] = builder_.CreateAdd(values[extra_cycles_value], stall);
@@ -3127,6 +3224,12 @@ llvm::Value *Lowering::compute_condition(const Values &values, const Instruction
 void Lowering::instruction(Values &values, const Instruction &op, bool partial) {
   values[astat_written_value] = builder_.getFalse();
   if (loaded_register(op) == pcstk_register) { guard_pc_stack_write(values, op, partial); }
+  if (loaded_register(op) == pcstkp_register) {
+    auto *enabled = op.type == register_move_type || conditional_memory(op)
+                        ? builder_.CreateExtractElement(condition(values, op), builder_.getInt32(0))
+                        : static_cast<llvm::Value *>(builder_.getTrue());
+    guard_pc_stack_pointer_write(values, op, enabled, partial);
+  }
   if (clock_reads_.contains(op.address)) {
     // Clock readers run after the preceding instructions have been charged.
     // Their own decode and address stalls precede the sampled execute cycle.
@@ -3134,6 +3237,7 @@ void Lowering::instruction(Values &values, const Instruction &op, bool partial) 
     clock_sample_ = builder_.CreateAdd(clock, pipeline_stall(values, op));
   }
   if (loop_setup(op)) {
+    apply_pc_stack_pointer(values, builder_.getTrue());
     loop_push(values, op, partial);
     values[hazard_value] = builder_.getIntN(hazard_bits, 0);
     return;
@@ -3405,11 +3509,7 @@ void Lowering::memory_instruction(Values &values, const Instruction &op, bool pa
     auto *wide = wide_memory_view(move, operands.words[0].view);
     if (wide != builder_.getFalse()) {
       auto *writes_pointer = builder_.CreateAnd(wide, operands.selected[0]);
-      instruction_guard(values,
-                        op,
-                        builder_.CreateNot(writes_pointer),
-                        partial,
-                        NativeExit::unsupported_pc_stack_wide_load);
+      guard_pc_stack_pointer_write(values, op, writes_pointer, partial);
     }
   }
   const auto read = memory_transfer(values, op, move, operands);
@@ -3993,7 +4093,15 @@ void Lowering::memory_writeback(Values &values,
     raw = builder_.CreateSelect(wide, upper, raw);
   }
   write_memory_register(values, move.reg, raw, operands.selected[0]);
-  if (unpaired) { return; }
+  if (unpaired) {
+    if ((move.reg == pcstk_register || move.reg == pcstkp_register) && !absolute_system) {
+      auto *neighbor_enabled = builder_.CreateAnd(wide, operands.selected[0]);
+      auto *neighbor_raw =
+          load_word(high_memory_word(operands, read), view_tag(MemoryView::normal_word));
+      write_memory_register(values, move.reg ^ 1, neighbor_raw, neighbor_enabled);
+    }
+    return;
+  }
   const auto implicit = complementary_register(move.reg);
   if (!operands.broadcast && !dag_register(move.reg) && operands.paired != builder_.getFalse()) {
     auto *other_lane =
@@ -4014,7 +4122,7 @@ void Lowering::memory_writeback(Values &values,
 }
 
 void Lowering::guard_pc_stack_write(const Values &values, const Instruction &op, bool partial) {
-  auto *depth = pc_stack_depth(values);
+  auto *depth = forwarded_pc_stack_depth(values);
   auto *occupied = pc_stack_top_present(depth);
   auto *index = builder_.CreateSelect(
       occupied, builder_.CreateSub(depth, builder_.getInt32(1)), builder_.getInt32(0));
@@ -4039,6 +4147,27 @@ void Lowering::guard_pc_stack_write(const Values &values, const Instruction &op,
   auto *refused = builder_.CreateAnd(selected, builder_.CreateAnd(occupied, owned));
   instruction_guard(
       values, op, builder_.CreateNot(refused), partial, NativeExit::unsupported_pc_stack_write);
+}
+
+void Lowering::guard_pc_stack_pointer_write(const Values &values,
+                                            const Instruction &op,
+                                            llvm::Value *enabled,
+                                            bool partial) {
+  auto *depth = forwarded_pc_stack_depth(values);
+  auto *accepts_write = builder_.CreateICmpNE(depth, builder_.getInt32(pc_stack_pointer_mask));
+  auto *owned = builder_.CreateOr(builder_.CreateIsNotNull(load(8, loop_address_depth_slot)),
+                                  builder_.CreateIsNotNull(load(32, interrupt_frame_slot)));
+  if (!reentry_calls_.empty()) {
+    auto *type = llvm::FixedVectorType::get(builder_.getInt64Ty(), Registers::pc_stack_capacity);
+    auto *calls = builder_.CreateAlignedLoad(type, pointer(loop_call_slot), llvm::Align(8));
+    owned = builder_.CreateOr(owned, builder_.CreateIsNotNull(builder_.CreateOrReduce(calls)));
+  }
+  auto *refused = builder_.CreateAnd(owned, builder_.CreateAnd(enabled, accepts_write));
+  instruction_guard(values,
+                    op,
+                    builder_.CreateNot(refused),
+                    partial,
+                    NativeExit::unsupported_pc_stack_pointer_write);
 }
 
 void Lowering::instruction_guard(const Values &values,
@@ -4085,7 +4214,7 @@ void Lowering::stack_status(Values &values) {
   status = builder_.CreateOr(
       status,
       builder_.CreateSelect(
-          builder_.CreateICmpEQ(depth, builder_.getInt32(Registers::pc_stack_capacity)),
+          builder_.CreateICmpUGE(depth, builder_.getInt32(Registers::pc_stack_capacity)),
           builder_.getInt32(full),
           builder_.getInt32(0)));
   values[sticky_value] =
@@ -4371,7 +4500,19 @@ llvm::Value *Lowering::pop(Values &values, const Instruction &op, bool partial) 
                                            depth, builder_.getInt32(Registers::pc_stack_capacity))),
                     partial);
   auto *popped_depth = builder_.CreateSub(depth, builder_.getInt32(1));
-  auto *top = builder_.CreateLoad(builder_.getInt32Ty(), stack_cell(popped_depth));
+  auto *target_index = popped_depth;
+  if (stack_pointer_effects_) {
+    // RTS captures the target earlier than it updates the physical stack pointer.
+    auto *prior =
+        builder_.CreateLShr(builder_.CreateAnd(values[dag_history_value],
+                                               builder_.getInt32(prior_pc_stack_history_mask)),
+                            builder_.getInt32(prior_pc_stack_history_shift));
+    auto *target_depth = builder_.CreateSelect(
+        builder_.CreateIsNotNull(prior), builder_.CreateSub(prior, builder_.getInt32(1)), depth);
+    instruction_guard(values, op, pc_stack_top_present(target_depth), partial);
+    target_index = builder_.CreateSub(target_depth, builder_.getInt32(1));
+  }
+  auto *top = builder_.CreateLoad(builder_.getInt32Ty(), stack_cell(target_index));
   auto *tagged = builder_.CreateICmpNE(builder_.CreateAnd(top, builder_.getInt32(pc_sequencer_tag)),
                                        builder_.getInt32(0));
   auto *allowed = builder_.CreateNot(tagged);
@@ -4737,7 +4878,7 @@ llvm::Value *Lowering::branch_lanes(const Values &values, const Instruction &op,
   if (!branch(op)) { return nullptr; }
   auto *lanes = condition(values, op);
   if (call_branch_instruction(op) && op.compute.kind != ComputeKind::none) {
-    auto *room = builder_.CreateICmpULT(values[pc_stack_depth_value],
+    auto *room = builder_.CreateICmpULT(forwarded_pc_stack_depth(values),
                                         builder_.getInt32(Registers::pc_stack_capacity));
     instruction_guard(
         values, op, builder_.CreateOr(builder_.CreateNot(branch_taken(lanes)), room), partial);
@@ -4787,7 +4928,10 @@ void Lowering::complete(Values values,
   builder_.CreateCondBr(taken, branch, fallthrough);
   builder_.SetInsertPoint(branch);
   auto branch_values = values;
-  if (call_branch_instruction(op)) { call(branch_values, op, partial); }
+  if (call_branch_instruction(op)) {
+    apply_pc_stack_pointer(branch_values, builder_.getTrue());
+    call(branch_values, op, partial);
+  }
   if (loop_abort(op)) { retire_loop_abort(branch_values, aborts_.at(op.address)); }
   auto *target = op.type == return_branch_type ? pop(branch_values, op, partial) : nullptr;
   retire_short_observation(op.address);
@@ -6097,8 +6241,9 @@ void Lowering::plan_hardware_grants(const LoopMap &shapes) {
                   (shape.counted() && fetch->second.counted() &&
                    overlapping_tail(shape, fetch->second))) &&
                  !modifies_index(op) && !dag_register(loaded_register(op)) && !writes_astat(op) &&
-                 loaded_register(op) != pcstk_register && !reads_emuclk(op) &&
-                 !stack_register(data_source_register(op)) && !shift::fifo_transfer(op.compute);
+                 loaded_register(op) != pcstk_register && !writes_stack_pointer(op) &&
+                 !reads_emuclk(op) && !stack_register(data_source_register(op)) &&
+                 !shift::fifo_transfer(op.compute);
         })) {
       continue;
     }
@@ -6438,8 +6583,8 @@ void Lowering::plan_loops() {
       linear = linear && instructions_[i].address + 1 == instructions_[i + 1].address &&
                !branch(instructions_[i]) && !dag_register(loaded_register(instructions_[i])) &&
                loaded_register(instructions_[i]) != pcstk_register &&
-               !writes_astat(instructions_[i]) && !reads_emuclk(instructions_[i]) &&
-               !shift::fifo_transfer(instructions_[i].compute);
+               !writes_stack_pointer(instructions_[i]) && !writes_astat(instructions_[i]) &&
+               !reads_emuclk(instructions_[i]) && !shift::fifo_transfer(instructions_[i].compute);
     }
     if (!linear) { continue; }
     const bool stall = conditional && (condition_hazard(instructions_[end - 1]) &
@@ -6688,6 +6833,7 @@ void Lowering::emit_instruction(std::size_t i,
   auto *lanes = branch_lanes(values, op, false);
   auto pipeline =
       PipelineEffects{.stall = pipeline_stall(values, op), .tag = loaded_tag(values, op)};
+  apply_pc_stack_stall(values, pipeline.stall);
   auto *old_status = values[status_value];
   if (branch(op)) { delayed_slot(values, op, false, old_status); }
   check_loop_end(values, op, false);
@@ -6725,6 +6871,7 @@ void Lowering::emit_instruction(std::size_t i,
   check_loop_end(values, op, true);
   lanes = branch_lanes(values, op, true);
   pipeline = {.stall = pipeline_stall(values, op), .tag = loaded_tag(values, op)};
+  apply_pc_stack_stall(values, pipeline.stall);
   old_status = values[status_value];
   instruction(values, op, true);
   if (!branch(op)) {
@@ -6799,8 +6946,9 @@ void Lowering::emit() {
   }
   plan_hardware_loops(loop_shapes_);
   plan_hardware_grants(loop_shapes_);
-  stack_written_ = !short_bodies_.empty() || !loop_setups_.empty() || !hardware_ends_.empty() ||
-                   !loop_fetches_.empty() || !loop_tests_.empty() || !jump_refills_.empty() ||
+  stack_written_ = stack_pointer_effects_ || !short_bodies_.empty() || !loop_setups_.empty() ||
+                   !hardware_ends_.empty() || !loop_fetches_.empty() || !loop_tests_.empty() ||
+                   !jump_refills_.empty() ||
                    std::ranges::any_of(instructions_, [this](const auto &op) {
                      return op.type == return_branch_type || call_branch_instruction(op) ||
                             loop_return_at(op.address, reentry_calls_) != nullptr;
@@ -7437,6 +7585,7 @@ std::shared_ptr<const PreparedImage> lower_image(const CodeImage &image,
   }
   const NativeAbi abi(module, result->units, continuations);
   const auto linked_io = declare_io_callbacks(module, *result);
+  const bool stack_pointer_effects = std::ranges::any_of(instructions, writes_stack_pointer);
   for (const auto &unit : result->units) {
     const auto variant = std::ranges::find(image.variants, unit.variant, &CodeVariant::id);
     const auto &plan = variant_loops.at(unit.variant);
@@ -7454,7 +7603,8 @@ std::shared_ptr<const PreparedImage> lower_image(const CodeImage &image,
                        unit.entry,
                        entry_context(*result, *variant, unit.entry)),
         unit,
-        plan)
+        plan,
+        stack_pointer_effects)
         .emit();
   }
   finalize_debug(module, debug);
