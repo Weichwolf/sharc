@@ -108,6 +108,7 @@ constexpr unsigned history_loop_setup = 1U << 16;
 constexpr unsigned conditional_compute_type = 2;
 constexpr unsigned immediate_shift_type = 6;
 constexpr unsigned register_move_type = 5;
+constexpr unsigned register_modify_type = 7;
 constexpr unsigned immediate_move_type = 17;
 constexpr unsigned nop_type = 21;
 constexpr unsigned idle_type = 22;
@@ -271,16 +272,30 @@ bool supported_compute(const Compute &compute) {
 }
 
 struct IndexModify {
-  unsigned source{}, destination{};
+  unsigned source{}, destination{}, modifier{};
   bool reverse{};
 };
 
+bool modifies_index(const Instruction &op) {
+  return op.type == index_modify_type || op.type == register_modify_type;
+}
+
 IndexModify index_modify(const Instruction &instruction) {
   constexpr unsigned dag_shift = 38;
+  const auto dag = static_cast<unsigned>((instruction.word >> dag_shift) & 1) * 8;
+  if (instruction.type == register_modify_type) {
+    constexpr unsigned source_shift = 30;
+    constexpr unsigned modifier_shift = 27;
+    constexpr unsigned destination_shift = 24;
+    const auto source = static_cast<unsigned>((instruction.word >> source_shift) & 7);
+    const auto change = static_cast<unsigned>((instruction.word >> destination_shift) & 7);
+    return {.source = source + dag,
+            .destination = (source ^ change) + dag,
+            .modifier = static_cast<unsigned>((instruction.word >> modifier_shift) & 7) + dag};
+  }
   constexpr unsigned destination_shift = 35;
   constexpr unsigned source_shift = 32;
   constexpr auto reverse = std::uint64_t{1} << 39;
-  const auto dag = static_cast<unsigned>((instruction.word >> dag_shift) & 1) * 8;
   const auto source = static_cast<unsigned>((instruction.word >> source_shift) & 7);
   return {.source = source + dag,
           .destination =
@@ -373,7 +388,7 @@ unsigned branch_condition(const Instruction &op) {
 bool observes_not_lce(const Instruction &op) {
   return branch_condition(op) == loop_counter_expired &&
          (branch(op) || op.type == conditional_compute_type || op.type == immediate_shift_type ||
-          op.type == register_move_type);
+          op.type == register_move_type || op.type == register_modify_type);
 }
 
 bool delayed(const Instruction &op) {
@@ -767,6 +782,20 @@ bool supported_standalone_compute(const Compute &compute) {
          (compute.kind == ComputeKind::dual_alu && compute.opcode == alu::dual_add_subtract);
 }
 
+void validate_register_modify(const Instruction &instruction, std::string_view identity) {
+  constexpr auto reserved = (std::uint64_t{1} << 39) | (std::uint64_t{1} << 23);
+  if ((instruction.word & reserved) != 0) {
+    reject(instruction, identity, FaultReason::invalid_encoding, "reserved register MODIFY bits");
+  }
+  validate_condition(instruction, identity);
+  if (!supported_standalone_compute(instruction.compute)) {
+    reject(instruction,
+           identity,
+           FaultReason::unsupported_instruction,
+           "register MODIFY compute is not lowered");
+  }
+}
+
 void validate(const Instruction &instruction, std::string_view identity) {
   if (instruction.instruction_set != InstructionSet::isa) {
     reject(instruction,
@@ -777,6 +806,10 @@ void validate(const Instruction &instruction, std::string_view identity) {
   validate_compute_writeback(instruction, identity);
   if ((instruction.type == nop_type && instruction.word == 0) || idle(instruction)) { return; }
   if (instruction.type == index_modify_type) { return; }
+  if (instruction.type == register_modify_type) {
+    validate_register_modify(instruction, identity);
+    return;
+  }
   if (instruction.type == register_move_type) {
     validate_register_move(instruction, identity);
     return;
@@ -1272,7 +1305,8 @@ private:
   void memory_instruction(Values &values, const Instruction &op, bool partial);
   void parallel_memory_instruction(Values &values, const Instruction &op, bool partial);
   void modify_instruction(Values &values, const Instruction &op);
-  void dag_modify(Values &values, IndexModify modify, llvm::Value *delta, bool circular);
+  void dag_modify(
+      Values &values, IndexModify modify, llvm::Value *delta, bool circular, llvm::Value *selected);
   void dag_overflow(Values &values, unsigned index, llvm::Value *overflow);
   llvm::Value *planned_pointer(const MemoryPlan &plan, llvm::Value *address, unsigned transfer);
   bool plan_changing_memory(const Instruction &op, const MemoryMove &move);
@@ -1543,6 +1577,7 @@ private:
   std::vector<BlockCost> block_costs() const;
   void emit_exit();
   void load_indices();
+  void load_modified_index(const Instruction &op);
   void load_dag(unsigned reg);
   llvm::Value *read_register(const Values &values, unsigned reg);
   void write_register(Values &values, unsigned reg, llvm::Value *raw, llvm::Value *selected);
@@ -1916,7 +1951,11 @@ llvm::Value *Lowering::pipeline_stall(const Values &values, const Instruction &o
     dependencies.push_back(move.index);
     if (op.type == parallel_memory_type) { dependencies.push_back(16 + move.modifier); }
   }
-  if (op.type == index_modify_type) { dependencies.push_back(index_modify(op).source); }
+  if (modifies_index(op)) {
+    const auto modify = index_modify(op);
+    dependencies.push_back(modify.source);
+    if (op.type == register_modify_type) { dependencies.push_back(16 + modify.modifier); }
+  }
   if (indirect_branch(op)) {
     dependencies.push_back(branch_index(op));
     dependencies.push_back(16 + branch_modifier(op));
@@ -2539,7 +2578,7 @@ void Lowering::instruction(Values &values, const Instruction &op, bool partial) 
     write_register(values, reg, raw, condition(values, true_condition));
     return;
   }
-  if (op.type == index_modify_type) {
+  if (modifies_index(op)) {
     modify_instruction(values, op);
     return;
   }
@@ -2571,11 +2610,29 @@ void Lowering::memory_failure(const Values &values,
 }
 
 void Lowering::modify_instruction(Values &values, const Instruction &op) {
-  dag_modify(
-      values, index_modify(op), builder_.getInt32(static_cast<std::uint32_t>(op.word)), true);
+  const auto modify = index_modify(op);
+  if (op.type == index_modify_type) {
+    dag_modify(values,
+               modify,
+               builder_.getInt32(static_cast<std::uint32_t>(op.word)),
+               true,
+               builder_.getTrue());
+    return;
+  }
+  const auto before = values;
+  auto *selected = compute_condition(before, op);
+  if (op.compute.kind != ComputeKind::none) {
+    compute_instruction(values, before, op.compute, selected);
+  }
+  dag_modify(values,
+             modify,
+             before[modifier_value + modify.modifier],
+             true,
+             builder_.CreateOrReduce(selected));
 }
 
-void Lowering::dag_modify(Values &values, IndexModify modify, llvm::Value *delta, bool circular) {
+void Lowering::dag_modify(
+    Values &values, IndexModify modify, llvm::Value *delta, bool circular, llvm::Value *selected) {
   auto *index = values[index_value + modify.source];
   auto *sum = builder_.CreateAdd(index, delta);
   llvm::Value *result = sum;
@@ -2602,13 +2659,14 @@ void Lowering::dag_modify(Values &values, IndexModify modify, llvm::Value *delta
         auto *past_base = builder_.CreateXor(negative, builder_.CreateICmpUGE(sum, base));
         overflow = builder_.CreateSelect(nonempty, wrapped, past_base);
       }
-      dag_overflow(values, modify.source, overflow);
+      dag_overflow(values, modify.source, builder_.CreateAnd(selected, overflow));
     }
   }
   if (modify.reverse) {
     result = builder_.CreateUnaryIntrinsic(llvm::Intrinsic::bitreverse, result);
   }
-  values[index_value + modify.destination] = result;
+  auto &destination = values[index_value + modify.destination];
+  destination = builder_.CreateSelect(selected, result, destination);
 }
 
 void Lowering::dag_overflow(Values &values, unsigned index, llvm::Value *overflow) {
@@ -2749,7 +2807,8 @@ void Lowering::parallel_memory_instruction(Values &values, const Instruction &op
     dag_modify(values,
                {.source = move.index, .destination = move.index},
                values[modifier_value + move.modifier],
-               (context_ & circular_mode) != 0);
+               (context_ & circular_mode) != 0,
+               builder_.getTrue());
   }
   values[hazard_value] = builder_.getInt1(op.compute.kind != ComputeKind::none);
 }
@@ -5106,7 +5165,7 @@ void Lowering::plan_hardware_grants(const LoopMap &shapes) {
                   overlapping_short_tail(shape, fetch->second) ||
                   (shape.counted() && fetch->second.counted() &&
                    overlapping_tail(shape, fetch->second))) &&
-                 op.type != index_modify_type && !dag_register(loaded_register(op));
+                 !modifies_index(op) && !dag_register(loaded_register(op));
         })) {
       continue;
     }
@@ -5379,6 +5438,17 @@ void Lowering::load_dag(unsigned reg) {
   dag_[reg] = load(32, dag_slot(bank, reg & 15, reg / 16));
 }
 
+void Lowering::load_modified_index(const Instruction &op) {
+  const auto modify = index_modify(op);
+  dag_written_.insert(modify.destination);
+  dag_status_written_ |= (modify.source & 7) == 7;
+  for (const auto reg :
+       {modify.source, modify.destination, 32 + modify.source, 48 + modify.source}) {
+    load_dag(reg);
+  }
+  if (op.type == register_modify_type) { load_dag(16 + modify.modifier); }
+}
+
 void Lowering::load_indices() {
   for (const auto &op : instructions_) {
     const auto destination = loaded_register(op);
@@ -5401,15 +5471,7 @@ void Lowering::load_indices() {
         dag_status_written_ |= (move.index & 7) == 7;
       }
     }
-    if (op.type == index_modify_type) {
-      const auto modify = index_modify(op);
-      dag_written_.insert(modify.destination);
-      dag_status_written_ |= (modify.source & 7) == 7;
-      for (const auto reg :
-           {modify.source, modify.destination, 32 + modify.source, 48 + modify.source}) {
-        load_dag(reg);
-      }
-    }
+    if (modifies_index(op)) { load_modified_index(op); }
   }
 }
 
@@ -5567,7 +5629,7 @@ std::vector<std::optional<BlockCost>> Lowering::unit_costs() const {
     }
     ++suffix.instructions;
     ++suffix.cycles;
-    if (memory_moves(op).count != 0 || op.type == index_modify_type || indirect_branch(op)) {
+    if (memory_moves(op).count != 0 || modifies_index(op) || indirect_branch(op)) {
       suffix.cycles += 2;
     }
     if (is_branch) {
@@ -5916,10 +5978,13 @@ std::uint32_t compute_context(const Compute &compute, ExecutionMode mode) {
 
 std::uint32_t instruction_context(const Instruction &instruction, ExecutionMode mode) {
   std::uint32_t mask = low_bank_mode | compute_context(instruction.compute, mode);
-  if (instruction.type == index_modify_type) {
+  if (modifies_index(instruction)) {
     const auto modify = index_modify(instruction);
     mask |= dag_bank_mode(modify.source) | dag_bank_mode(modify.destination);
     if ((modify.source & 7) == 7) { mask |= circular_mode; }
+    if (instruction.type == register_modify_type) {
+      mask |= dag_bank_mode(modify.modifier) | simd_mode | saturation_mode;
+    }
   }
   for (const auto &move : memory_moves(instruction)) {
     mask |= dag_bank_mode(move.index) | simd_mode | broadcast_mode(move);

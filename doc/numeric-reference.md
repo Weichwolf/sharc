@@ -495,6 +495,28 @@ RSQRTS inputs and either operation's NaNs produce an all-ones floating sentinel
 with AI/AIS and AN clear. The result width controls the sentinel extension byte.
 Ordinary seeds use the observed ROM fraction and instruction-specific exponent.
 
+## Register MODIFY and DAG interlocks
+
+In 64 authored type-7a probes, the CCES 2.12.1 ADSP-21489 functional simulator
+used source I15/B15/L15 and M14. The program varied both lane predicates, SISD
+and SIMD, CBUFEN, wrap direction and the choice of I15 or I13 as the
+destination. Either active lane triggered one shared update. Only selected
+lanes produced an ALU result. Both destinations raised CB15S in STKYx and
+CB15I in IRPTL on source-buffer wrap with CBUFEN clear or set. The simulator
+also returned bit 18 when reading STKYy in those 40 cases. Programming
+Reference 2.4, Table A-7, defines that bit for STKYx only. The core preserves
+the corresponding STKYy bit. Silicon behavior for the STKYy read remains
+unverified.
+
+An EMUCLK bracket covered one operation followed by a dependent memory load
+with zero, one or two intervening NOPs. The NOP control took three, four and
+five clocks. An explicit I2 load took five clocks at each spacing. Plain
+and enhanced register `MODIFY` matched the NOP timing, and the memory load
+used the resulting I2 at each spacing. A separate bracket around an explicit
+I5, M1, B5 or L5 load followed by enhanced `MODIFY` showed two, one and zero
+extra clocks. This qualifies simulator timing for register `MODIFY`; type 19
+and silicon timing remain separate.
+
 ## Fixed multiplier details
 
 The raw accumulator has 80 bits. Inputs use the upper 32 bits of each data

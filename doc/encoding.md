@@ -57,6 +57,11 @@ reads the data to append from X. `BFFWRP = Rn` also reads the Y field, and
 length or pointer from DATA and, for a 12-bit length, DATAEX. The installed
 FIFO execution coverage is tracked separately in `isa-coverage.md`.
 
+Authored type-7a register `MODIFY` probes encode the DAG in bit 38, the
+condition in bits 37:33, the source index in 32:30 and the modifier in 29:27.
+Bits 26:24 hold the within-DAG XOR of destination and source. The classic
+full form uses bits 22:0 for compute and leaves bits 39 and 23 clear.
+
 The 1001 VISA prefix uses additional discriminator bits to separate full-width
 immediate stores, compact immediate stores/offset transfers and short transfers.
 The optional-compute marker is tested only in the families that define it;

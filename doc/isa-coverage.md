@@ -501,6 +501,19 @@ including owner binding, yield after retirement, access fault and replay.
 Forced long-word encodings remain open. See
 [memory.md](memory.md) for the exact storage contract.
 
+Classic type 7a register `MODIFY` supports the implicit source destination and
+an explicit destination in the same DAG. Computation evaluates each lane's
+predicate independently. Either active lane can trigger the single shared
+index update. Wrap uses the source B/L independently of CBUFEN and reports
+I7/I15 overflow from the source, including an enhanced destination. Installed
+tests cover both DAGs, physical quarters, signed modifiers, circular overflow,
+combined fixed ADD, both lane predicates, complete state under instruction and
+cycle bounds, and both numerical modes. A following dependent memory read
+uses the updated index without a DAG register-load stall. Explicit I/M/B/L
+loads before `MODIFY` retain the corresponding two-, one- and zero-cycle
+interlocks. See the simulator observations in
+[numeric-reference.md](numeric-reference.md#register-modify-and-dag-interlocks).
+
 Classic type 19 implements immediate MODIFY/BITREV, including distinct source
 and destination I registers. The source B/L define circular adjustment before
 bit reversal; MODIFY ignores CBUFEN for nonzero L. All sixteen I registers, all

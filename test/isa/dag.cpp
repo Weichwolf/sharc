@@ -3,6 +3,8 @@
 #include "../support/isa.hpp"
 
 #include <array>
+#include <bit>
+#include <cstddef>
 #include <cstdint>
 #include <sharc/core.hpp>
 #include <vector>
@@ -193,11 +195,175 @@ void special_buffers(sharc::ExecutionMode mode) {
     }
   }
 }
+
+struct RegisterModify {
+  unsigned source{}, modifier{}, destination{};
+  std::uint64_t compute{};
+  unsigned condition{};
+};
+
+constexpr std::uint64_t encoding(const RegisterModify &op) {
+  constexpr std::uint64_t prefix = 0x040000000000;
+  constexpr unsigned dag_shift = 38;
+  constexpr unsigned condition_shift = 33;
+  constexpr unsigned source_shift = 30;
+  constexpr unsigned modifier_shift = 27;
+  constexpr unsigned destination_shift = 24;
+  return prefix | (std::uint64_t{op.source / 8} << dag_shift) |
+         (std::uint64_t{op.condition} << condition_shift) |
+         (std::uint64_t{op.source & 7} << source_shift) |
+         (std::uint64_t{op.modifier & 7} << modifier_shift) |
+         (std::uint64_t{(op.destination ^ op.source) & 7} << destination_shift) | op.compute;
+}
+
+constexpr std::uint64_t add_r4 = fixture::add(4, 1, 2) & 0x7fffff;
+constexpr RegisterModify enhanced_pm{
+    .source = 15, .modifier = 14, .destination = 13, .compute = add_r4};
+constexpr std::uint64_t assembled_enhanced_pm = 0x0441f2001412;
+static_assert(encoding(enhanced_pm) == assembled_enhanced_pm);
+
+void expect_register_modify(sharc::Registers &state,
+                            const RegisterModify &op,
+                            unsigned predicates) {
+  constexpr unsigned alu_status = 0x43f;
+  constexpr std::array<unsigned, 2> sums{49, 70};
+  const auto active = (state.mode1 & (1U << simd_bit)) == 0 ? predicates & 1 : predicates;
+  if (op.compute != 0) {
+    for (unsigned lane = 0; lane < state.pe.size(); ++lane) {
+      if ((active & (1U << lane)) == 0) { continue; }
+      state.pe[lane].data[0][4] = sums[lane] << 8;
+      state.pe[lane].astat &= ~alu_status;
+    }
+  }
+  if (active != 0) {
+    const auto bank = (state.mode1 >> bank_bits[op.modifier]) & 1;
+    const auto delta = std::bit_cast<std::int32_t>(state.dag[bank][op.modifier].modifier);
+    apply(state, {.source = op.source, .destination = op.destination, .displacement = delta});
+  } else {
+    fixture::boundary(state, {.pc = state.pc + 1, .clock = state.emuclk + 1});
+  }
+}
+
+struct ModifyConfiguration {
+  unsigned mode_flags{}, predicates{};
+};
+
+sharc::Registers register_modify_input(const RegisterModify &op,
+                                       ModifyConfiguration configuration) {
+  constexpr unsigned step = 7;
+  constexpr std::array<std::uint64_t, 2> x{19, 10};
+  constexpr std::array<std::uint64_t, 2> y{30, 60};
+  constexpr unsigned x_extension = 0x59;
+  constexpr unsigned y_extension = 0xa5;
+  auto state =
+      initial({.source = op.source, .flags = configuration.mode_flags, .configuration = 1});
+  for (unsigned bank = 0; bank < state.dag.size(); ++bank) {
+    auto &source = state.dag[bank][op.source];
+    source.length = buffer_length;
+    source.index = source.base + (bank == 0 ? buffer_length - 2 : 1);
+    state.dag[bank][op.modifier].modifier = bank == 0 ? step : 0U - step;
+  }
+  for (unsigned lane = 0; lane < state.pe.size(); ++lane) {
+    auto &pe = state.pe[lane];
+    pe.astat = (old_status & ~1U) | ((configuration.predicates >> lane) & 1);
+    pe.data[0][1] = (x[lane] << 8) | x_extension;
+    pe.data[0][2] = (y[lane] << 8) | y_extension;
+  }
+  return state;
+}
+
+void register_modify_matrix(sharc::ExecutionMode mode) {
+  constexpr std::array operations{
+      RegisterModify{.source = 7, .modifier = 1, .destination = 2, .compute = add_r4},
+      RegisterModify{.source = 7, .modifier = 3, .destination = 7},
+      enhanced_pm,
+      RegisterModify{.source = 12, .modifier = 9, .destination = 8, .compute = add_r4}};
+  constexpr unsigned contexts = 64;
+  constexpr unsigned masks = 4;
+  for (const auto &op : operations) {
+    fixture::Program program(std::array{encoding(op), std::uint64_t{0}});
+    const auto native = fixture::compile(program.code, mode);
+    sharc::Core core(program.memory(), mode);
+    (void)core.install(native, fixture::Program::variant_id);
+    const auto beginning = core.save();
+    for (unsigned flags = 0; flags < contexts; ++flags) {
+      for (unsigned predicates = 0; predicates < masks; ++predicates) {
+        auto expected = register_modify_input(op, {.mode_flags = flags, .predicates = predicates});
+        core.restore(beginning);
+        core.set_registers(expected);
+        const auto start = core.save();
+        expect_register_modify(expected, op, predicates);
+        check(fixture::completed(core.run_until(1), 1, 1) && core.registers() == expected,
+              "register MODIFY lost a predicate, bank, computation or overflow");
+        core.restore(start);
+        fixture::boundary(expected, {.pc = expected.pc + 1, .clock = 2});
+        check(fixture::completed(core.run(2), 2, 2) && core.registers() == expected,
+              "register MODIFY changed effects under a whole-unit grant");
+      }
+    }
+  }
+}
+
+void verify_register_modify_timing(sharc::ExecutionMode mode, unsigned reg, unsigned gap) {
+  constexpr unsigned i5 = 0x15;
+  constexpr unsigned m1 = 0x21;
+  constexpr unsigned b5 = 0x45;
+  constexpr unsigned ram_id = 27;
+  constexpr unsigned dm_address = 0x90000;
+  constexpr unsigned source = 5;
+  constexpr unsigned destination = 2;
+  constexpr unsigned condition_true = 31;
+  constexpr std::uint64_t read_r4 = 0xa40400000000; // R4 = DM(0,I2).
+  constexpr std::uint32_t value = 0x2468ace0;
+  const auto payload = reg == i5 || reg == b5 ? dm_address : static_cast<unsigned>(reg == m1);
+  std::vector words{reg == 0 ? std::uint64_t{0} : fixture::immediate(reg, payload)};
+  words.insert(words.end(), gap, 0);
+  words.push_back(encoding(RegisterModify{
+      .source = source, .modifier = 1, .destination = destination, .condition = condition_true}));
+  words.push_back(read_r4);
+  fixture::Program program(words);
+  program.code.variants.front().layout.regions.push_back(
+      fixture::normal_region(dm_address, 2, ram_id));
+  std::array<std::byte, 8> ram{};
+  for (unsigned byte = 0; byte < 4; ++byte) {
+    ram[4 + byte] = static_cast<std::byte>(value >> (byte * 8));
+  }
+  const auto native = fixture::compile(program.code, mode);
+  sharc::Core core(program.memory(ram_id, ram), mode);
+  sharc::Registers before;
+  before.pc = fixture::code_address;
+  before.dag[0][source] = {.index = dm_address, .base = dm_address};
+  before.dag[0][1].modifier = 1;
+  fixture::install(core, native, before);
+  const auto start = core.save();
+  const auto count = static_cast<std::uint32_t>(words.size());
+  const auto clocks = count + (reg == 0 ? 0 : 2 - gap);
+  auto expected = before;
+  expected.dag[0][destination].index = dm_address + 1;
+  expected.pe[0].data[0][4] = std::uint64_t{value} << 8;
+  fixture::boundary(expected, {.pc = before.pc + count, .clock = clocks});
+  check(fixture::completed(core.run(count), count, clocks) && core.registers() == expected,
+        "register MODIFY lost a source interlock or delayed the resulting address");
+  core.restore(start);
+  check(fixture::completed(core.run_until(clocks - 1), count - 1, clocks - 1),
+        "register MODIFY did not stop at the exact memory boundary");
+  check(fixture::completed(core.run_until(clocks), 1, 1) && core.registers() == expected,
+        "immediately following load did not see the modified index after a bound");
+}
+
+void register_modify_timing(sharc::ExecutionMode mode) {
+  constexpr std::array sources{0U, 0x15U, 0x21U, 0x35U, 0x45U}; // NOP, I5, M1, L5, B5.
+  for (const auto reg : sources) {
+    for (unsigned gap = 0; gap <= 2; ++gap) { verify_register_modify_timing(mode, reg, gap); }
+  }
+}
 } // namespace
 
 void fixture::dag_addressing() {
   for (const auto mode : fixture::numeric_modes) {
     index_matrix(mode);
     special_buffers(mode);
+    register_modify_matrix(mode);
+    register_modify_timing(mode);
   }
 }
