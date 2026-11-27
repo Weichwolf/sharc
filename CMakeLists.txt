@@ -116,6 +116,8 @@ if(BUILD_TESTING)
       add_test(NAME bench_${kernel} COMMAND sharc_${kernel}_bench --check)
       add_test(NAME bench_${kernel}_direct COMMAND sharc_${kernel}_bench --check --direct)
     endforeach()
+    # Each K3 test prepares two large LLVM images, one per numerical mode.
+    set_tests_properties(bench_k3 bench_k3_direct PROPERTIES TIMEOUT 5400)
     add_executable(sharc_k5_bench test/bench/k5.cpp test/bench/reference.cpp)
     target_link_libraries(sharc_k5_bench PRIVATE sharc::core)
     target_compile_options(sharc_k5_bench PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion -Werror)
