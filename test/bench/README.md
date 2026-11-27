@@ -1,7 +1,8 @@
 # Common benchmarks
 
-K1, K2, K4, K5 and K6 have checked Linux results. K3 qualification, macOS ARM64
-and protected-page peripheral I/O remain open.
+K1 through K6 have checked Linux x86-64 executions. K3 has passed Strict in
+Exact and Direct. The common measurement batch covers FastFP32 and the complete
+mode matrix. macOS ARM64 and protected-page peripheral I/O remain open.
 
 ## Current Linux results
 
@@ -59,7 +60,17 @@ Use one logical CPU throughout the serial measurement batch.
 ```sh
 nice -n 10 cmake --build build --target sharc_k1_bench sharc_k2_bench sharc_k3_bench \
   sharc_k4_bench sharc_k5_bench
+```
+
+CTest runs the correctness checks without hardware counters.
+
+```sh
 nice -n 10 ctest --test-dir build --output-on-failure -R '^bench_k[1-5](_direct)?$'
+```
+
+The measurement batch also verifies each run against the reference output.
+
+```sh
 mkdir -p build/local/common-kernels
 for kernel in 1 2 3 4 5; do
   taskset -c 2 nice -n 10 "build/sharc_k${kernel}_bench" --measure \
@@ -100,6 +111,8 @@ delays in base cycles. Portable reference timing covers the same FIR arithmetic.
 | Kernel | Assembly | Unique guest instructions | Instructions retired | Base cycles | Output SHA-256 |
 |---|---|---:|---:|---:|---|
 | K1 | [k1.asm](k1.asm) | 18 | 19,661,570 | 20,710,143 | `e0dd28045a3afa7150f68203e73f97539933139b0823efd64705cc1c63ea7462` |
+| K2 | [k2.asm](k2.asm) | 38 | 29,098,754 | 29,885,183 | `ab87d136a23ea837637b11274be389f0f31473c1d447d4f6fc752e823b20fe3a` |
+| K3 | [k3.asm](k3.asm) | 46 | 13,142,529 | 13,668,862 | Full C++ output comparison |
 | K4 | [k4.asm](k4.asm) | 61 | 18,874,369 | 39,845,886 | `490294093fdf6b9e10740daa992391bae19396c6e78bff448f035b4e7ca37f25` |
 | K5 | [k5.asm](k5.asm) | 13 | 14,682,625 | 23,071,742 | `e84b69ed409029f1af79718d2a57b8c0ab264a77e3979a939cb39b8087bdc589` |
 | K6 | [k1.asm](k1.asm) with IRQ2 | 20 | 19,671,704 | 20,755,746 | Same as K1 |
@@ -116,9 +129,9 @@ biquads. The guest loads the two old state words, puts each state contribution
 in the signed fractional multiply accumulator and combines it with products
 before rounding and saturating. Both updated state words and the stage output
 have their own quantization. State persists over all 256 blocks. The independent
-C++ implementation compares all samples and the eight final state words with
-the contract hashes. The guest retires 29,098,754 instructions in 29,885,183
-base cycles.
+C++ implementation checks the full output and the eight final state words
+against the contract hashes. The final state SHA-256 is
+`7fa60e5ab99a82116e669d32aec3e3af0cba013e494fd3b2af331d553c27e94f`.
 
 [K3](k3.asm) processes 512 copies of a 256-point complex radix-2 transform.
 The real and imaginary input components at natural index `i` are
@@ -165,11 +178,12 @@ size. The independent runtime-parameterized algorithms in `reference.cpp` use
 `-O3 -fno-lto` and `-march=native` on x86-64. Every run checks their output.
 One full guest/reference warm-up precedes three measured pairs.
 
-Counters cover `Core::run` and the small user timer/control wrapper. Wall time
-brackets only `run`. Preparation, installation, restore and validation are
-outside both. JSONL records paired elapsed times, raw counts and counter
+Counters and elapsed time cover the guest call and its owner wrapper. The
+bounded schedules include calls to `run_until`, and K6 includes interrupt
+delivery. Preparation, installation, restore and validation take place outside
+the timed region. JSONL records paired elapsed times, raw counts and counter
 enabled/running deltas. Equal nonzero deltas establish unscaled counts. The
-summary derives per-instruction costs and throughput and the paired ratio to
+summary derives per-instruction costs, throughput and the paired ratio to
 Clang O3, reporting min/median/max. Native size includes all prepared mode
-contexts and cold paths. Bytes per prepared instruction divide by the unique
-guest instruction count in the table.
+contexts and cold paths. Bytes per prepared instruction divide by the number
+of guest instruction sites in the prepared image.
