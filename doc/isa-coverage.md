@@ -461,8 +461,9 @@ long-word neighbor registers and broadcast, and raw 40-bit transfers. It checks
 declared callbacks for access order, refusal, yield, delay-slot continuation and
 replay, including 40-bit payloads. The Core control suite checks prepared
 handoffs on direct, computed and delayed control flow, rejected installations,
-generation rebinding and snapshot replay. Forced long-word encodings and
-changing prepared code through a memory alias remain open. See
+generation rebinding and snapshot replay. The memory suite checks coherent
+short and normal stores through PM/DM code aliases, including unchanged bytes
+and binding revocation on a later I/O fault. Forced long-word encodings remain open. See
 [memory.md](memory.md) for the exact storage contract.
 
 Classic type 19 implements immediate MODIFY/BITREV, including distinct source

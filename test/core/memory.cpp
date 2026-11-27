@@ -1060,6 +1060,191 @@ bool read_store(void * /*owner*/,
 
 enum class CodeStorage : std::uint8_t { aliased, callback, undeclared };
 
+struct CodeWriter {
+  static constexpr auto next = fixture::code_address + 1;
+  static constexpr unsigned replacement_variant = 8;
+  static constexpr unsigned before = 7;
+  static constexpr unsigned after = 12;
+  static constexpr auto offset = fixture::Program::word_bytes;
+  fixture::Program program;
+
+  explicit CodeWriter(std::uint64_t store)
+      : program(std::array{store, fixture::immediate(1, before), std::uint64_t{0}}) {
+    auto alias = fixture::normal_region(ram_address, 1, fixture::Program::storage_id);
+    alias.byte_offset = offset;
+    program.code.variants.front().layout.regions.push_back(alias);
+  }
+
+  void allow(std::uint32_t entry = next) {
+    auto target = program.code.variants.front();
+    target.id = replacement_variant;
+    target.entries = {entry};
+    constexpr auto low_parcel_of_second_word = 5;
+    target.spans.front().parcels[low_parcel_of_second_word] = after;
+    program.code.variants.push_back(target);
+    program.code.transitions.push_back({.from_variant = fixture::Program::variant_id,
+                                        .address = entry,
+                                        .to_variants = {replacement_variant}});
+  }
+};
+
+void rewrite_and_resume() {
+  constexpr std::uint64_t store_pm_r0 = 0xb10000000000;
+  for (const bool program_bus : {false, true}) {
+    CodeWriter writer(program_bus ? store_pm_r0 : store_r0);
+    auto &program = writer.program;
+    if (program_bus) {
+      auto &alias = program.code.variants.front().layout.regions.back();
+      alias.space = sharc::MemorySpace::program;
+      alias.view = sharc::MemoryView::short_word;
+      alias.byte_stride = 2;
+    }
+    writer.allow();
+    const auto native = sharc::Core::compile(program.code);
+    sharc::Core core(program.memory());
+    auto start = initial();
+    start.dag[0][8].index = ram_address;
+    start.pe[0].data[0][0] = CodeWriter::before << word_shift;
+    fixture::install(core, native, start);
+    const auto original = program.bytes;
+    check(fixture::completed(core.run(2), 2, 2) && program.bytes == original &&
+              core.registers().pe[0].data[0][1] == (CodeWriter::before << word_shift),
+          "unchanged code alias store invalidated the active variant");
+
+    start.pe[0].data[0][0] = CodeWriter::after << word_shift;
+    core.set_registers(start);
+    const auto before = core.save();
+    const auto result = core.run(10);
+    check(result.execution == sharc::ExecutionState::code_transfer && !result.has_fault &&
+              result.progress == sharc::Progress{.instructions = 1, .base_cycles = 1} &&
+              core.registers().pc == CodeWriter::next && core.registers().pe[0].data[0][1] == 0 &&
+              fixture::get_word(program.bytes.data() + CodeWriter::offset) == CodeWriter::after,
+          "code-alias write did not stop before the replaced native instruction");
+    const auto pending = core.save();
+    core.restore(before);
+    check(core.run(1).fault.reason == sharc::FaultReason::unprepared,
+          "snapshot recovered the obsolete binding after a code change");
+    fixture::throws<sharc::PreparationError>(
+        [&] { (void)core.install(native, fixture::Program::variant_id); },
+        "installation accepted the old opcode after the code change");
+    core.restore(pending);
+    (void)core.install(native, CodeWriter::replacement_variant);
+    check(fixture::completed(core.run(1), 1, 1) &&
+              core.registers().pe[0].data[0][1] == (CodeWriter::after << word_shift),
+          "code change did not resume from the prepared replacement");
+  }
+}
+
+void rewrite_without_target() {
+  CodeWriter writer(store_r0);
+  writer.allow(CodeWriter::next + 1);
+  auto &program = writer.program;
+  const auto native = sharc::Core::compile(program.code);
+  sharc::Core core(program.memory());
+  auto start = initial();
+  start.pe[0].data[0][0] = CodeWriter::after << word_shift;
+  fixture::install(core, native, start);
+  const auto saved = core.save();
+  const auto result = core.run(10);
+  check(result.has_fault && result.fault.reason == sharc::FaultReason::unsupported_feature &&
+            result.fault.address == CodeWriter::next &&
+            result.fault.identity == native.report().identity &&
+            result.progress == sharc::Progress{.instructions = 1, .base_cycles = 1} &&
+            fixture::get_word(program.bytes.data() + CodeWriter::offset) == CodeWriter::after,
+        "code write accepted a transition for the wrong continuation");
+  core.restore(saved);
+  check(core.run(1).fault.reason == sharc::FaultReason::unprepared,
+        "unsupported code rewrite retained an outdated binding");
+}
+
+void code_padding_store() {
+  CodeWriter writer(store_r0);
+  auto &program = writer.program;
+  auto &layouts = program.code.variants.front().layout.regions;
+  constexpr std::array padding{std::byte{0}, std::byte{0}};
+  layouts.front().byte_stride = CodeWriter::offset + padding.size();
+  constexpr auto second_end = std::ptrdiff_t{2} * CodeWriter::offset;
+  program.bytes.insert(program.bytes.begin() + second_end, padding.begin(), padding.end());
+  program.bytes.insert(program.bytes.begin() + CodeWriter::offset, padding.begin(), padding.end());
+  layouts.back().view = sharc::MemoryView::short_word;
+  layouts.back().byte_stride = padding.size();
+  const auto native = sharc::Core::compile(program.code);
+  sharc::Core core(program.memory());
+  auto start = initial();
+  constexpr unsigned padding_value = 0x5511;
+  constexpr std::array written_padding{std::byte{0x11}, std::byte{0x55}};
+  start.pe[0].data[0][0] = padding_value << word_shift;
+  fixture::install(core, native, start);
+  check(fixture::completed(core.run(2), 2, 2) &&
+            std::ranges::equal(std::span(program.bytes).subspan(CodeWriter::offset, padding.size()),
+                               written_padding) &&
+            core.registers().pe[0].data[0][1] == (CodeWriter::before << word_shift),
+        "a store in physical instruction padding was treated as changing code");
+}
+
+void rewrite_before_io_fault() {
+  constexpr std::uint64_t store_dm_read_pm = 0x34c89a000000;
+  CodeWriter writer(store_dm_read_pm);
+  writer.allow();
+  auto &program = writer.program;
+  auto peripheral_alias = fixture::normal_region(ram_address, 1, ram_id);
+  peripheral_alias.space = sharc::MemorySpace::program;
+  peripheral_alias.initialized = false;
+  program.code.variants.front().layout.regions.push_back(peripheral_alias);
+  auto memory = program.memory();
+  Peripheral peripheral{.fault_on = 1};
+  memory.io = peripheral.binding();
+  sharc::Core core(memory);
+  peripheral.core = &core;
+  auto start = initial();
+  start.dag[0][2].index = ram_address;
+  start.dag[0][10].index = ram_address;
+  start.pe[0].data[0][4] = CodeWriter::after << word_shift;
+  const auto native = sharc::Core::compile(program.code);
+  fixture::install(core, native, start);
+  const auto saved = core.save();
+  const auto fault = core.run(1);
+  check(fault.has_fault && fault.fault.reason == sharc::FaultReason::access_fault &&
+            fault.fault.address == start.pc && fault.progress == sharc::Progress{} &&
+            core.registers() == start && peripheral.calls == 1 &&
+            fixture::get_word(program.bytes.data() + CodeWriter::offset) == CodeWriter::after,
+        "late peripheral refusal lost the earlier code store or retired the packet");
+  core.restore(saved);
+  check(core.run(1).fault.reason == sharc::FaultReason::unprepared,
+        "late peripheral refusal retained a modified source binding");
+}
+
+void rewrite_inside_delay() {
+  constexpr auto slot = fixture::code_address + 2;
+  constexpr std::uint64_t delayed_jump = 0x063e04000000 | (slot + 1);
+  constexpr auto slot_offset = 2 * fixture::Program::word_bytes;
+  const std::array words{
+      delayed_jump, store_r0, fixture::immediate(1, CodeWriter::before), std::uint64_t{0}};
+  fixture::Program program(words);
+  auto alias = fixture::normal_region(ram_address, 1, fixture::Program::storage_id);
+  alias.byte_offset = slot_offset;
+  program.code.variants.front().layout.regions.push_back(alias);
+  auto target = program.code.variants.front();
+  target.id = CodeWriter::replacement_variant;
+  target.entries = {slot};
+  target.spans.front().parcels[8] = CodeWriter::after;
+  program.code.variants.push_back(target);
+  program.code.transitions.push_back(
+      {.from_variant = fixture::Program::variant_id, .address = slot, .to_variants = {target.id}});
+  const auto native = sharc::Core::compile(program.code);
+  sharc::Core core(program.memory());
+  auto start = initial();
+  start.pe[0].data[0][0] = CodeWriter::after << word_shift;
+  fixture::install(core, native, start);
+  const auto result = core.run(10);
+  check(result.has_fault && result.fault.reason == sharc::FaultReason::unsupported_feature &&
+            result.fault.address == slot && result.fault.detail.contains("active delay or loop") &&
+            result.progress == sharc::Progress{.instructions = 2, .base_cycles = 2} &&
+            core.registers().pe[0].data[0][1] == 0 &&
+            fixture::get_word(program.bytes.data() + slot_offset) == CodeWriter::after,
+        "a code store allowed continuation without the active delay-slot context");
+}
+
 void refused_code_store(CodeStorage storage) {
   const std::array words{store_r0};
   Program program(words);
@@ -1122,6 +1307,11 @@ int main() {
     parallel_broadcast();
     parallel_interlock();
     hidden_storage_alias();
+    rewrite_and_resume();
+    rewrite_without_target();
+    code_padding_store();
+    rewrite_before_io_fault();
+    rewrite_inside_delay();
     refused_code_store(CodeStorage::callback);
     refused_code_store(CodeStorage::undeclared);
   });

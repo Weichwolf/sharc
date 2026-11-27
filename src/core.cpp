@@ -395,7 +395,9 @@ struct Core::Impl {
     pointers[detail::progress_cycle_slot] = &state.progress.base_cycles;
     pointers[detail::interrupt_deadline_slot] = &loops.interrupt_deadline;
     pointers[detail::io_slot] = &memory.io;
-    pointers[detail::yield_slot] = &yield_requested;
+    pointers[detail::owner_events_slot] = &owner_events;
+    pointers[detail::code_owner_slot] = this;
+    pointers[detail::code_check_slot] = std::bit_cast<void *>(&check_code_write);
     for (unsigned bank = 0; bank < 2; ++bank) {
       for (unsigned index = 0; index < 16; ++index) {
         auto &dag = state.registers.dag[bank][index];
@@ -545,10 +547,27 @@ struct Core::Impl {
   RunResult execute(std::uint64_t instructions, std::uint64_t cycles);
   std::optional<RunResult> open_run(bool has_budget);
   std::optional<RunResult> native_stop(const detail::ControlWords &control, Progress progress);
-  [[nodiscard]] const CodeTransition *transfer_target() const;
+  [[nodiscard]] const CodeTransition *transfer_target(bool code_changed) const;
+  RunResult start_transfer(const CodeTransition &edge, Progress progress);
+  RunResult stop_after_code_write(const detail::ControlWords &control, Progress progress);
+
+  static std::uint32_t check_code_write(const Impl &core,
+                                        std::uint64_t payload,
+                                        MemorySpace space,
+                                        std::uint32_t address) noexcept {
+    return detail::changes_code(*core.installed_variant(), payload, space, address)
+               ? detail::code_write_event
+               : 0U;
+  }
+
+  void revoke_binding() noexcept {
+    installed.reset();
+    views.clear();
+    native_call.bind({}, {});
+  }
 
   RunResult yield(Progress progress) noexcept {
-    yield_requested = 0;
+    owner_events = 0;
     state.execution = ExecutionState::yielded;
     return {.progress = progress, .execution = state.execution, .has_fault = false, .fault = {}};
   }
@@ -564,7 +583,7 @@ struct Core::Impl {
   Memory memory;
   const ExecutionMode mode;
   State state;
-  std::uint8_t yield_requested{};
+  std::uint8_t owner_events{};
   bool executing{};
   bool terminal_fault{};
   detail::NativeCall native_call;
@@ -709,8 +728,7 @@ PreparationReport Core::install(const NativeImage &image, std::uint32_t variant)
                    impl_->state.registers.pc,
                    "installation is outside the pending code transition");
   }
-  impl_->installed.reset();
-  impl_->views.clear();
+  impl_->revoke_binding();
   {
     impl_->executing = true;
     const auto release = llvm::make_scope_exit([&] { impl_->executing = false; });
@@ -749,7 +767,7 @@ RunResult Core::run_until(std::uint64_t base_cycle_deadline) {
 }
 
 void Core::request_yield() noexcept {
-  impl_->yield_requested = 1;
+  impl_->owner_events |= detail::owner_yield_event;
 }
 
 bool Core::interrupt_ready(const InterruptRequest &request) const noexcept {
@@ -868,7 +886,7 @@ void Core::reset(std::uint32_t address, InstructionSet instruction_set) {
   state.execution = ExecutionState::stopped;
   state.has_fault = false;
   state.fault = {};
-  impl_->yield_requested = 0;
+  impl_->owner_events = 0;
   impl_->clear_continuation();
   impl_->transfer.reset();
   impl_->interrupt_frames.clear();
@@ -883,7 +901,7 @@ void Core::resume_from_stop() {
 void Core::set_memory(Memory memory) {
   impl_->stopped_owner();
   impl_->memory = std::move(memory);
-  impl_->installed.reset();
+  impl_->revoke_binding();
 }
 
 Registers Core::registers() const {
@@ -937,7 +955,7 @@ Snapshot Core::save() const {
   snapshot.impl_ = std::make_shared<const Snapshot::Impl>(
       Snapshot::Impl{.mode = impl_->mode,
                      .state = impl_->state,
-                     .yield_requested = impl_->yield_requested != 0,
+                     .yield_requested = (impl_->owner_events & detail::owner_yield_event) != 0,
                      .resume = impl_->resume,
                      .transfer = impl_->transfer,
                      .pipeline_history = impl_->pipeline_history,
@@ -954,7 +972,7 @@ void Core::restore(const Snapshot &snapshot) {
   }
   auto restored = *snapshot.impl_;
   impl_->state = std::move(restored.state);
-  impl_->yield_requested = static_cast<std::uint8_t>(restored.yield_requested);
+  impl_->owner_events = restored.yield_requested ? detail::owner_yield_event : 0;
   impl_->resume = std::move(restored.resume);
   impl_->transfer = std::move(restored.transfer);
   impl_->pipeline_history = restored.pipeline_history;
@@ -1073,13 +1091,14 @@ std::optional<RunResult> Core::Impl::open_run(bool has_budget) {
   return std::nullopt;
 }
 
-const CodeTransition *Core::Impl::transfer_target() const {
+const CodeTransition *Core::Impl::transfer_target(bool code_changed) const {
   const auto pc = state.registers.pc;
   const auto &transitions = installed->image->code.transitions;
   const auto edge = std::ranges::find_if(transitions, [&](const auto &candidate) {
     return candidate.from_variant == variant && candidate.address == pc;
   });
   if (edge == transitions.end()) { return nullptr; }
+  if (code_changed) { return &*edge; }
   constexpr auto parcels_per_word = detail::full_instruction_bits / detail::short_instruction_bits;
   const auto resident = std::ranges::any_of(installed_variant()->spans, [&](const CodeSpan &span) {
     const auto words = span.parcels.size() / parcels_per_word;
@@ -1088,8 +1107,39 @@ const CodeTransition *Core::Impl::transfer_target() const {
   return resident ? nullptr : &*edge;
 }
 
+RunResult Core::Impl::start_transfer(const CodeTransition &edge, Progress progress) {
+  if (delayed_target != 0 || loops.active()) {
+    auto result = fail(FaultReason::unsupported_feature,
+                       "code transition cannot resume an active delay or loop in another variant");
+    result.progress = progress;
+    return result;
+  }
+  transfer = PendingTransfer{.identity = installed->image->identity, .targets = edge.to_variants};
+  state.execution = ExecutionState::code_transfer;
+  return {.progress = progress, .execution = state.execution, .has_fault = false, .fault = {}};
+}
+
+RunResult Core::Impl::stop_after_code_write(const detail::ControlWords &control,
+                                            Progress progress) {
+  owner_events &= detail::owner_yield_event;
+  const auto revoke = llvm::make_scope_exit([&] { revoke_binding(); });
+  const auto reason = static_cast<detail::NativeExit>(control[detail::exit_reason]);
+  if (reason != detail::NativeExit::undeclared) {
+    if (auto result = native_failure(control, progress)) { return std::move(*result); }
+  }
+  (void)continue_after(reason);
+  if (const auto *edge = transfer_target(true)) { return start_transfer(*edge, progress); }
+  auto result =
+      fail(FaultReason::unsupported_feature, "code changed without a declared transition");
+  result.progress = progress;
+  return result;
+}
+
 std::optional<RunResult> Core::Impl::native_stop(const detail::ControlWords &control,
                                                  Progress progress) {
+  if ((owner_events & detail::code_write_event) != 0) {
+    return stop_after_code_write(control, progress);
+  }
   const auto reason = static_cast<detail::NativeExit>(control[detail::exit_reason]);
   switch (reason) {
     case detail::NativeExit::bound:
@@ -1097,13 +1147,7 @@ std::optional<RunResult> Core::Impl::native_stop(const detail::ControlWords &con
     case detail::NativeExit::indirect:
     case detail::NativeExit::returned:
       if (control[detail::retired_instructions] != 0) {
-        if (const auto *edge = transfer_target()) {
-          transfer =
-              PendingTransfer{.identity = installed->image->identity, .targets = edge->to_variants};
-          state.execution = ExecutionState::code_transfer;
-          return RunResult{
-              .progress = progress, .execution = state.execution, .has_fault = false, .fault = {}};
-        }
+        if (const auto *edge = transfer_target(false)) { return start_transfer(*edge, progress); }
       }
       break;
     default: break;
@@ -1131,7 +1175,7 @@ RunResult Core::Impl::execute(std::uint64_t instructions, std::uint64_t cycles) 
       return failure(FaultReason::unsupported_feature,
                      "VISA execution or an enabled core timer is not implemented");
     }
-    if (yield_requested != 0) { return yield(progress); }
+    if (owner_events != 0) { return yield(progress); }
     const auto cycle_budget = cycles - std::min(cycles, progress.base_cycles);
     if (instructions == progress.instructions || cycle_budget == 0) { break; }
     const auto index = prepared_unit();
@@ -1154,12 +1198,12 @@ RunResult Core::Impl::execute(std::uint64_t instructions, std::uint64_t cycles) 
                     .entry = static_cast<std::uint32_t>(control[detail::resume_entry])};
     if (const auto result = native_stop(control, progress)) { return *result; }
     const auto reason = static_cast<detail::NativeExit>(control[detail::exit_reason]);
-    if (!continue_after(reason) || yield_requested != 0 || progress.instructions == instructions ||
+    if (!continue_after(reason) || owner_events != 0 || progress.instructions == instructions ||
         progress.base_cycles >= cycles) {
       break;
     }
   }
-  if (yield_requested != 0) { return yield(progress); }
+  if (owner_events != 0) { return yield(progress); }
   if (state.execution != ExecutionState::sleeping) { state.execution = ExecutionState::stopped; }
   return {.progress = progress, .execution = state.execution, .has_fault = false, .fault = {}};
 }

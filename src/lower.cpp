@@ -788,7 +788,7 @@ struct MemoryPlan {
 };
 
 struct MemoryWord {
-  llvm::Value *address{}, *host{}, *view{};
+  llvm::Value *address{}, *host{}, *view{}, *code_event{};
 };
 
 llvm::Value *resolved_phi(llvm::PHINode *phi) {
@@ -906,11 +906,13 @@ public:
            CompileOptions::MemoryMode memory_mode,
            const NativeAbi &abi,
            const CodeVariant &variant,
+           bool code_transitions,
            std::vector<Instruction> instructions,
            const NativeUnit &unit,
            const LoopPlan &loops)
       : module_(module),
         memory_mode_(memory_mode),
+        code_transitions_(code_transitions),
         abi_(abi),
         unit_(unit),
         variant_(variant),
@@ -947,9 +949,12 @@ private:
            layout.view == MemoryView::normal_word && layout.count == (std::uint64_t{1} << 32);
   }
 
-  llvm::Value *yield_pending() {
-    return runtime_io_ ? builder_.CreateICmpNE(load(8, yield_slot), builder_.getInt8(0))
-                       : static_cast<llvm::Value *>(builder_.getFalse());
+  bool owner_events_possible() const {
+    return runtime_io_ || (code_transitions_ && (code_alias_buses_[0] || code_alias_buses_[1]));
+  }
+
+  llvm::Value *owner_stop_pending() {
+    return builder_.CreateICmpNE(load(8, owner_events_slot), builder_.getInt8(0));
   }
 
   llvm::Type *vector_type(unsigned bits) const {
@@ -1103,6 +1108,12 @@ private:
                         const Instruction &op,
                         const MemoryMove &move,
                         MemoryOperands &operands);
+  void plan_code_writes();
+  llvm::Value *check_code_store(const Values &values,
+                                const Instruction &op,
+                                const MemoryMove &move,
+                                const MemoryOperands &operands,
+                                unsigned lane);
 
   llvm::ConstantInt *view_tag(MemoryView view) {
     return builder_.getInt8(static_cast<std::uint8_t>(view));
@@ -1367,6 +1378,8 @@ private:
   llvm::Module &module_;
   CompileOptions::MemoryMode memory_mode_;
   bool runtime_io_{};
+  bool code_transitions_{}, code_storage_known_{};
+  std::array<bool, 2> code_alias_buses_{};
   const NativeAbi &abi_;
   const NativeUnit &unit_;
   const CodeVariant &variant_;
@@ -2214,7 +2227,8 @@ void Lowering::resolve_memory(const Values &values,
       memory_failure(values, op, move, address, NativeExit::access_fault);
     } else if (!layout.initialized && callback == nullptr) {
       memory_failure(values, op, move, address, NativeExit::unsupported_memory);
-    } else if (!host_protected(layout) && move.write && aliases_code(variant_, i)) {
+    } else if (!host_protected(layout) && move.write &&
+               (!layout.initialized || !code_storage_known_) && aliases_code(variant_, i)) {
       memory_failure(values, op, move, address, NativeExit::code_alias);
     } else {
       if (word.view != nullptr) {
@@ -2319,7 +2333,42 @@ MemoryOperands Lowering::memory_operands(const Values &values,
   }
   resolve_memory(values, op, move, operands.words[0], operands.callback);
   if (simd_pair) { resolve_implicit(values, op, move, operands); }
+  if (move.write && code_alias_buses_[static_cast<std::size_t>(move.space)]) {
+    operands.words[0].code_event = check_code_store(values, op, move, operands, 0);
+    operands.words[1].code_event = optional_memory(
+        operands.paired,
+        [&] { return check_code_store(values, op, move, operands, 1); },
+        builder_.getInt8(0));
+  }
   return operands;
+}
+
+llvm::Value *Lowering::check_code_store(const Values &values,
+                                        const Instruction &op,
+                                        const MemoryMove &move,
+                                        const MemoryOperands &operands,
+                                        unsigned lane) {
+  const auto &word = operands.words[lane];
+  auto *type = llvm::FunctionType::get(
+      builder_.getInt32Ty(),
+      {builder_.getPtrTy(), builder_.getInt64Ty(), builder_.getInt8Ty(), builder_.getInt32Ty()},
+      false);
+  auto *result = builder_.CreateCall(type,
+                                     pointer(code_check_slot),
+                                     {pointer(code_owner_slot),
+                                      store_word(values, move, word, lane),
+                                      builder_.getInt8(static_cast<std::uint8_t>(move.space)),
+                                      word.address});
+  result->setDoesNotThrow();
+  result->addParamAttr(2, llvm::Attribute::ZExt);
+  if (code_transitions_) { return builder_.CreateTrunc(result, builder_.getInt8Ty()); }
+  auto *accepted = llvm::BasicBlock::Create(module_.getContext(), "code.unchanged", function_);
+  auto *refused = llvm::BasicBlock::Create(module_.getContext(), "cold.code.changed", function_);
+  builder_.CreateCondBr(builder_.CreateICmpEQ(result, builder_.getInt32(0)), accepted, refused);
+  builder_.SetInsertPoint(refused);
+  memory_failure(values, op, move, word.address, NativeExit::code_alias);
+  builder_.SetInsertPoint(accepted);
+  return builder_.getInt8(0);
 }
 
 void Lowering::resolve_implicit(const Values &values,
@@ -2401,7 +2450,15 @@ llvm::Value *Lowering::memory_word(const Values &values,
                                    unsigned lane) {
   const auto &word = operands.words[lane];
   auto *payload = move.write ? store_word(values, move, word, lane) : nullptr;
-  if (operands.callback == nullptr) { return direct_word(move, word, payload); }
+  const auto direct_access = [&] {
+    auto *result = direct_word(move, word, payload);
+    if (code_transitions_ && word.code_event != nullptr) {
+      auto *events = builder_.CreateOr(load(8, owner_events_slot), word.code_event);
+      store(events, owner_events_slot);
+    }
+    return result;
+  };
+  if (operands.callback == nullptr) { return direct_access(); }
   auto *direct = llvm::BasicBlock::Create(module_.getContext(), "memory.native", function_);
   auto *callback = llvm::BasicBlock::Create(module_.getContext(), "cold.memory.io", function_);
   auto *failed = llvm::BasicBlock::Create(module_.getContext(), "cold.io.fault", function_);
@@ -2409,7 +2466,7 @@ llvm::Value *Lowering::memory_word(const Values &values,
   auto *done = llvm::BasicBlock::Create(module_.getContext(), "memory.complete", function_);
   builder_.CreateCondBr(builder_.CreateIsNotNull(word.host), direct, callback);
   builder_.SetInsertPoint(direct);
-  auto *native_word = direct_word(move, word, payload);
+  auto *native_word = direct_access();
   auto *native_done = builder_.GetInsertBlock();
   builder_.CreateBr(done);
   builder_.SetInsertPoint(callback);
@@ -4768,7 +4825,7 @@ void Lowering::finish(Values values, std::uint32_t next, bool partial) {
   llvm::Value *done = builder_.CreateOr(
       builder_.CreateICmpEQ(values[instruction_remaining_value], builder_.getInt64(0)),
       builder_.CreateICmpEQ(values[cycle_remaining_value], builder_.getInt64(0)));
-  if (partial && runtime_io_) { done = builder_.CreateOr(done, yield_pending()); }
+  if (partial && owner_events_possible()) { done = builder_.CreateOr(done, owner_stop_pending()); }
   builder_.CreateCondBr(done, bound, missing);
   builder_.SetInsertPoint(bound);
   exit(values, builder_.getInt32(next), NativeExit::bound);
@@ -5102,10 +5159,10 @@ void Lowering::emit_instruction(std::size_t i,
       llvm::DILocation::get(module_.getContext(), op.address + 1, 0, function_->getSubprogram()));
   builder_.SetInsertPoint(admission_[i].block);
   auto values = admission_[i].values();
-  if (runtime_io_) {
-    auto *stop = llvm::BasicBlock::Create(module_.getContext(), "cold.yield", function_);
+  if (owner_events_possible()) {
+    auto *stop = llvm::BasicBlock::Create(module_.getContext(), "cold.owner.event", function_);
     auto *admit = llvm::BasicBlock::Create(module_.getContext(), "admission", function_);
-    builder_.CreateCondBr(yield_pending(), stop, admit);
+    builder_.CreateCondBr(owner_stop_pending(), stop, admit);
     builder_.SetInsertPoint(stop);
     exit(values, builder_.getInt32(op.address), NativeExit::bound);
     builder_.SetInsertPoint(admit);
@@ -5187,8 +5244,8 @@ void Lowering::emit_instruction(std::size_t i,
   llvm::Value *available = builder_.CreateAnd(
       builder_.CreateICmpNE(values[instruction_remaining_value], builder_.getInt64(0)),
       builder_.CreateICmpNE(values[cycle_remaining_value], builder_.getInt64(0)));
-  if (runtime_io_) {
-    available = builder_.CreateAnd(available, builder_.CreateNot(yield_pending()));
+  if (owner_events_possible()) {
+    available = builder_.CreateAnd(available, builder_.CreateNot(owner_stop_pending()));
   }
   builder_.CreateCondBr(available, execute, bound);
   builder_.SetInsertPoint(bound);
@@ -5216,8 +5273,22 @@ void Lowering::emit_instruction(std::size_t i,
   }
 }
 
+void Lowering::plan_code_writes() {
+  code_storage_known_ = code_storage_declared(variant_);
+  if (!code_storage_known_) { return; }
+  for (std::size_t i = 0; i < variant_.layout.regions.size(); ++i) {
+    const auto &region = variant_.layout.regions[i];
+    if (region.view == MemoryView::instruction || !region.initialized || !region.writable ||
+        region.count == 0 || host_protected(region)) {
+      continue;
+    }
+    code_alias_buses_[static_cast<std::size_t>(region.space)] |= aliases_code(variant_, i);
+  }
+}
+
 void Lowering::emit() {
   runtime_io_ = std::ranges::any_of(variant_.layout.regions, callback_region);
+  plan_code_writes();
   has_plain_loop_returns_ = std::ranges::any_of(reentry_calls_, [](const auto &site) {
     return (loop_return_payload(site.first, site.second) & return_loop_fetch) != 0;
   });
@@ -5769,14 +5840,17 @@ std::shared_ptr<const PreparedImage> lower_image(const CodeImage &image,
   for (const auto &unit : result->units) {
     const auto variant = std::ranges::find(image.variants, unit.variant, &CodeVariant::id);
     const auto &plan = variant_loops.at(unit.variant);
-    Lowering(module,
-             debug,
-             options.memory_mode,
-             abi,
-             *variant,
-             connected_code(variant_code.at(unit.variant), plan.shapes, unit.entry),
-             unit,
-             plan)
+    Lowering(
+        module,
+        debug,
+        options.memory_mode,
+        abi,
+        *variant,
+        std::ranges::any_of(image.transitions,
+                            [&](const auto &edge) { return edge.from_variant == unit.variant; }),
+        connected_code(variant_code.at(unit.variant), plan.shapes, unit.entry),
+        unit,
+        plan)
         .emit();
   }
   finalize_debug(module, debug);

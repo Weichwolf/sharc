@@ -156,19 +156,22 @@ They never reuse a host pointer computed from an obsolete I value.
 ## Boundaries and current gaps
 
 In Exact and checked fallback, denied reads/writes report `access_fault`.
-Unprepared addresses, missing callback bindings,
-unsupported views and stores whose declared storage may overlap code report
-`unsupported_feature`. Diagnostics retain image identity, guest PC, instruction
+Unprepared addresses, missing callback bindings, unsupported views and
+unqualified code-alias stores report `unsupported_feature`. Diagnostics
+retain image identity, guest PC, instruction
 and data-space/address context. The failed instruction does not retire; completed
 instructions and their effects remain. Both SIMD destinations are validated
 before a store changes memory, so a missing implicit binding produces no partial
 store. These are preparation/access boundaries, not a complete model of hardware
 memory exceptions.
 
-Declared byte aliases work for reads. Potential code-alias writes are conservatively
-refused before changing bytes. Stores also require complete initialized
-instruction-view coverage of the declared code to prove its physical backing.
-Changes to prepared instruction bytes and unchanged code-alias stores remain open.
+Declared byte aliases share the same physical storage. A checked store whose
+range may overlap prepared code compares the outgoing bytes with the declared
+instruction bytes before transfer. It can write non-code bytes and repeat
+the existing instruction bytes without invalidation. This comparison requires
+initialized instruction layouts and known physical backing. Callback paths with
+an opaque code alias are refused. A store that would change code is refused when
+the source declares no transition.
 
 An uninitialized data region calls the corresponding `Io` function on the owner
 thread with the declared bus, view and resolved word address. A payload uses
@@ -196,6 +199,16 @@ destination. An ordinary branch, return or sequential flow to a declared PC
 outside the active variant retires its completed prefix and reports
 `ExecutionState::code_transfer`. A delayed branch completes its slots and
 redirection before the handoff. Resident code continues in the active variant.
+An attempted handoff with an active delay slot or hardware loop reports the
+missing cross-variant sequencer continuation at the boundary.
+
+A checked store that changes prepared bytes revokes the active binding and
+stops at the complete instruction boundary, even when the successor was
+resident. The resolved PC must have a transition declaration. If it does not,
+the core reports a fault with the retired store and its bytes intact. A later
+I/O rejection in the same packet keeps earlier stores visible, revokes the
+binding and reports the I/O fault at the unretired instruction. A Direct
+protected access continues to rely on the consumer's page permissions.
 
 The consumer selects an allowed target with `install`. A failed installation
 leaves the pending transfer and processor progress intact. A run with a positive
