@@ -226,11 +226,8 @@ FastFP32 rounds finite inputs first and preserves the class and sign of NaN
 inputs, including extension-only payloads. Its expected effects come from the
 independent approximation and the qualified operations.
 
-Remaining observation targets include FIX/TRUNC sentinel flags, LOGB NaN,
-FPACK inexact storage and flags, and MANT with nonzero extension under RND32.
-The reciprocal and reciprocal-square-root seed probes need every ordinary
-mantissa bin and both square-root exponent parities. Shifter gaps include
-zero-source OR-shift, BTST position -1 and sign-extended empty fields.
+Shifter observation targets include zero-source OR-shift, BTST position -1
+and sign-extended empty fields.
 
 ## Floating conversion and seed observations
 
@@ -242,6 +239,12 @@ AUS when a nonzero result underflows and preserves it when the input is zero.
 Its signed scale includes the full fixed 32-bit range. FastFP32 rounds the
 floating result to binary32 using the guest rounding direction.
 
+SCALB matched the independent model in 144 cases across the first batch
+and a 336-case follow-up. The scale is a signed 32-bit fixed operand. In
+nearest rounding, an exact midpoint below minimum normal returns minimum
+normal with AUS set and AZ clear. Scaling an input signed zero or a
+denormal consumed as zero generates no AUS.
+
 A separate sweep checked 1,024 RECIPS and RSQRTS lookups in both widths and
 rounding modes. It covered the 128 RECIPS indices and both groups of 64
 RSQRTS indices. For each index the fraction matched across lower and upper
@@ -249,6 +252,10 @@ bin endpoints and different input exponents. The result exponents matched
 `-e - 1` for RECIPS and `-floor(e/2) - 1` for RSQRTS, where `e` is the
 unbiased source exponent. Seed lowering and installed-image qualification
 remain open under #24.
+
+The 244-case seed boundary follow-up also distinguishes two RECIPS zero
+results. Finite inputs with unbiased exponent 126 or 127 set AUS on signed
+zero output. Infinity inputs produce signed zero and preserve AUS.
 
 ## Primary observation tools
 
@@ -271,9 +278,9 @@ bits are MVS/MUS, while MOS remains unchanged.
 
 ADD/SUB, their absolute forms and average set AUS for nonzero underflow.
 Negate, absolute, pass, RND, selection operations and compare leave AUS
-unchanged. Average clears AV and preserves AVS. The conversion reference still
-uses the manual rule for SCALB. Scaled FLOAT sets AUS on nonzero underflow
-and AVS on overflow. Unscaled FLOAT preserves both sticky bits.
+unchanged. Average clears AV and preserves AVS. SCALB and scaled FLOAT
+set AUS on nonzero underflow and AVS on overflow. Unscaled FLOAT preserves
+both sticky bits.
 
 Ordered compare treats both zeros as equal and orders infinities normally. It
 shifts CACC independently of the numeric result, preserves other non-ALU bits,

@@ -557,7 +557,7 @@ computational inputs and results to binary32 with the guest rounding direction.
 Both identities use the raw register file and leave guest MODE1 visible.
 
 `test/isa/floating.cpp` runs independently authored instruction fields and
-5,048 paired rational expectations, split evenly between Strict and FastFP32,
+5,160 paired rational expectations, split evenly between Strict and FastFP32,
 through installed images. It checks full register state,
 arithmetic flags, comparison history, sticky flags, and progress for admitted
 blocks and partial bounds in SISD and SIMD, with alternate banks and separate
@@ -580,14 +580,16 @@ Classic FLOAT and FLOAT BY preserve signed fixed-point inputs and scale
 operands, and produce extended Strict or binary32 FastFP32 results. The
 matrix covers integer low bits, ignored raw operand extension, exact zero,
 overflow, signed underflow, and extreme scales in both widths and rounding
-modes. The other conversions, packing, seeds, floating multifunction
+modes. SCALB covers signed fixed scaling, infinity and NaN classification,
+and the midpoint where minimum normal and AUS occur together.
+The other conversions, packing, seeds, floating multifunction
 execution and floating parallel-transfer qualification remain open.
 Floating-workload performance is tracked separately from the fixed K1–K6 identities.
 
 ## S2 independent expectations (complete milestone, numerical gaps retained)
 
 `test/support/reference.py` supplies a separate exact integer/rational numeric
-model. `generate_expectations.py` checks 300 numeric/conversion/accumulator/shifter
+model. `generate_expectations.py` checks 305 numeric/conversion/accumulator/shifter
 anchors, 48,768 normal-range rounding positions and 27,648 limb-based multiplier
 cases and can emit deterministic machine-readable expectations without loading
 production code. Fixed ALU records include complete

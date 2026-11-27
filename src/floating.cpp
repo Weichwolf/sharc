@@ -79,6 +79,7 @@ private:
   Number add(FloatingOp operation, const Operands &operands);
   Number multiply(const Operands &operands);
   Number from_fixed(FloatingOp operation, const FloatingInputs &inputs);
+  Number scale(const Operand &value, llvm::Value *raw_scale);
   Number select(FloatingOp operation, const Operands &operands);
   FloatingEffects compare(const Operands &operands, const FloatingInputs &inputs);
   Number unary(FloatingOp operation, const Operand &value);
@@ -282,6 +283,20 @@ Number Floating::from_fixed(FloatingOp operation, const FloatingInputs &inputs) 
   return result;
 }
 
+Number Floating::scale(const Operand &value, llvm::Value *raw_scale) {
+  auto *exponent = ir_.CreateAdd(value.exponent, fixed_operand(raw_scale));
+  auto *at_top = ir_.CreateAdd(exponent, word(wide_bits - 1 - exponent_shift));
+  auto result =
+      pack({.magnitude = significand(value), .exponent_at_top = at_top, .sign = value.sign},
+           mode_.rnd32 || mode_.fast_fp32);
+  auto *finite = ir_.CreateNot(ir_.CreateOr(value.infinite, value.nan));
+  result.raw = ir_.CreateSelect(value.infinite, value.raw, result.raw);
+  result.overflow = ir_.CreateAnd(finite, result.overflow);
+  result.underflow = ir_.CreateAnd(finite, result.underflow);
+  result.invalid = value.nan;
+  return result;
+}
+
 llvm::Value *Floating::ordered_key(const Operand &value) {
   auto *negative = ir_.CreateICmpNE(value.sign, word(0));
   return ir_.CreateSelect(negative, ir_.CreateNot(value.magnitude), value.magnitude);
@@ -375,7 +390,8 @@ Floating::effects(FloatingOp operation, const Number &number, const FloatingInpu
   flags = ir_.CreateOr(flags, flag(number.invalid, 32));
   auto *sticky = ir_.CreateOr(inputs.sticky, flag(number.invalid, 32));
   if (!average) { sticky = ir_.CreateOr(sticky, flag(number.overflow, 2)); }
-  if (floating_arithmetic(operation) || operation == FloatingOp::float_scaled) {
+  if (floating_arithmetic(operation) || operation == FloatingOp::float_scaled ||
+      operation == FloatingOp::scale) {
     sticky = ir_.CreateOr(sticky, flag(number.underflow, 1));
   }
   return {.raw = raw,
@@ -393,6 +409,9 @@ FloatingEffects Floating::emit(FloatingOp operation, const FloatingInputs &input
     return effects(operation, number, inputs);
   }
   const auto left = operand(inputs.left);
+  if (operation == FloatingOp::scale) {
+    return effects(operation, scale(left, inputs.right), inputs);
+  }
   if (operation == FloatingOp::pass || operation == FloatingOp::negate ||
       operation == FloatingOp::absolute) {
     return effects(operation, unary(operation, left), inputs);
@@ -425,6 +444,7 @@ bool floating_alu(std::uint8_t opcode) {
     case FloatingOp::negate:
     case FloatingOp::round:
     case FloatingOp::absolute:
+    case FloatingOp::scale:
     case FloatingOp::float_fixed:
     case FloatingOp::float_scaled:
     case FloatingOp::copy_sign:

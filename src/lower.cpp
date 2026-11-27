@@ -5488,7 +5488,7 @@ std::uint32_t compute_context(const Compute &compute, ExecutionMode mode) {
     }
     if (mode == ExecutionMode::fast_fp32 || floating_arithmetic(operation) ||
         operation == FloatingOp::multiply || operation == FloatingOp::round ||
-        operation == FloatingOp::float_scaled) {
+        operation == FloatingOp::float_scaled || operation == FloatingOp::scale) {
       mask |= truncation_mode;
     }
   } else if (fixed_multiplier(compute) || compute.kind == ComputeKind::mr_transfer) {

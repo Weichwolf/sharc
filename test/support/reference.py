@@ -388,7 +388,7 @@ def _floating_order(raw: int):
 
 
 def _floating_effects(result: FloatingResult, astat: int, stky: int, *,
-                      zero_sticky: bool = False, overflow_sticky: bool = True,
+                      underflow_sticky: bool = False, overflow_sticky: bool = True,
                       absolute: bool = False, input_sign: bool = False) -> IntegerResult:
     validate_flags(astat, stky)
     x = Operand(result.raw)
@@ -397,7 +397,7 @@ def _floating_effects(result: FloatingResult, astat: int, stky: int, *,
     flags |= AN if negative else 0
     flags |= (AV if result.overflow else 0) | (AI if result.invalid else 0)
     flags |= AS if input_sign else 0
-    sticky = (AUS if zero_sticky and flags & AZ else 0)
+    sticky = AUS if underflow_sticky else 0
     sticky |= (AVS if overflow_sticky and flags & AV else 0) | (AIS if flags & AI else 0)
     return IntegerResult(x.raw, (astat & ~ALU_FLAGS) | flags, stky | sticky)
 
@@ -405,7 +405,7 @@ def _floating_effects(result: FloatingResult, astat: int, stky: int, *,
 def fixed_float_effects(raw: int, mode: Mode, *, scale: int | None = None,
                         precision: int = 40, astat: int = 0, stky: int = 0) -> IntegerResult:
     result = float_from_fixed(raw, mode, scale=0 if scale is None else scale, precision=precision)
-    return _floating_effects(result, astat, stky, zero_sticky=result.underflow,
+    return _floating_effects(result, astat, stky, underflow_sticky=result.underflow,
                              overflow_sticky=scale is not None)
 
 
@@ -418,14 +418,14 @@ def floating_alu(operation: str, left: int, right: int = 0, *, mode: Mode,
         raise ValueError("scale must be a signed 32-bit integer")
     if operation == "scale" and scale is None:
         raise ValueError("SCALB requires a scale factor")
-    zero_sticky, overflow_sticky, absolute, input_sign = False, True, False, False
+    underflow_sticky, overflow_sticky, absolute, input_sign = False, True, False, False
     if operation in ("add", "sub", "avg", "absadd", "abssub"):
         base = {"absadd": "add", "abssub": "sub"}.get(operation, operation)
         result = floating(base, left, right, mode)
         absolute = operation in ("absadd", "abssub")
         if absolute and not result.invalid:
             result = FloatingResult(result.raw & ~SIGN, result.overflow, result.underflow)
-        zero_sticky, overflow_sticky = result.underflow, operation != "avg"
+        underflow_sticky, overflow_sticky = result.underflow, operation != "avg"
     elif operation == "float":
         return fixed_float_effects(left, mode, scale=scale, astat=astat, stky=stky)
     elif operation == "round":
@@ -464,10 +464,10 @@ def floating_alu(operation: str, left: int, right: int = 0, *, mode: Mode,
                 result = FloatingResult(raw)
         absolute = operation == "abs"
         input_sign = absolute and x.negative and x.kind != "nan"
-        zero_sticky = operation == "scale"
+        underflow_sticky = operation == "scale" and result.underflow
     else:
         raise Unqualified(f"unmodeled floating ALU operation: {operation}")
-    return _floating_effects(result, astat, stky, zero_sticky=zero_sticky,
+    return _floating_effects(result, astat, stky, underflow_sticky=underflow_sticky,
                              overflow_sticky=overflow_sticky, absolute=absolute,
                              input_sign=input_sign)
 

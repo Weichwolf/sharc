@@ -68,6 +68,16 @@ ALU = [
      {"scale": 1}, IntegerResult(0x7F7FFFFFFF, 0x402, 2)),
     ("SCALB infinity is not finite overflow", "scale", 0x7F80000000, 0, Mode(40),
      {"scale": -0x80000000}, IntegerResult(0x7F80000000, 0x400, 0)),
+    ("SCALB preserves AUS on negative zero", "scale", 0x8000000000, 0, Mode(40),
+     {"scale": 0x7fffffff}, IntegerResult(0x8000000000, 0x405, 0)),
+    ("SCALB flushes a denormal input before applying scale", "scale", 0x8000000100, 0, Mode(40),
+     {"scale": 200}, IntegerResult(0x8000000000, 0x405, 0)),
+    ("SCALB midpoint promotes and sets AUS", "scale", 0x3F7FFFFFFF, 0, Mode(40),
+     {"scale": -126}, IntegerResult(0x0080000000, 0x400, 1)),
+    ("SCALB with RND32 promotes midpoint and sets AUS", "scale", 0x3F7FFFFFFF, 0, Mode(32),
+     {"scale": -126}, IntegerResult(0x0080000000, 0x400, 1)),
+    ("SCALB consumes extension-only NaN in extended precision", "scale", 0xFF80000001, 0,
+     Mode(40), {"scale": 1}, IntegerResult(0xFFFFFFFFFF, 0x420, 0x20)),
     ("unscaled FLOAT zero preserves AUS", "float", 0, 0, Mode(32), {},
      IntegerResult(0, 0x401, 0)),
     ("scaled FLOAT exact zero preserves AUS", "float", 0x42, 0, Mode(32), {"scale": 0},
@@ -247,11 +257,10 @@ def unary_lattice():
                 negative_zero = operation == "neg" and value == 0
                 flags = 0xFFFFFFC0 | int(output == 0) | (int(output < 0 or negative_zero) << 2)
                 flags |= 0x10 if operation == "abs" and value < 0 else 0
-                sticky = 0x44 | int(output == 0 and operation == "scale")
                 raw = 0x8000000000 if negative_zero else encode(output)
                 require(floating_alu(operation, source, mode=mode, scale=scale,
                                      astat=0xFFFFFFFF, stky=0x44),
-                        IntegerResult(raw, flags, sticky), (operation, value, mode, scale))
+                        IntegerResult(raw, flags, 0x44), (operation, value, mode, scale))
                 count += 1
     return count
 
@@ -290,7 +299,7 @@ def installed_header():
     fields = {"add": 0x081000, "sub": 0x082000, "avg": 0x089000, "cmp": 0x08a000,
               "absadd": 0x091000, "abssub": 0x092000, "pass": 0x0a1000,
               "neg": 0x0a2000, "round": 0x0a5000, "abs": 0x0b0000,
-              "float": 0x0ca000, "float-scaled": 0x0da000,
+              "scale": 0x0bd000, "float": 0x0ca000, "float-scaled": 0x0da000,
               "copysign": 0x0e0000, "min": 0x0e1000, "max": 0x0e2000, "clip": 0x0e3000,
               "mul": 0x130000}
     unary = {"pass", "neg", "round", "abs", "float"}
@@ -317,6 +326,10 @@ def installed_header():
         (left, (options["scale"] & 0xffffffff) << 8)
         for _, name, left, _, _, options, _ in ALU if name == "float" and "scale" in options
     ]
+    anchors["scale"] = [
+        (left, ((options["scale"] & 0xffffffff) << 8) | 0x7b)
+        for _, name, left, _, _, options, _ in ALU if name == "scale"
+    ]
     fixed_edges = [
         (0, 0),
         (0x0100000157, 0xffffff8100),
@@ -324,6 +337,15 @@ def installed_header():
         (0x7fffffffef, 0x7fffffff00),
         (0x8000000042, 0x8000000000),
         (0xfeffffff57, 0x0000008000),
+    ]
+    scale_edges = [
+        (0x0080000000, 0xffffffff00),
+        (0x3f80001234, 0),
+        (0x3f7ffffe00, 0xffffff8200),
+        (0x3f80000000, 0xffffff8200),
+        (0xff80000000, 0x7fffffff00),
+        (0x3f80000000, 0x8000000000),
+        (0x3f80000000, 0x7fffffff00),
     ]
 
     def approximate(raw, mode):
@@ -341,6 +363,9 @@ def installed_header():
             scale = signed(raw_word(right)) if operation == "float-scaled" else None
             return fixed_float_effects(left, mode, scale=scale, precision=32 if fast else 40,
                                        astat=astat, stky=stky)
+        if operation == "scale":
+            return floating_alu(operation, approximate(left, mode) if fast else left,
+                                mode=mode, scale=signed(raw_word(right)), astat=astat, stky=stky)
         if fast:
             left, right = approximate(left, mode), approximate(right, mode)
         if operation == "mul":
@@ -352,9 +377,10 @@ def installed_header():
     def array(values):
         return "{" + ", ".join(f"0x{value:x}ULL" for value in values) + "}"
 
+    op_edges = {"float": fixed_edges, "float-scaled": fixed_edges, "scale": scale_edges}
     rows = []
     for operation, field in fields.items():
-        inputs = fixed_edges if operation in ("float", "float-scaled") else edges
+        inputs = op_edges.get(operation, edges)
         pairs = [(x, 0) for x, _ in inputs] if operation in unary else inputs
         for index, (left, right) in enumerate(dict.fromkeys(anchors[operation] + pairs)):
             for fast, rnd32, truncate in cartesian_product((False, True), repeat=3):
