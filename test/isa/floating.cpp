@@ -4,6 +4,7 @@
 #include "floating_cases.hpp"
 
 #include <array>
+#include <cfenv>
 #include <cstddef>
 #include <cstdint>
 #include <ios>
@@ -109,7 +110,15 @@ void verify_compare_sequence(sharc::Core &core, bool fast_mode) {
   finished.astat = fast_mode ? equal_twice : greater_twice;
   constexpr auto count = static_cast<std::uint32_t>(comparison_program.size());
   fixture::boundary(expected, {.pc = initial.pc + count, .clock = count});
-  fixture::check(fixture::completed(core.run(count), count, count) && core.registers() == expected,
+  // The midpoint would compare greater after upward host rounding in FastFP32.
+  const auto host_rounding = std::fegetround();
+  fixture::check(host_rounding != -1 && std::fesetround(FE_UPWARD) == 0,
+                 "could not select upward host rounding");
+  const auto result = core.run(count);
+  const auto observed_rounding = std::fegetround();
+  fixture::check(std::fesetround(host_rounding) == 0 && observed_rounding == FE_UPWARD,
+                 "installed floating compute changed host rounding");
+  fixture::check(fixture::completed(result, count, count) && core.registers() == expected,
                  "floating comparison lost the predicate, raw transfer or CACC history");
 }
 

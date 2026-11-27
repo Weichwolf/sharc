@@ -137,8 +137,8 @@ These are checks of the expectation generator, not a new CTest layer and not a
 replacement execution path for ISA tests. They do not call a fake Core or execute
 an interpreter. Installed-image ISA tests will need complete independent results,
 including all lane flags and ordered effects, before any corresponding coverage
-row can be accepted. Current installed-image coverage is limited to the fixed
-ALU and direct-branch subsets listed in `isa-coverage.md`.
+row can be accepted. See `isa-coverage.md` for installed-image coverage by
+instruction family and execution mode.
 
 ## Unqualified numerical cases
 
