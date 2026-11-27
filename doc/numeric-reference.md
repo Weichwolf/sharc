@@ -1103,6 +1103,23 @@ Programming Reference, p. 4-50, says writes outside a counted DO have no
 effect. Buffered short counted loops, indexed wide loads also writing a
 live LADDR, and competing refill or asynchronous events remain open.
 
+## Loop address stack write observations
+
+In 66 authored CCES 2.12.1 ADSP-21489 simulator probes, LADDR writes left
+an empty stack untouched. On a manually occupied stack, register and
+immediate moves replaced the top address word and preserved CURLCNTR and
+LCNTR. PEx selected the write, including for a combined PX source. CCES
+selected PX2, whereas the general system-register moves in Programming
+Reference 2.4, p. 2-16, specify PX1.
+
+On DM and PM, absolute wide loads placed the upper word in LADDR and
+preserved CURLCNTR. Indexed wide loads placed the low word in LADDR and
+the high word in CURLCNTR, with both native long views and `(LW)`. Indexed
+narrow loads used the addressed word. A post-modifying load updated its
+index when either PE was selected and wrote the stack only for PEx.
+The probes used a manually occupied stack with no reachable endpoint.
+Changing a live endpoint or termination condition still needs qualification.
+
 ## Fixed multiplier details
 
 The raw accumulator has 80 bits. Inputs use the upper 32 bits of each data
