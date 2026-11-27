@@ -1003,6 +1003,32 @@ miss stretched the execute interval to the successor. An installed-image
 comparison at `517befa` gave intervals of one cycle for both buses and
 retired the three-instruction sequence in three base cycles for both.
 
+### PC stack top writes
+
+Thirty-eight register and immediate write probes and 64 memory load
+probes ran in the CCES 2.12.1 ADSP-21489 functional simulator. In the
+predicated cases only PEx selected the write to the shared PCSTK. A
+parallel ADD transferred the old register operand. An indexed load
+post-modified once when either lane was selected, including the PEy-only
+case that left PCSTK unchanged.
+
+Absolute long-word loads used the upper word for PCSTK and kept PCSTKP.
+Indexed long-word loads also wrote PCSTKP from the upper word when PEx
+was selected. This held on both buses and for a long-word view and the
+`(LW)` normal-word override. The Core currently refuses that indexed
+form when it would write PCSTKP. The simulator took PX2 for the combined
+`PCSTK = PX` source. The Core uses the PX1 rule for DAG and system
+registers from Programming Reference 2.4, p. 2-16. Silicon readback of
+the combined PX source and the 26-bit PCSTK tags remains unverified.
+
+The control probes redirected RTS after a PCSTK write in either CALL
+delay slot and after a write immediately before RTS. A write immediately
+before CALL updated the previous frame and CALL pushed its own return
+address. The first slot could read the original return address before
+the second slot replaced it. With PCSTKP at zero or 31, the simulator
+returned its empty PCSTK value and ignored the write. The Core uses
+`0x03ffffff` for the empty projection and keeps the stored cells.
+
 ## Fixed multiplier details
 
 The raw accumulator has 80 bits. Inputs use the upper 32 bits of each data

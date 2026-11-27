@@ -781,6 +781,13 @@ forms. Installed fixtures cover the executing address in a delay slot, raw
 PC-stack tags, empty-stack values, a CALL and return across a snapshot,
 and the loop sequencer's early pop. Stack observers inside a hardware loop
 use the per-instruction path. See [sequencer register reads](numeric-reference.md#sequencer-register-reads).
+PCSTK accepts type 5a and 17a writes and types 3a, 14a and 15a loads
+in the qualified views. Native fixtures check the shared X predicate,
+the 26-bit raw value, empty and overflowed pointers, absolute long-word
+selection and snapshot replay after replacing the return address in either
+CALL delay slot. Writes to sequencer-owned frames and indexed long-word
+loads that would also write PCSTKP fail explicitly.
+See [PC stack top writes](numeric-reference.md#pc-stack-top-writes).
 Other system-register writes and their pipeline effects, FADDR/DADDR
 reads and unresolved event semantics remain open. See
 [the simulator probes](numeric-reference.md#control-register-read-operands)

@@ -178,7 +178,9 @@ enum class NativeExit : std::uint8_t {
   interrupt_return_slots,
   interrupt_return_redirect,
   invalid_fifo,
-  unsupported_memory_width
+  unsupported_memory_width,
+  unsupported_pc_stack_write,
+  unsupported_pc_stack_wide_load
 };
 using NativeEntry = void (*)(void **, std::uint64_t *);
 using RegisterPointers = std::vector<void *>;

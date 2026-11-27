@@ -497,6 +497,16 @@ struct Core::Impl {
         result = fail(FaultReason::unsupported_feature,
                       "PC stack underflow, overflow or tagged continuation is not implemented");
         break;
+      case detail::NativeExit::unsupported_pc_stack_write:
+      case detail::NativeExit::unsupported_pc_stack_wide_load:
+        result = fail(FaultReason::unsupported_feature,
+                      reason == detail::NativeExit::unsupported_pc_stack_write
+                          ? "PCSTK write to a sequencer-owned frame"
+                          : "indexed long-word PCSTK load also writes PCSTKP");
+        result.fault.instruction = control[detail::fault_instruction];
+        result.fault.instruction_bits = detail::full_instruction_bits;
+        state.fault = result.fault;
+        break;
       case detail::NativeExit::unsupported_loop_stack:
         result = fail(FaultReason::unsupported_feature, "invalid or exhausted hardware loop stack");
         result.fault.instruction = control[detail::fault_instruction];

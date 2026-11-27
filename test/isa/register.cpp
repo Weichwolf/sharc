@@ -490,6 +490,126 @@ void sequencer_register_reads() {
   }
 }
 
+constexpr std::uint32_t pc_stack_immediate = 0x89ab1234;
+
+struct PcStackWrite {
+  std::uint8_t depth;
+  unsigned predicate;
+};
+
+void verify_pc_stack_writes(sharc::Core &core, PcStackWrite input) {
+  const auto [depth, predicate] = input;
+  constexpr std::uint32_t reg_word = 0xf3245678;
+  constexpr std::uint64_t y_word = 0x8765432100;
+  constexpr std::uint32_t low_px = 0x02c01234;
+  constexpr std::uint64_t raw_px = 0x01d0abcd00000000 | low_px;
+  sharc::Registers expected;
+  expected.pc = base;
+  expected.mode1 = 1U << simd_bit;
+  expected.pc_stack_pointer = depth;
+  expected.pc_stack.fill(base + 1);
+  expected.pe[0].astat = predicate & 1;
+  expected.pe[1].astat = predicate >> 1;
+  expected.pe[0].data[0][6] = (std::uint64_t{reg_word} << 8) | extension;
+  expected.pe[1].data[0][6] = y_word;
+  expected.px = raw_px;
+  core.set_registers(expected);
+  const bool occupied = depth != 0 && depth <= sharc::Registers::pc_stack_capacity;
+  const auto old_top = occupied ? expected.pc_stack[depth - 1] : empty_pc_stack;
+  const auto after_move = occupied && (predicate & 1) != 0 ? reg_word & empty_pc_stack : old_top;
+  const auto after_immediate = occupied ? pc_stack_immediate & empty_pc_stack : old_top;
+  if (occupied) { expected.pc_stack[depth - 1] = low_px; }
+  for (auto &pe : expected.pe) {
+    pe.data[0][4] = std::uint64_t{after_move} << 8;
+    pe.data[0][5] = std::uint64_t{after_immediate} << 8;
+  }
+  fixture::boundary(expected, {.pc = base + 5, .clock = 5});
+  check(fixture::completed(core.run(5), 5, 5) && core.registers() == expected,
+        "a PCSTK write lost the stack top, X predicate, raw mask, or PX1 source");
+}
+
+void pc_stack_writes() {
+  constexpr std::array<std::uint8_t, 4> depths{0, 2, sharc::Registers::pc_stack_capacity, 31};
+  const std::array words{encoding({.source = 6, .destination = pcstk_code}),
+                         encoding({.source = pcstk_code, .destination = 4}, true_condition),
+                         fixture::immediate(pcstk_code, pc_stack_immediate),
+                         encoding({.source = pcstk_code, .destination = 5}, true_condition),
+                         encoding({.source = px, .destination = pcstk_code}, true_condition)};
+  fixture::Program program(words);
+  for (const auto mode : fixture::numeric_modes) {
+    const auto native = fixture::compile(program.code, mode);
+    sharc::Core core(program.memory(), mode);
+    (void)core.install(native, fixture::Program::variant_id);
+    for (const auto depth : depths) {
+      for (unsigned predicate = 0; predicate < 4; ++predicate) {
+        verify_pc_stack_writes(core, {.depth = depth, .predicate = predicate});
+      }
+    }
+  }
+}
+
+void rewrite_delayed_return(bool first_slot) {
+  constexpr std::uint64_t call_db = 0x06be04000000;
+  constexpr std::uint64_t rts = 0x0a3e00000000;
+  constexpr auto callee = base + 5;
+  constexpr auto alternate = base + 6;
+  constexpr std::uint32_t original = (base + 3) | (1U << 24);
+  const auto write = encoding({.source = 6, .destination = pcstk_code}, true_condition);
+  const auto read = encoding({.source = pcstk_code, .destination = 4}, true_condition);
+  const std::array words{call_db | callee,
+                         first_slot ? write : read,
+                         first_slot ? read : write,
+                         std::uint64_t{0},
+                         std::uint64_t{0},
+                         rts,
+                         std::uint64_t{0}};
+  fixture::Program program(words);
+  program.code.variants.front().entries.push_back(alternate);
+  for (const auto mode : fixture::numeric_modes) {
+    const auto native = fixture::compile(program.code, mode);
+    sharc::Core core(program.memory(), mode);
+    sharc::Core replay(program.memory(), mode);
+    sharc::Registers initial;
+    initial.pc = base;
+    initial.pe[0].data[0][6] = std::uint64_t{alternate} << 8;
+    fixture::install(core, native, initial);
+    (void)replay.install(native, fixture::Program::variant_id);
+    const auto start = core.save();
+    const auto slot_read = first_slot ? alternate : original;
+    check(fixture::completed(core.run(2), 2, 2) && core.registers().pc_stack[0] == slot_read,
+          "the first CALL slot exposed the wrong stack word at its boundary");
+    replay.restore(core.save());
+    check(fixture::completed(replay.run(2), 2, 6), "the rewritten return failed after a snapshot");
+    const auto result = replay.registers();
+    check(result.pc == alternate && result.pc_stack_pointer == 0 &&
+              result.pe[0].data[0][4] == (std::uint64_t{slot_read} << 8),
+          "the slot read or RTS observed the wrong return address");
+    core.restore(start);
+    check(fixture::completed(core.run(4), 4, 8) && core.registers() == result,
+          "bounded and continuous execution disagreed on the rewritten PC stack");
+  }
+}
+
+void refuse_unimplemented_loop_stack_write() {
+  constexpr std::uint64_t do_three = 0x0c0003000007;
+  const auto write = fixture::immediate(pcstk_code, base + 2);
+  const std::array<std::uint64_t, 9> words{do_three, write};
+  fixture::Program program(words);
+  const auto native = fixture::compile(program.code, sharc::ExecutionMode::strict);
+  sharc::Core core(program.memory());
+  sharc::Registers initial;
+  initial.pc = base;
+  fixture::install(core, native, initial);
+  const auto result = core.run(words.size());
+  const auto state = core.registers();
+  check(result.has_fault && result.fault.reason == sharc::FaultReason::unsupported_feature &&
+            result.fault.address == base + 1 && result.fault.instruction == write &&
+            result.progress == sharc::Progress{.instructions = 1, .base_cycles = 1} &&
+            state.pc_stack_pointer == 1 && state.pc_stack[0] == base + 1 &&
+            state.loop_address_depth == 1,
+        "an unsupported PCSTK write changed a live DO frame or lost the exact prefix");
+}
+
 void pc_and_stack_in_delay_slots() {
   constexpr std::uint64_t call_db = 0x06be04000000;
   constexpr std::uint64_t rts = 0x0a3e00000000;
@@ -1388,6 +1508,10 @@ void register_transfers() {
   emulation_clock_wrap();
   emulation_clock_short_loop();
   sequencer_register_reads();
+  pc_stack_writes();
+  rewrite_delayed_return(true);
+  rewrite_delayed_return(false);
+  refuse_unimplemented_loop_stack_write();
   pc_and_stack_in_delay_slots();
   loop_register_reads();
   combined_px_moves();
