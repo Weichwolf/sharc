@@ -61,8 +61,8 @@ doc/architecture.md; they were paid for on cpu12 and dsp56300.
   per host at a time, including tests, benchmarks and standalone SHARC probes.
   Use `ctest -j1` and wait for each SHARC process to finish before starting the
   next one.
-- Commit reviewed increments and push them to origin/main (Weichwolf/sharc).
-  No force pushes or backup branches.
+- Commit every reviewed increment and push it to the active issue branch on
+  origin (Weichwolf/sharc). Keep the pushed branch current between increments.
 - This repository is public. Nothing from private repositories enters it: no
   firmware-derived code or data, no reconstruction notes, no text copied from
   private issues, no manufacturer documents. Refer to private issues by number
@@ -81,25 +81,21 @@ doc/architecture.md; they were paid for on cpu12 and dsp56300.
 
 ## Branches
 
-- `main` is the only long-lived branch, locally and on the remote. The remote
-  holds `main`; no review or backup branches, no tags used as backups. One
-  exception: to hand unpublished work to another developer or host, push the
-  step's work branch (`work/<issue>-<step>`) and name it in the issue. Its
-  owner deletes it on the remote when the step is published or dropped. Code
-  is handed over as a branch, never as a patch pasted into an issue.
+- `main` is the only long-lived branch. Each host or agent owns at most one
+  active branch for one open GitHub issue. Use `{hostname}/{issueid}_{issuename}`,
+  with the numeric issue ID and a branch-safe title. No force pushes, backup
+  branches or tags used as backups.
 - Local `main` equals the remote `main`. Fast-forward it (`git fetch --prune`,
   then `git merge --ff-only`) before starting work, before any measurement that
-  names a published commit, and before every push. Nothing is committed on
-  local `main` that is not pushed in the same step.
-- Unpublished work lives on at most one work branch per open step, named
-  `work/<issue>-<step>` (for example `work/37-r1`), rebased on the remote
-  `main`, without merge commits. Publishing is: fast-forward `main` to it,
-  push, delete the work branch, all in one step.
+  names a published commit, and before every push.
+- The branch owner opens the pull request with `gh pr create` after meeting
+  the issue's acceptance criteria, and merges it with `gh pr merge` into
+  `main` after required checks and approvals pass. Delete the local and remote
+  issue branch after merge, then start the next issue.
 - A measurement baseline may be a detached worktree at a published commit. It
   is removed when the result is posted.
-- A branch, worktree or stash is orphaned when its step is published, cancelled
-  or superseded, or when no open issue step names it. Orphans are deleted, not
-  archived: history on `main` and the issue record are the archive. A stash is
-  never storage.
+- A branch, worktree or stash is orphaned when its work is merged, cancelled
+  or superseded, or when no open issue owns it. Delete orphans. History on
+  `main` and the issue record are the archive. A stash is never storage.
 - At every publication `git branch` shows `main` plus the active work branches
   and `git worktree list` shows nothing else. No force pushes to `main`.
