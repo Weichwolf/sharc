@@ -759,9 +759,15 @@ Type 5a reads LCNTR, MODE1, MODE2, MMASK, FLAGS, ASTATx/y, STKYx/y, IRPTL,
 IMASK, IMASKP and LIRPTL. Types 3a, 14a and 15a also accept them as store
 sources. Installed fixtures check raw 32-bit projections, lane and bank
 selection, old flags with parallel compute, memory footprints across widths,
-and IRPTL after a DAG overflow in the same native grant. Guest writes and
-their pipeline effects, dynamic sequencer register reads and unresolved event
-semantics remain open. See [the simulator probes](numeric-reference.md#control-register-read-operands).
+and IRPTL after a DAG overflow in the same native grant. LCNTR can also be
+written by type 5a, an immediate type 17a or a load in types 3a, 14a and 15a.
+Installed tests cover masked writes, a fault in a forced pair, and immediate
+use of the preload by a type 13a DO UNTIL LCE across public execution bounds.
+An in-loop write leaves the current frame's iteration count intact.
+Other system-register writes and their pipeline effects, dynamic sequencer
+register reads and unresolved event semantics remain open. See
+[the simulator probes](numeric-reference.md#control-register-read-operands)
+and [loop preload observations](numeric-reference.md#loop-preload-writes).
 
 Remaining system UREG transfers, DAG addressing variants and silicon
 confirmation of contended register writeback are tracked in #26. Remaining

@@ -112,6 +112,14 @@ including forced normal-word pairs. ASTAT and STKY supply their counterpart
 as the high word, and an unpaired register supplies the same word twice.
 Parallel compute leaves the old status available to the store.
 
+Loads into LCNTR in types 3a, 14a and 15a use one register destination.
+The explicit predicate enables the read and writeback. An implicit-only
+post-modifying packet still advances the shared index. Short loads use SSE
+and extended loads discard the extension byte. A long load selects the upper
+word for absolute addressing and the lower word for indexed addressing. Both
+normal-word reads of a forced long pair must succeed before the register,
+parallel compute or index changes.
+
 Combined PX can transfer all 64 bits through a long-word view or a forced
 long-word access to two successive normal words. Long-word broadcast selects
 the reversed halves if its implicit transfer is selected. For an unqualified

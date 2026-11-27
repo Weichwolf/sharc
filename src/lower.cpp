@@ -124,6 +124,7 @@ enum class ControlRegister : std::uint8_t {
   imaskp = 0x7c,
   lirptl = 0x7d
 };
+constexpr auto lcntr_register = static_cast<unsigned>(ControlRegister::lcntr);
 constexpr unsigned ureg_mask = 127, byte_mask = 255;
 constexpr unsigned history_older_mask = 0xff00;
 constexpr unsigned history_loop_setup = 1U << 16;
@@ -379,6 +380,10 @@ unsigned complementary_register(unsigned reg) {
 
 bool ordinary_ureg(unsigned reg) {
   return data_register(reg) || dag_register(reg) || paired_system_register(reg);
+}
+
+bool writable_ureg(unsigned reg) {
+  return ordinary_ureg(reg) || reg == px_register || reg == lcntr_register;
 }
 
 bool astat_register(unsigned reg) {
@@ -793,8 +798,7 @@ void validate_register_move(const Instruction &instruction, std::string_view ide
   }
   const bool readable = ordinary_ureg(move.source) || move.source == px_register ||
                         readable_control_register(move.source);
-  const bool writable = ordinary_ureg(move.destination) || move.destination == px_register;
-  if (!readable || !writable || !supported_compute(instruction.compute)) {
+  if (!readable || !writable_ureg(move.destination) || !supported_compute(instruction.compute)) {
     reject(instruction,
            identity,
            FaultReason::unsupported_instruction,
@@ -825,7 +829,7 @@ void validate_return(const Instruction &instruction, std::string_view identity) 
 void validate_memory_register(const Instruction &instruction, std::string_view identity) {
   const auto move = memory_move(instruction);
   if (data_register(move.reg) || paired_system_register(move.reg) || move.reg == px_register ||
-      (move.write && readable_control_register(move.reg))) {
+      move.reg == lcntr_register || (move.write && readable_control_register(move.reg))) {
     return;
   }
   if (!dag_register(move.reg)) {
@@ -859,7 +863,7 @@ void validate_immediate_move(const Instruction &instruction, std::string_view id
     reject(instruction, identity, FaultReason::invalid_encoding, "reserved ISA immediate-move bit");
   }
   const auto reg = (instruction.word >> immediate_register_shift) & 0x7f;
-  if (ordinary_ureg(static_cast<unsigned>(reg)) || reg == px_register) { return; }
+  if (writable_ureg(static_cast<unsigned>(reg))) { return; }
   reject(instruction,
          identity,
          FaultReason::unsupported_instruction,
@@ -1162,7 +1166,8 @@ bool callback_region(const RegionLayout &layout) {
 }
 
 std::uint32_t broadcast_mode(const MemoryMove &move) {
-  if (move.write || dag_memory_read(move) || move.addressing == MemoryAddressing::absolute) {
+  if (move.write || dag_memory_read(move) || move.reg == lcntr_register ||
+      move.addressing == MemoryAddressing::absolute) {
     return 0;
   }
   if (move.index == 1) { return broadcast1_mode; }
@@ -1170,7 +1175,8 @@ std::uint32_t broadcast_mode(const MemoryMove &move) {
 }
 
 bool simd_memory_pair(const MemoryMove &move, std::uint32_t context) {
-  return !dag_memory_read(move) && move.reg != px_register && (context & simd_mode) != 0 &&
+  return !dag_memory_read(move) && (move.write || move.reg != lcntr_register) &&
+         move.reg != px_register && (context & simd_mode) != 0 &&
          (context & broadcast_mode(move)) == 0;
 }
 
@@ -2097,6 +2103,13 @@ void Lowering::write_px(llvm::Value *word, llvm::Value *enabled) {
 }
 
 void Lowering::write_system_register(unsigned reg, llvm::Value *raw, llvm::Value *selected) {
+  if (reg == lcntr_register) {
+    auto *first = builder_.getInt32(0);
+    auto *word = builder_.CreateExtractElement(fixed_word(raw), first);
+    auto *enabled = builder_.CreateExtractElement(selected, first);
+    store(builder_.CreateSelect(enabled, word, load(32, lcntr_slot)), lcntr_slot);
+    return;
+  }
   if (reg == px_register) {
     constexpr unsigned register_alignment = 24;
     auto *word = builder_.CreateExtractElement(raw, builder_.getInt32(0));
@@ -2202,8 +2215,9 @@ void Lowering::register_instruction(Values &values, const Instruction &op, const
   if (move.source == px_register && move.destination == px_register) { return; }
   auto *selected = condition(before, op);
   if (move.source == px_register &&
-      (dag_register(move.destination) || user_status(move.destination))) {
-    // The combined-register exception takes PX1, even for a paired USTAT destination.
+      (dag_register(move.destination) || user_status(move.destination) ||
+       move.destination == lcntr_register)) {
+    // These destinations take PX1 from the combined register.
     auto *x = builder_.CreateExtractElement(selected, builder_.getInt32(0));
     auto *low = builder_.CreateTrunc(load(64, px_slot), builder_.getInt32Ty());
     auto *raw = builder_.CreateShl(builder_.CreateZExt(low, builder_.getInt64Ty()),
@@ -3732,7 +3746,8 @@ void Lowering::memory_writeback(Values &values,
   }
   auto *view = operands.words[0].view;
   auto *raw = load_word(read[0], view);
-  const bool system_pair = paired_system_register(move.reg);
+  const bool loop_preload = move.reg == lcntr_register;
+  const bool system_pair = loop_preload || paired_system_register(move.reg);
   const bool absolute_system = system_pair && move.addressing == MemoryAddressing::absolute;
   auto *wide = wide_memory_view(move, view);
   if (absolute_system) {
@@ -3740,6 +3755,7 @@ void Lowering::memory_writeback(Values &values,
     raw = builder_.CreateSelect(wide, upper, raw);
   }
   write_memory_register(values, move.reg, raw, operands.selected[0]);
+  if (loop_preload) { return; }
   const auto implicit = complementary_register(move.reg);
   if (!operands.broadcast && !dag_register(move.reg) && operands.paired != builder_.getFalse()) {
     auto *other_lane =

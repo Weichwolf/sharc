@@ -995,8 +995,11 @@ void predicated_wide_implicit(sharc::ExecutionMode mode, bool force, bool write)
         "PEy-only long-word packet lost its explicit store or changed a masked load");
 }
 
-void forced_dag_load_refusal(sharc::ExecutionMode mode) {
-  constexpr std::uint64_t load = 0x52c04e801612; // IF EQ R6=R1+R2, I13=DM(I1,M3)(LW).
+void forced_register_load_refusal(sharc::ExecutionMode mode, bool loop_preload) {
+  // IF EQ R6=R1+R2, I13 or LCNTR = DM(I1,M3)(LW).
+  constexpr std::uint64_t load_i13 = 0x52c04e801612;
+  constexpr std::uint64_t load_lcntr = 0x52c074001612;
+  const auto load = loop_preload ? load_lcntr : load_i13;
   constexpr std::array<std::uint64_t, 2> payloads{0x13579bdf, 0x2468ace0};
   const std::array words{load};
   Program program(words);
@@ -1009,6 +1012,8 @@ void forced_dag_load_refusal(sharc::ExecutionMode mode) {
   device.core = &core;
   auto before = initial();
   before.mode1 = simd_bit;
+  before.lcntr = 2;
+  before.pe[0].astat = unsigned{loop_preload};
   before.pe[1].astat = 1;
   before.pe[1].data[0][1] = 4U << word_shift;
   before.pe[1].data[0][2] = 8U << word_shift;
@@ -1023,7 +1028,23 @@ void forced_dag_load_refusal(sharc::ExecutionMode mode) {
             result.fault.detail.contains(std::to_string(ram_address + 1)) && device.calls == 2 &&
             device.trace[0].address == ram_address && device.trace[1].address == ram_address + 1 &&
             core.registers() == before,
-        "forced DAG load changed state or lost the ordered callback fault");
+        "forced UREG load changed state or lost the ordered callback fault");
+
+  if (loop_preload) {
+    sharc::Core masked(memory, mode);
+    device.core = &masked;
+    device.calls = 0;
+    before.pe[0].astat = 0;
+    fixture::install(masked, native, before);
+    auto expected = before;
+    expected.pe[1].data[0][6] = 12U << word_shift;
+    expected.pe[1].astat = 0;
+    expected.dag[0][1].index += 2;
+    fixture::boundary(expected, {.pc = expected.pc + 1, .clock = 1});
+    check(fixture::completed(masked.run(1), 1, 1) && device.calls == 0 &&
+              masked.registers() == expected,
+          "PEy-only LCNTR load accessed memory or suppressed the shared DAG update");
+  }
 }
 
 void refused_combined_px(sharc::ExecutionMode mode, bool force) {
@@ -1846,7 +1867,8 @@ int main() {
       predicated_fifo_refusal(mode);
       predicated_modifier_interlock(mode);
       predicated_forced_pair(mode);
-      forced_dag_load_refusal(mode);
+      forced_register_load_refusal(mode, false);
+      forced_register_load_refusal(mode, true);
       for (const bool write : {false, true}) { short_px_third_callback_refusal(mode, write); }
       for (const bool force : {false, true}) {
         refused_combined_px(mode, force);

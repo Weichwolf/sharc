@@ -821,6 +821,26 @@ adjacent transfer conditional on TF. The flags and transfer results matched
 the per-lane operands read before the bit test. All other ASTAT bits retained
 their prior values.
 
+## Loop preload writes
+
+In 134 authored probes, the CCES 2.12.1 ADSP-21489 functional simulator
+checked register moves, immediate writes and memory loads into LCNTR.
+The explicit lane predicate controlled the register write. Parallel ADD
+preserved the old source for the move. A post-modifying load updated its
+index once when either predicate was true and kept LCNTR unchanged when
+only PEy was selected. Absolute long-word loads took the upper word.
+Indexed long-word loads took the lower word. Both results held for native
+long views and for the normal-word `(LW)` override.
+
+The simulator took PX2 for `LCNTR = PX`. Programming Reference 2.4,
+p. 2-16, explicitly specifies PX1, which the core uses. Silicon confirmation
+remains open. In the timing probes a type 13a `DO ... UNTIL LCE` immediately
+used the new value after an immediate write, register transfer, absolute DM
+load or post-modifying DM load. The clock bracket around the write and three
+five-word loop turns measured 18 clocks in every case. Adding one or two
+NOPs before the DO added one or two clocks, consistent with Table A-10's
+zero read and effect latency for LCNTR.
+
 ## Fixed multiplier details
 
 The raw accumulator has 80 bits. Inputs use the upper 32 bits of each data

@@ -1034,6 +1034,19 @@ void expect_system_store(const sharc::Registers &state,
   }
 }
 
+void expect_loop_preload(sharc::Registers &state, const RegisterMemoryCase &item, unsigned active) {
+  if ((active & 1) == 0) { return; }
+  auto word = item.form == RegisterMemoryForm::absolute && system_memory_wide(item) ? dag_high_word
+                                                                                    : dag_low_word;
+  if (item.view == sharc::MemoryView::short_word) {
+    word = static_cast<std::uint16_t>(word);
+    if ((state.mode1 & (1U << short_sign_bit)) != 0) {
+      word = static_cast<std::uint32_t>(static_cast<std::int16_t>(word));
+    }
+  }
+  state.lcntr = word;
+}
+
 void expect_system_load(sharc::Registers &state,
                         const RegisterMemoryCase &item,
                         unsigned active,
@@ -1073,7 +1086,9 @@ sharc::Registers system_memory_state(const RegisterMemoryCase &item,
   constexpr std::uint32_t imask_seed = 0x0abff000;
   const auto broadcast =
       item.space == sharc::MemorySpace::program ? broadcast9_bit : broadcast1_bit;
-  const auto mode = ((controls.flags & 1) << simd_bit) | (((controls.flags >> 1) & 1) << broadcast);
+  const auto mode = ((controls.flags & 1) << simd_bit) |
+                    (((controls.flags >> 1) & 1) << broadcast) |
+                    (((controls.flags >> 2) & 1) << short_sign_bit);
   auto state = initial({.index = controls.index, .mode = mode});
   if (controls.write) { state.pc += 2; }
   state.px = px_seed;
@@ -1103,6 +1118,8 @@ void verify_system_memory_case(sharc::Core &core,
   auto expected_ram = seed;
   if (controls.write) {
     expect_system_store(before, expected_ram, item, active);
+  } else if (item.reg == lcntr_port) {
+    expect_loop_preload(expected, item, active);
   } else {
     const auto read = broadcast && !simd && active != 0 ? 3U : active;
     expect_system_load(expected, item, read, broadcast);
@@ -1158,7 +1175,9 @@ void system_memory_access(const RegisterMemoryCase &item,
   (void)core.install(native, fixture::Program::variant_id);
   const bool conditional =
       item.form == RegisterMemoryForm::pre || item.form == RegisterMemoryForm::post;
-  for (unsigned flags = 0; flags < 4; ++flags) {
+  const auto configurations =
+      item.reg == lcntr_port && item.view == sharc::MemoryView::short_word ? 8U : 4U;
+  for (unsigned flags = 0; flags < configurations; ++flags) {
     for (unsigned predicates = conditional ? 0U : 3U; predicates < 4; ++predicates) {
       for (const bool write : {false, true}) {
         if (store_only && !write) { continue; }
@@ -1170,6 +1189,35 @@ void system_memory_access(const RegisterMemoryCase &item,
       }
     }
   }
+}
+
+void loop_preload_memory(sharc::ExecutionMode mode) {
+  using enum RegisterMemoryForm;
+  using enum sharc::MemorySpace;
+  using enum sharc::MemoryView;
+  constexpr std::array cases{
+      RegisterMemoryCase{
+          .form = absolute, .space = data, .view = long_word, .reg = lcntr_port, .width = 8},
+      RegisterMemoryCase{.form = absolute,
+                         .space = program,
+                         .view = normal_word,
+                         .reg = lcntr_port,
+                         .width = 4,
+                         .force = true},
+      RegisterMemoryCase{
+          .form = immediate, .space = program, .view = long_word, .reg = lcntr_port, .width = 8},
+      RegisterMemoryCase{
+          .form = immediate, .space = data, .view = extended, .reg = lcntr_port, .width = 5},
+      RegisterMemoryCase{
+          .form = post, .space = data, .view = short_word, .reg = lcntr_port, .width = 2},
+      RegisterMemoryCase{.form = post,
+                         .space = program,
+                         .view = normal_word,
+                         .reg = lcntr_port,
+                         .width = 4,
+                         .force = true},
+  };
+  for (const auto &item : cases) { system_memory_access(item, mode); }
 }
 
 void control_memory_stores(sharc::ExecutionMode mode) {
@@ -1309,6 +1357,7 @@ void memory_access() {
     predicated_short_lane(mode);
     dag_memory_access(mode);
     system_memory_access(mode);
+    loop_preload_memory(mode);
     control_memory_stores(mode);
     store_live_alu_status(mode);
     for (const auto space : {sharc::MemorySpace::data, sharc::MemorySpace::program}) {

@@ -19,6 +19,7 @@ constexpr unsigned condition_shift = 33, simd_bit = 21;
 constexpr unsigned shadow_first = 0x50, true_condition = 31, i8_code = 0x18;
 constexpr unsigned px = 0x6b, px1 = 0x6c, px2 = 0x6d;
 constexpr std::array ustat{0x70U, 0x71U, 0x7eU, 0x7fU};
+constexpr unsigned lcntr_code = 0x68;
 constexpr unsigned mode1_code = 0x72, astat_x_code = 0x76, astat_y_code = 0x77;
 constexpr unsigned stky_x_code = 0x78, stky_y_code = 0x79, irptl_code = 0x7a;
 constexpr std::array lane_status_codes{astat_x_code, astat_y_code, stky_x_code, stky_y_code};
@@ -30,7 +31,7 @@ struct ScalarControl {
 };
 
 constexpr std::array scalar_controls{
-    ScalarControl{.code = 0x68, .member = &sharc::Registers::lcntr, .seed = 0x1234},
+    ScalarControl{.code = lcntr_code, .member = &sharc::Registers::lcntr, .seed = 0x1234},
     ScalarControl{.code = mode1_code, .member = &sharc::Registers::mode1, .seed = 0},
     ScalarControl{.code = 0x73, .member = &sharc::Registers::mmask, .seed = 0x17abcdef},
     ScalarControl{.code = 0x74, .member = &sharc::Registers::mode2, .seed = 0x0400},
@@ -130,6 +131,10 @@ void write(sharc::Registers &state, unsigned reg, bool implicit, std::uint64_t r
     return;
   }
   const auto value = static_cast<std::uint32_t>(raw >> 8);
+  if (reg == lcntr_code) {
+    state.lcntr = value;
+    return;
+  }
   if (px_half(reg)) {
     constexpr unsigned word_bits = 32;
     const auto shift = ((reg == px2) != implicit) ? word_bits : 0U;
@@ -309,6 +314,16 @@ void control_reads() {
   }
 }
 
+void loop_preload_moves() {
+  constexpr unsigned i12 = 0x1c;
+  std::vector<Move> moves;
+  for (const auto source :
+       {6U, shadow_first + 6, i12, ustat[1], px, px1, astat_y_code, lcntr_code}) {
+    moves.push_back({.source = source, .destination = lcntr_code});
+  }
+  verify_moves(moves);
+}
+
 void read_latched_dag_overflow() {
   constexpr std::uint64_t modify_i7_by_one = 0x160700000001;
   constexpr std::uint32_t overflow = 1U << 20;
@@ -398,6 +413,7 @@ void parallel_priority() {
                              Move{.source = 0, .destination = px2},
                              Move{.source = px, .destination = ustat[0]},
                              Move{.source = ustat[3], .destination = px},
+                             Move{.source = 0, .destination = lcntr_code},
                              Move{.source = 0x50, .destination = 0, .swap = true}};
   const auto exercise = [](const Move &move) {
     const std::array words{encoding(move) | add_r0_r2_r3};
@@ -466,7 +482,7 @@ void immediate_registers(unsigned quarter) {
 }
 
 void system_immediates() {
-  verify_immediates({ustat[0], ustat[1], ustat[2], ustat[3], px1, px2, px});
+  verify_immediates({ustat[0], ustat[1], ustat[2], ustat[3], px1, px2, px, lcntr_code});
 }
 
 enum class UserBitAction : std::uint8_t { set, clear, toggle, test, compare };
@@ -966,6 +982,7 @@ void register_transfers() {
   raw_moves();
   system_moves();
   control_reads();
+  loop_preload_moves();
   read_latched_dag_overflow();
   combined_px_moves();
   combined_px_aliases();

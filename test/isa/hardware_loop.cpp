@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <sharc/core.hpp>
 #include <span>
 #include <vector>
@@ -133,19 +134,28 @@ void counted_turn(Timeline &trace, unsigned turn, bool repeats) {
   tail(trace, {.start = base + 1, .end = base + 5}, repeats);
 }
 
-void counted_case(std::uint64_t setup, sharc::Registers registers, std::uint32_t count) {
+void counted_case(std::uint64_t setup,
+                  sharc::Registers registers,
+                  std::uint32_t count,
+                  std::optional<std::uint64_t> preload = {}) {
   constexpr auto end = base + 5;
-  const std::array words{setup | 5,
+  const std::array words{preload.value_or(0),
+                         setup | 5,
                          fixture::add(0, 0, 1),
                          std::uint64_t{0},
                          std::uint64_t{0},
                          std::uint64_t{0},
                          std::uint64_t{0},
                          std::uint64_t{0}};
-  fixture::Program program(words);
+  if (preload) { --registers.pc; }
+  fixture::Program program(std::span{words}.subspan(preload ? 0U : 1U), registers.pc);
   registers.pe[0].data[0][1] = 1U << raw_shift;
   Timeline trace{.registers = registers, .prefixes = {}};
   trace.registers.lcntr = count;
+  if (preload) {
+    trace.boundary(base);
+    trace.record();
+  }
   entered(trace, {.address = counted_address | end, .count = count});
   const auto turns = count == 0 ? 2U : count;
   for (unsigned turn = 1; turn <= turns; ++turn) {
@@ -182,6 +192,39 @@ void counted_forms() {
   registers.mode1 = alternate_dag2;
   registers.dag[1][8].index = count;
   counted_case(do_i8, registers, count);
+  constexpr unsigned lcntr = 0x68;
+  counted_case(do_lce, starting(), count, fixture::immediate(lcntr, count));
+  registers = starting();
+  registers.pe[0].data[0][9] = (count << raw_shift) | raw_extension;
+  constexpr std::uint64_t from_r9 = 0x70beb4000000; // LCNTR = R9.
+  counted_case(do_lce, registers, count, from_r9);
+}
+
+void write_preload_in_active_loop() {
+  constexpr unsigned lcntr = 0x68;
+  constexpr unsigned count = 3;
+  constexpr unsigned instructions = 1 + (5 * count);
+  constexpr std::array words{do_immediate | (std::uint64_t{count} << count_shift) | 5,
+                             fixture::immediate(lcntr, 1),
+                             fixture::add(0, 0, 1),
+                             std::uint64_t{0},
+                             std::uint64_t{0},
+                             std::uint64_t{0},
+                             std::uint64_t{0}};
+  fixture::Program program(words);
+  auto initial = starting();
+  initial.pe[0].data[0][1] = 1U << raw_shift;
+  for (const auto mode : fixture::numeric_modes) {
+    const auto native = fixture::compile(program.code, mode);
+    sharc::Core core(program.memory(), mode);
+    fixture::install(core, native, initial);
+    const auto report = core.run(instructions);
+    const auto state = core.registers();
+    check(fixture::completed(report, instructions, instructions) && state.lcntr == 1 &&
+              state.pe[0].data[0][0] == (count << raw_shift) &&
+              state.pc == base + words.size() - 1 && state.loop_counter_depth == 0,
+          "writing LCNTR inside a DO changed the active loop count");
+  }
 }
 
 struct ShortBoundary {
@@ -4214,6 +4257,7 @@ void short_loop_call_cases() {
 
 void fixture::hardware_loop_control_flow() {
   counted_forms();
+  write_preload_in_active_loop();
   single_word_loops();
   multiword_short_loops();
   single_word_arithmetic();
