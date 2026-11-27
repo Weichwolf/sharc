@@ -73,7 +73,8 @@ inline constexpr std::size_t interrupt_mask_slot = flags_slot + 1;
 inline constexpr std::size_t interrupt_mask_pointer_slot = interrupt_mask_slot + 1;
 inline constexpr std::size_t extended_interrupt_slot = interrupt_mask_pointer_slot + 1;
 inline constexpr std::size_t astat_effect_slot = extended_interrupt_slot + 1;
-inline constexpr std::size_t register_pointer_count = astat_effect_slot + 1;
+inline constexpr std::size_t loop_retarget_slot = astat_effect_slot + 1;
+inline constexpr std::size_t register_pointer_count = loop_retarget_slot + 1;
 inline constexpr std::uint8_t owner_yield_event = 1;
 inline constexpr std::uint8_t code_write_event = 2;
 
@@ -88,6 +89,7 @@ inline constexpr std::uint32_t loop_pc_index_mask = 31;
 inline constexpr std::uint32_t loop_frame_live = 1U << 5;
 inline constexpr std::uint32_t loop_repeat_scheduled = 1U << 6;
 inline constexpr std::uint32_t loop_counter_written = 1U << 7;
+inline constexpr std::uint32_t loop_retarget_live = maximum_pc + 1U;
 inline constexpr unsigned loop_fetch_distance = 4;
 inline constexpr unsigned loop_decode_distance = 2;
 inline constexpr unsigned loop_refill_end_shift = 24;

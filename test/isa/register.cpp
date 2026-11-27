@@ -597,6 +597,107 @@ void loop_address_writes() {
   }
 }
 
+struct LoopAddressEdit {
+  unsigned site, endpoint, instructions, early, old, late;
+  bool missed{}, committed{}, immediate{};
+};
+
+void rewrite_loop_address(const LoopAddressEdit &edit) {
+  constexpr unsigned old_end = 13;
+  constexpr unsigned early_end = 11;
+  constexpr unsigned late_end = 15;
+  constexpr unsigned source = 6;
+  constexpr std::uint64_t do_three = 0x0c0003000000;
+  constexpr std::uint32_t counted = 0xef000000;
+  const auto replacement = counted | (base + edit.endpoint);
+  std::array<std::uint64_t, late_end + 2> words{};
+  words.front() = do_three | old_end;
+  words[edit.site] = edit.immediate
+                         ? fixture::immediate(laddr_code, replacement)
+                         : encoding({.source = source, .destination = laddr_code}, true_condition);
+  words[early_end] = fixture::add(2, 2, 1);
+  words[old_end] = fixture::add(3, 3, 1);
+  words[late_end] = fixture::add(4, 4, 1);
+  fixture::Program program(words);
+  for (const auto mode : fixture::numeric_modes) {
+    const auto native = fixture::compile(program.code, mode);
+    sharc::Core core(program.memory(), mode);
+    sharc::Registers before;
+    before.pc = base;
+    before.pe[0].data[0][1] = 1U << 8;
+    before.pe[0].data[0][source] = std::uint64_t{replacement} << 8;
+    fixture::install(core, native, before);
+    const auto prefix = edit.site + 1;
+    check(fixture::completed(core.run(prefix), prefix, prefix),
+          "failed to reach the LADDR write boundary");
+    const auto after_write = core.registers();
+    check(after_write.loop_address_stack[0] == replacement &&
+              (!edit.committed || after_write.faddr == base + 1),
+          "the next fetch lost the committed endpoint after rewriting LADDR");
+    sharc::Core replay(program.memory(), mode);
+    (void)replay.install(native, fixture::Program::variant_id);
+    replay.restore(core.save());
+    const auto remaining = edit.instructions - prefix;
+    check(fixture::completed(replay.run(remaining), remaining, remaining),
+          "replaying the LADDR edit did not retire the expected instructions and cycles");
+    fixture::install(core, native, before);
+    check(fixture::completed(core.run(edit.instructions), edit.instructions, edit.instructions) &&
+              core.registers() == replay.registers(),
+          "the LADDR edit changed across an execution boundary or snapshot");
+    const auto after = core.registers();
+    const auto &r = after.pe[0].data[0];
+    check(r[2] == (std::uint64_t{edit.early} << 8) && r[3] == (std::uint64_t{edit.old} << 8) &&
+              r[4] == (std::uint64_t{edit.late} << 8) && after.pc == base + late_end + 1 &&
+              after.loop_address_depth == unsigned{edit.missed} &&
+              after.loop_counter_depth == unsigned{edit.missed} &&
+              after.loop_counter_stack[0] == (edit.missed ? 3U : 0U),
+          "the rewritten loop used the wrong endpoint, counter or retirement boundary");
+  }
+}
+
+void loop_address_edits() {
+  // The distinct markers come from the early, original and late ends in the simulator probes.
+  constexpr std::array edits{
+      LoopAddressEdit{
+          .site = 6, .endpoint = 11, .instructions = 38, .early = 3, .old = 1, .late = 1},
+      LoopAddressEdit{.site = 7,
+                      .endpoint = 11,
+                      .instructions = 16,
+                      .early = 1,
+                      .old = 1,
+                      .late = 1,
+                      .missed = true},
+      LoopAddressEdit{.site = 9,
+                      .endpoint = 11,
+                      .instructions = 40,
+                      .early = 3,
+                      .old = 2,
+                      .late = 1,
+                      .committed = true},
+      LoopAddressEdit{.site = 8,
+                      .endpoint = 15,
+                      .instructions = 46,
+                      .early = 3,
+                      .old = 3,
+                      .late = 3,
+                      .immediate = true},
+      LoopAddressEdit{.site = 9,
+                      .endpoint = 15,
+                      .instructions = 44,
+                      .early = 3,
+                      .old = 3,
+                      .late = 2,
+                      .committed = true},
+      LoopAddressEdit{.site = 9,
+                      .endpoint = 13,
+                      .instructions = 42,
+                      .early = 3,
+                      .old = 3,
+                      .late = 1,
+                      .committed = true}};
+  std::ranges::for_each(edits, rewrite_loop_address);
+}
+
 void pc_stack_pointer_latency() {
   constexpr std::uint32_t first_cell = 0x1081001;
   constexpr std::uint32_t third_cell = 0x2081003;
@@ -1802,6 +1903,7 @@ void register_transfers() {
   sequencer_register_reads();
   pc_stack_writes();
   loop_address_writes();
+  loop_address_edits();
   pc_stack_pointer_latency();
   for (unsigned gap = 0; gap < 3; ++gap) { pc_stack_pointer_rts(gap); }
   pc_stack_pointer_in_delayed_return();

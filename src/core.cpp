@@ -190,6 +190,7 @@ std::optional<std::uint64_t> declared_isa_word(const CodeVariant &variant, std::
 
 struct LoopPipeline {
   std::array<std::uint32_t, detail::loop_stack_capacity> frames{};
+  std::uint32_t retarget{};
   std::uint64_t refill{};
   std::array<std::uint64_t, detail::loop_stack_capacity> counted_tails{};
   std::uint64_t short_counted_tail{};
@@ -235,7 +236,8 @@ struct LoopPipeline {
       if ((frame & detail::loop_repeat_scheduled) == 0) { continue; }
       const auto pc_slot = frame & detail::loop_pc_index_mask;
       if (pc_slot + 1 != registers.pc_stack_pointer) { continue; }
-      const auto end = registers.loop_address_stack[depth - 1] & detail::maximum_pc;
+      const auto end =
+          (retarget != 0 ? retarget : registers.loop_address_stack[depth - 1]) & detail::maximum_pc;
       const auto distance = (end - pc) & detail::maximum_pc;
       if (distance >= detail::loop_fetch_distance) { continue; }
       const auto start = registers.pc_stack[pc_slot];
@@ -404,6 +406,7 @@ struct Core::Impl {
     pointers[detail::loop_counter_depth_slot] = &state.registers.loop_counter_depth;
     pointers[detail::lcntr_slot] = &state.registers.lcntr;
     pointers[detail::loop_frames_slot] = loops.frames.data();
+    pointers[detail::loop_retarget_slot] = &loops.retarget;
     pointers[detail::loop_refill_slot] = &loops.refill;
     pointers[detail::short_loop_slot] = loops.short_loop.data();
     pointers[detail::loop_call_slot] = loops.calls.data();
@@ -524,7 +527,7 @@ struct Core::Impl {
       case detail::NativeExit::unsupported_loop_counter_write:
       case detail::NativeExit::unsupported_pm_loop_counter_write:
       case detail::NativeExit::unsupported_loop_address_write: {
-        const char *message = "LADDR write to a sequencer-owned DO frame";
+        const char *message = "unsupported LADDR edit or event in an edited DO frame";
         if (reason == detail::NativeExit::unsupported_loop_counter_write) {
           message = "CURLCNTR write to a buffered counted DO";
         } else if (reason == detail::NativeExit::unsupported_pm_loop_counter_write) {
@@ -1223,9 +1226,10 @@ bool Core::Impl::accepts_delay(std::uint32_t target) const {
 }
 
 bool Core::Impl::accepts_loop(std::uint32_t target) const {
-  return std::ranges::any_of(installed->image->loop_handoffs, [&](const auto &edge) {
-    return edge.from == variant && edge.to == target && edge.address == state.registers.pc;
-  });
+  return loops.retarget == 0 &&
+         std::ranges::any_of(installed->image->loop_handoffs, [&](const auto &edge) {
+           return edge.from == variant && edge.to == target && edge.address == state.registers.pc;
+         });
 }
 
 RunResult Core::Impl::start_transfer(const CodeTransition &edge, Progress progress) {

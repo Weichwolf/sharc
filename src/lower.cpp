@@ -520,6 +520,12 @@ bool writes_stack_pointer(const Instruction &op) {
          memory_move(op).addressing != MemoryAddressing::absolute;
 }
 
+bool edits_loop_address(const Instruction &op) {
+  return loaded_register(op) == laddr_register &&
+         (op.type == immediate_move_type ||
+          (op.type == register_move_type && op.compute.kind == ComputeKind::none));
+}
+
 bool branch(const Instruction &op) {
   return op.type == direct_branch_type || op.type == computed_branch_type ||
          op.type == return_branch_type;
@@ -1263,7 +1269,7 @@ struct BlockCost {
 };
 
 struct LoopFrame {
-  llvm::Value *index{}, *metadata{}, *matches{};
+  llvm::Value *index{}, *metadata{}, *matches{}, *address{}, *start{};
 };
 
 struct OverlappingLoopFetch {
@@ -1273,6 +1279,16 @@ struct OverlappingLoopFetch {
 
 struct LoopConditionSample {
   llvm::Value *status{}, *enabled{}, *interrupt_clocks{};
+};
+
+struct LoopFetchSample {
+  const LoopShape *shape{};
+  llvm::Value *enabled{}, *edited_end{}, *age{};
+  bool returning{};
+};
+
+struct LoopAddressWrite {
+  llvm::Value *raw{}, *selected{};
 };
 
 enum class RefillSample : std::uint8_t { instruction, whole_turn, call_return };
@@ -1339,6 +1355,7 @@ void finalize_debug(llvm::Module &module, llvm::DIBuilder &debug) {
 struct StackWrites {
   bool pointer{};
   bool loop_counter{};
+  bool loop_address{};
 };
 
 class Lowering {
@@ -1360,6 +1377,12 @@ public:
         code_transitions_(code_transitions),
         stack_pointer_effects_(stack_writes.pointer),
         loop_counter_writes_(stack_writes.loop_counter),
+        loop_address_writes_(stack_writes.loop_address &&
+                             std::ranges::any_of(loops.shapes,
+                                                 [](const auto &entry) {
+                                                   return entry.second.counted() &&
+                                                          !entry.second.short_body();
+                                                 })),
         abi_(abi),
         linked_io_(linked_io),
         unit_(unit),
@@ -1737,6 +1760,7 @@ private:
   llvm::Value *
   abort_target_in_parent(llvm::Value *target, const Values &values, llvm::Value *already_exited);
   void loop_status(Values &values, llvm::Value *depth);
+  [[nodiscard]] LoopFrame owned_loop(const Values &values);
   [[nodiscard]] LoopFrame active_loop(const Values &values, const LoopShape &shape);
   llvm::Value *repeat_scheduled(const LoopFrame &frame);
   void clear_loop_repeat(const LoopFrame &frame);
@@ -1745,6 +1769,7 @@ private:
                   llvm::Value *enabled,
                   bool returning = false,
                   llvm::Value *age = nullptr);
+  void commit_loop_fetch(Values &values, const LoopFrame &frame, LoopFetchSample sample);
   void loop_test(Values &values, const LoopShape &shape, LoopConditionSample sample);
   [[nodiscard]] llvm::Value *refill_at(llvm::Value *refill, std::uint32_t child_end);
   void overlapping_loop_fetches(Values &values,
@@ -1907,22 +1932,34 @@ private:
                                 llvm::Value *selected,
                                 bool partial);
   llvm::Value *loop_address_frame_live();
+  void prepare_loop_address_write(Values &values, const Instruction &op, LoopAddressWrite operands);
+  void guard_retargeted_loop(const Values &values,
+                             const Instruction &op,
+                             llvm::Value *lanes,
+                             PipelineEffects pipeline);
+  void sample_retargeted_loop(Values &values, std::uint32_t pc);
+  llvm::Value *decrement_loop_counter(const LoopFrame &frame);
+  void retargeted_backedge(const Values &values, std::uint32_t pc);
+  void emit_retargeted_dispatch();
   void age_loop_counter_write(const Values &values,
                               const Instruction &op,
                               llvm::Value *stall,
                               bool partial);
-  [[nodiscard]] bool loop_fetch_before_counter_write(const Instruction &op) const;
-  void sample_before_counter_write(Values &values, const Instruction &op);
+  [[nodiscard]] bool loop_fetch_before_write(const Instruction &op, bool partial) const;
+  void sample_before_loop_write(Values &values, const Instruction &op, bool partial);
   void mark_loop_counter_write(const Values &values, const Instruction &op);
   llvm::Value *stack_top(llvm::Value *depth, std::size_t slot, llvm::ConstantInt *empty_value);
   void write_register(Values &values, unsigned reg, llvm::Value *raw, llvm::Value *selected);
   void write_lane_status(Values &values, unsigned reg, llvm::Value *words, llvm::Value *selected);
-  void register_instruction(Values &values, const Instruction &op, const Values &before);
+  void
+  register_instruction(Values &values, const Instruction &op, const Values &before, bool partial);
   llvm::Value *pipeline_stall(const Values &values, const Instruction &op);
   llvm::Value *elapsed_cycles(const Values &values);
   unsigned dag_access_tag(unsigned slot, bool paired = false) const;
   llvm::Value *loop_count_loaded(const Values &values);
   llvm::Value *loaded_tag(const Values &values, const Instruction &op);
+  PipelineEffects
+  begin_pipeline(Values &values, const Instruction &op, llvm::Value *lanes, bool partial);
   void retire_pipeline(Values &values, PipelineEffects effects);
   void plan_memory();
   void plan_memory(const Instruction &op, const MemoryMove &move);
@@ -1941,6 +1978,7 @@ private:
   bool code_transitions_{}, code_storage_known_{};
   bool stack_pointer_effects_{};
   bool loop_counter_writes_{};
+  bool loop_address_writes_{};
   std::array<bool, 2> code_alias_buses_{};
   const NativeAbi &abi_;
   LinkedIoCallbacks linked_io_;
@@ -1963,6 +2001,9 @@ private:
   llvm::IRBuilder<> builder_;
   llvm::Function *function_{};
   std::map<std::uint32_t, std::size_t> addresses_;
+  std::set<std::uint32_t> loop_address_edits_;
+  Node retarget_dispatch_;
+  llvm::PHINode *retarget_start_{};
   std::set<std::uint32_t> delay_slots_;
   std::map<std::uint32_t, const Instruction *> delay_starts_, delay_ends_;
   std::map<std::uint32_t, LoopShape> loop_fetches_, loop_tests_, hardware_ends_;
@@ -2536,7 +2577,10 @@ void Lowering::write_register(Values &values,
   written_.insert(reg & 15);
 }
 
-void Lowering::register_instruction(Values &values, const Instruction &op, const Values &before) {
+void Lowering::register_instruction(Values &values,
+                                    const Instruction &op,
+                                    const Values &before,
+                                    bool partial) {
   const auto move = register_move(op);
   if (move.source == px_register && move.destination == px_register) { return; }
   auto *selected = condition(before, op);
@@ -2554,8 +2598,14 @@ void Lowering::register_instruction(Values &values, const Instruction &op, const
     auto *low = builder_.CreateTrunc(load(64, px_slot), builder_.getInt32Ty());
     auto *raw = builder_.CreateShl(builder_.CreateZExt(low, builder_.getInt64Ty()),
                                    builder_.getInt64(raw_extension_bits));
-    sample_before_counter_write(values, op);
-    write_register(values, move.destination, pair(raw, raw, 64), pair(x, builder_.getFalse(), 1));
+    auto *source = pair(raw, raw, 64);
+    auto *lanes = pair(x, builder_.getFalse(), 1);
+    if (partial && loop_address_edits_.contains(op.address)) {
+      prepare_loop_address_write(values, op, {.raw = source, .selected = lanes});
+    } else {
+      sample_before_loop_write(values, op, partial);
+    }
+    write_register(values, move.destination, source, lanes);
     return;
   }
   if (move.destination == px_register && (dag_register(move.source) || user_status(move.source) ||
@@ -2574,7 +2624,11 @@ void Lowering::register_instruction(Values &values, const Instruction &op, const
   }
   if (!move.swap) {
     auto *raw = read_register(before, op, move.source);
-    sample_before_counter_write(values, op);
+    if (partial && loop_address_edits_.contains(op.address)) {
+      prepare_loop_address_write(values, op, {.raw = raw, .selected = selected});
+    } else {
+      sample_before_loop_write(values, op, partial);
+    }
     write_register(values, move.destination, raw, selected);
     return;
   }
@@ -2685,6 +2739,16 @@ llvm::Value *Lowering::pipeline_stall(const Values &values, const Instruction &o
     stall = builder_.CreateBinaryIntrinsic(llvm::Intrinsic::umax, stall, interlock);
   }
   return stall;
+}
+
+PipelineEffects
+Lowering::begin_pipeline(Values &values, const Instruction &op, llvm::Value *lanes, bool partial) {
+  const PipelineEffects pipeline{.stall = pipeline_stall(values, op),
+                                 .tag = loaded_tag(values, op)};
+  if (partial) { guard_retargeted_loop(values, op, lanes, pipeline); }
+  age_loop_counter_write(values, op, pipeline.stall, partial);
+  apply_pc_stack_stall(values, pipeline.stall);
+  return pipeline;
 }
 
 void Lowering::retire_pipeline(Values &values, PipelineEffects effects) {
@@ -3279,7 +3343,8 @@ void Lowering::instruction(Values &values, const Instruction &op, bool partial) 
   if (loaded_register(op) == pcstkp_register) {
     guard_pc_stack_pointer_write(values, op, scalar_move_condition(values, op), partial);
   }
-  if (loaded_register(op) == laddr_register) {
+  const bool address_edit = partial && loop_address_edits_.contains(op.address);
+  if (loaded_register(op) == laddr_register && !address_edit) {
     guard_loop_address_write(values, op, scalar_move_condition(values, op), partial);
   }
   if (loaded_register(op) == curlcntr_register) { guard_loop_counter_write(values, op, partial); }
@@ -3314,8 +3379,13 @@ void Lowering::instruction(Values &values, const Instruction &op, bool partial) 
       return;
     }
     auto *raw = vector(64, word << raw_extension_bits);
-    sample_before_counter_write(values, op);
-    write_register(values, reg, raw, condition(values, true_condition));
+    auto *selected = condition(values, true_condition);
+    if (address_edit) {
+      prepare_loop_address_write(values, op, {.raw = raw, .selected = selected});
+    } else {
+      sample_before_loop_write(values, op, partial);
+    }
+    write_register(values, reg, raw, selected);
     return;
   }
   if (op.type == system_bit_type) {
@@ -3329,11 +3399,11 @@ void Lowering::instruction(Values &values, const Instruction &op, bool partial) 
   const auto before = values;
   const auto &compute = op.compute;
   if (compute.kind == ComputeKind::none) {
-    if (op.type == register_move_type) { register_instruction(values, op, before); }
+    if (op.type == register_move_type) { register_instruction(values, op, before, partial); }
     return;
   }
   compute_instruction(values, before, compute, compute_condition(before, op));
-  if (op.type == register_move_type) { register_instruction(values, op, before); }
+  if (op.type == register_move_type) { register_instruction(values, op, before, partial); }
 }
 
 void Lowering::memory_failure(const Values &values,
@@ -4267,6 +4337,65 @@ void Lowering::guard_loop_address_write(const Values &values,
       values, op, builder_.CreateNot(refused), partial, NativeExit::unsupported_loop_address_write);
 }
 
+void Lowering::prepare_loop_address_write(Values &values,
+                                          const Instruction &op,
+                                          LoopAddressWrite operands) {
+  constexpr auto counted =
+      (long_counted_loop_kind << loop_type_shift) | (loop_counter_expired << immediate_count_shift);
+  auto *write = builder_.CreateExtractElement(operands.selected, builder_.getInt32(0));
+  auto *address = builder_.CreateExtractElement(fixed_word(operands.raw), builder_.getInt32(0));
+  const auto before = owned_loop(values);
+  const auto is_long_counted = [&](llvm::Value *word) {
+    auto *tag = builder_.CreateAnd(word, builder_.getInt32(~maximum_pc));
+    auto *span =
+        builder_.CreateAnd(builder_.CreateSub(word, before.start), builder_.getInt32(maximum_pc));
+    return builder_.CreateAnd(builder_.CreateICmpEQ(tag, builder_.getInt32(counted)),
+                              builder_.CreateICmpUGE(span, builder_.getInt32(loop_fetch_distance)));
+  };
+  auto *outer = builder_.CreateAnd(
+      builder_.CreateIsNull(before.index),
+      builder_.CreateICmpEQ(load(8, loop_counter_depth_slot), builder_.getInt8(1)));
+  auto *eligible = builder_.CreateAnd(before.matches,
+                                      builder_.CreateAnd(outer, is_long_counted(before.address)));
+  eligible = builder_.CreateAnd(eligible, is_long_counted(address));
+  auto *refused = builder_.CreateAnd(loop_address_frame_live(),
+                                     builder_.CreateAnd(write, builder_.CreateNot(eligible)));
+  instruction_guard(
+      values, op, builder_.CreateNot(refused), true, NativeExit::unsupported_loop_address_write);
+  sample_before_loop_write(values, op, true);
+  const auto frame = owned_loop(values);
+  auto *unmodified = builder_.CreateIsNull(load(32, loop_retarget_slot));
+  auto *change = builder_.CreateAnd(write, builder_.CreateICmpNE(frame.address, address));
+  auto *activate = builder_.CreateAnd(frame.matches, builder_.CreateAnd(unmodified, change));
+  // If Fetch1 has committed a repeat already, keep its endpoint for this pass.
+  optional_memory(
+      activate,
+      [&] {
+        auto *end = builder_.CreateAnd(frame.address, builder_.getInt32(maximum_pc));
+        auto *latch = builder_.CreateOr(end, builder_.getInt32(loop_retarget_live));
+        return builder_.CreateStore(latch, pointer(loop_retarget_slot));
+      },
+      nullptr);
+}
+
+void Lowering::guard_retargeted_loop(const Values &values,
+                                     const Instruction &op,
+                                     llvm::Value *lanes,
+                                     PipelineEffects pipeline) {
+  if (!loop_address_writes_) { return; }
+  const bool program_bus = std::ranges::any_of(
+      memory_moves(op), [](const MemoryMove &move) { return move.space == MemorySpace::program; });
+  const bool uncertain = loop_setup(op) || idle(op) || observes_not_lce(op) ||
+                         loaded_register(op) == curlcntr_register || program_bus;
+  auto *blocks = uncertain ? builder_.getTrue() : builder_.CreateIsNotNull(pipeline.stall);
+  if (branch(op)) { blocks = builder_.CreateOr(blocks, branch_taken(lanes)); }
+  if (blocks == builder_.getFalse()) { return; }
+  auto *refused =
+      builder_.CreateAnd(blocks, builder_.CreateIsNotNull(load(32, loop_retarget_slot)));
+  instruction_guard(
+      values, op, builder_.CreateNot(refused), true, NativeExit::unsupported_loop_address_write);
+}
+
 void Lowering::age_loop_counter_write(const Values &values,
                                       const Instruction &op,
                                       llvm::Value *stall,
@@ -5115,8 +5244,8 @@ void Lowering::complete(Values values,
   retire_short_observation(op.address);
   retire_pipeline(values, pipeline);
   values[hazard_value] = builder_.getIntN(hazard_bits, condition_hazard(op));
-  if (loop_abort(op) || loop_fetches_.contains(op.address) || hardware_ends_.contains(op.address) ||
-      reentry_calls_.contains(op.address)) {
+  if ((partial && loop_address_writes_) || loop_abort(op) || loop_fetches_.contains(op.address) ||
+      hardware_ends_.contains(op.address) || reentry_calls_.contains(op.address)) {
     loop_retirement(values, op, old_status, partial);
   }
   credit(values, count, builder_.CreateAdd(count, values[extra_cycles_value]), partial);
@@ -5253,13 +5382,17 @@ bool Lowering::sequencer_boundary(std::uint32_t pc) const {
          loop_tests_.contains(pc) || hardware_ends_.contains(pc) || hardware_grants_.contains(pc) ||
          short_bodies_.contains(pc) || short_successors_.contains(pc) || aborts_.contains(pc) ||
          overlapping_fetches_.contains(pc) || jump_refills_.contains(pc) || not_lce_.contains(pc) ||
-         clock_reads_.contains(pc);
+         clock_reads_.contains(pc) || loop_address_edits_.contains(pc);
 }
 
 void Lowering::plan_hardware_loops(const LoopMap &shapes) {
   for (const auto &op : instructions_) {
     if (loop_setup(op)) { loop_setups_.insert(op.address); }
     if (reads_emuclk(op)) { clock_reads_.insert(op.address); }
+    if (loop_address_writes_ && not_lce_.empty() && edits_loop_address(op) &&
+        !delay_boundary(op.address)) {
+      loop_address_edits_.insert(op.address);
+    }
   }
   const auto sample_site = [this](std::uint32_t pc) {
     // An explicitly prepared return entry may exclude the preceding CALL.
@@ -5941,7 +6074,7 @@ void Lowering::loop_status(Values &values, llvm::Value *depth) {
       builder_.CreateInsertElement(values[sticky_value], sticky, builder_.getInt32(0));
 }
 
-LoopFrame Lowering::active_loop(const Values &values, const LoopShape &shape) {
+LoopFrame Lowering::owned_loop(const Values &values) {
   auto *depth = builder_.CreateZExt(load(8, loop_address_depth_slot), builder_.getInt32Ty());
   auto *occupied =
       builder_.CreateAnd(builder_.CreateICmpNE(depth, builder_.getInt32(0)),
@@ -5955,14 +6088,26 @@ LoopFrame Lowering::active_loop(const Values &values, const LoopShape &shape) {
   auto *live = builder_.CreateICmpNE(
       builder_.CreateAnd(metadata, builder_.getInt32(loop_frame_live)), builder_.getInt32(0));
   auto *pc_depth = builder_.CreateAdd(pc_index, builder_.getInt32(1));
-  auto *matches =
-      builder_.CreateAnd(builder_.CreateICmpEQ(address, builder_.getInt32(shape.address_word())),
-                         builder_.CreateICmpEQ(pc, builder_.getInt32(shape.start)));
-  matches =
-      builder_.CreateAnd(matches, builder_.CreateICmpEQ(pc_depth, values[pc_stack_depth_value]));
   return {.index = index,
           .metadata = metadata,
-          .matches = builder_.CreateAnd(matches, builder_.CreateAnd(occupied, live))};
+          .matches =
+              builder_.CreateAnd(builder_.CreateAnd(occupied, live),
+                                 builder_.CreateICmpEQ(pc_depth, values[pc_stack_depth_value])),
+          .address = address,
+          .start = pc};
+}
+
+LoopFrame Lowering::active_loop(const Values &values, const LoopShape &shape) {
+  auto frame = owned_loop(values);
+  auto *same = builder_.CreateAnd(
+      builder_.CreateICmpEQ(frame.address, builder_.getInt32(shape.address_word())),
+      builder_.CreateICmpEQ(frame.start, builder_.getInt32(shape.start)));
+  frame.matches = builder_.CreateAnd(frame.matches, same);
+  if (loop_address_writes_) {
+    frame.matches =
+        builder_.CreateAnd(frame.matches, builder_.CreateIsNull(load(32, loop_retarget_slot)));
+  }
+  return frame;
 }
 
 void Lowering::loop_pop(Values &values, const LoopFrame &frame) {
@@ -6094,33 +6239,39 @@ void Lowering::retire_loop_abort(Values &values, const LoopShape &shape) {
   }
 }
 
+llvm::Value *Lowering::decrement_loop_counter(const LoopFrame &frame) {
+  auto *cell = loop_cell(loop_counter_slot, frame.index);
+  auto *count = builder_.CreateLoad(builder_.getInt32Ty(), cell);
+  auto *remaining = builder_.CreateSub(count, builder_.getInt32(1));
+  auto *update = remaining;
+  if (loop_counter_writes_) {
+    auto *written = builder_.CreateAnd(frame.metadata, builder_.getInt32(loop_counter_written));
+    update = builder_.CreateSelect(builder_.CreateIsNotNull(written), count, remaining);
+  }
+  builder_.CreateStore(update, cell);
+  return remaining;
+}
+
 void Lowering::loop_fetch(Values &values,
                           const LoopShape &shape,
                           llvm::Value *enabled,
                           bool returning,
                           llvm::Value *age) {
-  const auto frame = active_loop(values, shape);
-  auto *pending = builder_.CreateAnd(frame.metadata, builder_.getInt32(loop_repeat_scheduled));
+  commit_loop_fetch(values,
+                    active_loop(values, shape),
+                    {.shape = &shape, .enabled = enabled, .age = age, .returning = returning});
+}
+
+void Lowering::commit_loop_fetch(Values &values, const LoopFrame &frame, LoopFetchSample sample) {
+  const auto *shape = sample.shape;
   auto *consider = llvm::BasicBlock::Create(module_.getContext(), "loop.fetch.end", function_);
   auto continuation = node("loop.fetch.continue");
   continuation.incoming(values, builder_.GetInsertBlock());
-  builder_.CreateCondBr(
-      builder_.CreateAnd(
-          enabled,
-          builder_.CreateAnd(frame.matches, builder_.CreateICmpEQ(pending, builder_.getInt32(0)))),
-      consider,
-      continuation.block);
+  auto *ready = builder_.CreateAnd(frame.matches, builder_.CreateNot(repeat_scheduled(frame)));
+  builder_.CreateCondBr(builder_.CreateAnd(sample.enabled, ready), consider, continuation.block);
   builder_.SetInsertPoint(consider);
-  if (shape.counted()) {
-    auto *cell = loop_cell(loop_counter_slot, frame.index);
-    auto *count = builder_.CreateLoad(builder_.getInt32Ty(), cell);
-    auto *remaining = builder_.CreateSub(count, builder_.getInt32(1));
-    auto *update = remaining;
-    if (loop_counter_writes_) {
-      auto *written = builder_.CreateAnd(frame.metadata, builder_.getInt32(loop_counter_written));
-      update = builder_.CreateSelect(builder_.CreateIsNotNull(written), count, remaining);
-    }
-    builder_.CreateStore(update, cell);
+  if (shape == nullptr || shape->counted()) {
+    auto *remaining = decrement_loop_counter(frame);
     auto *repeat = llvm::BasicBlock::Create(module_.getContext(), "loop.fetch.repeat", function_);
     auto *terminate = llvm::BasicBlock::Create(module_.getContext(), "loop.fetch.exit", function_);
     builder_.CreateCondBr(
@@ -6128,11 +6279,18 @@ void Lowering::loop_fetch(Values &values,
     builder_.SetInsertPoint(terminate);
     auto popped = values;
     loop_pop(popped, frame);
-    if (shape.has_reentry || shape.has_tail_abort || lce_endpoints_.contains(shape.end)) {
-      save_counted_tail(shape, age != nullptr ? age : builder_.getInt64(1), returning);
+    if (sample.edited_end != nullptr) { store(builder_.getInt32(0), loop_retarget_slot); }
+    if (shape != nullptr &&
+        (shape->has_reentry || shape->has_tail_abort || lce_endpoints_.contains(shape->end))) {
+      auto *age = sample.age != nullptr ? sample.age : builder_.getInt64(1);
+      save_counted_tail(*shape, age, sample.returning);
     }
     jump(continuation, popped);
     builder_.SetInsertPoint(repeat);
+  }
+  if (sample.edited_end != nullptr) {
+    auto *latch = builder_.CreateOr(sample.edited_end, builder_.getInt32(loop_retarget_live));
+    store(latch, loop_retarget_slot);
   }
   auto *metadata =
       loop_counter_writes_
@@ -6143,6 +6301,15 @@ void Lowering::loop_fetch(Values &values,
   jump(continuation, values);
   builder_.SetInsertPoint(continuation.block);
   values = continuation.values();
+}
+
+void Lowering::sample_retargeted_loop(Values &values, std::uint32_t pc) {
+  const auto frame = owned_loop(values);
+  auto *end = builder_.CreateAnd(frame.address, builder_.getInt32(maximum_pc));
+  auto *fetch = builder_.getInt32((pc + loop_fetch_distance) & maximum_pc);
+  auto *enabled = builder_.CreateAnd(builder_.CreateICmpEQ(end, fetch),
+                                     builder_.CreateIsNotNull(load(32, loop_retarget_slot)));
+  commit_loop_fetch(values, frame, {.enabled = enabled, .edited_end = end});
 }
 
 void Lowering::loop_test(Values &values, const LoopShape &shape, LoopConditionSample sample) {
@@ -6271,6 +6438,45 @@ void Lowering::loop_backedge(const Values &values,
   builder_.SetInsertPoint(next);
 }
 
+void Lowering::retargeted_backedge(const Values &values, std::uint32_t pc) {
+  const auto frame = owned_loop(values);
+  auto *matches = builder_.CreateICmpEQ(load(32, loop_retarget_slot),
+                                        builder_.getInt32(loop_retarget_live | pc));
+  auto *taken =
+      builder_.CreateAnd(matches, builder_.CreateAnd(frame.matches, repeat_scheduled(frame)));
+  auto *repeat = llvm::BasicBlock::Create(module_.getContext(), "edited.loop.backedge", function_);
+  auto *next = llvm::BasicBlock::Create(module_.getContext(), "edited.loop.next", function_);
+  builder_.CreateCondBr(taken, repeat, next);
+  builder_.SetInsertPoint(repeat);
+  clear_loop_repeat(frame);
+  auto turn = values;
+  credit(turn,
+         builder_.getInt64(1),
+         builder_.CreateAdd(builder_.getInt64(1), values[extra_cycles_value]),
+         true);
+  retarget_start_->addIncoming(frame.start, builder_.GetInsertBlock());
+  jump(retarget_dispatch_, turn);
+  builder_.SetInsertPoint(next);
+}
+
+void Lowering::emit_retargeted_dispatch() {
+  builder_.SetInsertPoint(retarget_dispatch_.block);
+  const auto values = retarget_dispatch_.values();
+  auto *unknown =
+      llvm::BasicBlock::Create(module_.getContext(), "edited.loop.undeclared", function_);
+  auto *dispatch = builder_.CreateSwitch(retarget_start_, unknown);
+  for (const auto &[end, shape] : loop_shapes_) {
+    (void)end;
+    if (!shape.counted() || shape.short_body() || !addresses_.contains(shape.start)) { continue; }
+    auto *target = llvm::BasicBlock::Create(module_.getContext(), "edited.loop.start", function_);
+    dispatch->addCase(builder_.getInt32(shape.start), target);
+    builder_.SetInsertPoint(target);
+    finish(values, shape.start, true);
+  }
+  builder_.SetInsertPoint(unknown);
+  exit(values, retarget_start_, NativeExit::undeclared);
+}
+
 void Lowering::retire_short_observation(std::uint32_t pc) {
   if (!short_successors_.contains(pc)) { return; }
   auto *live = builder_.CreateICmpNE(short_word(short_remaining), builder_.getInt64(0));
@@ -6351,19 +6557,29 @@ void Lowering::loop_retirement(Values &values,
                op.address,
                refill,
                RefillSample::instruction,
-               loop_fetch_before_counter_write(op));
+               loop_fetch_before_write(op, partial));
   mark_loop_counter_write(values, op);
+  if (partial && loop_address_writes_) {
+    if (!loop_address_edits_.contains(op.address)) { sample_retargeted_loop(values, op.address); }
+    retargeted_backedge(values, op.address);
+  }
   if (end != hardware_ends_.end()) { loop_backedge(values, op, end->second, partial); }
 }
 
-bool Lowering::loop_fetch_before_counter_write(const Instruction &op) const {
-  if (loaded_register(op) != curlcntr_register) { return false; }
+bool Lowering::loop_fetch_before_write(const Instruction &op, bool partial) const {
+  if (loaded_register(op) != curlcntr_register &&
+      !(partial && loop_address_edits_.contains(op.address))) {
+    return false;
+  }
   const auto fetch = loop_fetches_.find(op.address);
   return fetch != loop_fetches_.end() && fetch->second.counted();
 }
 
-void Lowering::sample_before_counter_write(Values &values, const Instruction &op) {
-  if (!loop_fetch_before_counter_write(op)) { return; }
+void Lowering::sample_before_loop_write(Values &values, const Instruction &op, bool partial) {
+  if (partial && loop_address_edits_.contains(op.address)) {
+    sample_retargeted_loop(values, op.address);
+  }
+  if (!loop_fetch_before_write(op, partial)) { return; }
   const auto &shape = loop_fetches_.at(op.address);
   auto *refill =
       shifted_fetches_.contains(shape.end) ? load(64, loop_refill_slot) : builder_.getInt64(0);
@@ -7015,6 +7231,9 @@ void Lowering::emit_instruction(std::size_t i,
   } else if (grant.has_value()) {
     admitted = unit_admitted(values, *grant);
   }
+  if (loop_address_writes_ && admitted != builder_.getFalse()) {
+    admitted = builder_.CreateAnd(admitted, builder_.CreateIsNull(load(32, loop_retarget_slot)));
+  }
   auto hot = values;
   // A fixed-cost loop grant proves that no incoming DAG load is pending.
   if (loop != loop_headers_.end()) { hot[dag_history_value] = builder_.getInt32(0); }
@@ -7036,10 +7255,7 @@ void Lowering::emit_instruction(std::size_t i,
   values = fast_[i].values();
   guard_fifo(values, op, false);
   auto *lanes = branch_lanes(values, op, false);
-  auto pipeline =
-      PipelineEffects{.stall = pipeline_stall(values, op), .tag = loaded_tag(values, op)};
-  age_loop_counter_write(values, op, pipeline.stall, false);
-  apply_pc_stack_stall(values, pipeline.stall);
+  auto pipeline = begin_pipeline(values, op, lanes, false);
   auto *old_status = values[status_value];
   if (branch(op)) { delayed_slot(values, op, false, old_status); }
   check_loop_end(values, op, false);
@@ -7076,9 +7292,7 @@ void Lowering::emit_instruction(std::size_t i,
   if (branch(op)) { delayed_slot(values, op, true, values[status_value]); }
   check_loop_end(values, op, true);
   lanes = branch_lanes(values, op, true);
-  pipeline = {.stall = pipeline_stall(values, op), .tag = loaded_tag(values, op)};
-  age_loop_counter_write(values, op, pipeline.stall, true);
-  apply_pc_stack_stall(values, pipeline.stall);
+  pipeline = begin_pipeline(values, op, lanes, true);
   old_status = values[status_value];
   instruction(values, op, true);
   if (!branch(op)) {
@@ -7153,9 +7367,14 @@ void Lowering::emit() {
   }
   plan_hardware_loops(loop_shapes_);
   plan_hardware_grants(loop_shapes_);
-  stack_written_ = stack_pointer_effects_ || !short_bodies_.empty() || !loop_setups_.empty() ||
-                   !hardware_ends_.empty() || !loop_fetches_.empty() || !loop_tests_.empty() ||
-                   !jump_refills_.empty() ||
+  if (loop_address_writes_) {
+    retarget_dispatch_ = node("edited.loop.dispatch");
+    llvm::IRBuilder<> dispatch_builder(retarget_dispatch_.block);
+    retarget_start_ = dispatch_builder.CreatePHI(builder_.getInt32Ty(), 2);
+  }
+  stack_written_ = loop_address_writes_ || stack_pointer_effects_ || !short_bodies_.empty() ||
+                   !loop_setups_.empty() || !hardware_ends_.empty() || !loop_fetches_.empty() ||
+                   !loop_tests_.empty() || !jump_refills_.empty() ||
                    std::ranges::any_of(instructions_, [this](const auto &op) {
                      return op.type == return_branch_type || call_branch_instruction(op) ||
                             loop_return_at(op.address, reentry_calls_) != nullptr;
@@ -7223,6 +7442,7 @@ void Lowering::emit() {
     emit_instruction(i, grants[i], dead_status[i]);
   }
   builder_.SetCurrentDebugLocation({});
+  if (loop_address_writes_) { emit_retargeted_dispatch(); }
   emit_exit();
 }
 
@@ -7813,11 +8033,12 @@ std::shared_ptr<const PreparedImage> lower_image(const CodeImage &image,
   }
   const NativeAbi abi(module, result->units, continuations);
   const auto linked_io = declare_io_callbacks(module, *result);
-  const StackWrites stack_writes{.pointer = std::ranges::any_of(instructions, writes_stack_pointer),
-                                 .loop_counter =
-                                     std::ranges::any_of(instructions, [](const Instruction &op) {
-                                       return loaded_register(op) == curlcntr_register;
-                                     })};
+  const StackWrites stack_writes{
+      .pointer = std::ranges::any_of(instructions, writes_stack_pointer),
+      .loop_counter = std::ranges::any_of(
+          instructions,
+          [](const Instruction &op) { return loaded_register(op) == curlcntr_register; }),
+      .loop_address = std::ranges::any_of(instructions, edits_loop_address)};
   for (const auto &unit : result->units) {
     const auto variant = std::ranges::find(image.variants, unit.variant, &CodeVariant::id);
     const auto &plan = variant_loops.at(unit.variant);

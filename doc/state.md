@@ -137,6 +137,9 @@ progress forward relative to the middle endpoint and preserves any outer
 decision already reached during the inner drain.
 A counted DO loads LCNTR once. The current count then evolves on the loop
 counter stack while LCNTR continues to hold the setup value.
+An admitted write to LADDR changes the raw endpoint immediately. An
+already scheduled repeat retains the earlier sampled end for its redirect
+and FADDR/DADDR observation. Snapshots retain both values across a bound.
 A qualified CALL saves a suspended terminating tail with its PC-stack entry.
 For a delayed `RTS (LR)`, the tail becomes active after the two return slots.
 An overlapping short CALL also saves the ancestor fetch position and any

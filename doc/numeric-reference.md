@@ -1133,13 +1133,26 @@ endpoint for all repeats. At `E-4` or `E-3`, the sample had already
 committed the old endpoint for the current pass. Repeating used the
 replacement on the next pass.
 
+Installed fixtures reproduce these outcomes for plain register and
+immediate writes in outermost long counted loops. Fetch1 samples the old
+address before a simultaneous write. The repeat retains its sampled
+endpoint separately from the raw stack word. The core refuses edited-loop
+sequencer events that need additional timing evidence, including taken
+branches, another DO, IDLE, interlocks, PM transfers, explicit count
+updates and a code handoff. Variants that observe `NOT LCE` retain the
+guard on active address edits pending termination-tail qualification.
+
 Sixteen arithmetic DO probes retained the endpoint and switched between
 EQ and NE. Both switches reached the condition sample when written at
 `E-3` or earlier. A write at `E-2` or later left the original condition
 in effect for that pass. These observations distinguish the fetch sample
 for an endpoint from the later decode sample for its arithmetic condition.
-The core explicitly refuses writes to a sequencer-owned frame until it
-can preserve both samples when the frame is edited.
+Twelve further probes moved the endpoint by two words and changed EQ to NE
+in the same write. A write at the original `E-4` or `E-3` retained the old
+endpoint but used the new condition on the first pass. At `E-2` both decisions
+used the old word. An early write to the shorter endpoint could repeat there.
+Missing both endpoint samples left the edited frame on the stack.
+Writes that change a sequencer-owned arithmetic frame remain open.
 
 ## Fixed multiplier details
 

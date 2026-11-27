@@ -805,7 +805,11 @@ PM timing at the sample fail explicitly. See
 LADDR accepts the same register and memory forms on empty or manually
 occupied frames. Installed fixtures check PEx selection, both memory
 buses, and paired writes to LADDR and CURLCNTR in indexed wide loads.
-Writes targeting a sequencer-owned LADDR fail explicitly. See
+Plain register and immediate writes can also move the endpoint of an
+outermost counted DO longer than four words while preserving its type and
+condition. Installed fixtures cover shorter and longer bodies, both sides
+of the fetch sample, a missed endpoint, FADDR and snapshot replay. Active
+arithmetic, nested, buffered and memory-write forms remain open. See
 [loop address stack writes](numeric-reference.md#loop-address-stack-write-observations).
 Other system-register writes and their pipeline effects, FADDR/DADDR
 reads and unresolved event semantics remain open. See
