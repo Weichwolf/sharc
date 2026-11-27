@@ -19,7 +19,11 @@
 
 namespace sharc::detail {
 namespace {
-constexpr unsigned normal_bytes = 4, code_bytes = 6;
+constexpr unsigned normal_bytes = memory_bytes(MemoryView::normal_word);
+constexpr unsigned code_bytes = memory_bytes(MemoryView::instruction);
+constexpr unsigned parcel_bytes = sizeof(std::uint16_t);
+constexpr unsigned parcels_per_instruction = code_bytes / parcel_bytes;
+constexpr unsigned byte_bits = 8;
 constexpr auto address_count = std::uint64_t{1} << 32;
 
 bool overlaps(const RegionLayout &a, const RegionLayout &b) {
@@ -64,16 +68,55 @@ void validate_storage(const Memory &memory, const PreparedImage &image, std::uin
   }
 }
 
+struct StoreSpan {
+  std::uint64_t first{}, end{}, payload{};
+};
+
+bool changes_word(const CodeSpan &span, std::uint32_t pc, std::uint64_t first, StoreSpan store) {
+  const auto parcel = std::size_t{pc - span.address} * parcels_per_instruction;
+  const auto end = std::min(store.end, first + code_bytes);
+  for (auto offset = std::max(store.first, first); offset < end; ++offset) {
+    const auto code_byte = offset - first;
+    const auto index = (code_bytes - 1 - code_byte) / parcel_bytes;
+    const auto shift = (code_byte % parcel_bytes) * byte_bits;
+    const auto expected = static_cast<std::uint8_t>(span.parcels[parcel + index] >> shift);
+    const auto actual =
+        static_cast<std::uint8_t>(store.payload >> ((offset - store.first) * byte_bits));
+    if (expected != actual) { return true; }
+  }
+  return false;
+}
+
+bool changes_layout(const CodeVariant &variant, const RegionLayout &layout, StoreSpan store) {
+  if (layout.byte_stride < code_bytes || store.end <= layout.byte_offset) { return false; }
+  const auto offset = layout.byte_offset;
+  const auto first = (std::max(store.first, offset) - offset) / layout.byte_stride;
+  const auto end = std::min(layout.count, ((store.end - 1 - offset) / layout.byte_stride) + 1);
+  for (auto index = first; index < end; ++index) {
+    const auto pc = layout.first + static_cast<std::uint32_t>(index);
+    const auto span = std::ranges::find_if(variant.spans, [pc](const CodeSpan &candidate) {
+      return pc >= candidate.address &&
+             pc - candidate.address < candidate.parcels.size() / parcels_per_instruction;
+    });
+    if (span != variant.spans.end() &&
+        changes_word(*span, pc, offset + (index * layout.byte_stride), store)) {
+      return true;
+    }
+  }
+  return false;
+}
+} // namespace
+
 bool code_storage_declared(const CodeVariant &variant) {
   for (const auto &span : variant.spans) {
     if (span.instruction_set != InstructionSet::isa) { return false; }
     auto cursor = std::uint64_t{span.address};
-    const auto end = cursor + (span.parcels.size() / 3);
+    const auto end = cursor + (span.parcels.size() / parcels_per_instruction);
     while (cursor < end) {
       auto next = cursor;
       for (const auto &layout : variant.layout.regions) {
         if (layout.space == MemorySpace::program && layout.view == MemoryView::instruction &&
-            layout.first <= cursor) {
+            layout.initialized && layout.first <= cursor) {
           next = std::max(next, std::uint64_t{layout.first} + layout.count);
         }
       }
@@ -83,7 +126,6 @@ bool code_storage_declared(const CodeVariant &variant) {
   }
   return true;
 }
-} // namespace
 
 std::string_view complete_views_error(const Memory::Views &views) {
   const auto page = sysconf(_SC_PAGESIZE);
@@ -120,6 +162,11 @@ void validate_memory_layout(const CodeVariant &variant, std::string_view identit
   const auto &regions = variant.layout.regions;
   for (std::size_t i = 0; i < regions.size(); ++i) {
     const auto &a = regions[i];
+    if (memory_bytes(a.view) == 0 ||
+        (a.space != MemorySpace::program && a.space != MemorySpace::data)) {
+      refuse(
+          FaultReason::invalid_image, identity, variant.id, a.first, "unknown memory view or bus");
+    }
     if (a.count > address_count - a.first) {
       refuse(FaultReason::invalid_image,
              identity,
@@ -127,15 +174,15 @@ void validate_memory_layout(const CodeVariant &variant, std::string_view identit
              a.first,
              "memory layout exceeds address space");
     }
-    if (a.view == MemoryView::instruction || a.count == 0) { continue; }
+    const bool instruction = a.view == MemoryView::instruction;
     for (std::size_t j = i + 1; j < regions.size(); ++j) {
       const auto &b = regions[j];
-      if (b.view != MemoryView::instruction && overlaps(a, b)) {
+      if (instruction == (b.view == MemoryView::instruction) && overlaps(a, b)) {
         refuse(FaultReason::invalid_image,
                identity,
                variant.id,
                a.first,
-               "ambiguous data memory views");
+               instruction ? "ambiguous instruction memory views" : "ambiguous data memory views");
       }
     }
   }
@@ -165,23 +212,24 @@ direct_memory(const PreparedImage &image, std::uint32_t variant_id, const Memory
   std::vector<void *> result(count * 2);
   for (std::size_t i = 0; i < count; ++i) {
     const auto &layout = variant->layout.regions[i];
-    if (!layout.initialized || layout.count == 0 || layout.view != MemoryView::normal_word) {
+    if (!layout.initialized || layout.count == 0 || layout.view == MemoryView::instruction) {
       continue;
     }
     const auto region =
         std::ranges::find(memory.regions, layout.storage_id, &MemoryRegion::storage_id);
-    if (region == memory.regions.end() || layout.byte_stride < normal_bytes ||
-        end_offset(layout, normal_bytes) > region->bytes.size()) {
+    const auto width = memory_bytes(layout.view);
+    if (region == memory.regions.end() || layout.byte_stride < width ||
+        end_offset(layout, width) > region->bytes.size()) {
       refuse(FaultReason::invalid_image,
              image.identity,
              variant_id,
              layout.first,
-             "direct normal-word storage is missing, truncated or has an invalid stride");
+             "direct storage is missing, truncated or has an invalid stride");
     }
     result[i] = region->bytes.data() + static_cast<std::size_t>(layout.byte_offset);
     result[count + i] = result[i];
     const auto space = static_cast<std::size_t>(layout.space);
-    if (space < memory.views().read.size() && layout.byte_stride == normal_bytes &&
+    if (layout.view == MemoryView::normal_word && layout.byte_stride == normal_bytes &&
         !memory.views().read[space].data.empty()) {
       const auto offset = std::uint64_t{layout.first} * normal_bytes;
       result[i] = memory.views().read[space].data.data() + offset;
@@ -194,11 +242,32 @@ direct_memory(const PreparedImage &image, std::uint32_t variant_id, const Memory
 bool aliases_code(const CodeVariant &variant, std::size_t region) {
   if (!code_storage_declared(variant)) { return true; }
   const auto &data = variant.layout.regions[region];
-  const auto data_end = end_offset(data, normal_bytes);
+  const auto data_end = end_offset(data, memory_bytes(data.view));
   return std::ranges::any_of(variant.layout.regions, [&](const auto &code) {
-    return code.view == MemoryView::instruction && code.count != 0 &&
-           code.storage_id == data.storage_id && data.byte_offset < end_offset(code, code_bytes) &&
-           code.byte_offset < data_end;
+    return code.space == MemorySpace::program && code.view == MemoryView::instruction &&
+           code.initialized && code.count != 0 && code.storage_id == data.storage_id &&
+           data.byte_offset < end_offset(code, code_bytes) && code.byte_offset < data_end;
+  });
+}
+
+bool changes_code(const CodeVariant &variant,
+                  std::uint64_t payload,
+                  MemorySpace space,
+                  std::uint32_t address) noexcept {
+  const auto &regions = variant.layout.regions;
+  const auto data = std::ranges::find_if(regions, [&](const RegionLayout &layout) {
+    return layout.space == space && layout.view != MemoryView::instruction && layout.initialized &&
+           address >= layout.first && std::uint64_t{address} - layout.first < layout.count;
+  });
+  if (data == regions.end()) { return false; }
+  const auto offset =
+      data->byte_offset + (std::uint64_t{address - data->first} * data->byte_stride);
+  const StoreSpan store{
+      .first = offset, .end = offset + memory_bytes(data->view), .payload = payload};
+  return std::ranges::any_of(regions, [&](const RegionLayout &code) {
+    return code.space == MemorySpace::program && code.view == MemoryView::instruction &&
+           code.initialized && code.storage_id == data->storage_id &&
+           changes_layout(variant, code, store);
   });
 }
 } // namespace sharc::detail

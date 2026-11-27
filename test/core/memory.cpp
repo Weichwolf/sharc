@@ -10,7 +10,9 @@
 #include <sharc/core.hpp>
 #include <sharc/memory.hpp>
 #include <span>
+#include <stdexcept>
 #include <string>
+#include <utility>
 #if defined(__linux__)
 #include "../support/word_space.hpp"
 
@@ -306,21 +308,24 @@ void code_alias_read() {
   Program program(words);
   auto &layout = program.code.code.variants[0].layout.regions.back();
   layout.storage_id = fixture::Program::storage_id;
-  layout.byte_offset = 2;
   layout.byte_stride = fixture::Program::word_bytes;
   layout.writable = false;
   const auto original = program.code.bytes;
-  const auto native = sharc::Core::compile(program.code.code);
-  sharc::Core core(program.memory());
-  auto expected = initial();
-  fixture::install(core, native, expected);
-  const auto result = core.run(1);
-  constexpr std::uint64_t projected_opcode = 0xa000000000;
-  expected.pe[0].data[0][0] = projected_opcode;
-  fixture::boundary(expected, {.pc = expected.pc + 1, .clock = 1});
-  check(fixture::completed(result, 1, 1) && core.registers() == expected &&
-            program.code.bytes == original,
-        "normal-word projection through a declared code-storage alias differs");
+  for (const auto view : {sharc::MemoryView::normal_word, sharc::MemoryView::extended}) {
+    layout.view = view;
+    layout.byte_offset = view == sharc::MemoryView::normal_word ? 2 : 1;
+    const auto native = sharc::Core::compile(program.code.code);
+    sharc::Core core(program.memory());
+    auto expected = initial();
+    fixture::install(core, native, expected);
+    const auto result = core.run(1);
+    constexpr std::uint64_t projected_opcode = 0xa000000000;
+    expected.pe[0].data[0][0] = projected_opcode;
+    fixture::boundary(expected, {.pc = expected.pc + 1, .clock = 1});
+    check(fixture::completed(result, 1, 1) && core.registers() == expected &&
+              program.code.bytes == original,
+          "data projection through a declared code-storage alias differs");
+  }
 }
 
 void layout_validation() {
@@ -331,6 +336,12 @@ void layout_validation() {
   regions.push_back(normal);
   fixture::throws<sharc::PreparationError>([&] { (void)sharc::Core::lower(program.code.code); },
                                            "ambiguous data layout accepted");
+  regions.pop_back();
+  const auto instruction = regions.front();
+  regions.push_back(instruction);
+  regions.back().initialized = false;
+  fixture::throws<sharc::PreparationError>([&] { (void)sharc::Core::lower(program.code.code); },
+                                           "overlapping direct and callback code layouts accepted");
   regions.pop_back();
   regions.back().count = std::uint64_t{1} << 32;
   fixture::throws<sharc::PreparationError>([&] { (void)sharc::Core::lower(program.code.code); },
@@ -423,6 +434,366 @@ struct ParallelProgram {
 constexpr std::uint32_t simd_bit = 1U << 21, cbufen = 1U << 24;
 constexpr std::size_t word_bytes = 4;
 constexpr unsigned word_shift = 8;
+
+void short_word_alias() {
+  constexpr auto normal_address = ram_address + 16;
+  constexpr std::uint64_t load_pm_r2 = 0xb00200000000;
+  constexpr std::uint64_t negative_offset = 0xffffffff;
+  const std::array words{load_r0, store_r0 | negative_offset, load_pm_r2};
+  fixture::Program program(words);
+  auto &regions = program.code.variants.front().layout.regions;
+  regions.push_back({.view = sharc::MemoryView::short_word,
+                     .first = ram_address,
+                     .count = 4,
+                     .storage_id = ram_id,
+                     .byte_stride = 2,
+                     .initialized = true});
+  auto alias = fixture::normal_region(normal_address, 2, ram_id);
+  regions.push_back(alias);
+  alias.space = sharc::MemorySpace::program;
+  regions.push_back(alias);
+  const auto native = sharc::Core::compile(program.code);
+  for (const bool sign : {false, true}) {
+    constexpr unsigned sse = 1U << 14;
+    constexpr std::uint32_t x_word = 0x80014433;
+    constexpr std::uint32_t y_word = 0xf1238877;
+    constexpr std::uint32_t new_x = 0x80018001;
+    constexpr std::uint32_t new_y = 0xf123f123;
+    std::array<std::byte, 2 * word_bytes> ram{};
+    fixture::put_word(ram.data(), x_word);
+    fixture::put_word(ram.data() + word_bytes, y_word);
+    sharc::Core core(program.memory(ram_id, ram));
+    auto expected = initial();
+    expected.mode1 = simd_bit | (sign ? sse : 0);
+    expected.dag[0][0].index = ram_address + 1;
+    expected.dag[0][8].index = normal_address;
+    fixture::install(core, native, expected);
+    const auto result = core.run(3);
+    constexpr std::array<std::uint64_t, 2> x_raw{0x800100, 0xffff800100};
+    constexpr std::array<std::uint64_t, 2> y_raw{0xf12300, 0xfffff12300};
+    expected.pe[0].data[0][0] = x_raw[sign ? 1U : 0U];
+    expected.pe[1].data[0][0] = y_raw[sign ? 1U : 0U];
+    expected.pe[0].data[0][2] = std::uint64_t{new_x} << word_shift;
+    expected.pe[1].data[0][2] = std::uint64_t{new_y} << word_shift;
+    fixture::boundary(expected, {.pc = expected.pc + 3, .clock = 3});
+    check(fixture::completed(result, 3, 3) && core.registers() == expected &&
+              fixture::get_word(ram.data()) == new_x &&
+              fixture::get_word(ram.data() + word_bytes) == new_y,
+          "short-word stride, SSE or PM/DM storage alias differs");
+  }
+}
+
+void wide_words() {
+  constexpr auto extended_address = ram_address + 16;
+  constexpr std::uint64_t store_s5_i1 = 0xa35500000000;
+  constexpr std::uint64_t load_r5_i1 = 0xa20500000000;
+  constexpr std::uint64_t store_s6_i2 = 0xa55600000000;
+  constexpr std::uint64_t load_r7_i2 = 0xa40700000000;
+  constexpr std::uint64_t mixed_packet = 0x22c89a800000; // R4=DM(I1,M3), R5=PM(I10,M11).
+  const std::array words{store_s5_i1, load_r5_i1, store_s6_i2, load_r7_i2, mixed_packet};
+  fixture::Program program(words);
+  auto &regions = program.code.variants.front().layout.regions;
+  constexpr unsigned extended_offset = 11;
+  regions.push_back({.view = sharc::MemoryView::long_word,
+                     .first = ram_address,
+                     .count = 1,
+                     .storage_id = ram_id,
+                     .byte_offset = 1,
+                     .byte_stride = 10,
+                     .initialized = true});
+  regions.push_back({.view = sharc::MemoryView::extended,
+                     .first = extended_address,
+                     .count = 1,
+                     .storage_id = ram_id,
+                     .byte_offset = extended_offset,
+                     .byte_stride = 6,
+                     .initialized = true});
+  auto pm = regions.back();
+  pm.space = sharc::MemorySpace::program;
+  regions.push_back(pm);
+  const auto native = sharc::Core::compile(program.code);
+  for (const bool broadcast : {false, true}) {
+    constexpr std::uint32_t broadcast1 = 1U << 23;
+    constexpr std::uint64_t raw_low = 0x2233445501;
+    constexpr std::uint64_t raw_high = 0xb1b2b3b4ab;
+    constexpr std::uint64_t raw_extended = 0x91a2b3c4d5;
+    constexpr auto guard = std::byte{0x67};
+    constexpr unsigned ram_bytes = 17;
+    std::array<std::byte, ram_bytes> ram;
+    ram.fill(guard);
+    sharc::Core core(program.memory(ram_id, ram));
+    auto expected = initial();
+    expected.mode1 = simd_bit | (broadcast ? broadcast1 : 0);
+    expected.dag[0][1].index = ram_address;
+    expected.dag[0][2].index = extended_address;
+    expected.dag[0][10].index = extended_address;
+    auto &x = expected.pe[0].data[0];
+    auto &y = expected.pe[1].data[0];
+    y[4] = raw_high;
+    y[5] = raw_low;
+    y[6] = raw_extended;
+    fixture::install(core, native, expected);
+    const auto result = core.run(4);
+    x[4] = (raw_high >> word_shift) << word_shift;
+    x[5] = (raw_low >> word_shift) << word_shift;
+    x[7] = raw_extended;
+    if (broadcast) {
+      y[4] = x[4];
+      y[5] = x[5];
+    }
+    fixture::boundary(expected, {.pc = expected.pc + 4, .clock = 4});
+    constexpr std::array expected_bytes{
+        guard,
+        std::byte{0x55},
+        std::byte{0x44},
+        std::byte{0x33},
+        std::byte{0x22},
+        std::byte{0xb4},
+        std::byte{0xb3},
+        std::byte{0xb2},
+        std::byte{0xb1},
+        guard,
+        guard,
+        std::byte{0xd5},
+        std::byte{0xc4},
+        std::byte{0xb3},
+        std::byte{0xa2},
+        std::byte{0x91},
+        guard,
+    };
+    check(fixture::completed(result, 4, 4) && core.registers() == expected && ram == expected_bytes,
+          "long or extended word transfer lost width, neighbor, broadcast or guard bytes");
+    const auto mixed = core.run(1);
+    std::swap(x[4], x[5]);
+    if (broadcast) { std::swap(y[4], y[5]); }
+    fixture::boundary(expected, {.pc = expected.pc + 1, .clock = 5});
+    check(fixture::completed(mixed, 1, 1) && core.registers() == expected && ram == expected_bytes,
+          "PM extended-word writeback overrode a DM long-word neighbor");
+  }
+}
+
+struct Peripheral {
+  struct Access {
+    sharc::MemorySpace space{};
+    std::uint32_t address{};
+    std::uint64_t word{};
+    bool writing{};
+    bool operator==(const Access &) const = default;
+  };
+
+  sharc::Core *core{};
+  sharc::MemoryView format{sharc::MemoryView::normal_word};
+  std::array<std::uint64_t, 2> words{};
+  std::array<Access, 4> trace{};
+  unsigned calls{}, refusals{}, yield_on{}, fault_on{};
+
+  bool access(sharc::MemorySpace space,
+              sharc::MemoryView view,
+              std::uint32_t address,
+              std::uint64_t &word,
+              bool writing) noexcept {
+    const auto index = address - ram_address;
+    if (view != format || index >= words.size() || calls >= trace.size()) { return false; }
+    try {
+      (void)core->run(1);
+    } catch (const std::logic_error &) { ++refusals; }
+    if (!writing) { word = words[index]; }
+    trace[calls++] = {.space = space, .address = address, .word = word, .writing = writing};
+    if (calls == yield_on) { core->request_yield(); }
+    if (calls == fault_on) { return false; }
+    if (writing) { words[index] = word; }
+    return true;
+  }
+
+  sharc::Io binding() noexcept {
+    return {.owner = this,
+            .read =
+                [](void *owner,
+                   sharc::MemorySpace space,
+                   sharc::MemoryView view,
+                   std::uint32_t address,
+                   std::uint64_t &value) noexcept {
+                  return static_cast<Peripheral *>(owner)->access(
+                      space, view, address, value, false);
+                },
+            .write =
+                [](void *owner,
+                   sharc::MemorySpace space,
+                   sharc::MemoryView view,
+                   std::uint32_t address,
+                   const std::uint64_t value) noexcept {
+                  auto word = value;
+                  return static_cast<Peripheral *>(owner)->access(space, view, address, word, true);
+                }};
+  }
+};
+
+void extended_io() {
+  const std::array words{load_r0, store_r0 | 1};
+  Program program(words);
+  auto &region = program.code.code.variants.front().layout.regions.back();
+  region.initialized = false;
+  region.view = sharc::MemoryView::extended;
+  constexpr auto mode = sharc::ExecutionMode::fast_fp32;
+  const auto native = fixture::compile(program.code.code, mode);
+  constexpr std::uint64_t device_word = 0xaabbcc123456789a;
+  constexpr std::uint64_t raw = 0x123456789a;
+  Peripheral peripheral{.format = region.view, .words = {device_word, 0}};
+  auto memory = program.code.memory();
+  memory.io = peripheral.binding();
+  sharc::Core core(memory, mode);
+  peripheral.core = &core;
+  auto expected = initial();
+  expected.mode1 = simd_bit;
+  fixture::install(core, native, expected);
+  const auto result = core.run(2);
+  expected.pe[0].data[0][0] = raw;
+  fixture::boundary(expected, {.pc = expected.pc + 2, .clock = 2});
+  check(fixture::completed(result, 2, 2) && core.registers() == expected && peripheral.calls == 2 &&
+            peripheral.words[1] == raw,
+        "extended I/O lost its declared width, raw extension or explicit lane");
+}
+
+void runtime_io() {
+  constexpr std::uint64_t device_word = 0x123456789a;
+  constexpr std::uint64_t normal = 0x3456789a;
+  constexpr unsigned marker = 9;
+  const std::array words{load_r0, store_r0 | 1, fixture::immediate(1, marker)};
+  Program program(words);
+  program.code.code.variants[0].layout.regions.back().initialized = false;
+  const auto native = sharc::Core::compile(program.code.code);
+  Peripheral peripheral{.words = {device_word, 0}, .yield_on = 1, .fault_on = 2};
+  auto memory = program.code.memory();
+  memory.io = peripheral.binding();
+  sharc::Core core(memory);
+  peripheral.core = &core;
+  auto expected = initial();
+  fixture::install(core, native, expected);
+  const auto result = core.run_until(20);
+  expected.pe[0].data[0][0] = normal << word_shift;
+  fixture::boundary(expected, {.pc = expected.pc + 1, .clock = 1});
+  constexpr auto dm = sharc::MemorySpace::data;
+  check(result.execution == sharc::ExecutionState::yielded && !result.has_fault &&
+            result.progress == sharc::Progress{.instructions = 1, .base_cycles = 1} &&
+            core.registers() == expected && peripheral.calls == 1 && peripheral.refusals == 1 &&
+            peripheral.trace[0] ==
+                Peripheral::Access{.space = dm, .address = ram_address, .word = device_word},
+        "I/O read did not complete before the synchronous yield");
+  const auto saved = core.save();
+  const auto fault = core.run(2);
+  check(fault.has_fault && fault.fault.reason == sharc::FaultReason::access_fault &&
+            fault.fault.identity == native.report().identity &&
+            fault.fault.address == expected.pc && fault.fault.instruction == words[1] &&
+            fault.fault.detail.contains(std::to_string(ram_address + 1)) &&
+            fault.progress == sharc::Progress{} && core.registers() == expected &&
+            peripheral.trace[1] ==
+                Peripheral::Access{
+                    .space = dm, .address = ram_address + 1, .word = normal, .writing = true} &&
+            peripheral.words[1] == 0 && peripheral.refusals == 2,
+        "a false I/O result retired the store or lost fault context");
+  core.restore(saved);
+  peripheral.yield_on = 3;
+  const auto retry = core.run(1);
+  fixture::boundary(expected, {.pc = expected.pc + 1, .clock = 2});
+  check(retry.execution == sharc::ExecutionState::yielded &&
+            retry.progress == sharc::Progress{.instructions = 1, .base_cycles = 1} &&
+            core.registers() == expected && peripheral.words[1] == normal,
+        "yield took effect after the instruction budget boundary or lost the store");
+  const auto finish = core.run(1);
+  check(fixture::completed(finish, 1, 1) && peripheral.calls == 3 && peripheral.refusals == 3 &&
+            core.registers().pe[0].data[0][1] == (marker << word_shift),
+        "resume after I/O re-executed the effect or skipped ordinary code");
+}
+
+void delayed_io() {
+  constexpr auto target = fixture::code_address + 4;
+  constexpr std::uint64_t jump_with_delay = 0x063e04000000 | target;
+  const std::array words{jump_with_delay,
+                         fixture::immediate(1, 1),
+                         load_r0,
+                         fixture::immediate(2, 2),
+                         fixture::immediate(3, 3)};
+  Program program(words);
+  program.code.code.variants[0].layout.regions.back().initialized = false;
+  const auto native = sharc::Core::compile(program.code.code);
+  Peripheral peripheral{.words = {7, 0}, .yield_on = 1};
+  auto memory = program.code.memory();
+  memory.io = peripheral.binding();
+  sharc::Core core(memory);
+  peripheral.core = &core;
+  fixture::install(core, native, initial());
+  const auto result = core.run(5);
+  const auto after = core.registers();
+  check(result.execution == sharc::ExecutionState::yielded &&
+            result.progress == sharc::Progress{.instructions = 3, .base_cycles = 4} &&
+            after.pc == target && after.pe[0].data[0][0] == (7U << word_shift) &&
+            after.pe[0].data[0][1] == (1U << word_shift) && after.pe[0].data[0][2] == 0 &&
+            after.pe[0].data[0][3] == 0,
+        "I/O yield lost the delayed branch or advanced into its target");
+  const auto finish = core.run(1);
+  check(fixture::completed(finish, 1, 1) && peripheral.calls == 1 &&
+            core.registers().pe[0].data[0][3] == (3U << word_shift),
+        "delayed I/O yield lost the prepared destination continuation");
+}
+
+void parallel_io() {
+  constexpr std::uint64_t packet = 0x34c89a001401; // DM store, PM load and ADD.
+  const std::array words{packet, fixture::immediate(1, 9)};
+  ParallelProgram program(words, ram_address, 2);
+  auto &regions = program.code.code.variants[0].layout.regions;
+  for (auto &region : std::span(regions).subspan(1)) { region.initialized = false; }
+  const auto native = sharc::Core::compile(program.code.code);
+  for (const bool reject : {false, true}) {
+    Peripheral peripheral{.yield_on = reject ? 0U : 1U, .fault_on = reject ? 4U : 0U};
+    auto memory = program.code.memory();
+    memory.io = peripheral.binding();
+    sharc::Core core(memory);
+    peripheral.core = &core;
+    auto expected = initial();
+    expected.mode1 = simd_bit;
+    expected.dag[0][2].index = ram_address;
+    expected.dag[0][10].index = ram_address;
+    expected.dag[0][3].modifier = 2;
+    expected.dag[0][11].modifier = 2;
+    constexpr std::array<std::uint64_t, 2> stored{11, 12};
+    constexpr unsigned extension_byte = 0xff;
+    for (unsigned lane = 0; lane < stored.size(); ++lane) {
+      expected.pe[lane].data[0][4] = (stored[lane] << word_shift) | extension_byte;
+    }
+    fixture::install(core, native, expected);
+    const auto result = core.run(2);
+    constexpr auto dm = sharc::MemorySpace::data;
+    constexpr auto pm = sharc::MemorySpace::program;
+    constexpr std::array<Peripheral::Access, 4> trace{{
+        {.space = dm, .address = ram_address, .word = stored[0], .writing = true},
+        {.space = dm, .address = ram_address + 1, .word = stored[1], .writing = true},
+        {.space = pm, .address = ram_address, .word = stored[0]},
+        {.space = pm, .address = ram_address + 1, .word = stored[1]},
+    }};
+    check(peripheral.trace == trace && peripheral.calls == trace.size() &&
+              peripheral.words == stored,
+          "parallel callbacks lost DM-before-PM or explicit-before-implicit ordering");
+    if (reject) {
+      check(result.has_fault && result.fault.reason == sharc::FaultReason::access_fault &&
+                result.fault.detail.contains(std::to_string(ram_address + 1)) &&
+                result.progress == sharc::Progress{} && core.registers() == expected,
+            "late callback rejection committed register or DAG effects");
+    } else {
+      for (unsigned lane = 0; lane < stored.size(); ++lane) {
+        expected.pe[lane].data[0][4] = stored[lane] << word_shift;
+      }
+      expected.dag[0][2].index += 2;
+      expected.dag[0][10].index += 2;
+      fixture::boundary(expected, {.pc = expected.pc + 1, .clock = 1});
+      check(result.execution == sharc::ExecutionState::yielded &&
+                result.progress == sharc::Progress{.instructions = 1, .base_cycles = 1} &&
+                core.registers().pc == expected.pc && core.registers().dag == expected.dag &&
+                core.registers().pe[0].data == expected.pe[0].data &&
+                core.registers().pe[1].data == expected.pe[1].data,
+            "yield in the first lane interrupted the memory packet");
+    }
+  }
+}
 
 void parallel_writeback() {
   // Both spaces alias. The load/load packet computes R6 = R4 + R1.
@@ -687,19 +1058,233 @@ bool read_store(void * /*owner*/,
   return true;
 }
 
-void refused_code_store(bool declared_alias) {
+enum class CodeStorage : std::uint8_t { aliased, callback, undeclared };
+
+struct CodeWriter {
+  static constexpr auto next = fixture::code_address + 1;
+  static constexpr unsigned replacement_variant = 8;
+  static constexpr unsigned before = 7;
+  static constexpr unsigned after = 12;
+  static constexpr auto offset = fixture::Program::word_bytes;
+  fixture::Program program;
+
+  explicit CodeWriter(std::uint64_t store)
+      : program(std::array{store, fixture::immediate(1, before), std::uint64_t{0}}) {
+    auto alias = fixture::normal_region(ram_address, 1, fixture::Program::storage_id);
+    alias.byte_offset = offset;
+    program.code.variants.front().layout.regions.push_back(alias);
+  }
+
+  void allow(std::uint32_t entry = next) {
+    auto target = program.code.variants.front();
+    target.id = replacement_variant;
+    target.entries = {entry};
+    constexpr auto low_parcel_of_second_word = 5;
+    target.spans.front().parcels[low_parcel_of_second_word] = after;
+    program.code.variants.push_back(target);
+    program.code.transitions.push_back({.from_variant = fixture::Program::variant_id,
+                                        .address = entry,
+                                        .to_variants = {replacement_variant}});
+  }
+};
+
+void rewrite_and_resume() {
+  constexpr std::uint64_t store_pm_r0 = 0xb10000000000;
+  for (const bool program_bus : {false, true}) {
+    CodeWriter writer(program_bus ? store_pm_r0 : store_r0);
+    auto &program = writer.program;
+    if (program_bus) {
+      auto &alias = program.code.variants.front().layout.regions.back();
+      alias.space = sharc::MemorySpace::program;
+      alias.view = sharc::MemoryView::short_word;
+      alias.byte_stride = 2;
+    }
+    writer.allow();
+    const auto native = sharc::Core::compile(program.code);
+    sharc::Core core(program.memory());
+    auto start = initial();
+    start.dag[0][8].index = ram_address;
+    start.pe[0].data[0][0] = CodeWriter::before << word_shift;
+    fixture::install(core, native, start);
+    const auto original = program.bytes;
+    check(fixture::completed(core.run(2), 2, 2) && program.bytes == original &&
+              core.registers().pe[0].data[0][1] == (CodeWriter::before << word_shift),
+          "unchanged code alias store invalidated the active variant");
+
+    start.pe[0].data[0][0] = CodeWriter::after << word_shift;
+    core.set_registers(start);
+    const auto before = core.save();
+    const auto result = core.run(10);
+    check(result.execution == sharc::ExecutionState::code_transfer && !result.has_fault &&
+              result.progress == sharc::Progress{.instructions = 1, .base_cycles = 1} &&
+              core.registers().pc == CodeWriter::next && core.registers().pe[0].data[0][1] == 0 &&
+              fixture::get_word(program.bytes.data() + CodeWriter::offset) == CodeWriter::after,
+          "code-alias write did not stop before the replaced native instruction");
+    const auto pending = core.save();
+    core.restore(before);
+    check(core.run(1).fault.reason == sharc::FaultReason::unprepared,
+          "snapshot recovered the obsolete binding after a code change");
+    fixture::throws<sharc::PreparationError>(
+        [&] { (void)core.install(native, fixture::Program::variant_id); },
+        "installation accepted the old opcode after the code change");
+    core.restore(pending);
+    (void)core.install(native, CodeWriter::replacement_variant);
+    check(fixture::completed(core.run(1), 1, 1) &&
+              core.registers().pe[0].data[0][1] == (CodeWriter::after << word_shift),
+          "code change did not resume from the prepared replacement");
+  }
+}
+
+void rewrite_without_target() {
+  CodeWriter writer(store_r0);
+  writer.allow(CodeWriter::next + 1);
+  auto &program = writer.program;
+  const auto native = sharc::Core::compile(program.code);
+  sharc::Core core(program.memory());
+  auto start = initial();
+  start.pe[0].data[0][0] = CodeWriter::after << word_shift;
+  fixture::install(core, native, start);
+  const auto saved = core.save();
+  const auto result = core.run(10);
+  check(result.has_fault && result.fault.reason == sharc::FaultReason::unsupported_feature &&
+            result.fault.address == CodeWriter::next &&
+            result.fault.identity == native.report().identity &&
+            result.progress == sharc::Progress{.instructions = 1, .base_cycles = 1} &&
+            fixture::get_word(program.bytes.data() + CodeWriter::offset) == CodeWriter::after,
+        "code write accepted a transition for the wrong continuation");
+  core.restore(saved);
+  check(core.run(1).fault.reason == sharc::FaultReason::unprepared,
+        "unsupported code rewrite retained an outdated binding");
+}
+
+void code_padding_store() {
+  CodeWriter writer(store_r0);
+  auto &program = writer.program;
+  auto &layouts = program.code.variants.front().layout.regions;
+  constexpr std::array padding{std::byte{0}, std::byte{0}};
+  layouts.front().byte_stride = CodeWriter::offset + padding.size();
+  constexpr auto second_end = std::ptrdiff_t{2} * CodeWriter::offset;
+  program.bytes.insert(program.bytes.begin() + second_end, padding.begin(), padding.end());
+  program.bytes.insert(program.bytes.begin() + CodeWriter::offset, padding.begin(), padding.end());
+  layouts.back().view = sharc::MemoryView::short_word;
+  layouts.back().byte_stride = padding.size();
+  const auto native = sharc::Core::compile(program.code);
+  sharc::Core core(program.memory());
+  auto start = initial();
+  constexpr unsigned padding_value = 0x5511;
+  constexpr std::array written_padding{std::byte{0x11}, std::byte{0x55}};
+  start.pe[0].data[0][0] = padding_value << word_shift;
+  fixture::install(core, native, start);
+  check(fixture::completed(core.run(2), 2, 2) &&
+            std::ranges::equal(std::span(program.bytes).subspan(CodeWriter::offset, padding.size()),
+                               written_padding) &&
+            core.registers().pe[0].data[0][1] == (CodeWriter::before << word_shift),
+        "a store in physical instruction padding was treated as changing code");
+}
+
+void rewrite_before_io_fault() {
+  constexpr std::uint64_t store_dm_read_pm = 0x34c89a000000;
+  CodeWriter writer(store_dm_read_pm);
+  writer.allow();
+  auto &program = writer.program;
+  auto peripheral_alias = fixture::normal_region(ram_address, 1, ram_id);
+  peripheral_alias.space = sharc::MemorySpace::program;
+  peripheral_alias.initialized = false;
+  program.code.variants.front().layout.regions.push_back(peripheral_alias);
+  auto memory = program.memory();
+  Peripheral peripheral{.fault_on = 1};
+  memory.io = peripheral.binding();
+  sharc::Core core(memory);
+  peripheral.core = &core;
+  auto start = initial();
+  start.dag[0][2].index = ram_address;
+  start.dag[0][10].index = ram_address;
+  start.pe[0].data[0][4] = CodeWriter::after << word_shift;
+  const auto native = sharc::Core::compile(program.code);
+  fixture::install(core, native, start);
+  const auto saved = core.save();
+  const auto fault = core.run(1);
+  check(fault.has_fault && fault.fault.reason == sharc::FaultReason::access_fault &&
+            fault.fault.address == start.pc && fault.progress == sharc::Progress{} &&
+            core.registers() == start && peripheral.calls == 1 &&
+            fixture::get_word(program.bytes.data() + CodeWriter::offset) == CodeWriter::after,
+        "late peripheral refusal lost the earlier code store or retired the packet");
+  core.restore(saved);
+  check(core.run(1).fault.reason == sharc::FaultReason::unprepared,
+        "late peripheral refusal retained a modified source binding");
+}
+
+void rewrite_inside_delay(bool compatible) {
+  constexpr auto slot = fixture::code_address + 2;
+  constexpr auto taken = slot + 2;
+  constexpr std::uint64_t delayed_jump = 0x063e04000000 | taken;
+  constexpr auto slot_offset = 2 * fixture::Program::word_bytes;
+  const std::array words{delayed_jump,
+                         store_r0,
+                         fixture::immediate(1, CodeWriter::before),
+                         fixture::immediate(2, 1),
+                         fixture::immediate(3, 2)};
+  fixture::Program program(words);
+  auto alias = fixture::normal_region(ram_address, 1, fixture::Program::storage_id);
+  alias.byte_offset = slot_offset;
+  program.code.variants.front().layout.regions.push_back(alias);
+  auto target = program.code.variants.front();
+  target.id = CodeWriter::replacement_variant;
+  target.entries = {slot};
+  target.spans.front().parcels[8] = CodeWriter::after;
+  if (!compatible) { target.spans.front().parcels[2] ^= 1; }
+  program.code.variants.push_back(target);
+  program.code.transitions.push_back(
+      {.from_variant = fixture::Program::variant_id, .address = slot, .to_variants = {target.id}});
+  const auto native = sharc::Core::compile(program.code);
+  sharc::Core core(program.memory());
+  auto start = initial();
+  start.pe[0].data[0][0] = CodeWriter::after << word_shift;
+  fixture::install(core, native, start);
+  const auto result = core.run(10);
+  check(result.progress == sharc::Progress{.instructions = 2, .base_cycles = 2} &&
+            core.registers().pc == slot && core.registers().pe[0].data[0][1] == 0 &&
+            fixture::get_word(program.bytes.data() + slot_offset) == CodeWriter::after,
+        "a code store executed the stale second delay slot");
+  if (!compatible) {
+    check(result.has_fault && result.fault.reason == sharc::FaultReason::unsupported_feature &&
+              result.fault.address == slot && result.fault.detail.contains("no compatible delay"),
+          "a code store accepted a destination with a different delayed branch origin");
+    return;
+  }
+  check(result.execution == sharc::ExecutionState::code_transfer && !result.has_fault,
+        "rewrite did not hand off with a live delayed branch");
+  sharc::Core replay(program.memory());
+  replay.restore(core.save());
+  (void)replay.install(native, target.id);
+  const auto second_slot = replay.run(1);
+  const auto boundary = replay.registers();
+  check(fixture::completed(second_slot, 1, 2) && boundary.pc == taken &&
+            boundary.pe[0].data[0][1] == (CodeWriter::after << word_shift) &&
+            boundary.pe[0].data[0][2] == 0,
+        "the replaced slot lost the latched redirect or its refill cycle");
+  check(fixture::completed(replay.run(1), 1, 1) &&
+            replay.registers().pe[0].data[0][3] == (2U << word_shift),
+        "the replaced slot did not continue in the prepared target code");
+}
+
+void refused_code_store(CodeStorage storage) {
   const std::array words{store_r0};
   Program program(words);
   auto &regions = program.code.code.variants[0].layout.regions;
   auto memory = program.memory();
   auto registers = initial();
-  if (declared_alias) {
+  if (storage == CodeStorage::aliased) {
     regions.back().storage_id = fixture::Program::storage_id;
     regions.back().count = 1;
     constexpr std::uint64_t raw = 0x12345678ab;
     registers.pe[0].data[0][0] = raw;
   } else {
-    regions.erase(regions.begin());
+    if (storage == CodeStorage::callback) {
+      regions.front().initialized = false;
+    } else {
+      regions.erase(regions.begin());
+    }
     memory.io.read = read_store;
   }
   const auto original = program.code.bytes;
@@ -711,8 +1296,8 @@ void refused_code_store(bool declared_alias) {
             result.fault.detail.contains("instruction storage") &&
             result.progress == sharc::Progress{} && core.registers() == registers &&
             program.code.bytes == original && program.ram == initial_ram,
-        declared_alias ? "store through a declared code alias changed state"
-                       : "store ran without a declared physical code-storage dependency");
+        storage == CodeStorage::aliased ? "store through a declared code alias changed state"
+                                        : "store ran without proven physical code storage");
 }
 } // namespace
 
@@ -726,11 +1311,17 @@ int main() {
     changing_complete_space();
 #endif
     rebound_snapshot();
-    refused_code_store(true);
+    refused_code_store(CodeStorage::aliased);
     code_alias_read();
     layout_validation();
     ordinary_region_alias();
     incomplete_simd_store();
+    short_word_alias();
+    wide_words();
+    extended_io();
+    runtime_io();
+    delayed_io();
+    parallel_io();
     parallel_writeback();
     parallel_refusal();
     parallel_circular(ram_address, ram_address);
@@ -739,6 +1330,13 @@ int main() {
     parallel_broadcast();
     parallel_interlock();
     hidden_storage_alias();
-    refused_code_store(false);
+    rewrite_and_resume();
+    rewrite_without_target();
+    code_padding_store();
+    rewrite_before_io_fault();
+    rewrite_inside_delay(true);
+    rewrite_inside_delay(false);
+    refused_code_store(CodeStorage::callback);
+    refused_code_store(CodeStorage::undeclared);
   });
 }

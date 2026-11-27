@@ -456,8 +456,20 @@ read broadcast. Full raw registers and padded storage are checked at every
 instruction/cycle prefix by `test/isa/memory.cpp`. `test/core/memory.cpp` checks
 precise access/refusal prefixes, rebinding, declared code-storage reads, protected
 code-alias writes, ambiguous/truncated layouts and missing implicit SIMD storage.
-Runtime data callbacks, post-modification, other views and actual code transitions
-remain unimplemented. See [memory.md](memory.md) for the exact storage contract.
+The core memory suite checks short-word SSE and SIMD stride, PM/DM aliases,
+long-word neighbor registers and broadcast, and raw 40-bit transfers. It checks
+declared callbacks for access order, refusal, yield, delay-slot continuation and
+replay, including 40-bit payloads. The Core control suite checks prepared
+handoffs on direct, computed and delayed control flow, rejected installations,
+generation rebinding and snapshot replay. The memory suite checks coherent
+short and normal stores through PM/DM code aliases, including unchanged bytes
+and binding revocation on a later I/O fault. It also checks transfer in a live
+delay slot. The native suite checks active counted-loop handoff and rejection of
+an incompatible loop plan through a cached, consumer-linked artifact.
+It also checks consumer-linked read and write roles through a cached artifact,
+including owner binding, yield after retirement, access fault and replay.
+Forced long-word encodings remain open. See
+[memory.md](memory.md) for the exact storage contract.
 
 Classic type 19 implements immediate MODIFY/BITREV, including distinct source
 and destination I registers. The source B/L define circular adjustment before

@@ -152,6 +152,7 @@ struct CodeVariant {
 };
 
 struct CodeTransition {
+  // The destination PC must be an entry in each listed target variant.
   std::uint32_t from_variant{}, address{};
   std::vector<std::uint32_t> to_variants;
 };
@@ -162,6 +163,7 @@ struct CodeImage {
 };
 
 struct CallbackBinding {
+  // The read and write roles name consumer-linked functions using the runtime I/O ABI.
   std::string role, symbol;
 };
 

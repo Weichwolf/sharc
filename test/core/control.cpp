@@ -8,6 +8,7 @@
 #include <sharc/core.hpp>
 #include <sharc/memory.hpp>
 #include <span>
+#include <stdexcept>
 
 namespace {
 using fixture::check;
@@ -98,6 +99,131 @@ void missing_target() {
             result.fault.address == missing &&
             result.progress == sharc::Progress{.instructions = 1, .base_cycles = 4},
         "missing branch target did not preserve the completed prefix");
+}
+
+struct Handoff {
+  static constexpr std::uint32_t target = 0x400;
+  static constexpr std::uint32_t destination = 8;
+  static constexpr std::uint32_t alternate = 9;
+  static constexpr std::uint32_t storage = 10;
+  static constexpr unsigned raw_shift = 8;
+  static constexpr std::array destination_words{fixture::immediate(1, 7)};
+
+  fixture::Program source;
+  fixture::Program destination_code{destination_words, target};
+
+  explicit Handoff(std::span<const std::uint64_t> source_words) : source(source_words) {
+    auto code = destination_code.code.variants.front();
+    code.id = destination;
+    code.layout.regions.front().storage_id = storage;
+    source.code.variants.push_back(code);
+    code.id = alternate;
+    code.spans.front().parcels.back() ^= 1;
+    source.code.variants.push_back(code);
+    source.code.transitions.push_back({.from_variant = fixture::Program::variant_id,
+                                       .address = target,
+                                       .to_variants = {destination, alternate}});
+  }
+
+  sharc::Memory memory() { return source.memory(storage, destination_code.bytes); }
+};
+
+void pending_handoff() {
+  constexpr std::uint64_t jump = 0x063e00000000 | Handoff::target;
+  const std::array words{fixture::immediate(0, 6), jump};
+  Handoff program(words);
+  const auto native = sharc::Core::compile(program.source.code);
+  auto memory = program.memory();
+  sharc::Core core(memory);
+  sharc::Registers expected;
+  expected.pc = fixture::code_address;
+  fixture::install(core, native, expected);
+  const auto before = core.save();
+  const auto first = core.run(2);
+  expected.pe[0].data[0][0] = 6U << Handoff::raw_shift;
+  fixture::boundary(expected, {.pc = Handoff::target, .clock = 5});
+  constexpr sharc::Progress prefix{.instructions = 2, .base_cycles = 5};
+  check(first.execution == sharc::ExecutionState::code_transfer && !first.has_fault &&
+            first.progress == prefix && core.registers() == expected,
+        "a declared jump did not hand off at its exact budget boundary");
+  const auto pending_state = core.state();
+  const auto pending = core.save();
+  fixture::throws<std::logic_error>([&] { core.set_registers(expected); },
+                                    "pending handoff accepted a register replacement");
+  fixture::throws<sharc::PreparationError>(
+      [&] { (void)core.install(native, fixture::Program::variant_id); },
+      "pending handoff accepted its source variant");
+  auto other_code = program.source.code;
+  other_code.transitions.clear();
+  const auto unrelated = sharc::Core::compile(other_code);
+  fixture::throws<sharc::PreparationError>(
+      [&] { (void)core.install(unrelated, Handoff::destination); },
+      "pending handoff accepted an unrelated image");
+  fixture::throws<sharc::PreparationError>([&] { (void)core.install(native, Handoff::alternate); },
+                                           "handoff accepted bytes for the other variant");
+  check(core.state() == pending_state &&
+            core.run(10).execution == sharc::ExecutionState::code_transfer &&
+            core.state() == pending_state,
+        "failed destination installation consumed the pending handoff");
+
+  ++memory.regions.back().generation;
+  core.set_memory(memory);
+  (void)core.install(native, Handoff::destination);
+  check(core.run(0).execution == sharc::ExecutionState::code_transfer &&
+            core.state() == pending_state,
+        "destination installation or a zero budget consumed the pending handoff");
+  check(fixture::completed(core.run_until(6), 1, 1) &&
+            core.registers().pe[0].data[0][1] == (7U << Handoff::raw_shift),
+        "the installed destination did not continue at the saved target");
+
+  sharc::Core replay(memory);
+  replay.restore(pending);
+  check(replay.run(1).execution == sharc::ExecutionState::code_transfer &&
+            replay.state() == pending_state,
+        "an unbound Core lost the pending destination during restore");
+  (void)replay.install(native, Handoff::destination);
+  check(fixture::completed(replay.run(1), 1, 1) && replay.state() == core.state(),
+        "pending handoff replay in a second Core changed the final state");
+  core.restore(before);
+  (void)core.install(native, fixture::Program::variant_id);
+  check(core.run(10).progress == prefix && core.state() == pending_state,
+        "restoring the source snapshot left stale handoff state");
+
+  (void)core.install(native, Handoff::destination);
+  (void)core.run(1);
+  ++memory.regions.back().generation;
+  core.set_memory(memory);
+  const auto stale = core.run(1);
+  check(stale.has_fault && stale.fault.reason == sharc::FaultReason::unprepared &&
+            stale.progress == sharc::Progress{},
+        "same-address storage with a new generation retained its native binding");
+}
+
+void indirect_and_delayed_handoffs() {
+  constexpr std::uint64_t indirect_jump_i8_m8 = 0x083e00000000;
+  constexpr std::uint64_t delayed_jump = 0x063e04000000 | Handoff::target;
+  const std::array words{delayed_jump, fixture::immediate(2, 3), fixture::immediate(3, 4)};
+  for (const bool delayed : {false, true}) {
+    const std::array computed{indirect_jump_i8_m8};
+    Handoff program(delayed ? std::span<const std::uint64_t>(words)
+                            : std::span<const std::uint64_t>(computed));
+    const auto native = sharc::Core::compile(program.source.code);
+    sharc::Core core(program.memory());
+    sharc::Registers expected;
+    expected.pc = fixture::code_address;
+    expected.dag[0][8].index = Handoff::target;
+    fixture::install(core, native, expected);
+    const auto result = core.run(10);
+    if (delayed) {
+      expected.pe[0].data[0][2] = 3U << Handoff::raw_shift;
+      expected.pe[0].data[0][3] = 4U << Handoff::raw_shift;
+    }
+    fixture::boundary(expected, {.pc = Handoff::target, .clock = 4});
+    check(result.execution == sharc::ExecutionState::code_transfer && !result.has_fault &&
+              result.progress.instructions == (delayed ? words.size() : computed.size()) &&
+              result.progress.base_cycles == 4 && core.registers() == expected,
+          "dynamic or delayed jump lost native handoff state");
+  }
 }
 
 void observed_alu_status() {
@@ -560,6 +686,8 @@ int main() {
   return fixture::run_test([] {
     branch_boundaries();
     missing_target();
+    pending_handoff();
+    indirect_and_delayed_handoffs();
     observed_alu_status();
     call_snapshot();
     refused_stack_prefix();

@@ -195,6 +195,44 @@ void declarations() {
   }
 }
 
+void transitions() {
+  constexpr std::uint32_t source = 7;
+  constexpr std::uint32_t destination = 8;
+  constexpr std::uint32_t target = 0x400;
+  auto image = fixture::image(InstructionSet::isa, std::uint64_t{0});
+  auto variant = fixture::image(InstructionSet::isa, {0, 0, 0, 0, 0, 0}, target).variants.front();
+  variant.id = destination;
+  image.variants.push_back(variant);
+  const sharc::CodeTransition edge{
+      .from_variant = source, .address = target, .to_variants = {destination}};
+  image.transitions = {edge};
+  check(!Core::lower(image).bitcode().empty(), "declared out-of-variant entry was refused");
+  image.variants.back().entries = {target + 1};
+  check(refusal(image).reason == FaultReason::invalid_image,
+        "resident destination without a declared entry was accepted");
+  image.variants.back().entries = {target};
+  image.transitions.front().to_variants.push_back(destination);
+  check(refusal(image).reason == FaultReason::invalid_image, "duplicate destination was accepted");
+  image.transitions = {edge, edge};
+  check(refusal(image).reason == FaultReason::invalid_image, "duplicate transition was accepted");
+}
+
+void callback_bindings() {
+  const auto image = fixture::image(InstructionSet::isa, std::uint64_t{0});
+  sharc::CompileOptions options;
+  options.callbacks = {{.role = "unknown", .symbol = "consumer"}};
+  check(refusal(image, options).reason == FaultReason::invalid_image, "unknown I/O role accepted");
+  options.callbacks.front() = {.role = "read", .symbol = ""};
+  check(refusal(image, options).reason == FaultReason::invalid_image, "empty I/O symbol accepted");
+  options.callbacks.front().symbol = "llvm.bitreverse.i32";
+  check(refusal(image, options).reason == FaultReason::invalid_image,
+        "reserved LLVM symbol accepted as an I/O callback");
+  options.callbacks.front().symbol = "consumer_io_read";
+  options.callbacks.push_back(options.callbacks.front());
+  check(refusal(image, options).reason == FaultReason::invalid_image,
+        "duplicate I/O role accepted");
+}
+
 void identities() {
   auto image = fixture::image(InstructionSet::isa, fixture::add(1, 2, 3));
   const std::string original(Core::lower(image).identity());
@@ -225,6 +263,8 @@ int main() {
     formats();
     boundaries();
     declarations();
+    transitions();
+    callback_bindings();
     identities();
   });
 }

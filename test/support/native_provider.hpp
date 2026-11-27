@@ -45,6 +45,7 @@ struct ConsumerEffects {
   void (*probe)() noexcept {};
   std::uintptr_t fault_address{};
   bool wrap_exports{};
+  void (*link_ir)(llvm::Module &){};
 };
 
 struct Provider {
@@ -202,6 +203,7 @@ inline sharc::NativeSymbols link(const sharc::SemanticImage &image,
   if (effects.probe != nullptr || effects.fault_address != 0 || effects.wrap_exports) {
     inject_effects(*module, *engine, image, effects);
   }
+  if (effects.link_ir != nullptr) { effects.link_ir(*module); }
   if (strip) { llvm::StripDebugInfo(*module); }
   optimize(*module);
   if (auto error =

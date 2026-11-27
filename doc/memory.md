@@ -1,31 +1,38 @@
 # Prepared memory access
 
 The core executes classic type 15 pre-indexed and type 1a parallel post-indexed
-normal-word transfers. The remaining access widths, runtime I/O callbacks and
-code-changing stores are open. The reference is Programming Reference 2.4,
+data-register transfers over the declared storage views, with checked runtime
+I/O. Forced long-word instruction encodings and code-changing stores remain
+open. The reference is Programming Reference 2.4,
 sections 2-6–2-7, 4-110, 6-10–6-31, 7-36–7-40, 9-7–9-9, 9-56–9-59 and
 10-5/21/31/32, pinned in `reference-manifest.json`.
 
 ## Layout and storage
 
 A region in the instruction's program or data address space selects the view and
-permissions. Data-view regions in the same space must not overlap; an instruction
-view may alias a data view. Zero-length regions contribute no addresses. A region
-must fit the 32-bit address space.
+permissions. Data views must be disjoint within each space, as must instruction
+views. An instruction view may alias a data view. Zero-length regions contribute
+no addresses. A region must fit the 32-bit address space.
 
-For the implemented normal-word view, each value is an unsigned 32-bit number
-stored in four little-endian bytes. The address selects
-`byte_offset + (address - first) * byte_stride` in the lent storage id. A direct
-region has `initialized` set, stride at least four, and sufficient actual storage
-for its entire declared range. Padding and unaligned byte offsets are supported.
+Values are serialized little-endian. One short, normal, long, extended or
+instruction word occupies 2, 4, 8, 5 or 6 bytes respectively. The address selects
+`byte_offset + (address - first) * byte_stride` in the lent storage id. An
+initialized data region needs a stride at least as large as its word width and
+storage for its entire declared range. Padding and unaligned byte offsets are
+supported.
 Installation validates geometry and binds actual host pointers. Borrowed nonempty
 byte ranges must not overlap under different storage ids: physical storage has
-one canonical id, and logical aliases use that id in their layouts. No host address
-or memory contents enter LLVM artifacts; loading an artifact does not lower code.
+one canonical id, and logical aliases use that id in their layouts. For example,
+an extended-word alias can select the five significant bytes of a six-byte word
+by using a one-byte offset and six-byte stride. No host address or memory contents
+enter LLVM artifacts. Loading an artifact does not lower code.
 
-A normal-word load places those 32 bits in register bits 39:8 and clears the
-extension byte. A store discards the extension byte. These are raw transfers in
-both execution modes; they perform no floating conversion and change no flags.
+A normal-word load fills register bits 39:8 and clears the extension byte. A
+short-word load fills bits 23:8 and extends through bit 39 according to MODE1.SSE.
+Their stores use the corresponding bits. A long word transfers the low 32 bits
+through the explicit register and the upper 32 bits through its same-PE neighbor
+(`register ^ 1`). An extended word transfers all 40 raw bits. Transfers preserve
+flags and use the same raw format in Strict and FastFP32.
 
 ## Address and lane behavior
 
@@ -43,9 +50,11 @@ The post-modifier still updates the original unreversed I.
 The I register comes from the selected physical DAG bank: I0–3, I4–7, I8–11 and
 I12–15 have independent bank selections. Data-file bank selection remains separate.
 An explicit S register can transfer in SISD. SIMD transfers the explicit register
-and its complement at consecutive normal-word addresses, including odd explicit
-addresses. Read broadcast through I1 or I9 loads both complementary registers
-from one word independently of PEYEN. Broadcast does not duplicate stores.
+and its complement at offsets 0 and 1 for normal words and 0 and 2 for short words,
+including odd explicit addresses. Both addresses must resolve to the same view.
+An extended or long word uses the explicit PE. Read broadcast through I1 or I9
+loads both PEs from one word independently of PEYEN, including both neighboring
+registers for a long word. Broadcast does not duplicate stores.
 
 Type 1a stores and compute read the original register values. Same-packet
 loads write back over compute results, with DM taking precedence over PM for
@@ -127,7 +136,8 @@ mutation, saving and restoring that instance are rejected. Use Exact for precise
 resumable faults. The Linux x86-64 fixture exercises actual protected-page and
 truncated-file faults, mask restoration, handler chaining, nested owners and
 independent owner threads. macOS ARM64 fault escape remains unqualified.
-Protected-page peripheral emulation and resumable runtime I/O remain open.
+Protected-page peripheral emulation remains open. A declared callback region
+uses the checked path in either prepared memory mode.
 
 Classic type 19 immediate MODIFY/BITREV updates I in SSA, selecting source and
 destination DAG banks independently. Its circular adjustment uses the source B/L,
@@ -146,26 +156,89 @@ They never reuse a host pointer computed from an obsolete I value.
 ## Boundaries and current gaps
 
 In Exact and checked fallback, denied reads/writes report `access_fault`.
-Unprepared addresses, callback regions,
-unsupported views and stores whose declared storage may overlap code report
-`unsupported_feature`. Diagnostics retain image identity, guest PC, instruction
+Unprepared addresses, missing callback bindings, unsupported views and
+unqualified code-alias stores report `unsupported_feature`. Diagnostics
+retain image identity, guest PC, instruction
 and data-space/address context. The failed instruction does not retire; completed
 instructions and their effects remain. Both SIMD destinations are validated
 before a store changes memory, so a missing implicit binding produces no partial
 store. These are preparation/access boundaries, not a complete model of hardware
 memory exceptions.
 
-Declared byte aliases work for reads. Potential code-alias writes are conservatively
-refused before changing bytes. Stores also require complete instruction-view
-coverage of the declared code, so opaque instruction callbacks cannot hide an
-unknown alias. Actual code transitions, unchanged code stores and
-all other memory views still require implementation and independent qualification.
-`Io` currently supports installation-time instruction reads; runtime data access
-through callbacks is not implemented by this increment.
+Declared byte aliases share the same physical storage. A checked store whose
+range may overlap prepared code compares the outgoing bytes with the declared
+instruction bytes before transfer. It can write non-code bytes and repeat
+the existing instruction bytes without invalidation. This comparison requires
+initialized instruction layouts and known physical backing. Callback paths with
+an opaque code alias are refused. A store that would change code is refused when
+the source declares no transition.
+
+An uninitialized data region calls the corresponding `Io` function on the owner
+thread with the declared bus, view and resolved word address. A payload uses
+the low bits of the `uint64_t` for its view. The core checks permissions and
+callback availability for all selected lanes before executing the first
+transfer. DM completes before PM, and
+each explicit lane completes before its implicit lane. A false result faults
+at that transfer. Earlier effects remain visible, and the faulting instruction
+has no register writeback, index update or retirement. Callback code may call
+`request_yield()` to return at the next complete instruction boundary, including
+the resolved destination after a delay slot. Execution re-entry is rejected.
+
+`CompileOptions::callbacks` can bind `read` and `write` to definitions
+provided by the consumer's LLVM link. The semantic artifact declares each used
+symbol with this C calling convention:
+
+```llvm
+declare i32 @consumer_io(ptr %owner, i8 zeroext %space, i8 zeroext %view,
+                        i32 %address, ptr %word) nounwind
+```
+
+The owner comes from `Memory::io.owner` at installation. A nonzero return
+accepts the transfer. On read, the callback writes the unsigned payload to the
+64-bit `word` cell. On write, that cell contains the guest payload. The cell
+is borrowed for the duration of the call. Any role without a linked binding
+uses its `Memory::io` function pointer. Instruction validation continues to
+read the owner-provided storage or instruction-read callback during installation.
+For an image that uses a named symbol, the consumer links the result of `lower`
+or `load` and supplies the resolved native image to `bind`. Standalone
+compilation reports the unresolved role.
 
 `set_memory` revokes bindings. A subsequent install binds the new lent storage.
+Replacing a loan with the same host address and a new generation also revokes
+the old binding. Installation validates the declared words against the current
+storage before it accepts execution.
 Snapshots restore processor state and continuation, including I registers, and
 leave consumer memory alone. No obsolete host pointer is restored with a snapshot.
+
+## Prepared code handoff
+
+`CodeTransition` names a source variant, the destination PC and the allowed
+destination variants of the same image. The PC must be a declared entry in each
+destination. An ordinary branch, return or sequential flow to a declared PC
+outside the active variant retires its completed prefix and reports
+`ExecutionState::code_transfer`. A delayed branch completes its slots and
+redirection before the handoff. Resident code continues in the active variant.
+For a handoff inside an active delay, the destination must declare the same
+branch at its origin. The target entry includes the remaining slot and uses the
+latched redirect. An active hardware loop requires matching prepared loop
+shapes, continuation layouts and relevant jump targets. Preparation records
+those compatible destinations in the artifact and includes the associated
+loop bodies at the target entry. If no declared destination can preserve the
+active sequencer context, the core reports a fault at the handoff boundary.
+
+A checked store that changes prepared bytes revokes the active binding and
+stops at the complete instruction boundary, even when the successor was
+resident. The resolved PC must have a transition declaration. If it does not,
+the core reports a fault with the retired store and its bytes intact. A later
+I/O rejection in the same packet keeps earlier stores visible, revokes the
+binding and reports the I/O fault at the unretired instruction. A Direct
+protected access continues to rely on the consumer's page permissions.
+
+The consumer selects an allowed target with `install`. A failed installation
+leaves the pending transfer and processor progress intact. A run with a positive
+budget consumes the transfer once a matching binding is installed. Snapshots
+preserve the pending target set and image identity. The consumer manages loans
+and installs the destination separately when replaying on another Core.
 
 The installed-image ISA fixtures compare full registers and padded RAM under both
 numerical identities, all sixteen index registers, both DAG banks, all data-bank

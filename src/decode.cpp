@@ -11,6 +11,7 @@
 #include <llvm/ADT/ArrayRef.h>
 #include <llvm/ADT/StringRef.h>
 #include <llvm/Support/SHA256.h>
+#include <map>
 #include <optional>
 #include <set>
 #include <span>
@@ -237,6 +238,15 @@ void validate_options(const CompileOptions &options, std::string_view identity) 
       options.memory_mode != CompileOptions::MemoryMode::direct) {
     refuse(FaultReason::invalid_image, identity, 0, 0, "unknown memory mode");
   }
+  std::set<std::string_view> roles;
+  for (const auto &binding : options.callbacks) {
+    if ((binding.role != io_read_role && binding.role != io_write_role) ||
+        !roles.insert(binding.role).second || binding.symbol.empty() ||
+        binding.symbol.contains('\0') || binding.symbol.starts_with("llvm.")) {
+      refuse(
+          FaultReason::invalid_image, identity, 0, 0, "invalid or duplicated I/O symbol binding");
+    }
+  }
 }
 
 std::string input_identity(const CodeImage &image, const CompileOptions &options) {
@@ -342,7 +352,9 @@ public:
   }
 
   void variant(const CodeVariant &code) {
-    if (!variants_.insert(code.id).second) { invalid(code.id, 0, "duplicate code variant id"); }
+    if (!variants_.emplace(code.id, &code).second) {
+      invalid(code.id, 0, "duplicate code variant id");
+    }
     if (code.spans.empty() || code.entries.empty()) {
       invalid(code.id, 0, "variant needs code spans and entries");
     }
@@ -358,13 +370,24 @@ public:
     }
   }
 
-  void transition(const CodeTransition &code) const {
-    if (!boundaries_.contains({code.from_variant, code.address}) || code.to_variants.empty()) {
+  void transition(const CodeTransition &code) {
+    if (!variants_.contains(code.from_variant) || code.address > maximum_pc ||
+        code.to_variants.empty()) {
       invalid(code.from_variant, code.address, "invalid code transition source or targets");
     }
+    if (!transitions_.emplace(code.from_variant, code.address).second) {
+      invalid(code.from_variant, code.address, "duplicate code transition");
+    }
+    std::set<std::uint32_t> targets;
     for (const auto target : code.to_variants) {
-      if (!variants_.contains(target)) {
-        invalid(code.from_variant, code.address, "undeclared code transition target");
+      const auto destination = variants_.find(target);
+      if (destination == variants_.end() || target == code.from_variant ||
+          !targets.insert(target).second) {
+        invalid(code.from_variant, code.address, "invalid or duplicate code transition target");
+      }
+      const auto &entries = destination->second->entries;
+      if (std::ranges::find(entries, code.address) == entries.end()) {
+        invalid(target, code.address, "code transition target is not an entry in its variant");
       }
     }
   }
@@ -374,7 +397,8 @@ public:
 private:
   std::vector<Instruction> instructions_;
   std::string_view identity_;
-  std::set<std::uint32_t> variants_;
+  std::map<std::uint32_t, const CodeVariant *> variants_;
+  std::set<std::pair<std::uint32_t, std::uint32_t>> transitions_;
   std::set<std::pair<std::uint32_t, std::uint32_t>> boundaries_;
 };
 } // namespace

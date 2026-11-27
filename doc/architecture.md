@@ -117,7 +117,7 @@ include the high bank when a decoded operand can access it.
 Complete normal-word PM/DM views support separate lent read/write reservations,
 optional mirrored tails, explicit Direct preparation and a
 terminal host-fault adapter; see [memory.md](memory.md). Cross-unit flag recipes,
-remaining memory views and runtime data callbacks remain implementation work. See private issues
+remaining memory views and protected-page peripheral I/O remain implementation work. See private issues
 blofeld-src #36/#37 and lead-a1-src #2 for coordination.
 
 Hoist checks only with a valid alias or permission proof. Keep the host stack

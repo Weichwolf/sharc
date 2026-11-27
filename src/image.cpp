@@ -56,7 +56,7 @@
 
 namespace sharc::detail {
 namespace {
-constexpr std::string_view artifact_magic = "sharc-llvm-image-v3";
+constexpr std::string_view artifact_magic = "sharc-llvm-image-v4";
 constexpr unsigned byte_bits = 8;
 constexpr unsigned word_bytes = 6;
 
@@ -130,6 +130,25 @@ private:
   std::span<const std::byte> bytes_;
   std::string_view identity_;
 };
+
+void read_loop_handoffs(Reader &reader, PreparedImage &image) {
+  constexpr auto edge_bytes = 3 * sizeof(std::uint64_t);
+  const auto count = reader.number();
+  if (count > reader.remaining() / edge_bytes) { reader.invalid("invalid loop handoff count"); }
+  std::set<std::tuple<std::uint32_t, std::uint32_t, std::uint32_t>> edges;
+  for (std::uint64_t index = 0; index < count; ++index) {
+    const LoopHandoff handoff{.from = reader.word(), .to = reader.word(), .address = reader.word()};
+    const auto declared =
+        std::ranges::any_of(image.code.transitions, [&](const CodeTransition &edge) {
+          return edge.from_variant == handoff.from && edge.address == handoff.address &&
+                 std::ranges::contains(edge.to_variants, handoff.to);
+        });
+    if (!declared || !edges.emplace(handoff.from, handoff.to, handoff.address).second) {
+      reader.invalid("invalid or duplicate loop handoff metadata");
+    }
+    image.loop_handoffs.push_back(handoff);
+  }
+}
 
 llvm::MemoryBufferRef bitcode_buffer(const PreparedImage &image) {
   return {
@@ -353,6 +372,12 @@ std::vector<std::byte> serialize_image(const PreparedImage &image) {
     writer.number(unit.context);
     writer.text(unit.symbol);
   }
+  writer.number(image.loop_handoffs.size());
+  for (const auto &edge : image.loop_handoffs) {
+    writer.number(edge.from);
+    writer.number(edge.to);
+    writer.number(edge.address);
+  }
   writer.data(image.bitcode);
   for (const auto byte : checksum(writer.bytes)) {
     writer.bytes.push_back(static_cast<std::byte>(byte));
@@ -417,6 +442,7 @@ std::shared_ptr<const PreparedImage> load_image(const CodeImage &code,
     result->exports.push_back(unit.symbol);
     result->units.push_back(std::move(unit));
   }
+  read_loop_handoffs(reader, *result);
   const auto bitcode = reader.data();
   result->bitcode.assign(bitcode.begin(), bitcode.end());
   if (reader.remaining() != 0) { reader.invalid("trailing semantic artifact data"); }
@@ -462,6 +488,16 @@ CompiledSymbols compile_image(const PreparedImage &image) {
   }
   auto context = std::make_unique<llvm::LLVMContext>();
   auto module = parse_module(image, *context);
+  for (const auto &binding : image.options.callbacks) {
+    const auto *callback = module->getFunction(binding.symbol);
+    if (callback != nullptr && !callback->use_empty()) {
+      refuse(FaultReason::unsupported_feature,
+             image.identity,
+             0,
+             0,
+             "consumer link required for I/O callback " + binding.symbol);
+    }
+  }
   module->setDataLayout(jit->getDataLayout());
   module->setTargetTriple(jit->getTargetTriple().str());
   llvm::LoopAnalysisManager loops;

@@ -53,8 +53,17 @@ inline constexpr std::size_t interrupt_deadline_slot = progress_cycle_slot + 1;
 inline constexpr std::size_t accumulator_slot = interrupt_deadline_slot + 1;
 inline constexpr unsigned accumulator_banks = 2;
 inline constexpr unsigned accumulator_limbs = 3;
-inline constexpr std::size_t register_pointer_count =
+inline constexpr std::size_t io_slot =
     accumulator_slot + (std::size_t{2} * accumulator_banks * accumulator_limbs);
+inline constexpr std::size_t io_read_slot = io_slot + 1;
+inline constexpr std::size_t io_write_slot = io_read_slot + 1;
+inline constexpr std::size_t io_owner_slot = io_write_slot + 1;
+inline constexpr std::size_t owner_events_slot = io_owner_slot + 1;
+inline constexpr std::size_t code_owner_slot = owner_events_slot + 1;
+inline constexpr std::size_t code_check_slot = code_owner_slot + 1;
+inline constexpr std::size_t register_pointer_count = code_check_slot + 1;
+inline constexpr std::uint8_t owner_yield_event = 1;
+inline constexpr std::uint8_t code_write_event = 2;
 
 [[nodiscard]] constexpr std::size_t mr_slot(unsigned lane, unsigned bank, unsigned limb) {
   return accumulator_slot + (((std::size_t{lane} * accumulator_banks) + bank) * accumulator_limbs) +
@@ -106,6 +115,7 @@ inline constexpr std::uint32_t high_bank_mode = 1U << 7;
 inline constexpr std::uint32_t low_bank_mode = 1U << 10;
 inline constexpr std::uint32_t saturation_mode = 1U << 13;
 inline constexpr std::uint32_t multiplier_swap_mode = 1U << 2;
+inline constexpr std::uint32_t short_sign_mode = 1U << 14;
 inline constexpr std::uint32_t truncation_mode = 1U << 15;
 inline constexpr std::uint32_t simd_mode = 1U << 21;
 inline constexpr std::uint32_t broadcast9_mode = 1U << 22;
@@ -133,6 +143,7 @@ enum ControlSlot : std::uint8_t {
   memory_space,
   fault_instruction,
   resume_entry,
+  io_word,
   control_count
 };
 enum class NativeExit : std::uint8_t {
@@ -163,6 +174,10 @@ struct NativeUnit {
   std::string symbol;
 };
 
+struct LoopHandoff {
+  std::uint32_t from{}, to{}, address{};
+};
+
 struct PreparedImage {
   CodeImage code;
   CompileOptions options;
@@ -170,6 +185,7 @@ struct PreparedImage {
   std::vector<std::byte> bitcode;
   std::vector<std::string> exports;
   std::vector<NativeUnit> units;
+  std::vector<LoopHandoff> loop_handoffs;
 };
 
 struct CompiledSymbols {
@@ -192,4 +208,20 @@ void validate_memory_layout(const CodeVariant &variant, std::string_view identit
 [[nodiscard]] std::vector<void *>
 direct_memory(const PreparedImage &image, std::uint32_t variant, const Memory &memory);
 [[nodiscard]] bool aliases_code(const CodeVariant &variant, std::size_t region);
+[[nodiscard]] bool code_storage_declared(const CodeVariant &variant);
+[[nodiscard]] bool changes_code(const CodeVariant &variant,
+                                std::uint64_t payload,
+                                MemorySpace space,
+                                std::uint32_t address) noexcept;
+
+[[nodiscard]] constexpr unsigned memory_bytes(MemoryView view) {
+  switch (view) {
+    case MemoryView::short_word: return 2;
+    case MemoryView::normal_word: return 4;
+    case MemoryView::long_word: return 8;
+    case MemoryView::instruction: return 6;
+    case MemoryView::extended: return 5;
+  }
+  return 0;
+}
 } // namespace sharc::detail
