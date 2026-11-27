@@ -937,6 +937,37 @@ void parallel_refusal(sharc::ExecutionMode mode, std::uint64_t packet) {
         "refused PM lane changed a parallel DM store, compute or DAG update");
 }
 
+void parallel_fifo_refusal(sharc::ExecutionMode mode) {
+  // BITDEP R3 BY R9 with a DM store and PM load of R4.
+  constexpr std::uint64_t packet = 0x34c89a274039;
+  constexpr unsigned prefix_data = 5;
+  constexpr unsigned length = 32;
+  constexpr unsigned nearly_full = 63;
+  constexpr std::uint64_t stored = 0x1234567800;
+  const std::array words{fixture::immediate(2, prefix_data), packet};
+  ParallelProgram program(words, ram_address, 2);
+  auto ram = initial_ram;
+  const auto native = fixture::compile(program.code.code, mode);
+  sharc::Core core(program.code.memory(ram_id, ram), mode);
+  auto expected = initial();
+  expected.mode1 = simd_bit;
+  expected.dag[0][2].index = ram_address;
+  expected.dag[0][10].index = ram_address;
+  expected.pe[0].data[0][4] = stored;
+  expected.pe[1].data[0][4] = stored;
+  expected.pe[1].data[0][9] = length << word_shift;
+  expected.pe[1].bit_fifo_write_pointer = nearly_full;
+  fixture::install(core, native, expected);
+  const auto result = core.run(words.size());
+  for (auto &pe : expected.pe) { pe.data[0][2] = prefix_data << word_shift; }
+  fixture::boundary(expected, {.pc = expected.pc + 1, .clock = 1});
+  check(result.has_fault && result.fault.reason == sharc::FaultReason::unsupported_feature &&
+            result.fault.instruction == packet && result.fault.detail.contains("bit FIFO") &&
+            result.progress == sharc::Progress{.instructions = 1, .base_cycles = 1} &&
+            core.registers() == expected && ram == initial_ram,
+        "FIFO refusal in PEy committed an earlier effect of the parallel packet");
+}
+
 void parallel_circular(std::uint32_t dm_base, std::uint32_t pm_base) {
   // R0 = DM(I7,M6), R1 = PM(I15,M14).
   constexpr std::array<std::uint64_t, 1> words{0x2f81f0800000};
@@ -1382,6 +1413,7 @@ int main() {
     for (const auto mode : fixture::numeric_modes) {
       parallel_io(mode, floating_parallel_add);
       parallel_refusal(mode, floating_parallel_add);
+      parallel_fifo_refusal(mode);
     }
     parallel_circular(ram_address, ram_address);
     parallel_circular(std::numeric_limits<std::uint32_t>::max() - 3, 0);

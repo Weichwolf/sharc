@@ -408,6 +408,42 @@ void verify_shifter_case(sharc::Core &core,
   }
 }
 
+void verify_fifo_case(sharc::Core &core, const fixture::FifoCase &test, std::uint32_t address) {
+  constexpr unsigned destination = 11;
+  constexpr unsigned data = 3;
+  constexpr unsigned operand = 9;
+  for (unsigned configuration = 0; configuration < 32; ++configuration) {
+    auto before = initial(configuration);
+    before.pc = address;
+    for (std::size_t lane = 0; lane < before.pe.size(); ++lane) {
+      const auto &input = test.lanes[lane];
+      auto &pe = before.pe[lane];
+      pe.data[bank(before, data)][data] = input.source;
+      pe.data[bank(before, operand)][operand] = input.operand;
+      pe.astat = input.old_astat | (pe.astat & 1);
+      pe.bit_fifo = input.fifo;
+      pe.bit_fifo_write_pointer = input.pointer;
+    }
+    core.set_registers(before);
+    auto expected = before;
+    const auto active = (before.mode1 & (1U << simd_bit)) != 0 ? before.pe.size() : 1U;
+    for (std::size_t lane = 0; lane < active; ++lane) {
+      auto &pe = expected.pe[lane];
+      if ((pe.astat & 1) == 0) { continue; }
+      const auto &output = test.lanes[lane];
+      if (test.writes) { pe.data[bank(expected, destination)][destination] = output.result; }
+      pe.astat = output.astat | 1;
+      pe.bit_fifo = output.next_fifo;
+      pe.bit_fifo_write_pointer = output.next_pointer;
+    }
+    fixture::boundary(expected, {.pc = address + 1, .clock = 1});
+    verify_prefix(core,
+                  expected,
+                  {.instruction = "FIFO operation lost data, pointer, flags or admission",
+                   .deadline = "FIFO operation differed under a cycle bound"});
+  }
+}
+
 void verify_shifter_cases() {
   constexpr std::uint64_t off_scale_btst = 0x023e00332003;
   constexpr std::uint64_t immediate_exp = 0x023e00200003;
@@ -422,19 +458,152 @@ void verify_shifter_cases() {
   fixture::Program program(std::array{std::uint64_t{0}});
   auto &variant = program.code.variants.front();
   std::map<std::uint64_t, std::uint32_t> addresses;
-  for (const auto &test : fixture::shifter_cases) {
+  const auto include = [&](std::uint64_t word) {
     const auto address =
         fixture::code_address + (entry_stride * static_cast<std::uint32_t>(addresses.size() + 1));
-    if (!addresses.try_emplace(test.word, address).second) { continue; }
-    program.add_span(address, std::array{test.word, std::uint64_t{0}});
+    if (!addresses.try_emplace(word, address).second) { return; }
+    program.add_span(address, std::array{word, std::uint64_t{0}});
     variant.entries.push_back(address);
-  }
+  };
+  for (const auto &test : fixture::shifter_cases) { include(test.word); }
+  for (const auto &test : fixture::fifo_cases) { include(test.word); }
   for (const auto mode : fixture::numeric_modes) {
     const auto native = fixture::compile(program.code, mode);
     sharc::Core core(program.memory(), mode);
     (void)core.install(native, fixture::Program::variant_id);
     for (const auto &test : fixture::shifter_cases) {
       verify_shifter_case(core, test, addresses.at(test.word));
+    }
+    for (const auto &test : fixture::fifo_cases) {
+      verify_fifo_case(core, test, addresses.at(test.word));
+    }
+  }
+}
+
+void fifo_sequence() {
+  // BFFWRP = 0, BITDEP R3 BY 8, R11 = BITEXT 4 (NU), R12 = BITEXT 4, R13 = BFFWRP.
+  constexpr std::array<std::uint64_t, 5> words{
+      0x023e001f0000, 0x023e001d0803, 0x023e001604b0, 0x023e001404c0, 0x013e00270d00};
+  constexpr std::array<std::uint64_t, 2> sources{0x123456ab7f, 0xf1234572c3};
+  constexpr std::array<std::uint64_t, 2> appended{0xab00000000000000, 0x7200000000000000};
+  constexpr std::array<std::uint64_t, 2> remainder{0xb000000000000000, 0x2000000000000000};
+  constexpr std::array<std::uint64_t, 2> extracted{0x0a00, 0x0700};
+  constexpr std::uint32_t fifo_flags = 0x7800;
+  constexpr std::uint64_t final_pointer_word = 0x0400;
+  constexpr unsigned simd_configuration = 4;
+  constexpr unsigned prefix = 2;
+  constexpr auto count = static_cast<std::uint32_t>(words.size());
+  fixture::Program program(words);
+  for (const auto mode : fixture::numeric_modes) {
+    const auto native = fixture::compile(program.code, mode);
+    sharc::Core core(program.memory(), mode);
+    sharc::Core resumed(program.memory(), mode);
+    auto before = initial(simd_configuration);
+    for (std::size_t lane = 0; lane < before.pe.size(); ++lane) {
+      before.pe[lane].bit_fifo = ~std::uint64_t{0};
+      before.pe[lane].bit_fifo_write_pointer = 64;
+      before.pe[lane].data[0][3] = sources[lane];
+    }
+    fixture::install(core, native, before);
+    const auto beginning = core.save();
+    auto expected = before;
+    for (std::size_t lane = 0; lane < expected.pe.size(); ++lane) {
+      expected.pe[lane].bit_fifo = appended[lane];
+      expected.pe[lane].bit_fifo_write_pointer = 8;
+      expected.pe[lane].astat &= ~fifo_flags;
+    }
+    fixture::boundary(expected, {.pc = before.pc + prefix, .clock = prefix});
+    check(fixture::completed(core.run(prefix), prefix, prefix) && core.registers() == expected,
+          "FIFO prefix failed to spill raw state across a bound");
+    (void)resumed.install(native, fixture::Program::variant_id);
+    resumed.restore(core.save());
+    for (std::size_t lane = 0; lane < expected.pe.size(); ++lane) {
+      auto &pe = expected.pe[lane];
+      pe.bit_fifo = remainder[lane];
+      pe.bit_fifo_write_pointer = 4;
+      pe.data[0][11] = extracted[lane];
+      pe.data[0][12] = extracted[lane];
+      pe.data[0][13] = final_pointer_word;
+    }
+    fixture::boundary(expected, {.pc = before.pc + count, .clock = count});
+    check(fixture::completed(resumed.run_until(count), count - prefix, count - prefix) &&
+              resumed.registers() == expected,
+          "FIFO snapshot lost data or pointer across native owners");
+    core.restore(beginning);
+    check(fixture::completed(core.run(count), count, count) && core.registers() == expected,
+          "FIFO sequence differed under a whole-unit grant");
+  }
+}
+
+void verify_fifo_result(const sharc::RunResult &result,
+                        const sharc::Fault &expected,
+                        bool faulting,
+                        unsigned retired) {
+  if (!faulting) {
+    check(fixture::completed(result, retired, retired), "masked FIFO operands faulted");
+    return;
+  }
+  const auto &fault = result.fault;
+  check(result.has_fault && fault.reason == expected.reason && fault.address == expected.address &&
+            fault.variant == expected.variant && fault.instruction == expected.instruction &&
+            fault.instruction_bits == expected.instruction_bits &&
+            fault.identity == expected.identity && fault.detail.contains("bit FIFO") &&
+            result.progress == sharc::Progress{.instructions = retired, .base_cycles = retired},
+        "FIFO fault lost the prefix or the offending instruction");
+}
+
+void fifo_faults() {
+  struct Case {
+    std::uint64_t word;
+    std::uint8_t pointer;
+    unsigned amount;
+  };
+
+  constexpr std::array cases{Case{.word = 0x010000250b09, .pointer = 7, .amount = 8},
+                             Case{.word = 0x010000274039, .pointer = 64, .amount = 1},
+                             Case{.word = 0x0200401601b0, .pointer = 64, .amount = 1},
+                             Case{.word = 0x010000258b09, .pointer = 65, .amount = 0}};
+  constexpr unsigned both_predicates = 28;
+  constexpr unsigned simd_only = 4;
+  constexpr std::array configurations{both_predicates, simd_only};
+  constexpr std::array budgets{2U, 3U};
+  constexpr unsigned prefix_data = 5;
+  constexpr std::uint8_t instruction_bits = 48;
+  for (const auto &test : cases) {
+    fixture::Program program(
+        std::array{fixture::immediate(2, prefix_data), test.word, std::uint64_t{0}});
+    for (const auto mode : fixture::numeric_modes) {
+      const auto native = fixture::compile(program.code, mode);
+      const sharc::Fault fault{.reason = sharc::FaultReason::unsupported_feature,
+                               .identity = native.report().identity,
+                               .variant = fixture::Program::variant_id,
+                               .address = fixture::code_address + 1,
+                               .instruction = test.word,
+                               .instruction_bits = instruction_bits,
+                               .detail = {}};
+      sharc::Core core(program.memory(), mode);
+      (void)core.install(native, fixture::Program::variant_id);
+      const auto beginning = core.save();
+      for (const auto configuration : configurations) {
+        auto before = initial(configuration);
+        before.pe[0].data[0][9] = 0;
+        before.pe[1].bit_fifo = ~std::uint64_t{0};
+        before.pe[1].bit_fifo_write_pointer = test.pointer;
+        before.pe[1].data[0][9] = std::uint64_t{test.amount} << 8;
+        for (const auto count : budgets) {
+          core.restore(beginning);
+          core.set_registers(before);
+          const auto result = core.run(count);
+          const bool faulting = configuration == both_predicates;
+          const auto retired = faulting ? 1U : count;
+          auto expected = before;
+          for (auto &pe : expected.pe) { pe.data[0][2] = prefix_data << 8; }
+          fixture::boundary(expected, {.pc = before.pc + retired, .clock = retired});
+          verify_fifo_result(result, fault, faulting, retired);
+          check(core.registers() == expected,
+                "invalid or masked FIFO operation changed guest data");
+        }
+      }
     }
   }
 }
@@ -457,5 +626,7 @@ void rotations() {
   }
   shifts();
   verify_shifter_cases();
+  fifo_sequence();
+  fifo_faults();
 }
 } // namespace fixture

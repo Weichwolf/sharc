@@ -378,6 +378,8 @@ struct Core::Impl {
       }
       pointers[detail::astat_slot + lane] = &state.registers.pe[lane].astat;
       pointers[detail::stky_slot + lane] = &state.registers.pe[lane].stky;
+      pointers[detail::fifo_slot + lane] = &state.registers.pe[lane].bit_fifo;
+      pointers[detail::fifo_pointer_slot + lane] = &state.registers.pe[lane].bit_fifo_write_pointer;
     }
     pointers[detail::pc_slot] = &state.registers.pc;
     pointers[detail::faddr_slot] = &state.registers.faddr;
@@ -506,6 +508,14 @@ struct Core::Impl {
       case detail::NativeExit::invalid_interrupt_return:
         result = fail(FaultReason::unsupported_feature,
                       "RTI has no matching stack frame or uses DB with automatic status restore");
+        result.fault.instruction = control[detail::fault_instruction];
+        result.fault.instruction_bits = detail::full_instruction_bits;
+        state.fault = result.fault;
+        break;
+      case detail::NativeExit::invalid_fifo:
+        result = fail(FaultReason::unsupported_feature,
+                      "bit FIFO transfer has a prohibited length or pointer, or insufficient data "
+                      "or capacity");
         result.fault.instruction = control[detail::fault_instruction];
         result.fault.instruction_bits = detail::full_instruction_bits;
         state.fault = result.fault;

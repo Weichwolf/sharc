@@ -464,9 +464,21 @@ positions, non-writing BTST, the input AV and sign for EXP (EX), and register
 and standalone immediate field operands. The field cases check the DATAEX
 extension, empty fields, exactly full and off-scale fields, sign extension and
 OR with the old destination. Both PE predicates, physical banks and full raw
-writeback are checked at instruction and cycle boundaries. FIFO and parallel
+writeback are checked at instruction and cycle boundaries. Parallel
 immediate-shifter memory forms remain open. See `encoding.md` for
 standalone-prefix evidence.
+
+Classic BITDEP, BITEXT, BITEXT (NU) and both BFFWRP directions run through
+installed images in both numerical modes. The paired fixtures cover register
+and standalone immediate operands, stale raw storage, zero and full lengths,
+pointer thresholds, bank selection and lane predicates. A five-instruction
+sequence checks raw FIFO state and write pointers at a bound and after replay
+on a second Core. Selected lanes with prohibited operands fault at the
+instruction with its raw encoding and the retired prefix preserved.
+`test/core/memory.cpp` checks that such a refusal leaves both transfers of an
+unconditional type-1 packet untouched. The reference uses the documented
+left shift for extraction. Silicon behavior of the simulator's differing
+unoccupied bits remains unverified.
 
 Classic type 15 transfers use direct normal-word PM/DM layouts, pre-indexed
 32-bit displacements, physical DAG/data banks, explicit R/S registers, SIMD and

@@ -64,6 +64,11 @@ constexpr unsigned logical = 0x00, arithmetic = 0x04, rotate = 0x08;
 constexpr unsigned logical_or = 0x20, arithmetic_or = 0x24;
 constexpr unsigned extract = 0x40, deposit = 0x44, extract_signed = 0x48, deposit_signed = 0x4c;
 constexpr unsigned deposit_or = 0x64, deposit_or_signed = 0x6c;
+constexpr unsigned fifo_extract = 0x50, fifo_peek = 0x58, fifo_read = 0x70, fifo_deposit = 0x74,
+                   fifo_write = 0x7c;
+constexpr unsigned fifo_bits = 64;
+constexpr unsigned fifo_pointer_mask = 127;
+constexpr unsigned fifo_length_limit = 32;
 constexpr unsigned exponent = 0x80, exponent_extended = 0x84, leading_zero = 0x88,
                    leading_one = 0x8c;
 constexpr unsigned set_bit = 0xc0, clear_bit = 0xc4, toggle_bit = 0xc8, test_bit = 0xcc;
@@ -82,6 +87,16 @@ constexpr std::array leading_ops{exponent, exponent_extended, leading_zero, lead
 
 bool field(unsigned opcode) {
   return std::ranges::find(field_ops, opcode) != field_ops.end();
+}
+
+bool fifo_transfer(unsigned opcode) {
+  return opcode == fifo_deposit || opcode == fifo_extract || opcode == fifo_peek;
+}
+
+bool fifo(const Compute &compute) {
+  return ((compute.kind == ComputeKind::shifter || compute.kind == ComputeKind::shift_immediate) &&
+          (fifo_transfer(compute.opcode) || compute.opcode == fifo_write)) ||
+         (compute.kind == ComputeKind::shifter && compute.opcode == fifo_read);
 }
 } // namespace shift
 
@@ -245,6 +260,7 @@ bool supported_compute(const Compute &compute) {
   return compute.kind == ComputeKind::none || fixed_multiplier(compute) ||
          floating_compute(compute) || floating_dual(compute) || floating_multifunction(compute) ||
          fixed_multifunction(compute) || compute.kind == ComputeKind::mr_transfer ||
+         shift::fifo(compute) ||
          (compute.kind == ComputeKind::alu &&
           std::ranges::find(fixed_operations, compute.opcode) != fixed_operations.end()) ||
          ((compute.kind == ComputeKind::shifter || compute.kind == ComputeKind::shift_immediate) &&
@@ -702,8 +718,9 @@ void validate_immediate_shift(const Instruction &instruction, std::string_view i
   constexpr auto canonical_fields = (std::uint64_t{2} << prefix_shift) |
                                     (std::uint64_t{true_condition} << condition_shift) | 0x3fffff;
   constexpr auto data_extension = std::uint64_t{15} << 27;
-  const auto allowed =
-      canonical_fields | (shift::field(instruction.compute.opcode) ? data_extension : 0);
+  const bool wide =
+      shift::field(instruction.compute.opcode) || shift::fifo_transfer(instruction.compute.opcode);
+  const auto allowed = canonical_fields | (wide ? data_extension : 0);
   if ((instruction.word & ~allowed) != 0) {
     reject(instruction,
            identity,
@@ -715,6 +732,13 @@ void validate_immediate_shift(const Instruction &instruction, std::string_view i
   if (instruction.compute.opcode == shift::test_bit && instruction.compute.immediate > last_bit) {
     reject(
         instruction, identity, FaultReason::invalid_encoding, "BTST immediate position exceeds 31");
+  }
+  if (instruction.compute.opcode == shift::fifo_write &&
+      instruction.compute.immediate > shift::fifo_pointer_mask) {
+    reject(instruction,
+           identity,
+           FaultReason::invalid_encoding,
+           "BFFWRP immediate exceeds seven bits");
   }
   if (!supported_compute(instruction.compute)) {
     reject(instruction,
@@ -826,7 +850,9 @@ constexpr std::size_t modifier_value = index_value + 16;
 constexpr std::size_t length_value = modifier_value + 16;
 constexpr std::size_t base_value = length_value + 16;
 constexpr std::size_t accumulator_value = base_value + 16;
-constexpr std::size_t state_value_count = accumulator_value + accumulator_banks;
+constexpr std::size_t fifo_value = accumulator_value + accumulator_banks;
+constexpr std::size_t fifo_pointer_value = fifo_value + 1;
+constexpr std::size_t state_value_count = fifo_pointer_value + 1;
 using Values = std::array<llvm::Value *, state_value_count>;
 
 struct Node {
@@ -864,7 +890,7 @@ struct ShiftOperands {
 
 struct ShifterResult {
   llvm::Value *word{}, *overflow{}, *sign{};
-  bool writes{true};
+  bool writes{true}, clears_zero{};
 };
 
 struct MemoryPlan {
@@ -1160,23 +1186,30 @@ private:
                                 vector_type(32));
   }
 
+  llvm::Type *state_type(std::size_t index) {
+    if (index < status_value || index == fifo_value) { return vector_type(64); }
+    if (index < instruction_remaining_value || index == fifo_pointer_value) {
+      return vector_type(32);
+    }
+    if (index >= accumulator_value) { return vector_type(accumulator_bits); }
+    if (index == hazard_value || index == tail_value) { return builder_.getInt1Ty(); }
+    if (index >= dag_history_value || index == pc_stack_depth_value ||
+        index == interrupt_latch_value) {
+      return builder_.getInt32Ty();
+    }
+    return builder_.getInt64Ty();
+  }
+
   Node node(const std::string &name) {
     Node result;
     result.block = llvm::BasicBlock::Create(module_.getContext(), name, function_);
     llvm::IRBuilder<> start(result.block);
     for (std::size_t i = 0; i < state_value_count; ++i) {
-      if (i >= accumulator_value && !uses_multiplier_) { continue; }
+      if (i >= fifo_value ? !uses_fifo_ : i >= accumulator_value && !uses_multiplier_) { continue; }
       if (i >= index_value && i < accumulator_value && dag_[i - index_value] == nullptr) {
         continue;
       }
-      llvm::Type *type = builder_.getInt64Ty();
-      if (i < instruction_remaining_value) { type = vector_type(32); }
-      if (i < status_value) { type = vector_type(64); }
-      if (i == hazard_value || i == tail_value) { type = builder_.getInt1Ty(); }
-      if (i >= dag_history_value) { type = builder_.getInt32Ty(); }
-      if (i >= accumulator_value) { type = vector_type(accumulator_bits); }
-      if (i == pc_stack_depth_value || i == interrupt_latch_value) { type = builder_.getInt32Ty(); }
-      result.phi[i] = start.CreatePHI(type, 2);
+      result.phi[i] = start.CreatePHI(state_type(i), 2);
     }
     return result;
   }
@@ -1196,6 +1229,7 @@ private:
 
   llvm::Value *condition(const Values &values, unsigned code);
   llvm::Value *condition(const Values &values, const Instruction &op);
+  llvm::Value *compute_condition(const Values &values, const Instruction &op);
   Arithmetic arithmetic(const Values &values, const Compute &compute, unsigned opcode);
   Arithmetic floating(const Values &before, const Compute &compute, FloatingOp operation);
   Arithmetic multiplier(Values &values, const Compute &compute, llvm::Value *selected);
@@ -1222,6 +1256,13 @@ private:
   ShifterResult single_bit(unsigned opcode, ShiftOperands operands);
   ShifterResult shift_field(const Values &values, const Compute &compute, ShiftOperands operands);
   ShifterResult leading_bits(const Values &values, unsigned opcode, llvm::Value *source);
+  llvm::Value *fifo_operand(const Values &values, const Compute &compute);
+  llvm::Value *fifo_length(const Values &values, const Compute &compute);
+  void guard_fifo(const Values &values, const Instruction &op, bool partial);
+  Arithmetic
+  bit_fifo(Values &values, const Values &before, const Compute &compute, llvm::Value *selected);
+  void load_fifo(Values &values);
+  void spill_fifo(const Values &values);
   Arithmetic status_result(const Values &values,
                            const FixedResult &result,
                            llvm::Value *x,
@@ -1461,11 +1502,11 @@ private:
   loop_retirement(Values &values, const Instruction &op, llvm::Value *old_status, bool partial);
   llvm::Value *branch_lanes(const Values &values, const Instruction &op, bool partial);
   llvm::Value *branch_taken(llvm::Value *lanes);
-  void stack_guard(const Values &values,
-                   const Instruction &op,
-                   llvm::Value *allowed,
-                   bool partial,
-                   NativeExit reason = NativeExit::unsupported_stack);
+  void instruction_guard(const Values &values,
+                         const Instruction &op,
+                         llvm::Value *allowed,
+                         bool partial,
+                         NativeExit reason = NativeExit::unsupported_stack);
   void stack_status(Values &values);
   void push_pc(Values &values, llvm::Value *address);
   void call(Values &values, const Instruction &op, bool partial);
@@ -1564,6 +1605,7 @@ private:
   std::set<unsigned> y_written_;
   std::array<bool, accumulator_banks> accumulator_written_{};
   bool uses_multiplier_{};
+  bool uses_fifo_{}, fifo_written_{}, fifo_pointer_written_{};
   std::array<llvm::Value *, 64> dag_{};
   std::set<unsigned> dag_written_;
   bool dag_status_written_{};
@@ -1948,10 +1990,11 @@ Arithmetic Lowering::shifter_result(const Values &values, ShifterResult result) 
   constexpr std::uint32_t shifter_zero = 0x1000;
   constexpr std::uint32_t shifter_overflow = 0x800;
   constexpr std::uint32_t shifter_sign = 0x2000;
-  auto *zero = builder_.CreateICmpEQ(result.word, vector(32, 0));
-  auto *status =
-      builder_.CreateOr(builder_.CreateAnd(values[status_value], vector(32, ~shifter_flags)),
-                        flag(zero, shifter_zero));
+  auto *status = builder_.CreateAnd(values[status_value], vector(32, ~shifter_flags));
+  if (!result.clears_zero) {
+    auto *zero = builder_.CreateICmpEQ(result.word, vector(32, 0));
+    status = builder_.CreateOr(status, flag(zero, shifter_zero));
+  }
   if (result.overflow != nullptr) {
     status = builder_.CreateOr(status, flag(result.overflow, shifter_overflow));
   }
@@ -2072,6 +2115,115 @@ ShifterResult Lowering::leading_bits(const Values &values, unsigned opcode, llvm
     sign = builder_.CreateXor(sign, extended);
   }
   return {.word = exponent, .sign = sign};
+}
+
+llvm::Value *Lowering::fifo_operand(const Values &values, const Compute &compute) {
+  return compute.kind == ComputeKind::shift_immediate ? vector(32, compute.immediate)
+                                                      : fixed_word(values[compute.inputs[1]]);
+}
+
+llvm::Value *Lowering::fifo_length(const Values &values, const Compute &compute) {
+  auto *operand = fifo_operand(values, compute);
+  constexpr unsigned length_mask = 63;
+  return compute.kind == ComputeKind::shift_immediate
+             ? operand
+             : builder_.CreateAnd(operand, vector(32, length_mask));
+}
+
+void Lowering::guard_fifo(const Values &values, const Instruction &op, bool partial) {
+  if (!shift::fifo(op.compute) || !shift::fifo_transfer(op.compute.opcode)) { return; }
+  auto *pointer = values[fifo_pointer_value];
+  auto *length = fifo_length(values, op.compute);
+  auto *capacity = vector(32, shift::fifo_bits);
+  auto *available =
+      op.compute.opcode == shift::fifo_deposit ? builder_.CreateSub(capacity, pointer) : pointer;
+  auto *invalid =
+      builder_.CreateOr(builder_.CreateICmpUGT(length, vector(32, shift::fifo_length_limit)),
+                        builder_.CreateOr(builder_.CreateICmpUGT(pointer, capacity),
+                                          builder_.CreateICmpUGT(length, available)));
+  auto *admitted = compute_condition(values, op);
+  auto *fault = builder_.CreateOrReduce(builder_.CreateAnd(admitted, invalid));
+  instruction_guard(values, op, builder_.CreateNot(fault), partial, NativeExit::invalid_fifo);
+}
+
+Arithmetic Lowering::bit_fifo(Values &values,
+                              const Values &before,
+                              const Compute &compute,
+                              llvm::Value *selected) {
+  constexpr std::uint32_t fifo_full = 0x4000;
+  auto *pointer = before[fifo_pointer_value];
+  if (compute.opcode == shift::fifo_read) {
+    return shifter_result(before, {.word = pointer, .clears_zero = true});
+  }
+  ShifterResult result{.writes = false, .clears_zero = true};
+  if (compute.opcode == shift::fifo_write) {
+    pointer =
+        builder_.CreateAnd(fifo_operand(before, compute), vector(32, shift::fifo_pointer_mask));
+    result.overflow = builder_.CreateICmpUGT(pointer, vector(32, shift::fifo_bits));
+  } else {
+    auto *length = fifo_length(before, compute);
+    auto *old = before[fifo_value];
+    auto *wide = vector_type(64);
+    auto *max_shift = vector(64, shift::fifo_bits - 1);
+    auto *distance = builder_.CreateAnd(builder_.CreateZExt(length, wide), max_shift);
+    const auto right_shift = [&](llvm::Value *width) {
+      return builder_.CreateAnd(builder_.CreateSub(vector(64, shift::fifo_bits), width), max_shift);
+    };
+    if (compute.opcode == shift::fifo_deposit) {
+      auto *old_shift = right_shift(builder_.CreateZExt(pointer, wide));
+      auto *prefix = builder_.CreateShl(vector(64, ~std::uint64_t{0}), old_shift);
+      prefix = builder_.CreateSelect(
+          builder_.CreateICmpEQ(pointer, vector(32, 0)), vector(64, 0), prefix);
+      pointer = builder_.CreateAdd(pointer, length);
+      auto *input = builder_.CreateZExt(fixed_word(before[compute.inputs[0]]), wide);
+      auto *mask = builder_.CreateSub(builder_.CreateShl(vector(64, 1), distance), vector(64, 1));
+      auto *appended = builder_.CreateShl(builder_.CreateAnd(input, mask),
+                                          right_shift(builder_.CreateZExt(pointer, wide)));
+      auto *next = builder_.CreateOr(builder_.CreateAnd(old, prefix), appended);
+      values[fifo_value] = builder_.CreateSelect(selected, next, old);
+    } else {
+      auto *word =
+          builder_.CreateTrunc(builder_.CreateLShr(old, right_shift(distance)), vector_type(32));
+      auto *empty = builder_.CreateICmpEQ(length, vector(32, 0));
+      result = {.word = builder_.CreateSelect(empty, vector(32, 0), word)};
+      if (compute.opcode == shift::fifo_peek) { return shifter_result(before, result); }
+      pointer = builder_.CreateSub(pointer, length);
+      values[fifo_value] = builder_.CreateSelect(selected, builder_.CreateShl(old, distance), old);
+    }
+    fifo_written_ = true;
+  }
+  fifo_pointer_written_ = true;
+  values[fifo_pointer_value] = builder_.CreateSelect(selected, pointer, before[fifo_pointer_value]);
+  auto effect = shifter_result(before, result);
+  effect.status = builder_.CreateOr(
+      builder_.CreateAnd(effect.status, vector(32, ~fifo_full)),
+      flag(builder_.CreateICmpUGE(pointer, vector(32, shift::fifo_length_limit)), fifo_full));
+  return effect;
+}
+
+void Lowering::load_fifo(Values &values) {
+  if (!uses_fifo_) { return; }
+  const bool simd = (context_ & simd_mode) != 0;
+  values[fifo_value] =
+      pair(load(64, fifo_slot), simd ? load(64, fifo_slot + 1) : builder_.getInt64(0), 64);
+  auto *x = builder_.CreateZExt(load(8, fifo_pointer_slot), builder_.getInt32Ty());
+  auto *y = simd ? builder_.CreateZExt(load(8, fifo_pointer_slot + 1), builder_.getInt32Ty())
+                 : builder_.getInt32(0);
+  values[fifo_pointer_value] = pair(x, y, 32);
+}
+
+void Lowering::spill_fifo(const Values &values) {
+  const unsigned lanes = (context_ & simd_mode) != 0 ? 2U : 1U;
+  for (unsigned lane = 0; lane < lanes; ++lane) {
+    auto *index = builder_.getInt32(lane);
+    if (fifo_written_) {
+      store(builder_.CreateExtractElement(values[fifo_value], index), fifo_slot + lane);
+    }
+    if (fifo_pointer_written_) {
+      auto *pointer = builder_.CreateExtractElement(values[fifo_pointer_value], index);
+      store(builder_.CreateTrunc(pointer, builder_.getInt8Ty()), fifo_pointer_slot + lane);
+    }
+  }
 }
 
 void Lowering::load_accumulators(Values &values) {
@@ -2325,6 +2477,8 @@ void Lowering::compute_instruction(Values &values,
   Arithmetic result;
   if (floating_compute(compute)) {
     result = floating(before, compute, static_cast<FloatingOp>(compute.opcode));
+  } else if (shift::fifo(compute)) {
+    result = bit_fifo(values, before, compute, selected);
   } else if (compute.kind == ComputeKind::dual_alu) {
     const bool is_floating = floating_dual(compute);
     result = is_floating ? floating(before, compute, FloatingOp::add)
@@ -2348,6 +2502,16 @@ void Lowering::compute_instruction(Values &values,
   if (result.raw != nullptr) { write_register(values, compute.outputs[0], result.raw, selected); }
   values[status_value] = builder_.CreateSelect(selected, result.status, before[status_value]);
   values[sticky_value] = builder_.CreateSelect(selected, result.sticky, before[sticky_value]);
+}
+
+llvm::Value *Lowering::compute_condition(const Values &values, const Instruction &op) {
+  if (op.type == parallel_memory_type) { return condition(values, true_condition); }
+  auto *selected = condition(values, op);
+  if (op.type != computed_branch_type) { return selected; }
+  if ((op.word & else_compute) != 0) {
+    return builder_.CreateAnd(builder_.CreateNot(selected), condition(values, true_condition));
+  }
+  return (context_ & simd_mode) == 0 ? condition(values, true_condition) : selected;
 }
 
 void Lowering::instruction(Values &values, const Instruction &op, bool partial) {
@@ -2385,16 +2549,7 @@ void Lowering::instruction(Values &values, const Instruction &op, bool partial) 
     if (op.type == register_move_type) { register_instruction(values, op, before); }
     return;
   }
-  auto *selected = condition(values, op);
-  if (op.type == computed_branch_type) {
-    if ((op.word & else_compute) != 0) {
-      selected =
-          builder_.CreateAnd(builder_.CreateNot(selected), condition(values, true_condition));
-    } else if ((context_ & simd_mode) == 0) {
-      selected = condition(values, true_condition);
-    }
-  }
-  compute_instruction(values, before, compute, selected);
+  compute_instruction(values, before, compute, compute_condition(before, op));
   if (op.type == register_move_type) { register_instruction(values, op, before); }
 }
 
@@ -2585,7 +2740,7 @@ void Lowering::parallel_memory_instruction(Values &values, const Instruction &op
   const auto program_read = memory_transfer(values, op, program, program_operands);
   if (op.compute.kind != ComputeKind::none) {
     const auto before = values;
-    compute_instruction(values, before, op.compute, condition(before, true_condition));
+    compute_instruction(values, before, op.compute, compute_condition(before, op));
   }
   // Register priority is DAG1, DAG2, then the compute units.
   memory_writeback(values, program, program_operands, program_read);
@@ -2904,13 +3059,14 @@ void Lowering::memory_writeback(Values &values,
   }
 }
 
-void Lowering::stack_guard(const Values &values,
-                           const Instruction &op,
-                           llvm::Value *allowed,
-                           bool partial,
-                           NativeExit reason) {
-  auto *admitted = llvm::BasicBlock::Create(module_.getContext(), "stack.admitted", function_);
-  auto *refused = llvm::BasicBlock::Create(module_.getContext(), "cold.stack", function_);
+void Lowering::instruction_guard(const Values &values,
+                                 const Instruction &op,
+                                 llvm::Value *allowed,
+                                 bool partial,
+                                 NativeExit reason) {
+  auto *admitted =
+      llvm::BasicBlock::Create(module_.getContext(), "instruction.admitted", function_);
+  auto *refused = llvm::BasicBlock::Create(module_.getContext(), "cold.instruction", function_);
   builder_.CreateCondBr(
       allowed,
       admitted,
@@ -2919,13 +3075,11 @@ void Lowering::stack_guard(const Values &values,
   builder_.SetInsertPoint(refused);
   auto prefix = values;
   if (!partial) {
-    auto *completed = builder_.CreateSub(values[credit_value], builder_.getInt64(1));
+    const auto pending = costs_[addresses_.at(op.address)].instructions;
+    auto *completed = builder_.CreateSub(values[credit_value], builder_.getInt64(pending));
     credit(prefix, completed, builder_.CreateAdd(completed, values[extra_cycles_value]), false);
   }
-  if (reason == NativeExit::unsupported_loop_stack ||
-      reason == NativeExit::unsupported_loop_reentry || reason == NativeExit::invalid_loop_abort ||
-      reason == NativeExit::invalid_short_loop_call ||
-      reason == NativeExit::invalid_interrupt_return) {
+  if (reason != NativeExit::unsupported_stack) {
     auto *word = builder_.CreateGEP(builder_.getInt64Ty(),
                                     function_->getArg(unit_controls),
                                     builder_.getInt64(fault_instruction));
@@ -2973,11 +3127,11 @@ void Lowering::push_pc(Values &values, llvm::Value *address) {
 
 void Lowering::call(Values &values, const Instruction &op, bool partial) {
   if (op.compute.kind == ComputeKind::none) {
-    stack_guard(values,
-                op,
-                builder_.CreateICmpULT(values[pc_stack_depth_value],
-                                       builder_.getInt32(Registers::pc_stack_capacity)),
-                partial);
+    instruction_guard(values,
+                      op,
+                      builder_.CreateICmpULT(values[pc_stack_depth_value],
+                                             builder_.getInt32(Registers::pc_stack_capacity)),
+                      partial);
   }
   const auto site = reentry_calls_.find(op.address);
   auto *address = site == reentry_calls_.end() ? builder_.getInt32(call_resume(op) | pc_call_tag)
@@ -3211,29 +3365,29 @@ llvm::Value *Lowering::pop(Values &values, const Instruction &op, bool partial) 
                              : builder_.CreateOr(builder_.CreateNot(pops_status),
                                                  builder_.CreateICmpNE(load(8, status_depth_slot),
                                                                        builder_.getInt8(0)));
-    stack_guard(values,
-                op,
-                builder_.CreateAnd(has_frame, status_ready),
-                partial,
-                NativeExit::invalid_interrupt_return);
+    instruction_guard(values,
+                      op,
+                      builder_.CreateAnd(has_frame, status_ready),
+                      partial,
+                      NativeExit::invalid_interrupt_return);
     auto *popped_depth = builder_.CreateSub(depth, builder_.getInt32(1));
     auto *top = builder_.CreateLoad(builder_.getInt32Ty(), stack_cell(popped_depth));
     auto *tag = builder_.CreateAnd(top, builder_.getInt32(pc_call_tag | pc_sequencer_tag));
-    stack_guard(values,
-                op,
-                builder_.CreateICmpEQ(tag, builder_.getInt32(pc_sequencer_tag)),
-                partial,
-                NativeExit::invalid_interrupt_return);
+    instruction_guard(values,
+                      op,
+                      builder_.CreateICmpEQ(tag, builder_.getInt32(pc_sequencer_tag)),
+                      partial,
+                      NativeExit::invalid_interrupt_return);
     values[pc_stack_depth_value] = popped_depth;
     stack_status(values);
     return builder_.CreateAnd(top, builder_.getInt32(maximum_pc));
   }
-  stack_guard(values,
-              op,
-              builder_.CreateAnd(
-                  builder_.CreateICmpNE(depth, builder_.getInt32(0)),
-                  builder_.CreateICmpULE(depth, builder_.getInt32(Registers::pc_stack_capacity))),
-              partial);
+  instruction_guard(values,
+                    op,
+                    builder_.CreateAnd(builder_.CreateICmpNE(depth, builder_.getInt32(0)),
+                                       builder_.CreateICmpULE(
+                                           depth, builder_.getInt32(Registers::pc_stack_capacity))),
+                    partial);
   auto *popped_depth = builder_.CreateSub(depth, builder_.getInt32(1));
   auto *top = builder_.CreateLoad(builder_.getInt32Ty(), stack_cell(popped_depth));
   auto *tagged = builder_.CreateICmpNE(builder_.CreateAnd(top, builder_.getInt32(pc_sequencer_tag)),
@@ -3247,7 +3401,7 @@ llvm::Value *Lowering::pop(Values &values, const Instruction &op, bool partial) 
   }
   auto *payload =
       reentry_calls_.empty() ? nullptr : check_loop_return(values, op, popped_depth, partial);
-  stack_guard(values, op, allowed, partial);
+  instruction_guard(values, op, allowed, partial);
   if (payload != nullptr && (reentry || has_plain_loop_returns_)) {
     store(builder_.CreateAnd(payload, builder_.getInt64(~loop_call_live)), return_loop_tail_slot);
     builder_.CreateStore(builder_.getInt64(0), loop_cell(loop_call_slot, popped_depth, 64));
@@ -3273,7 +3427,7 @@ llvm::Value *Lowering::check_loop_return(const Values &values,
       ordinary = builder_.CreateOr(
           ordinary, builder_.CreateICmpEQ(fetch, builder_.getInt64(return_loop_fetch)));
     }
-    stack_guard(values, op, ordinary, partial, NativeExit::unsupported_loop_reentry);
+    instruction_guard(values, op, ordinary, partial, NativeExit::unsupported_loop_reentry);
   }
   return pending;
 }
@@ -3600,7 +3754,7 @@ llvm::Value *Lowering::branch_lanes(const Values &values, const Instruction &op,
   if (call_branch_instruction(op) && op.compute.kind != ComputeKind::none) {
     auto *room = builder_.CreateICmpULT(values[pc_stack_depth_value],
                                         builder_.getInt32(Registers::pc_stack_capacity));
-    stack_guard(
+    instruction_guard(
         values, op, builder_.CreateOr(builder_.CreateNot(branch_taken(lanes)), room), partial);
   }
   const auto site = reentry_calls_.find(op.address);
@@ -3608,7 +3762,7 @@ llvm::Value *Lowering::branch_lanes(const Values &values, const Instruction &op,
     auto *one_turn = short_flag(short_word(short_descriptor), short_compact_count);
     auto *active = short_active(site->second, short_word(short_remaining));
     auto *invalid = builder_.CreateAnd(branch_taken(lanes), builder_.CreateAnd(active, one_turn));
-    stack_guard(
+    instruction_guard(
         values, op, builder_.CreateNot(invalid), partial, NativeExit::invalid_short_loop_call);
   }
   if (loop_abort(op)) { guard_loop_abort(values, op, lanes, partial); }
@@ -3922,11 +4076,11 @@ void Lowering::loop_push(Values &values, const Instruction &op, bool partial) {
     }
     room = builder_.CreateAnd(room, available);
   }
-  stack_guard(values,
-              op,
-              builder_.CreateAnd(room, builder_.CreateICmpEQ(depth, counter_depth)),
-              partial,
-              NativeExit::unsupported_loop_stack);
+  instruction_guard(values,
+                    op,
+                    builder_.CreateAnd(room, builder_.CreateICmpEQ(depth, counter_depth)),
+                    partial,
+                    NativeExit::unsupported_loop_stack);
   if (parent_active != nullptr) {
     suspend_short_parent(values, op, parent->second, shape.length + 1, parent_active);
     depth = builder_.CreateZExt(load(8, loop_address_depth_slot), builder_.getInt32Ty());
@@ -4636,7 +4790,7 @@ void Lowering::guard_loop_abort(const Values &values,
   auto *owned = builder_.CreateAnd(stack_matches, builder_.CreateOr(frame.matches, already_exited));
   auto *allowed = builder_.CreateOr(builder_.CreateNot(branch_taken(lanes)),
                                     builder_.CreateAnd(owned, one_level));
-  stack_guard(values, op, allowed, partial, NativeExit::invalid_loop_abort);
+  instruction_guard(values, op, allowed, partial, NativeExit::invalid_loop_abort);
 }
 
 void Lowering::retire_loop_abort(Values &values, const LoopShape &shape) {
@@ -4792,7 +4946,7 @@ void Lowering::check_loop_end(const Values &values, const Instruction &op, bool 
   if (shape == hardware_ends_.end()) { return; }
   const auto frame = active_loop(values, shape->second);
   auto *known = builder_.CreateOr(builder_.CreateNot(frame.matches), repeat_scheduled(frame));
-  stack_guard(values, op, known, partial, NativeExit::unsupported_loop_stack);
+  instruction_guard(values, op, known, partial, NativeExit::unsupported_loop_stack);
 }
 
 llvm::Value *Lowering::repeat_scheduled(const LoopFrame &frame) {
@@ -5158,6 +5312,7 @@ void Lowering::emit_exit() {
     if (!accumulator_written_[bank]) { continue; }
     spill_accumulator(bank, values[accumulator_value + bank]);
   }
+  if (uses_fifo_) { spill_fifo(values); }
   if (stack_written_) {
     store(builder_.CreateTrunc(values[pc_stack_depth_value], builder_.getInt8Ty()),
           stack_depth_slot);
@@ -5515,6 +5670,7 @@ void Lowering::emit_instruction(std::size_t i,
   jump(fast_[i], values);
   builder_.SetInsertPoint(fast_[i].block);
   values = fast_[i].values();
+  guard_fifo(values, op, false);
   auto *lanes = branch_lanes(values, op, false);
   auto pipeline =
       PipelineEffects{.stall = pipeline_stall(values, op), .tag = loaded_tag(values, op)};
@@ -5550,6 +5706,7 @@ void Lowering::emit_instruction(std::size_t i,
   builder_.SetInsertPoint(bound);
   exit(values, builder_.getInt32(op.address), NativeExit::bound);
   builder_.SetInsertPoint(execute);
+  guard_fifo(values, op, true);
   if (branch(op)) { delayed_slot(values, op, true, values[status_value]); }
   check_loop_end(values, op, true);
   lanes = branch_lanes(values, op, true);
@@ -5610,6 +5767,8 @@ void Lowering::emit() {
     return fixed_multiplier(op.compute) || fixed_multifunction(op.compute) ||
            op.compute.kind == ComputeKind::mr_transfer;
   });
+  uses_fifo_ =
+      std::ranges::any_of(instructions_, [](const auto &op) { return shift::fifo(op.compute); });
   auto *entry = llvm::BasicBlock::Create(module_.getContext(), "entry", function_);
   builder_.SetInsertPoint(entry);
   load_indices();
@@ -5646,6 +5805,7 @@ void Lowering::emit() {
   initial[status_value] = function_->getArg(unit_status);
   initial[sticky_value] = function_->getArg(unit_sticky);
   load_accumulators(initial);
+  load_fifo(initial);
   initial[instruction_remaining_value] = function_->getArg(unit_instructions);
   initial[cycle_remaining_value] = function_->getArg(unit_cycles);
   initial[cycle_overrun_value] = function_->getArg(unit_cycle_overrun);

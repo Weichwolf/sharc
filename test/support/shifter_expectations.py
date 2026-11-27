@@ -218,6 +218,57 @@ struct ShifterCase {
 inline constexpr std::array<ShifterCase, """ + str(len(rows)) + "> shifter_cases{{\n" + ",\n".join(rows) + "\n}};\n"
 
 
+def fifo_header():
+    """Expected lane state for the authored classic FIFO encodings."""
+    register_form, immediate_form = 0x010000200000, 0x020000000000
+    rows = []
+
+    def emit(word, operation, arguments, pointers, no_update=False):
+        lanes = []
+        for lane, (argument, pointer) in enumerate(zip(arguments, pointers, strict=True)):
+            fifo = (0x812345679abcdef0, 0x13579bdf2468ace1)[lane]
+            source = (0xfedcba9857, 0x01234567a9)[lane]
+            operand = ((0xa5a5e000 | argument) << 8) | (0x91 + lane)
+            status = (0xa5003ffe, 0x5a007ffe)[lane]
+            raw = operand if operation == "write_pointer" else source
+            effect = bit_fifo(operation, fifo, pointer, raw=raw, length=argument,
+                              no_update=no_update, astat=status)
+            fields = (fifo, source, operand, effect.fifo, effect.raw or 0,
+                      status, effect.astat, pointer, effect.pointer)
+            lanes.append("{" + ", ".join(map(hex, fields)) + "}")
+        writes = str(operation in ("extract", "read_pointer")).lower()
+        rows.append(f"{{{word:#x}, {writes}, {{{{" + ", ".join(lanes) + "}}}")
+
+    for pointer in (0, 1, 31, 32, 64, 65, 127):
+        emit(register_form | 0x070b00, "read_pointer", (0, 0), (pointer, 127 - pointer))
+        emit(register_form | 0x07c009, "write_pointer", (pointer, 127 - pointer), (23, 65))
+        emit(immediate_form | 0x1f0000 | (pointer << 8), "write_pointer", (pointer,) * 2, (23, 65))
+
+    for opcode, operation, no_update in ((0x74, "deposit", False), (0x50, "extract", False),
+                                         (0x58, "extract", True)):
+        deposit = operation == "deposit"
+        registers = 0x39 if deposit else 0xb09
+        register = register_form | (opcode << 12) | registers
+        for size in (0, 1, 7, 15, 16, 23, 31, 32):
+            pointers = (7, 64 - size) if deposit else (size, 64)
+            emit(register, operation, (size, size), pointers, no_update)
+            immediate = immediate_form | (opcode << 14) | (size << 8) | (3 if deposit else 0xb0)
+            emit(immediate, operation, (size, size), pointers, no_update)
+
+    return """
+struct FifoLane {
+  std::uint64_t fifo, source, operand, next_fifo, result;
+  std::uint32_t old_astat, astat;
+  std::uint8_t pointer, next_pointer;
+};
+struct FifoCase {
+  std::uint64_t word;
+  bool writes;
+  std::array<FifoLane, 2> lanes;
+};
+inline constexpr std::array<FifoCase, """ + str(len(rows)) + "> fifo_cases{{\n" + ",\n".join(rows) + "\n}};\n"
+
+
 def bit_lattice():
     """Route individual bits instead of using whole-word shifts/masks."""
     count = 0

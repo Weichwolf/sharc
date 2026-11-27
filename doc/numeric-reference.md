@@ -446,6 +446,13 @@ clearing step. Extract shifts the complete raw FIFO left. NU preserves storage,
 the pointer and SF. Pointer writes preserve raw FIFO bits. They use seven bits,
 update SF at 32 and set SV above 64. Reads preserve SF and clear SZ/SV/SS.
 
+Register counts use the low six bits of the fixed word. In 48 immediate
+boundary probes, CCES encoded DATAEX in the assembled instruction. The
+functional simulator treated immediate lengths 64, 65 and 96 as out of range
+but treated `0x801` as length 1. The core uses the full documented 12-bit
+immediate and refuses lengths above 32. Silicon behavior for such operands
+remains unverified.
+
 The simulator matched 72 append/extract sequences, 22 pointer cases and 113
 of 117 defined operand-domain cases. The four differences were in the raw
 bits left behind by a 31-bit extract. To expose stored bits outside the logical
@@ -462,6 +469,7 @@ low bytes in the unoccupied tail. From `0x812345679abcdef0`, a 31-bit extract
 left `0xcd5e6f78006f7800` in the simulator. The reference follows the documented
 64-bit left shift, which leaves `0xcd5e6f7800000000`. Silicon behavior of
 the unoccupied bits remains unverified.
+
 FUNPACK uses all four exponent bits as finite short-format exponents, supports
 the short format's gradual underflow, and clears SZ/SV/SS even for signed zero.
 It ignores unrelated upper input bits and clears the result's extension byte.
