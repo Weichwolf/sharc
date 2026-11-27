@@ -42,6 +42,14 @@ def summary(records):
                 raise ValueError("missing prepared instruction denominator")
             entry["prepared_instructions"] = prepared
             entry["native_bytes_per_prepared_instruction"] = record["native_bytes"] / prepared
+        if "schedule" in record:
+            entry["schedule"] = record["schedule"]
+            for name in ("owner_calls", "owner_horizons", "irq_requested", "irq_accepted",
+                         "irq_max_delay", "irq_total_delay"):
+                values = [run[name] for run in runs]
+                if any(value != values[0] for value in values):
+                    raise ValueError(f"owner schedule changed between runs: {name}")
+                entry[name] = values[0]
         result.append(entry)
 
     if not result:
