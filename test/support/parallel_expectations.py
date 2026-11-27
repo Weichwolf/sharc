@@ -4,13 +4,14 @@
 from itertools import product as cartesian_product
 from dataclasses import asdict, is_dataclass
 from fractions import Fraction
+import json
 
 from floating_expectations import encode
 from multiplier_expectations import _limb_accumulate, _limb_product
 from expectation_check import require, require_raises
 from reference import (
-    IntegerResult, Mode, ParallelResult, Unqualified, dual_alu, fixed, floating_alu,
-    floating_multiply, parallel_compute,
+    IntegerResult, Mode, ParallelResult, RegisterWrite, Unqualified, dual_alu, fixed,
+    floating_alu, floating_multiply, parallel_compute, register_writeback,
 )
 
 
@@ -122,6 +123,92 @@ def anchors():
         records.append(dict(name=name, kind="simd-numeric", format=kind, operation=operation,
                             left=left, right=right, options=options, expected=expected))
     return [record_value(record) for record in records]
+
+
+def installed_header():
+    """Export authored multifunction packets with independently selected writeback winners."""
+    rows = []
+    input_registers = (0, 4, 8, 12)
+    inputs = ((0x8000000011, 0x8000000022, 0x7FFFFFFF33, 0x0000000144),
+              (0xFFFFFFFD55, 0x4000000066, 0xFFFFFFFD77, 0x0000000088))
+
+    def emit(name, opcode, multiplier, destination, alu, outputs, mode1, conditional=False):
+        astat = (0xA59903C1, 0x5A2203C0)
+        stky = (0x20, 0x200)
+        old_mr = (0x100000001, 0xFFFFFFFFFFFFFFFFFFFF)
+        registers = [[[0x1000000080 * (1 + lane) + (bank << 32) + (reg << 8)
+                       for reg in range(16)] for bank in range(2)] for lane in range(2)]
+        effects = []
+        proposals = []
+        for lane, arguments in enumerate(inputs):
+            for reg, value in zip(input_registers, arguments):
+                mode_bit = 0x400 if reg < 8 else 0x80
+                registers[lane][bool(mode1 & mode_bit)][reg] = value
+            active = (lane == 0 or mode1 & 0x200000) and (not conditional or astat[lane] & 1)
+            if active:
+                effect = parallel_compute(
+                    "fixed", *arguments, alu=alu, multiplier=multiplier, destination=destination,
+                    modifier="SSF" if destination == "mr" else "SSFR", accumulator=old_mr[lane],
+                    saturate=bool(mode1 & 0x2000), truncate=bool(mode1 & 0x8000),
+                    astat=astat[lane], stky=stky[lane])
+                pe = "x" if lane == 0 else "y"
+                proposals.extend(RegisterWrite(producer + pe, lane, reg, raw)
+                                 for producer, reg, raw in zip(("multiplier_", "alu_", "alu_"),
+                                                              outputs, effect.raw)
+                                 if raw is not None)
+                effects.append((effect.accumulator, effect.astat, effect.stky))
+            else:
+                effects.append((old_mr[lane], astat[lane], stky[lane]))
+        final = register_writeback(registers, proposals, mode1=mode1)
+        rm, ra, *rs = outputs
+        field = ((0x600000 | (rs[0] << 16)) if rs else 0x400000 | (opcode << 16)) | (rm << 12) | (ra << 8)
+
+        def array(values, suffix=""):
+            return "{" + ", ".join(f"0x{value:x}{suffix}" for value in values) + "}"
+
+        def banks(values):
+            return "{{" + ", ".join(array(bank, "ULL") for bank in values) + "}}"
+
+        def limbs(value):
+            return array((value >> shift) & 0xffffffff for shift in (0, 32, 64))
+
+        lanes = []
+        for lane, (mr, flags, sticky) in enumerate(effects):
+            lanes.append("MultifunctionLane{" + ", ".join((
+                banks(registers[lane]), banks(final[lane]), limbs(old_mr[lane]), limbs(mr),
+                f"0x{astat[lane]:x}", f"0x{stky[lane]:x}", f"0x{flags:x}", f"0x{sticky:x}")) + "}")
+        header = 0x010000000000 if conditional else 0x013e00000000
+        rows.append(f"MultifunctionCase{{{json.dumps(name)}, 0x{header | field:x}ULL, 0x{mode1:x}, "
+                    + "{" + ", ".join(lanes) + "}}")
+
+    for base, multiplier, destination in ((4, "mul", "register"), (8, "mac", "mr"),
+                                           (12, "mac", "register"), (16, "msub", "mr"),
+                                           (20, "msub", "register")):
+        for offset, alu in enumerate(("add", "sub", "avg")):
+            mode1 = 0x200000 | (0x480 if base & 4 else 0) | (0x2000 if base & 8 else 0)
+            mode1 |= (0x8004 if base & 16 else 0)
+            emit(f"{multiplier} to {destination} with {alu}", base + offset, multiplier,
+                 destination, alu, (8, 0), mode1)
+    emit("three fixed outputs read all old inputs", 0, "mul", "register", "dual", (8, 0, 4), 0x200000)
+    emit("add beats multiply on the same register", 4, "mul", "register", "add", (8, 8), 0x200000)
+    emit("subtract beats multiply with lane-local EQ", 0, "mul", "register", "dual", (4, 0, 4),
+         0x200480, True)
+    emit("SISD MAC uses the swapped physical bank", 8, "mac", "mr", "add", (0, 8), 4)
+
+    return """
+struct MultifunctionLane {
+  std::array<std::array<std::uint64_t, 16>, 2> old_registers, result_registers;
+  std::array<std::uint32_t, 3> old_mr, result_mr;
+  std::uint32_t old_astat, old_stky, astat, stky;
+};
+struct MultifunctionCase {
+  std::string_view name;
+  std::uint64_t word;
+  std::uint32_t mode1;
+  std::array<MultifunctionLane, 2> lanes;
+};
+inline constexpr std::array multifunction_cases{
+""" + ",\n".join(rows) + "\n};\n"
 
 
 def _fixed_alu(operation, x, y, saturate, truncate):

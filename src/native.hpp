@@ -50,7 +50,17 @@ inline constexpr std::size_t interrupt_frame_slot = suspended_call_state_slot + 
 inline constexpr std::size_t status_depth_slot = interrupt_frame_slot + 1;
 inline constexpr std::size_t progress_cycle_slot = status_depth_slot + 1;
 inline constexpr std::size_t interrupt_deadline_slot = progress_cycle_slot + 1;
-inline constexpr std::size_t register_pointer_count = interrupt_deadline_slot + 1;
+inline constexpr std::size_t accumulator_slot = interrupt_deadline_slot + 1;
+inline constexpr unsigned accumulator_banks = 2;
+inline constexpr unsigned accumulator_limbs = 3;
+inline constexpr std::size_t register_pointer_count =
+    accumulator_slot + (std::size_t{2} * accumulator_banks * accumulator_limbs);
+
+[[nodiscard]] constexpr std::size_t mr_slot(unsigned lane, unsigned bank, unsigned limb) {
+  return accumulator_slot + (((std::size_t{lane} * accumulator_banks) + bank) * accumulator_limbs) +
+         limb;
+}
+
 // Three short-buffer words, the arithmetic refill, and all counted tails.
 inline constexpr unsigned suspended_call_state_words = 4 + loop_stack_capacity + 2;
 inline constexpr std::uint32_t loop_pc_index_mask = 31;
@@ -86,6 +96,8 @@ inline constexpr std::uint32_t before_first_delay_slot = 1U << 25;
 inline constexpr std::uint32_t before_second_delay_slot = 1U << 24;
 inline constexpr std::uint32_t delayed_fetch_live = 1U << 26;
 inline constexpr unsigned delayed_fetch_shift = 32;
+inline constexpr std::uint32_t reverse8_mode = 1U << 0;
+inline constexpr std::uint32_t reverse0_mode = 1U << 1;
 inline constexpr std::uint32_t dag1_high_mode = 1U << 3;
 inline constexpr std::uint32_t dag1_low_mode = 1U << 4;
 inline constexpr std::uint32_t dag2_high_mode = 1U << 5;
@@ -93,6 +105,7 @@ inline constexpr std::uint32_t dag2_low_mode = 1U << 6;
 inline constexpr std::uint32_t high_bank_mode = 1U << 7;
 inline constexpr std::uint32_t low_bank_mode = 1U << 10;
 inline constexpr std::uint32_t saturation_mode = 1U << 13;
+inline constexpr std::uint32_t multiplier_swap_mode = 1U << 2;
 inline constexpr std::uint32_t truncation_mode = 1U << 15;
 inline constexpr std::uint32_t simd_mode = 1U << 21;
 inline constexpr std::uint32_t broadcast9_mode = 1U << 22;

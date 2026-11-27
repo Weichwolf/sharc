@@ -51,8 +51,24 @@ struct FaultAccess {
   std::uint32_t variant{}, pc{};
   std::uint64_t word{};
   std::uint8_t bits{};
-  MemorySpace space{};
+  std::array<unsigned, 2> spaces{}; // Read and write separately.
 };
+
+unsigned space_mask(MemorySpace space) {
+  return 1U << static_cast<unsigned>(space);
+}
+
+std::vector<FaultAccess> fault_accesses(std::span<const detail::Instruction> decoded) {
+  std::vector<FaultAccess> accesses;
+  for (const auto &op : decoded) {
+    const auto moves = detail::memory_moves(op);
+    if (moves.count == 0) { continue; }
+    FaultAccess access{.variant = op.variant, .pc = op.address, .word = op.word, .bits = op.bits};
+    for (const auto &move : moves) { access.spaces[move.write ? 1 : 0] |= space_mask(move.space); }
+    accesses.push_back(access);
+  }
+  return accesses;
+}
 } // namespace
 
 struct NativeImage::Impl {
@@ -313,6 +329,12 @@ struct Core::Impl {
         for (unsigned reg = 0; reg < 16; ++reg) {
           pointers[(lane * 32) + (bank * 16) + reg] = &state.registers.pe[lane].data[bank][reg];
         }
+      }
+      for (unsigned bank = 0; bank < detail::accumulator_banks; ++bank) {
+        auto &mr = state.registers.pe[lane].multiplier[bank];
+        pointers[detail::mr_slot(lane, bank, 0)] = &mr.low;
+        pointers[detail::mr_slot(lane, bank, 1)] = &mr.middle;
+        pointers[detail::mr_slot(lane, bank, 2)] = &mr.high;
       }
       pointers[detail::astat_slot + lane] = &state.registers.pe[lane].astat;
       pointers[detail::stky_slot + lane] = &state.registers.pe[lane].stky;
@@ -581,15 +603,7 @@ NativeImage Core::bind(const SemanticImage &image, const NativeSymbols &symbols)
                      0,
                      "direct image requires native fault attribution");
     }
-    constexpr unsigned memory_move_type = 15;
-    for (const auto &op : decoded) {
-      if (op.type != memory_move_type) { continue; }
-      bound->accesses.push_back({.variant = op.variant,
-                                 .pc = op.address,
-                                 .word = op.word,
-                                 .bits = op.bits,
-                                 .space = detail::memory_move(op).space});
-    }
+    bound->accesses = fault_accesses(decoded);
   }
   std::map<std::string, std::uintptr_t> addresses;
   for (const auto &symbol : symbols.entries) {
@@ -1066,19 +1080,22 @@ RunResult Core::Impl::host_failure(Progress progress) {
     } else {
       result.fault.instruction = access->word;
       result.fault.instruction_bits = access->bits;
-      const auto view = std::ranges::find_if(views, [&](const auto &candidate) {
-        return candidate.space == access->space && candidate.writing == record.writing &&
-               record.address >= candidate.address &&
-               record.address - candidate.address < candidate.size;
-      });
-      if (view == views.end()) {
+      bool attributed = false;
+      const auto spaces = access->spaces[record.writing ? 1 : 0];
+      for (const auto &view : views) {
+        if ((spaces & space_mask(view.space)) == 0 || view.writing != record.writing ||
+            record.address < view.address || record.address - view.address >= view.size) {
+          continue;
+        }
+        result.fault.detail +=
+            ", space " + std::to_string(static_cast<unsigned>(view.space)) + ", word address " +
+            std::to_string(
+                static_cast<std::uint32_t>((record.address - view.address) / view.stride));
+        attributed = true;
+      }
+      if (!attributed) {
         result.fault.reason = FaultReason::invalid_image;
         result.fault.detail += ": fault address is outside the guest instruction's view";
-      } else {
-        result.fault.detail +=
-            ", space " + std::to_string(static_cast<unsigned>(view->space)) + ", word address " +
-            std::to_string(
-                static_cast<std::uint32_t>((record.address - view->address) / view->stride));
       }
     }
   }

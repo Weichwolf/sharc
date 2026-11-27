@@ -2,6 +2,7 @@
 #pragma once
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <sharc/core.hpp>
 #include <string>
@@ -14,6 +15,8 @@ inline constexpr std::uint8_t wide_instruction_bits = 32;
 inline constexpr std::uint8_t short_instruction_bits = 16;
 inline constexpr std::uint32_t maximum_pc = 0xffffff;
 inline constexpr unsigned interrupt_source_count = 42;
+inline constexpr unsigned parallel_memory_type = 1;
+inline constexpr unsigned memory_move_type = 15;
 
 enum class ComputeKind : std::uint8_t {
   none,
@@ -45,12 +48,23 @@ struct Instruction {
 };
 
 struct MemoryMove {
-  unsigned index{}, reg{}, lane{};
+  unsigned index{}, reg{}, lane{}, modifier{};
   MemorySpace space{};
   bool write{};
 };
 
+struct MemoryMoves {
+  std::array<MemoryMove, 2> transfers{};
+  std::size_t count{};
+
+  [[nodiscard]] auto begin() const { return transfers.begin(); }
+
+  [[nodiscard]] auto end() const { return transfers.begin() + static_cast<std::ptrdiff_t>(count); }
+};
+
 [[nodiscard]] MemoryMove memory_move(const Instruction &instruction);
+[[nodiscard]] MemoryMoves memory_moves(const Instruction &instruction);
+
 void validate_options(const CompileOptions &options, std::string_view identity);
 
 [[nodiscard]] Compute decode_compute(const Instruction &instruction, std::string_view identity);

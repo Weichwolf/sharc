@@ -202,6 +202,51 @@ void terminal_access(sharc::ExecutionMode mode, Case item) {
   nonresumable(core, native, memory, snapshot);
 }
 
+void parallel_terminal_access(sharc::ExecutionMode mode) {
+  // DM(I2,M2) = R0, PM(I10,M10) = R1.
+  constexpr std::uint64_t packet = 0x34a090800000;
+  constexpr std::array program_words{packet};
+  constexpr std::uint32_t pm_id = ram_id + 1;
+  const Space dm;
+  const Space pm;
+  fixture::Program program(program_words);
+  auto memory = lend(program, dm, sharc::MemorySpace::data);
+  auto region = fixture::normal_region(0, words, pm_id);
+  region.space = sharc::MemorySpace::program;
+  program.code.variants[0].layout.regions.push_back(region);
+  memory.regions.push_back({.storage_id = pm_id, .bytes = pm.bytes(), .generation = 1});
+  const sharc::CompileOptions options{
+      .mode = mode, .memory_mode = MemoryMode::direct, .callbacks = {}};
+  const auto native = mode == sharc::ExecutionMode::strict
+                          ? sharc::Core::compile(program.code, options)
+                          : consumer_compile(program.code, options);
+  for (const bool deny_dm : {false, true}) {
+    for (const auto *space : {&dm, &pm}) {
+      space->allow(ram_address, Protection::read_write);
+      space->put({.address = ram_address, .word = expected_word});
+    }
+    (deny_dm ? dm : pm).allow(ram_address, Protection::read);
+    sharc::Core core(memory, mode);
+    auto registers = initial(fixture::code_address, sharc::MemorySpace::data, ram_address);
+    registers.dag[0][2].index = ram_address;
+    registers.dag[0][10].index = ram_address;
+    registers.pe[0].data[0][1] = raw_y;
+    fixture::install(core, native, registers);
+    const auto result = core.run(1);
+    check(result.has_fault && result.fault.reason == sharc::FaultReason::access_fault &&
+              result.fault.address == fixture::code_address && result.fault.instruction == packet &&
+              result.fault.instruction_bits == instruction_bits &&
+              result.fault.detail.contains(deny_dm ? "space 1" : "space 0") &&
+              result.fault.detail.contains("word address " + std::to_string(ram_address)) &&
+              result.progress == sharc::Progress{} &&
+              dm.get(ram_address) == (deny_dm ? expected_word : raw_x >> raw_shift) &&
+              pm.get(ram_address) == expected_word,
+          "parallel protected store lost bus order or host fault attribution: " +
+              result.fault.detail);
+    check_mask();
+  }
+}
+
 const volatile std::uint32_t *cpp_target{};
 
 void cpp_fault() noexcept {
@@ -493,6 +538,7 @@ int main() {
     for (const auto mode : fixture::numeric_modes) {
       effect_order(mode, false);
       effect_order(mode, true);
+      parallel_terminal_access(mode);
       cross_unit_fault(mode);
       constant_wrapping(mode, MemoryMode::exact);
       constant_wrapping(mode, MemoryMode::direct);

@@ -1,11 +1,10 @@
 # Prepared memory access
 
-The initial memory implementation executes classic type 15 pre-indexed transfers
-between R0–R15/S0–S15 and declared direct normal-word regions. Other transfers,
-runtime I/O callbacks and code-changing stores remain open; this is
-not complete memory or ADSP-21489 profile coverage. The reference is Programming
-Reference 2.4, sections 6-10, 6-19–6-29, 7-36–7-40, 9-56–9-59 and 10-21/31/32,
-pinned in `reference-manifest.json`.
+The core executes classic type 15 pre-indexed and type 1a parallel post-indexed
+normal-word transfers. The remaining access widths, runtime I/O callbacks and
+code-changing stores are open. The reference is Programming Reference 2.4,
+sections 2-6–2-7, 4-110, 6-10–6-31, 7-36–7-40, 9-7–9-9, 9-56–9-59 and
+10-5/21/31/32, pinned in `reference-manifest.json`.
 
 ## Layout and storage
 
@@ -35,12 +34,27 @@ leaves I unchanged. Circular and bit-reverse post-modification do not apply to
 this pre-indexed operation. Programs must obey the manual's restriction that
 pre-indexing does not change the address space.
 
+Type 1a transfers address DM using DAG1 and PM using DAG2. Both addresses use
+their old I. The packet updates each I once using the selected signed M from the
+same DAG. CBUFEN enables circular limits and the documented I7/I15 overflow
+effects. BR0 and BR8 reverse the I0/I8 bus address before the paired lane offset.
+The post-modifier still updates the original unreversed I.
+
 The I register comes from the selected physical DAG bank: I0–3, I4–7, I8–11 and
 I12–15 have independent bank selections. Data-file bank selection remains separate.
 An explicit S register can transfer in SISD. SIMD transfers the explicit register
 and its complement at consecutive normal-word addresses, including odd explicit
 addresses. Read broadcast through I1 or I9 loads both complementary registers
 from one word independently of PEYEN. Broadcast does not duplicate stores.
+
+Type 1a stores and compute read the original register values. Same-packet
+loads write back over compute results, with DM taking precedence over PM for
+each targeted lane. The DM bus completes first when the accesses contend for
+the same storage. Exact mode checks both buses and every selected lane before
+an access, compute writeback or index update can take effect. Direct protection
+can fault after an earlier bus or lane has written memory. When overlapping
+Direct reservations admit more than one possible logical word address for the
+same host fault, diagnostics include each matching view.
 
 For an index unchanged within a unit, LLVM computes the normal-word host
 addresses and combines layout, permission
