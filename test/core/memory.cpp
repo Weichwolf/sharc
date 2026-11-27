@@ -736,6 +736,55 @@ void delayed_io() {
         "delayed I/O yield lost the prepared destination continuation");
 }
 
+void immediate_store_io(sharc::ExecutionMode mode) {
+  constexpr std::uint32_t payload = 0x765432ab;
+  constexpr std::uint64_t opcode = 0x92c000000000; // DM(I1,M3) = immediate.
+  constexpr auto store = opcode | payload;
+  constexpr unsigned refusal = 2;
+  constexpr unsigned stop_after = 2;
+  constexpr unsigned postmodify = 2;
+  const std::array words{store, std::uint64_t{0}};
+  Program program(words);
+  program.code.code.variants.front().layout.regions.back().initialized = false;
+  const auto native = fixture::compile(program.code.code, mode);
+  auto before = initial();
+  before.mode1 = simd_bit;
+  before.dag[0][1].index = ram_address;
+  before.dag[0][3].modifier = postmodify;
+  for (const bool reject : {false, true}) {
+    Peripheral device{.yield_on = reject ? 0U : 1U, .fault_on = reject ? refusal : 0U};
+    auto memory = program.code.memory();
+    memory.io = device.binding();
+    sharc::Core core(memory, mode);
+    device.core = &core;
+    fixture::install(core, native, before);
+    const auto result = core.run(stop_after);
+    constexpr auto dm = sharc::MemorySpace::data;
+    check(device.calls == refusal && device.words[0] == payload &&
+              device.trace[0] ==
+                  Peripheral::Access{
+                      .space = dm, .address = ram_address, .word = payload, .writing = true} &&
+              device.trace[1] ==
+                  Peripheral::Access{
+                      .space = dm, .address = ram_address + 1, .word = payload, .writing = true},
+          "immediate store changed payload or explicit-before-implicit callback order");
+    if (reject) {
+      check(result.has_fault && result.fault.reason == sharc::FaultReason::access_fault &&
+                result.fault.instruction == store && result.progress == sharc::Progress{} &&
+                device.words[1] == 0 && core.registers() == before,
+            "refused implicit store committed DAG state or retired the packet");
+    } else {
+      auto expected = before;
+      expected.dag[0][1].index += postmodify;
+      fixture::boundary(expected, {.pc = expected.pc + 1, .clock = 1});
+      check(result.execution == sharc::ExecutionState::yielded &&
+                fixture::completed(result, 1, 1) && device.words[1] == payload &&
+                core.registers() == expected,
+            "immediate store yielded before both writes and the shared DAG update");
+    }
+  }
+}
+
 constexpr std::uint64_t fixed_parallel_add = 0x34c89a001401;
 constexpr std::uint64_t floating_parallel_add = 0x34c89a081401;
 
@@ -1411,6 +1460,7 @@ int main() {
     floating_parallel_writeback();
     parallel_refusal(sharc::ExecutionMode::strict, fixed_parallel_add);
     for (const auto mode : fixture::numeric_modes) {
+      immediate_store_io(mode);
       parallel_io(mode, floating_parallel_add);
       parallel_refusal(mode, floating_parallel_add);
       parallel_fifo_refusal(mode);

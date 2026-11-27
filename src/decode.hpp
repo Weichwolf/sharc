@@ -4,6 +4,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <sharc/core.hpp>
 #include <string>
 #include <string_view>
@@ -16,7 +17,9 @@ inline constexpr std::uint8_t short_instruction_bits = 16;
 inline constexpr std::uint32_t maximum_pc = 0xffffff;
 inline constexpr unsigned interrupt_source_count = 42;
 inline constexpr unsigned parallel_memory_type = 1;
+inline constexpr unsigned absolute_memory_type = 14;
 inline constexpr unsigned memory_move_type = 15;
+inline constexpr unsigned immediate_memory_store_type = 16;
 
 enum class ComputeKind : std::uint8_t {
   none,
@@ -47,10 +50,19 @@ struct Instruction {
   InstructionSet instruction_set{InstructionSet::isa};
 };
 
+constexpr bool single_memory_transfer(unsigned type) {
+  return type >= absolute_memory_type && type <= immediate_memory_store_type;
+}
+
+enum class MemoryAddressing : std::uint8_t { indexed_offset, absolute, postmodified };
+
 struct MemoryMove {
   unsigned index{}, reg{}, lane{}, modifier{};
   MemorySpace space{};
   bool write{};
+  MemoryAddressing addressing{};
+  std::uint32_t address_operand{};
+  std::optional<std::uint32_t> immediate = std::nullopt;
 };
 
 struct MemoryMoves {

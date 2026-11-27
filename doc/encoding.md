@@ -62,6 +62,12 @@ condition in bits 37:33, the source index in 32:30 and the modifier in 29:27.
 Bits 26:24 hold the within-DAG XOR of destination and source. The classic
 full form uses bits 22:0 for compute and leaves bits 39 and 23 clear.
 
+Type 14a uses bits 41 and 40 for PM/DM and direction, bit 39 for the long-word
+override, bits 38:32 for UREG and bits 31:0 for the full address. Type 16a
+places I in bits 43:41, M in 40:38, the DAG selector in bit 37 and the immediate
+in bits 31:0. CCES assembly of authored probes left bits 36:32 clear. Classic
+preparation rejects those five reserved bits on type 16a.
+
 The 1001 VISA prefix uses additional discriminator bits to separate full-width
 immediate stores, compact immediate stores/offset transfers and short transfers.
 The optional-compute marker is tested only in the families that define it;

@@ -483,6 +483,16 @@ unconditional type-1 packet untouched. The reference uses the documented
 left shift for extraction. Silicon behavior of the simulator's differing
 unoccupied bits remains unverified.
 
+Classic type 14 absolute data-register transfers cover both PM and DM, both
+data bank halves, explicit R and S registers, and paired normal-word offsets.
+Type 16 immediate stores cover short, normal, long and extended declared
+views, including zero extension, long-word replication, alternate DAG banks,
+signed post-modification and circular sticky/interrupt effects. Installed
+fixtures compare complete registers and padded storage in both numerical
+modes. The Exact callback fixture checks explicit-before-implicit stores,
+the retained first write on refusal, and retirement before yield with the
+single shared index update.
+
 Classic type 15 transfers use direct normal-word PM/DM layouts, pre-indexed
 32-bit displacements, physical DAG/data banks, explicit R/S registers, SIMD and
 read broadcast. Full raw registers and padded storage are checked at every

@@ -698,6 +698,13 @@ void validate_return(const Instruction &instruction, std::string_view identity) 
 }
 
 void validate_memory_move(const Instruction &instruction, std::string_view identity) {
+  if (instruction.type == immediate_memory_store_type) {
+    constexpr auto reserved = std::uint64_t{31} << 32;
+    if ((instruction.word & reserved) != 0) {
+      reject(instruction, identity, FaultReason::invalid_encoding, "reserved immediate store bits");
+    }
+    return;
+  }
   constexpr unsigned register_shift = 32;
   constexpr unsigned y_first = 0x50;
   constexpr unsigned y_limit = 0x60;
@@ -834,7 +841,7 @@ void validate(const Instruction &instruction, std::string_view identity) {
     validate_loop(instruction, identity);
     return;
   }
-  if (instruction.type == memory_move_type) {
+  if (single_memory_transfer(instruction.type)) {
     validate_memory_move(instruction, identity);
     return;
   }
@@ -999,7 +1006,7 @@ bool callback_region(const RegionLayout &layout) {
 }
 
 std::uint32_t broadcast_mode(const MemoryMove &move) {
-  if (move.write) { return 0; }
+  if (move.write || move.addressing == MemoryAddressing::absolute) { return 0; }
   if (move.index == 1) { return broadcast1_mode; }
   return move.index == 9 ? broadcast9_mode : 0;
 }
@@ -1314,6 +1321,8 @@ private:
   void dag_overflow(Values &values, unsigned index, llvm::Value *overflow);
   llvm::Value *planned_pointer(const MemoryPlan &plan, llvm::Value *address, unsigned transfer);
   bool plan_changing_memory(const Instruction &op, const MemoryMove &move);
+  llvm::Value *effective_address(const MemoryMove &move, llvm::Value *index);
+  void postmodify_memory(Values &values, const MemoryMove &move);
   void resolve_memory(const Values &values,
                       const Instruction &op,
                       const MemoryMove &move,
@@ -1952,8 +1961,11 @@ llvm::Value *Lowering::pipeline_stall(const Values &values, const Instruction &o
   llvm::Value *stall = builder_.getInt64(0);
   std::vector<unsigned> dependencies;
   for (const auto &move : memory_moves(op)) {
+    if (move.addressing == MemoryAddressing::absolute) { continue; }
     dependencies.push_back(move.index);
-    if (op.type == parallel_memory_type) { dependencies.push_back(16 + move.modifier); }
+    if (move.addressing == MemoryAddressing::postmodified) {
+      dependencies.push_back(16 + move.modifier);
+    }
   }
   if (modifies_index(op)) {
     const auto modify = index_modify(op);
@@ -2563,7 +2575,7 @@ void Lowering::instruction(Values &values, const Instruction &op, bool partial) 
     values[hazard_value] = builder_.getFalse();
     return;
   }
-  if (op.type == memory_move_type) {
+  if (single_memory_transfer(op.type)) {
     memory_instruction(values, op, partial);
     values[hazard_value] = builder_.getFalse();
     return;
@@ -2791,6 +2803,7 @@ void Lowering::memory_instruction(Values &values, const Instruction &op, bool pa
   const auto move = memory_move(op);
   const auto operands = memory_operands(values, op, move, partial);
   memory_writeback(values, move, operands, memory_transfer(values, op, move, operands));
+  if (move.addressing == MemoryAddressing::postmodified) { postmodify_memory(values, move); }
 }
 
 void Lowering::parallel_memory_instruction(Values &values, const Instruction &op, bool partial) {
@@ -2807,26 +2820,37 @@ void Lowering::parallel_memory_instruction(Values &values, const Instruction &op
   // Register priority is DAG1, DAG2, then the compute units.
   memory_writeback(values, program, program_operands, program_read);
   memory_writeback(values, data, data_operands, data_read);
-  for (const auto &move : {data, program}) {
-    dag_modify(values,
-               {.source = move.index, .destination = move.index},
-               values[modifier_value + move.modifier],
-               (context_ & circular_mode) != 0,
-               builder_.getTrue());
-  }
+  postmodify_memory(values, data);
+  postmodify_memory(values, program);
   values[hazard_value] = builder_.getInt1(op.compute.kind != ComputeKind::none);
+}
+
+void Lowering::postmodify_memory(Values &values, const MemoryMove &move) {
+  dag_modify(values,
+             {.source = move.index, .destination = move.index},
+             values[modifier_value + move.modifier],
+             (context_ & circular_mode) != 0,
+             builder_.getTrue());
+}
+
+llvm::Value *Lowering::effective_address(const MemoryMove &move, llvm::Value *index) {
+  if (move.addressing == MemoryAddressing::absolute) {
+    return builder_.getInt32(move.address_operand);
+  }
+  if (move.addressing == MemoryAddressing::indexed_offset) {
+    return builder_.CreateAdd(index, builder_.getInt32(move.address_operand));
+  }
+  if ((context_ & reverse_mode(move.index)) != 0) {
+    return builder_.CreateUnaryIntrinsic(llvm::Intrinsic::bitreverse, index);
+  }
+  return index;
 }
 
 MemoryOperands Lowering::memory_operands(const Values &values,
                                          const Instruction &op,
                                          const MemoryMove &move,
                                          bool partial) {
-  auto *address = values[index_value + move.index];
-  if (op.type == memory_move_type) {
-    address = builder_.CreateAdd(address, builder_.getInt32(static_cast<std::uint32_t>(op.word)));
-  } else if ((context_ & reverse_mode(move.index)) != 0) {
-    address = builder_.CreateUnaryIntrinsic(llvm::Intrinsic::bitreverse, address);
-  }
+  auto *address = effective_address(move, values[index_value + move.index]);
   MemoryOperands operands;
   operands.words[0].address = address;
   operands.broadcast = (context_ & broadcast_mode(move)) != 0;
@@ -3040,13 +3064,18 @@ llvm::Value *Lowering::store_word(const Values &values,
                                   unsigned lane) {
   constexpr unsigned normal_bits = 32;
   auto *element = builder_.getInt32(move.lane ^ lane);
-  auto *raw = builder_.CreateExtractElement(values[move.reg], element);
+  auto *raw = move.immediate.has_value()
+                  ? builder_.getInt64(std::uint64_t{*move.immediate} << raw_extension_bits)
+                  : builder_.CreateExtractElement(values[move.reg], element);
   auto *normal = builder_.CreateLShr(raw, builder_.getInt64(raw_extension_bits));
   if (word.view == view_tag(MemoryView::normal_word)) { return normal; }
   auto *short_word = builder_.CreateZExt(builder_.CreateTrunc(normal, builder_.getInt16Ty()),
                                          builder_.getInt64Ty());
-  auto *neighbor = builder_.CreateExtractElement(values[move.reg ^ 1], element);
-  auto *upper = builder_.CreateLShr(neighbor, builder_.getInt64(raw_extension_bits));
+  auto *upper = normal;
+  if (!move.immediate.has_value()) {
+    auto *neighbor = builder_.CreateExtractElement(values[move.reg ^ 1], element);
+    upper = builder_.CreateLShr(neighbor, builder_.getInt64(raw_extension_bits));
+  }
   auto *wide = builder_.CreateOr(normal, builder_.CreateShl(upper, builder_.getInt64(normal_bits)));
   auto *fixed = builder_.CreateSelect(
       builder_.CreateICmpEQ(word.view, view_tag(MemoryView::short_word)), short_word, normal);
@@ -5467,8 +5496,9 @@ void Lowering::load_indices() {
       load_dag(16 + branch_modifier(op));
     }
     for (const auto &move : memory_moves(op)) {
+      if (move.addressing == MemoryAddressing::absolute) { continue; }
       load_dag(move.index);
-      if (op.type != parallel_memory_type) { continue; }
+      if (move.addressing != MemoryAddressing::postmodified) { continue; }
       dag_written_.insert(move.index);
       load_dag(16 + move.modifier);
       if ((context_ & circular_mode) != 0) {
@@ -5582,16 +5612,16 @@ void Lowering::plan_memory() {
 }
 
 void Lowering::plan_memory(const Instruction &op, const MemoryMove &move) {
-  if (dag_written_.contains(move.index)) {
+  if (move.addressing != MemoryAddressing::absolute && dag_written_.contains(move.index)) {
     if (!plan_changing_memory(op, move)) { memory_admitted_ = builder_.getFalse(); }
     return;
   }
   const bool broadcast = (context_ & broadcast_mode(move)) != 0;
   const unsigned transfers = !broadcast && (context_ & simd_mode) != 0 ? 2U : 1U;
   auto &plan = memory_plan_[{op.address, move.space}];
+  auto *base = effective_address(move, dag_[move.index]);
   for (unsigned transfer = 0; transfer < transfers; ++transfer) {
-    auto *address = builder_.CreateAdd(
-        dag_[move.index], builder_.getInt32(static_cast<std::uint32_t>(op.word) + transfer));
+    auto *address = builder_.CreateAdd(base, builder_.getInt32(transfer));
     const auto [host, valid] = plan_pointer(move, address);
     plan.pointers[transfer] = host;
     memory_admitted_ = builder_.CreateAnd(memory_admitted_, valid);
@@ -5668,7 +5698,7 @@ std::vector<bool> Lowering::dead_alu_status() const {
       overwritten = opcode != alu::add_carry && opcode != alu::subtract_carry &&
                     opcode != alu::add_carry_only && opcode != alu::subtract_borrow;
     } else if (op.type != nop_type && op.type != immediate_move_type &&
-               op.type != index_modify_type && op.type != memory_move_type) {
+               op.type != index_modify_type && !single_memory_transfer(op.type)) {
       overwritten = false;
     }
   }
@@ -5995,9 +6025,10 @@ std::uint32_t instruction_context(const Instruction &instruction, ExecutionMode 
     }
   }
   for (const auto &move : memory_moves(instruction)) {
-    mask |= dag_bank_mode(move.index) | simd_mode | broadcast_mode(move);
-    mask |= move.reg < 8 ? low_bank_mode : high_bank_mode;
-    if (instruction.type == parallel_memory_type) {
+    mask |= simd_mode | broadcast_mode(move);
+    if (move.addressing != MemoryAddressing::absolute) { mask |= dag_bank_mode(move.index); }
+    if (!move.immediate.has_value()) { mask |= move.reg < 8 ? low_bank_mode : high_bank_mode; }
+    if (move.addressing == MemoryAddressing::postmodified) {
       mask |= dag_bank_mode(move.modifier) | circular_mode | reverse_mode(move.index);
     }
   }

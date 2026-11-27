@@ -1,11 +1,11 @@
 # Prepared memory access
 
-The core executes classic type 15 pre-indexed and type 1a parallel post-indexed
-data-register transfers over the declared storage views, with checked runtime
-I/O. Forced long-word instruction encodings and code-changing stores remain
-open. The reference is Programming Reference 2.4,
-sections 2-6–2-7, 4-110, 6-10–6-31, 7-36–7-40, 9-7–9-9, 9-56–9-59 and
-10-5/21/31/32, pinned in `reference-manifest.json`.
+The core executes classic absolute type 14, pre-indexed type 15 and parallel
+post-indexed type 1a data-register transfers, and type 16 immediate stores.
+These forms use the declared storage views and checked runtime I/O. Forced
+long-word instruction encodings remain open. The reference is Programming
+Reference 2.4, sections 2-6–2-13, 4-110, 6-10–6-31, 7-36–7-40, 9-7–9-9,
+9-53–9-61 and 10-5/20–22, pinned in `reference-manifest.json`.
 
 ## Layout and storage
 
@@ -41,11 +41,23 @@ leaves I unchanged. Circular and bit-reverse post-modification do not apply to
 this pre-indexed operation. Programs must obey the manual's restriction that
 pre-indexing does not change the address space.
 
+Type 14 takes the full unsigned address from the instruction. It leaves the
+DAGs unchanged and ignores their broadcast and bit-reverse settings. An
+explicit S register selects PEy first, with the complementary register used
+for a paired access.
+
 Type 1a transfers address DM using DAG1 and PM using DAG2. Both addresses use
 their old I. The packet updates each I once using the selected signed M from the
 same DAG. CBUFEN enables circular limits and the documented I7/I15 overflow
 effects. BR0 and BR8 reverse the I0/I8 bus address before the paired lane offset.
 The post-modifier still updates the original unreversed I.
+
+Type 16 uses the same post-modification for its selected bus. Paired stores
+use the same immediate in both lanes. The extended view receives the 32-bit
+immediate in bits 39:8 with a zero extension, and the long view receives the
+32-bit value in both halves. The shared index update follows the transfer. If
+an implicit callback refuses a store, a completed explicit write remains
+visible and the index retains its original value.
 
 The I register comes from the selected physical DAG bank: I0–3, I4–7, I8–11 and
 I12–15 have independent bank selections. Data-file bank selection remains separate.

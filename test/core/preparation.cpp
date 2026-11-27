@@ -11,6 +11,8 @@
 namespace {
 constexpr unsigned full_width = 48, wide_width = 32;
 constexpr unsigned register_modify_type = 7;
+constexpr unsigned absolute_memory_type = 14;
+constexpr unsigned immediate_store_type = 16;
 constexpr unsigned immediate_move_type = 17, index_modify_type = 19, nop_type = 21, idle_type = 22;
 constexpr std::uint64_t classic_branch = 0xc00000001123;
 constexpr std::uint16_t compact_immediate_head = 0x0f81;
@@ -100,7 +102,8 @@ void formats() {
     if (item.bits == full_width) {
       const auto image = fixture::image(InstructionSet::isa, item.word);
       if (item.type == 1 || item.type == 2 || item.type == 5 || item.type == 8 || item.type == 9 ||
-          item.type == register_modify_type || item.type == 15 ||
+          item.type == register_modify_type || item.type == absolute_memory_type ||
+          item.type == 15 || item.type == immediate_store_type ||
           item.type == immediate_move_type || item.type == index_modify_type ||
           item.type == nop_type || item.type == idle_type || item.word == standalone_shift) {
         const auto semantic = Core::lower(image);
@@ -138,6 +141,19 @@ void register_modify_encoding() {
     check(fault.reason == FaultReason::invalid_encoding && fault.instruction == word &&
               fault.address == fixture::code_address && fault.instruction_bits == full_width,
           "reserved register MODIFY bit lost its encoding fault");
+  }
+}
+
+void immediate_store_encoding() {
+  constexpr std::uint64_t store = 0x92c0765432ab;
+  constexpr unsigned first_reserved = 32;
+  constexpr unsigned reserved_count = 5;
+  for (unsigned bit = first_reserved; bit < first_reserved + reserved_count; ++bit) {
+    const auto word = store | (std::uint64_t{1} << bit);
+    const auto fault = refusal(fixture::image(InstructionSet::isa, word));
+    check(fault.reason == FaultReason::invalid_encoding && fault.instruction == word &&
+              fault.address == fixture::code_address && fault.instruction_bits == full_width,
+          "reserved immediate-store bit lost its encoding fault");
   }
 }
 
@@ -289,6 +305,7 @@ int main() {
   return fixture::run_test([] {
     formats();
     register_modify_encoding();
+    immediate_store_encoding();
     boundaries();
     declarations();
     transitions();

@@ -187,22 +187,39 @@ Instruction instruction(std::span<const std::uint16_t> parcels,
 }
 
 MemoryMove memory_move(const Instruction &instruction) {
-  constexpr unsigned dag_shift = 44;
   constexpr unsigned index_shift = 41;
+  constexpr unsigned indexed_dag_shift = 44;
+  constexpr unsigned absolute_space_shift = 41;
   constexpr unsigned register_shift = 32;
   constexpr std::uint64_t memory_write = std::uint64_t{1} << 40;
+  if (instruction.type == immediate_memory_store_type) {
+    constexpr unsigned dag_shift = 37;
+    constexpr unsigned modifier_shift = 38;
+    const bool program = ((instruction.word >> dag_shift) & 1) != 0;
+    const auto dag = program ? 8U : 0U;
+    return {.index = static_cast<unsigned>((instruction.word >> index_shift) & 7) + dag,
+            .modifier = static_cast<unsigned>((instruction.word >> modifier_shift) & 7) + dag,
+            .space = program ? MemorySpace::program : MemorySpace::data,
+            .write = true,
+            .addressing = MemoryAddressing::postmodified,
+            .immediate = static_cast<std::uint32_t>(instruction.word)};
+  }
+  const bool absolute = instruction.type == absolute_memory_type;
+  const auto dag_shift = absolute ? absolute_space_shift : indexed_dag_shift;
   const bool program = ((instruction.word >> dag_shift) & 1) != 0;
   const auto ureg = static_cast<unsigned>((instruction.word >> register_shift) & 0x7f);
-  return {.index =
-              static_cast<unsigned>((instruction.word >> index_shift) & 7) + (program ? 8U : 0U),
+  const auto index = static_cast<unsigned>((instruction.word >> index_shift) & 7);
+  return {.index = absolute ? 0U : index + (program ? 8U : 0U),
           .reg = ureg & 15,
           .lane = ureg < 16 ? 0U : 1U,
           .space = program ? MemorySpace::program : MemorySpace::data,
-          .write = (instruction.word & memory_write) != 0};
+          .write = (instruction.word & memory_write) != 0,
+          .addressing = absolute ? MemoryAddressing::absolute : MemoryAddressing::indexed_offset,
+          .address_operand = static_cast<std::uint32_t>(instruction.word)};
 }
 
 MemoryMoves memory_moves(const Instruction &instruction) {
-  if (instruction.type == memory_move_type) {
+  if (single_memory_transfer(instruction.type)) {
     return {.transfers = {memory_move(instruction), {}}, .count = 1};
   }
   if (instruction.type != parallel_memory_type) { return {}; }
@@ -221,12 +238,14 @@ MemoryMoves memory_moves(const Instruction &instruction) {
                         .reg = field(dm_register, 15),
                         .modifier = field(dm_modifier, 7),
                         .space = MemorySpace::data,
-                        .write = field(dm_direction, 1) != 0};
+                        .write = field(dm_direction, 1) != 0,
+                        .addressing = MemoryAddressing::postmodified};
   const MemoryMove program{.index = 8 + field(pm_index, 7),
                            .reg = field(pm_register, 15),
                            .modifier = 8 + field(pm_modifier, 7),
                            .space = MemorySpace::program,
-                           .write = field(pm_direction, 1) != 0};
+                           .write = field(pm_direction, 1) != 0,
+                           .addressing = MemoryAddressing::postmodified};
   return {.transfers = {data, program}, .count = 2};
 }
 

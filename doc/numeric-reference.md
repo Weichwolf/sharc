@@ -495,6 +495,34 @@ RSQRTS inputs and either operation's NaNs produce an all-ones floating sentinel
 with AI/AIS and AN clear. The result width controls the sentinel extension byte.
 Ordinary seeds use the observed ROM fraction and instruction-specific exponent.
 
+## Absolute transfers and immediate stores
+
+In 48 authored type-14a normal-word probes, the CCES 2.12.1 ADSP-21489
+functional simulator loaded and stored through both PM and DM with explicit
+R4 or S4. SISD touched one lane. SIMD accessed the addressed word with the
+explicit register and the next word with the complementary register. Setting
+BDCST1 or BDCST9 had no effect on these absolute transfers.
+
+Another 32 type-16a normal-word probes used I1/M3 or I9/M11. A store from
+the last word of a two-word buffer wrote the same immediate to both lane
+addresses in SIMD, including the adjacent word past the buffer. CBUFEN
+affected the single post-modification of I and left the lane addresses
+unchanged. The broadcast bits had no effect on the writes. Programming
+Reference 2.4 gives the extended-word placement in section 9-60 and
+long-word replication in section 2-13.
+
+Eight additional immediate-store probes used short and long SRAM addresses
+for both buses and both PE modes. The short view used `0x32ab` from immediate
+`0x765432ab`, adding a second store at short address +2 in SIMD. The long
+view contained two copies of the full immediate in either mode. The probes
+read the resulting words through their normal-word aliases in the
+[ADSP-21489 memory map](https://www.analog.com/media/en/technical-documentation/data-sheets/ADSP-21483_21486_21487_21488_21489.pdf).
+
+Eight separate aligned forced-long probes loaded or stored R5 through a
+normal-word address using the `(LW)` qualifier. The addressed word used R5
+and the next word used R4 in SISD and SIMD. These observations concern the
+forced encoding, whose native lowering remains open.
+
 ## Register MODIFY and DAG interlocks
 
 In 64 authored type-7a probes, the CCES 2.12.1 ADSP-21489 functional simulator
