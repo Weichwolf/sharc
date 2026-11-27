@@ -183,6 +183,14 @@ reference matched the destinations, ASTATx and writable STKYx in both sets.
 Captures covered MODE1 values `0`, `0x8000`, `0x10000` and `0x18000`
 (both widths and both rounding directions).
 
+An additional 20 paired SIMD probes matched destinations, ASTAT and arithmetic
+sticky bits in both lanes. They checked distinct ADD and multiplier exceptions,
+ABS of a negative NaN and negative zero, unordered and ordered COMP in the
+same instruction, and a conditional ABS admitted only in PEx. To repeat them,
+write the S registers through PX and seed ASTATy and ASTATx separately in SISD,
+then enable PEy before the compute. Return to SISD before reading both raw
+results through PX and collecting their status words.
+
 | Boundary | Observed single-function behavior |
 |---|---|
 | RND32 input | Clear the extension byte before classification, including for explicit RND. PASS and COMP see positive infinity for `0x7f80000001` with RND32 set. |
