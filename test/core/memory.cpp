@@ -995,11 +995,15 @@ void predicated_wide_implicit(sharc::ExecutionMode mode, bool force, bool write)
         "PEy-only long-word packet lost its explicit store or changed a masked load");
 }
 
-void forced_register_load_refusal(sharc::ExecutionMode mode, bool loop_preload) {
-  // IF EQ R6=R1+R2, I13 or LCNTR = DM(I1,M3)(LW).
+enum class ForcedLoadDestination : std::uint8_t { dag, loop_preload, sticky };
+
+void forced_register_load_refusal(sharc::ExecutionMode mode, ForcedLoadDestination destination) {
+  // IF EQ R6=R1+R2, I13, LCNTR or STKYx = DM(I1,M3)(LW).
   constexpr std::uint64_t load_i13 = 0x52c04e801612;
   constexpr std::uint64_t load_lcntr = 0x52c074001612;
-  const auto load = loop_preload ? load_lcntr : load_i13;
+  constexpr std::uint64_t load_stky = 0x52c07c001612;
+  const std::array loads{load_i13, load_lcntr, load_stky};
+  const auto load = loads[static_cast<std::size_t>(destination)];
   constexpr std::array<std::uint64_t, 2> payloads{0x13579bdf, 0x2468ace0};
   const std::array words{load};
   Program program(words);
@@ -1013,7 +1017,7 @@ void forced_register_load_refusal(sharc::ExecutionMode mode, bool loop_preload) 
   auto before = initial();
   before.mode1 = simd_bit;
   before.lcntr = 2;
-  before.pe[0].astat = unsigned{loop_preload};
+  before.pe[0].astat = unsigned{destination != ForcedLoadDestination::dag};
   before.pe[1].astat = 1;
   before.pe[1].data[0][1] = 4U << word_shift;
   before.pe[1].data[0][2] = 8U << word_shift;
@@ -1030,7 +1034,7 @@ void forced_register_load_refusal(sharc::ExecutionMode mode, bool loop_preload) 
             core.registers() == before,
         "forced UREG load changed state or lost the ordered callback fault");
 
-  if (loop_preload) {
+  if (destination == ForcedLoadDestination::loop_preload) {
     sharc::Core masked(memory, mode);
     device.core = &masked;
     device.calls = 0;
@@ -1867,8 +1871,11 @@ int main() {
       predicated_fifo_refusal(mode);
       predicated_modifier_interlock(mode);
       predicated_forced_pair(mode);
-      forced_register_load_refusal(mode, false);
-      forced_register_load_refusal(mode, true);
+      for (const auto destination : {ForcedLoadDestination::dag,
+                                     ForcedLoadDestination::loop_preload,
+                                     ForcedLoadDestination::sticky}) {
+        forced_register_load_refusal(mode, destination);
+      }
       for (const bool write : {false, true}) { short_px_third_callback_refusal(mode, write); }
       for (const bool force : {false, true}) {
         refused_combined_px(mode, force);

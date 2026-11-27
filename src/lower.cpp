@@ -388,12 +388,17 @@ bool astat_register(unsigned reg) {
   return (reg & ~1U) == static_cast<unsigned>(ControlRegister::astat_x);
 }
 
-bool writable_ureg(unsigned reg) {
-  return ordinary_ureg(reg) || reg == px_register || reg == lcntr_register || astat_register(reg);
-}
-
 bool stky_register(unsigned reg) {
   return (reg & ~1U) == static_cast<unsigned>(ControlRegister::stky_x);
+}
+
+bool lane_status_register(unsigned reg) {
+  return astat_register(reg) || stky_register(reg);
+}
+
+bool writable_ureg(unsigned reg) {
+  return ordinary_ureg(reg) || reg == px_register || reg == lcntr_register ||
+         lane_status_register(reg);
 }
 
 std::optional<std::size_t> scalar_control_slot(unsigned reg) {
@@ -412,7 +417,7 @@ std::optional<std::size_t> scalar_control_slot(unsigned reg) {
 }
 
 bool readable_control_register(unsigned reg) {
-  return astat_register(reg) || stky_register(reg) || scalar_control_slot(reg).has_value();
+  return lane_status_register(reg) || scalar_control_slot(reg).has_value();
 }
 
 std::size_t user_status_slot(unsigned reg) {
@@ -844,7 +849,7 @@ void validate_return(const Instruction &instruction, std::string_view identity) 
 void validate_memory_register(const Instruction &instruction, std::string_view identity) {
   const auto move = memory_move(instruction);
   if (data_register(move.reg) || paired_system_register(move.reg) || move.reg == px_register ||
-      move.reg == lcntr_register || astat_register(move.reg) ||
+      move.reg == lcntr_register || lane_status_register(move.reg) ||
       (move.write && readable_control_register(move.reg))) {
     return;
   }
@@ -894,7 +899,7 @@ void validate_system_bit(const Instruction &op, std::string_view identity) {
     reject(op, identity, FaultReason::invalid_encoding, "reserved system bit operation or SREG");
   }
   const auto reg = system_bit_register(op);
-  if (!user_status(reg) && !astat_register(reg) &&
+  if (!user_status(reg) && !lane_status_register(reg) &&
       !(tests_system_bits(operation) && readable_control_register(reg))) {
     reject(op,
            identity,
@@ -1825,6 +1830,7 @@ private:
   void system_bit_instruction(Values &values, const Instruction &op);
   llvm::Value *read_register(const Values &values, unsigned reg);
   void write_register(Values &values, unsigned reg, llvm::Value *raw, llvm::Value *selected);
+  void write_lane_status(Values &values, unsigned reg, llvm::Value *words, llvm::Value *selected);
   void register_instruction(Values &values, const Instruction &op, const Values &before);
   llvm::Value *pipeline_stall(const Values &values, const Instruction &op);
   unsigned dag_access_tag(unsigned slot, bool paired = false) const;
@@ -2208,7 +2214,7 @@ llvm::Value *Lowering::read_register(const Values &values, unsigned reg) {
     auto *word = values[index_value + dag_number(reg)];
     return raw_words(pair(word, word, 32));
   }
-  if (astat_register(reg) || stky_register(reg)) {
+  if (lane_status_register(reg)) {
     auto *words = values[astat_register(reg) ? status_value : sticky_value];
     return raw_words((reg & 1) != 0 ? builder_.CreateShuffleVector(words, {1, 0}) : words);
   }
@@ -2223,17 +2229,20 @@ llvm::Value *Lowering::read_register(const Values &values, unsigned reg) {
   return reg < 16 ? raw : builder_.CreateShuffleVector(raw, {1, 0});
 }
 
-void Lowering::write_register(Values &values,
-                              unsigned reg,
-                              llvm::Value *raw,
-                              llvm::Value *selected) {
-  if (astat_register(reg)) {
-    auto *old = values[status_value];
-    auto *word = fixed_word(raw);
-    if ((reg & 1) != 0) {
-      word = builder_.CreateShuffleVector(word, {1, 0});
-      selected = builder_.CreateShuffleVector(selected, {1, 0});
-    }
+void Lowering::write_lane_status(Values &values,
+                                 unsigned reg,
+                                 llvm::Value *words,
+                                 llvm::Value *selected) {
+  if ((reg & 1) != 0) {
+    words = builder_.CreateShuffleVector(words, {1, 0});
+    selected = builder_.CreateShuffleVector(selected, {1, 0});
+  }
+  const bool astat = astat_register(reg);
+  const auto slot = astat ? status_value : sticky_value;
+  auto *old = values[slot];
+  llvm::Value *writable{};
+  llvm::Value *retained{};
+  if (astat) {
     auto *written =
         builder_.CreateOr(builder_.CreateExtractElement(selected, builder_.getInt32(0)),
                           builder_.CreateExtractElement(selected, builder_.getInt32(1)));
@@ -2244,11 +2253,30 @@ void Lowering::write_register(Values &values,
                                         builder_.CreateBitCast(old, builder_.getInt64Ty()));
     store(saved, astat_effect_slot);
     values[astat_written_value] = builder_.CreateOr(values[astat_written_value], written);
-    constexpr std::uint32_t writable = 0xff043fff;
+    constexpr std::uint32_t astat_writable = 0xff043fff;
     constexpr std::uint32_t fifo_flag = 1U << 14;
-    auto *update = builder_.CreateOr(builder_.CreateAnd(old, vector(32, fifo_flag)),
-                                     builder_.CreateAnd(word, vector(32, writable)));
-    values[status_value] = builder_.CreateSelect(selected, update, old);
+    writable = vector(32, astat_writable);
+    retained = vector(32, fifo_flag);
+  } else {
+    constexpr std::uint32_t arithmetic_sticky = 0x000003e7;
+    constexpr std::uint32_t dag_and_memory_sticky = 0x001e0000;
+    constexpr std::uint32_t sequencer_stack_flags = 0x07e00000;
+    writable = pair(builder_.getInt32(arithmetic_sticky | dag_and_memory_sticky),
+                    builder_.getInt32(arithmetic_sticky),
+                    32);
+    retained = pair(builder_.getInt32(sequencer_stack_flags), builder_.getInt32(0), 32);
+  }
+  auto *update =
+      builder_.CreateOr(builder_.CreateAnd(old, retained), builder_.CreateAnd(words, writable));
+  values[slot] = builder_.CreateSelect(selected, update, old);
+}
+
+void Lowering::write_register(Values &values,
+                              unsigned reg,
+                              llvm::Value *raw,
+                              llvm::Value *selected) {
+  if (lane_status_register(reg)) {
+    write_lane_status(values, reg, fixed_word(raw), selected);
     return;
   }
   if (dag_register(reg)) {
@@ -3829,7 +3857,7 @@ void Lowering::memory_writeback(Values &values,
   auto *raw = load_word(read[0], view);
   const bool loop_preload = move.reg == lcntr_register;
   const bool system_pair =
-      loop_preload || paired_system_register(move.reg) || astat_register(move.reg);
+      loop_preload || paired_system_register(move.reg) || lane_status_register(move.reg);
   const bool absolute_system = system_pair && move.addressing == MemoryAddressing::absolute;
   auto *wide = wide_memory_view(move, view);
   if (absolute_system) {
@@ -3838,7 +3866,7 @@ void Lowering::memory_writeback(Values &values,
   }
   write_memory_register(values, move.reg, raw, operands.selected[0]);
   if (loop_preload) { return; }
-  const auto implicit = astat_register(move.reg) ? move.reg ^ 1 : complementary_register(move.reg);
+  const auto implicit = complementary_register(move.reg);
   if (!operands.broadcast && !dag_register(move.reg) && operands.paired != builder_.getFalse()) {
     auto *other_lane =
         builder_.CreateAnd(operands.paired, builder_.CreateNot(operands.forced_pair));

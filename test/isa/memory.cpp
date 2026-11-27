@@ -998,6 +998,14 @@ void set_system_word(sharc::Registers &state, SystemWord transfer) {
     astat = (astat & fifo_status) | (word & writable);
     return;
   }
+  if (reg == stky_x_port || reg == stky_y_port) {
+    constexpr std::uint32_t stack_flags = 0x07e00000;
+    constexpr std::array<std::uint32_t, 2> writable{0x001e03e7, 0x000003e7};
+    const auto lane = reg & 1;
+    auto &stky = state.pe[lane].stky;
+    stky = (lane == 0 ? stky & stack_flags : 0) | (word & writable[lane]);
+    return;
+  }
   if (reg == first_px_half || reg == second_px_half) {
     const auto shift = reg == first_px_half ? 0U : bits;
     state.px = (state.px & ~(px_word_mask << shift)) | (std::uint64_t{word} << shift);
@@ -1063,6 +1071,10 @@ void expect_system_load(sharc::Registers &state,
     return;
   }
   const auto explicit_reg = item.reg == combined_px ? first_px_half : item.reg;
+  if (item.view == sharc::MemoryView::extended) {
+    if ((active & 1) != 0) { set_system_word(state, {.reg = explicit_reg, .word = dag_low_word}); }
+    return;
+  }
   if (system_memory_wide(item)) {
     if (item.form == RegisterMemoryForm::absolute && item.reg != combined_px) {
       set_system_word(state, {.reg = explicit_reg, .word = dag_high_word});
@@ -1227,7 +1239,7 @@ void loop_preload_memory(sharc::ExecutionMode mode) {
   for (const auto &item : cases) { system_memory_access(item, mode); }
 }
 
-void control_memory_stores(sharc::ExecutionMode mode) {
+void control_memory_access(sharc::ExecutionMode mode) {
   using enum RegisterMemoryForm;
   using enum sharc::MemorySpace;
   using enum sharc::MemoryView;
@@ -1236,6 +1248,8 @@ void control_memory_stores(sharc::ExecutionMode mode) {
           .form = absolute, .space = data, .view = long_word, .reg = astat_y_port, .width = 8},
       RegisterMemoryCase{
           .form = absolute, .space = data, .view = extended, .reg = stky_x_port, .width = 5},
+      RegisterMemoryCase{
+          .form = absolute, .space = data, .view = long_word, .reg = stky_x_port, .width = 8},
       RegisterMemoryCase{
           .form = immediate, .space = program, .view = long_word, .reg = stky_y_port, .width = 8},
       RegisterMemoryCase{.form = immediate,
@@ -1253,12 +1267,20 @@ void control_memory_stores(sharc::ExecutionMode mode) {
       RegisterMemoryCase{
           .form = post, .space = data, .view = short_word, .reg = astat_x_port, .width = 2},
       RegisterMemoryCase{
+          .form = post, .space = data, .view = short_word, .reg = stky_y_port, .width = 2},
+      RegisterMemoryCase{.form = post,
+                         .space = program,
+                         .view = normal_word,
+                         .reg = stky_x_port,
+                         .width = 4,
+                         .force = true},
+      RegisterMemoryCase{
           .form = post, .space = data, .view = long_word, .reg = lcntr_port, .width = 8},
       RegisterMemoryCase{
           .form = post, .space = program, .view = normal_word, .reg = mode1_port, .width = 4},
   };
   for (const auto &item : cases) {
-    system_memory_access(item, mode, item.reg != astat_x_port && item.reg != astat_y_port);
+    system_memory_access(item, mode, item.reg == mode1_port || item.reg == imask_port);
   }
 }
 
@@ -1373,7 +1395,7 @@ void memory_access() {
     dag_memory_access(mode);
     system_memory_access(mode);
     loop_preload_memory(mode);
-    control_memory_stores(mode);
+    control_memory_access(mode);
     store_live_alu_status(mode);
     for (const auto space : {sharc::MemorySpace::data, sharc::MemorySpace::program}) {
       for (const bool indexed : {false, true}) {

@@ -868,6 +868,30 @@ reserved bits consistently on both lanes, following Programming Reference
 2.4, Table A-6. The differing write masks and conditional-interlock timing
 await silicon confirmation.
 
+## Explicit sticky status writes
+
+The CCES 2.12.1 ADSP-21489 functional simulator ran 88 register, immediate
+and bit-operation probes and another 168 memory and timing probes. Register
+transfers and bit operations kept the explicit and complementary lanes
+independent. A parallel ADD left its ASTAT and data result intact, and the
+explicit STKY transfer replaced the computed sticky bits of its physical
+destination. Direct reads and `BIT TST` saw a completed STKY write or
+arithmetic overflow at the next instruction without an extra clock.
+
+Absolute long loads selected the high word and the named register. Indexed
+long loads selected both words when the explicit predicate was true. A
+PEy-only post-modifying long load left both STKY registers unchanged and
+updated the shared index. This held for native long views and the `(LW)`
+override in normal views.
+
+Programming Reference 2.4, Table A-7, assigns the arithmetic sticky bits to
+both lanes and the DAG, memory and stack fields to STKYx. The core preserves
+the read-only stack fields and masks reserved bits. CCES exposed stack bits
+in both registers and accepted writes to reserved fields and to PEy fields
+that the manual assigns to PEx. For the defined writable fields the core uses the observed bit
+replacement behavior, including zero to clear and one to set. The differing
+mask and software set of arithmetic sticky bits await silicon confirmation.
+
 ## Fixed multiplier details
 
 The raw accumulator has 80 bits. Inputs use the upper 32 bits of each data

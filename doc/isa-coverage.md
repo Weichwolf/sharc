@@ -768,11 +768,16 @@ ASTATx/y writes execute through types 3a, 5a, 14a, 15a and 17a and through
 BIT SET, CLR and TGL. Installed fixtures cover old operands in parallel
 compute, the independent SIMD predicates, narrow and wide memory loads, and
 the distinction between raw readback and predicate effect across a snapshot.
+STKYx/y support the same explicit forms. Their tests cover independent lane
+writes, read-only sequencer flags, priority over a parallel compute result,
+readback and `BIT TST` immediately after a write, and a refused second read
+of a forced long load.
 Other system-register writes and their pipeline effects, dynamic sequencer
 register reads and unresolved event semantics remain open. See
 [the simulator probes](numeric-reference.md#control-register-read-operands)
 and the observations on [loop preload](numeric-reference.md#loop-preload-writes)
-and [arithmetic status writes](numeric-reference.md#explicit-arithmetic-status-writes).
+[arithmetic status writes](numeric-reference.md#explicit-arithmetic-status-writes)
+and [sticky status writes](numeric-reference.md#explicit-sticky-status-writes).
 
 Remaining system UREG transfers, DAG addressing variants and silicon
 confirmation of contended register writeback are tracked in #26. Remaining

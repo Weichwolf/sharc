@@ -72,7 +72,7 @@ bool px_half(unsigned reg) {
 }
 
 bool has_peer(unsigned reg) {
-  return is_data(reg) || px_half(reg) || reg == astat_x_code || reg == astat_y_code ||
+  return is_data(reg) || px_half(reg) || std::ranges::contains(lane_status_codes, reg) ||
          std::ranges::contains(ustat, reg);
 }
 
@@ -139,6 +139,14 @@ void write(sharc::Registers &state, unsigned reg, bool implicit, std::uint64_t r
     lane = (lane & fifo_status) | (value & writable);
     return;
   }
+  if (reg == stky_x_code || reg == stky_y_code) {
+    constexpr std::array<std::uint32_t, 2> writable{0x001e03e7, 0x000003e7};
+    constexpr std::uint32_t stack_flags = 0x07e00000;
+    const auto lane = (reg & 1) ^ unsigned { implicit };
+    auto &stky = state.pe[lane].stky;
+    stky = (lane == 0 ? stky & stack_flags : 0) | (value & writable[lane]);
+    return;
+  }
   if (reg == lcntr_code) {
     state.lcntr = value;
     return;
@@ -169,7 +177,8 @@ void apply(const sharc::Registers &before, Move move, sharc::Registers &state) {
   const bool x = (before.pe[0].astat & 1) != 0;
   const bool y = (before.pe[1].astat & 1) != 0;
   const bool simd = (before.mode1 & (1U << simd_bit)) != 0;
-  if (move.source == px && !is_data(move.destination) && !px_half(move.destination)) {
+  if (move.source == px && !is_data(move.destination) && !px_half(move.destination) &&
+      !std::ranges::contains(lane_status_codes, move.destination)) {
     if (x) {
       const auto low = static_cast<std::uint32_t>(before.px);
       write(state, move.destination, false, std::uint64_t{low} << 8);
@@ -332,6 +341,17 @@ void loop_preload_moves() {
   verify_moves(moves);
 }
 
+void sticky_status_moves() {
+  constexpr unsigned i12 = 0x1c;
+  for (const auto destination : {stky_x_code, stky_y_code}) {
+    std::vector<Move> moves;
+    for (const auto source : {6U, shadow_first + 6, i12, ustat[1], px, px1, stky_y_code}) {
+      moves.push_back({.source = source, .destination = destination});
+    }
+    verify_moves(moves);
+  }
+}
+
 void read_latched_dag_overflow() {
   constexpr std::uint64_t modify_i7_by_one = 0x160700000001;
   constexpr std::uint32_t overflow = 1U << 20;
@@ -424,6 +444,9 @@ void parallel_priority() {
                              Move{.source = 0, .destination = lcntr_code},
                              Move{.source = 0, .destination = astat_x_code},
                              Move{.source = 0, .destination = astat_y_code},
+                             Move{.source = 0, .destination = stky_x_code},
+                             Move{.source = 0, .destination = stky_y_code},
+                             Move{.source = px, .destination = astat_y_code},
                              Move{.source = 0x50, .destination = 0, .swap = true}};
   const auto exercise = [](const Move &move) {
     const std::array words{encoding(move) | add_r0_r2_r3};
@@ -501,7 +524,9 @@ void system_immediates() {
                      px,
                      lcntr_code,
                      astat_x_code,
-                     astat_y_code});
+                     astat_y_code,
+                     stky_x_code,
+                     stky_y_code});
 }
 
 enum class UserBitAction : std::uint8_t { set, clear, toggle, test, compare };
@@ -526,6 +551,49 @@ std::uint64_t bit_word(UserBitAction action, unsigned reg, std::uint32_t mask) {
 
 std::uint64_t bit_word(UserBit bit) {
   return bit_word(bit.action, ustat[bit.port], bit.mask);
+}
+
+void sticky_bit_writes() {
+  using enum UserBitAction;
+  constexpr std::uint32_t all = 0xffffffff;
+  constexpr std::uint32_t overflow = 4;
+  constexpr std::uint32_t x_stack = (1U << 22) | (1U << 26);
+  constexpr std::uint32_t x_writable = 0x001e03e7;
+  constexpr std::uint32_t y_writable = 0x000003e7;
+  constexpr std::uint32_t y_initial = 0x20;
+  const std::array words{bit_word(set, stky_x_code, all),
+                         encoding({.source = stky_x_code, .destination = 4}, true_condition),
+                         bit_word(toggle, stky_y_code, overflow),
+                         bit_word(test, stky_x_code, overflow),
+                         encoding({.source = 5, .destination = 6}, tf_condition),
+                         bit_word(clear, stky_x_code, all)};
+  fixture::Program program(words);
+  for (const auto mode : fixture::numeric_modes) {
+    const auto native = fixture::compile(program.code, mode);
+    sharc::Core core(program.memory(), mode);
+    (void)core.install(native, fixture::Program::variant_id);
+    for (const bool simd : {false, true}) {
+      auto expected = initial(unsigned{simd} << 2);
+      expected.pe[0].stky = x_stack;
+      expected.pe[1].stky = y_initial;
+      core.set_registers(expected);
+      expected.pe[0].data[0][4] = std::uint64_t{x_stack | x_writable} << 8;
+      if (simd) {
+        expected.pe[1].data[0][4] = std::uint64_t{y_writable} << 8;
+        expected.pe[1].stky = 0;
+      } else {
+        expected.pe[0].astat = btf;
+        expected.pe[0].data[0][6] = expected.pe[0].data[0][5];
+        expected.pe[1].stky |= overflow;
+      }
+      fixture::boundary(expected,
+                        {.pc = base + static_cast<std::uint32_t>(words.size()),
+                         .clock = clock_seed + words.size()});
+      check(fixture::completed(core.run(words.size()), words.size(), words.size()) &&
+                core.registers() == expected,
+            "STKY bit operations lost a stack flag, lane, or immediate test result");
+    }
+  }
 }
 
 void astat_effect_sequence(sharc::ExecutionMode mode, bool raw_read, bool old_zero) {
@@ -1128,6 +1196,7 @@ void register_transfers() {
   system_moves();
   control_reads();
   loop_preload_moves();
+  sticky_status_moves();
   read_latched_dag_overflow();
   combined_px_moves();
   combined_px_aliases();
@@ -1135,6 +1204,7 @@ void register_transfers() {
   for (unsigned quarter = 0; quarter < 4; ++quarter) { immediate_registers(quarter); }
   system_immediates();
   user_status_bits();
+  sticky_bit_writes();
   astat_effects();
   control_bit_reads();
   bit_flag_consumers();
