@@ -103,6 +103,15 @@ Absolute stores use the named register and its peer as specified for USTAT
 in the programming reference. The simulator duplicates the named word in
 this form, so silicon confirmation remains open for both register classes.
 
+Types 3a, 14a and 15a also store the current loop preload, mode, flag and
+interrupt registers listed in [ISA coverage](isa-coverage.md). ASTATx/y and
+STKYx/y supply the named register to the explicit transfer and its counterpart
+to the implicit transfer. An unconditional extended store uses the named
+word in bits 39:8. The named register supplies the low word in a long store,
+including forced normal-word pairs. ASTAT and STKY supply their counterpart
+as the high word, and an unpaired register supplies the same word twice.
+Parallel compute leaves the old status available to the store.
+
 Combined PX can transfer all 64 bits through a long-word view or a forced
 long-word access to two successive normal words. Long-word broadcast selects
 the reversed halves if its implicit transfer is selected. For an unqualified

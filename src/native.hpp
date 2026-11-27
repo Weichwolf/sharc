@@ -67,7 +67,12 @@ inline constexpr std::size_t mode2_slot = fifo_pointer_slot + 2;
 inline constexpr std::size_t px_slot = mode2_slot + 1;
 inline constexpr std::size_t ustat_slot = px_slot + 1;
 inline constexpr unsigned ustat_register_count = 4;
-inline constexpr std::size_t register_pointer_count = ustat_slot + ustat_register_count;
+inline constexpr std::size_t mode_mask_slot = ustat_slot + ustat_register_count;
+inline constexpr std::size_t flags_slot = mode_mask_slot + 1;
+inline constexpr std::size_t interrupt_mask_slot = flags_slot + 1;
+inline constexpr std::size_t interrupt_mask_pointer_slot = interrupt_mask_slot + 1;
+inline constexpr std::size_t extended_interrupt_slot = interrupt_mask_pointer_slot + 1;
+inline constexpr std::size_t register_pointer_count = extended_interrupt_slot + 1;
 inline constexpr std::uint8_t owner_yield_event = 1;
 inline constexpr std::uint8_t code_write_event = 2;
 

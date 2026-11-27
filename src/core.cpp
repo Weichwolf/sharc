@@ -408,6 +408,11 @@ struct Core::Impl {
     pointers[detail::suspended_call_state_slot] = loops.suspended_calls.data();
     pointers[detail::interrupt_latch_slot] = &state.registers.irptl;
     pointers[detail::mode2_slot] = &state.registers.mode2;
+    pointers[detail::mode_mask_slot] = &state.registers.mmask;
+    pointers[detail::flags_slot] = &state.registers.flags;
+    pointers[detail::interrupt_mask_slot] = &state.registers.imask;
+    pointers[detail::interrupt_mask_pointer_slot] = &state.registers.imaskp;
+    pointers[detail::extended_interrupt_slot] = &state.registers.lirptl;
     pointers[detail::px_slot] = &state.registers.px;
     for (std::size_t reg = 0; reg < state.registers.ustat.size(); ++reg) {
       pointers[detail::ustat_slot + reg] = &state.registers.ustat[reg];

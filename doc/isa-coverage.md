@@ -746,14 +746,21 @@ fixtures cover independent predicates, register aliases, old sources in parallel
 compute, all four physical DAG bank selectors, a dependent DAG2 jump across
 bounds and snapshot replay, both buses, and broadcast. Tests also check refused
 pair and triplet callbacks, overlapping ordinary and packed data views, and
-declared code replacement through a packed store. Combined-PX moves involving
-other system UREGs remain open. See
+declared code replacement through a packed store. See
 [the register and memory observations](numeric-reference.md#user-status-and-bus-exchange-registers-as-memory-operands)
 for the simulator differences in absolute long-word stores and register moves.
 
-Other system UREG transfers, DAG addressing variants and silicon confirmation
-of contended register writeback are tracked in #26. Remaining compound control
-forms are tracked in #27.
+Type 5a reads LCNTR, MODE1, MODE2, MMASK, FLAGS, ASTATx/y, STKYx/y, IRPTL,
+IMASK, IMASKP and LIRPTL. Types 3a, 14a and 15a also accept them as store
+sources. Installed fixtures check raw 32-bit projections, lane and bank
+selection, old flags with parallel compute, memory footprints across widths,
+and IRPTL after a DAG overflow in the same native grant. Guest writes and
+their pipeline effects, dynamic sequencer register reads and unresolved event
+semantics remain open. See [the simulator probes](numeric-reference.md#control-register-read-operands).
+
+Remaining system UREG transfers, DAG addressing variants and silicon
+confirmation of contended register writeback are tracked in #26. Remaining
+compound control forms and system-register effects are tracked in #27.
 
 ## S2 independent expectations (complete milestone, numerical gaps retained)
 

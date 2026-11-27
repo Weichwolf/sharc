@@ -6,6 +6,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <sharc/core.hpp>
 #include <sharc/memory.hpp>
 #include <vector>
@@ -18,6 +19,27 @@ constexpr unsigned condition_shift = 33, simd_bit = 21;
 constexpr unsigned shadow_first = 0x50, true_condition = 31, i8_code = 0x18;
 constexpr unsigned px = 0x6b, px1 = 0x6c, px2 = 0x6d;
 constexpr std::array ustat{0x70U, 0x71U, 0x7eU, 0x7fU};
+constexpr unsigned mode1_code = 0x72, astat_x_code = 0x76, astat_y_code = 0x77;
+constexpr unsigned stky_x_code = 0x78, stky_y_code = 0x79, irptl_code = 0x7a;
+constexpr std::array lane_status_codes{astat_x_code, astat_y_code, stky_x_code, stky_y_code};
+
+struct ScalarControl {
+  unsigned code;
+  std::uint32_t sharc::Registers::*member;
+  std::uint32_t seed;
+};
+
+constexpr std::array scalar_controls{
+    ScalarControl{.code = 0x68, .member = &sharc::Registers::lcntr, .seed = 0x1234},
+    ScalarControl{.code = mode1_code, .member = &sharc::Registers::mode1, .seed = 0},
+    ScalarControl{.code = 0x73, .member = &sharc::Registers::mmask, .seed = 0x17abcdef},
+    ScalarControl{.code = 0x74, .member = &sharc::Registers::mode2, .seed = 0x0400},
+    ScalarControl{.code = 0x75, .member = &sharc::Registers::flags, .seed = 0x0a},
+    ScalarControl{.code = irptl_code, .member = &sharc::Registers::irptl, .seed = 0x0280},
+    ScalarControl{.code = 0x7b, .member = &sharc::Registers::imask, .seed = 0x126000},
+    ScalarControl{.code = 0x7c, .member = &sharc::Registers::imaskp, .seed = 0x18000},
+    ScalarControl{.code = 0x7d, .member = &sharc::Registers::lirptl, .seed = 0x24},
+};
 constexpr std::uint64_t extension = 0xab;
 constexpr std::uint32_t old_sticky = 0xa5000040;
 constexpr std::uint64_t clock_seed = 123;
@@ -70,6 +92,16 @@ template <class State> auto &dag(State &state, unsigned reg) {
   }
 }
 
+std::optional<std::uint32_t>
+control_word(const sharc::Registers &state, unsigned reg, bool implicit) {
+  const auto lane = (reg & 1) ^ unsigned { implicit };
+  if (reg == astat_x_code || reg == astat_y_code) { return state.pe[lane].astat; }
+  if (reg == stky_x_code || reg == stky_y_code) { return state.pe[lane].stky; }
+  const auto *const control = std::ranges::find(scalar_controls, reg, &ScalarControl::code);
+  if (control != scalar_controls.end()) { return state.*control->member; }
+  return std::nullopt;
+}
+
 std::uint64_t read(const sharc::Registers &state, unsigned reg, bool implicit) {
   if (reg == px) {
     constexpr unsigned register_alignment = 24;
@@ -85,6 +117,7 @@ std::uint64_t read(const sharc::Registers &state, unsigned reg, bool implicit) {
   if (status != ustat.end()) {
     return std::uint64_t{state.ustat[static_cast<std::size_t>(status - ustat.begin())]} << 8;
   }
+  if (const auto word = control_word(state, reg, implicit)) { return std::uint64_t{*word} << 8; }
   if (!is_data(reg)) { return std::uint64_t{dag(state, reg)} << 8; }
   const auto lane = unsigned{reg >= shadow_first} ^ unsigned { implicit };
   return state.pe[lane].data[data_bank(state, reg)][reg & 15];
@@ -135,7 +168,7 @@ void apply(const sharc::Registers &before, Move move, sharc::Registers &state) {
       constexpr std::uint64_t half_radix = 0x100000000;
       const auto *const reg = std::ranges::find(ustat, move.source);
       if (reg == ustat.end()) {
-        state.px = (half_radix + 1) * dag(before, move.source);
+        state.px = (half_radix + 1) * (read(before, move.source, false) >> 8);
       } else {
         const auto pos = static_cast<std::size_t>(reg - ustat.begin());
         state.px = before.ustat[pos] + (half_radix * before.ustat[pos ^ 1]);
@@ -196,6 +229,7 @@ void verify_moves(const std::vector<Move> &moves) {
     (void)core.install(native, fixture::Program::variant_id);
     for (unsigned configuration = 0; configuration < 512; ++configuration) {
       auto expected = initial(configuration);
+      for (const auto &control : scalar_controls) { expected.*control.member |= control.seed; }
       core.set_registers(expected);
       const auto saved = core.save();
       for (unsigned count = 1; count <= moves.size(); ++count) {
@@ -259,6 +293,46 @@ void system_moves() {
   verify_moves(moves);
 }
 
+void control_reads() {
+  constexpr unsigned s10 = shadow_first + 10;
+  constexpr unsigned i12 = 0x1c;
+  for (const auto destination : {4U, s10, i12, ustat[2], px}) {
+    std::vector<Move> moves;
+    moves.reserve(scalar_controls.size() + lane_status_codes.size());
+    for (const auto &control : scalar_controls) {
+      moves.push_back({.source = control.code, .destination = destination});
+    }
+    for (const auto source : lane_status_codes) {
+      moves.push_back({.source = source, .destination = destination});
+    }
+    verify_moves(moves);
+  }
+}
+
+void read_latched_dag_overflow() {
+  constexpr std::uint64_t modify_i7_by_one = 0x160700000001;
+  constexpr std::uint32_t overflow = 1U << 20;
+  constexpr sharc::AddressGenerator circular{.index = 0x2003, .length = 4, .base = 0x2000};
+  const std::array words{modify_i7_by_one,
+                         encoding({.source = irptl_code, .destination = 4}, true_condition)};
+  fixture::Program program(words);
+  for (const auto mode : fixture::numeric_modes) {
+    const auto native = fixture::compile(program.code, mode);
+    sharc::Core core(program.memory(), mode);
+    sharc::Registers state;
+    state.pc = base;
+    state.irptl = 2;
+    state.dag[0][7] = circular;
+    fixture::install(core, native, state);
+    const auto report = core.run(words.size());
+    const auto actual = core.registers();
+    const auto expected = state.irptl | overflow;
+    check(fixture::completed(report, words.size(), words.size()) && actual.irptl == expected &&
+              actual.pe[0].data[0][4] == (std::uint64_t{expected} << 8),
+          "IRPTL read missed a DAG overflow in the same native grant");
+  }
+}
+
 void combined_px_moves() {
   for (unsigned quarter = 0; quarter < 4; ++quarter) {
     std::vector<Move> from_px;
@@ -319,6 +393,8 @@ void parallel_priority() {
                              Move{.source = 0x50, .destination = 0x2c},
                              Move{.source = 0x18, .destination = 0},
                              Move{.source = ustat[0], .destination = 0},
+                             Move{.source = astat_x_code, .destination = 0},
+                             Move{.source = stky_y_code, .destination = 0},
                              Move{.source = 0, .destination = px2},
                              Move{.source = px, .destination = ustat[0]},
                              Move{.source = ustat[3], .destination = px},
@@ -785,7 +861,6 @@ void two_pending_loads() {
 
 void refused_register_fields() {
   constexpr std::array reserved{42U, 32U, 31U, 30U, 29U, 28U, 27U};
-  constexpr unsigned mode1_code = 0x72;
   for (const auto bit : reserved) {
     const auto word = encoding({.source = shadow_first, .destination = 0, .swap = true}) |
                       (std::uint64_t{1} << bit);
@@ -797,9 +872,9 @@ void refused_register_fields() {
   fixture::throws<sharc::PreparationError>(
       [&] {
         (void)sharc::Core::lower(fixture::image(
-            sharc::InstructionSet::isa, encoding({.source = mode1_code, .destination = 0})));
+            sharc::InstructionSet::isa, encoding({.source = 0, .destination = mode1_code})));
       },
-      "unimplemented system-register read was accepted");
+      "unimplemented system-register write was accepted");
 }
 
 void dependencies() {
@@ -824,6 +899,8 @@ namespace fixture {
 void register_transfers() {
   raw_moves();
   system_moves();
+  control_reads();
+  read_latched_dag_overflow();
   combined_px_moves();
   combined_px_aliases();
   parallel_priority();

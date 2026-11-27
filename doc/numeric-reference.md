@@ -787,6 +787,29 @@ I5, M1, B5 or L5 load followed by enhanced `MODIFY` showed two, one and zero
 extra clocks. This qualifies simulator timing for register `MODIFY`; type 19
 and silicon timing remain separate.
 
+## Control-register read operands
+
+The CCES 2.12.1 ADSP-21489 functional simulator ran 208 authored register
+probes. They combined 13 system registers with independent lane predicates,
+R/S destinations and parallel ADD, or with DAG and combined-PX destinations.
+ASTAT and STKY selected the named register for the explicit result and its
+counterpart for the implicit result. A parallel ADD changed ASTAT after the
+transfer had sampled the old status. Only the explicit predicate enabled the
+combined-PX transfer. The simulator placed the source in PX2 and cleared PX1.
+The core repeats the named source in both halves, following the documented
+system-register exception and its I0 and PC examples in Programming Reference
+2.4, pp. 2-16–2-17. Silicon confirmation remains open for these sources.
+
+Another 240 authored store probes covered absolute DM, post-modifying DM/PM
+and immediate-indexed PM. Normal and short stores followed the selected lanes.
+Indexed wide stores paired ASTAT and STKY, while absolute wide stores repeated
+the named register in the simulator. For unpaired sources the simulator
+repeated the word in absolute wide stores and used the next UREG selector for
+the high word of indexed wide stores. The core uses the documented unpaired
+replication rule, including LCNTR (p. 2-13), and uses the complementary status
+pair in both addressing forms (pp. 4-95–4-96 and 10-31–10-32). Silicon
+confirmation of the differing wide stores remains open.
+
 ## Fixed multiplier details
 
 The raw accumulator has 80 bits. Inputs use the upper 32 bits of each data
