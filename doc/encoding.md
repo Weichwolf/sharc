@@ -50,6 +50,13 @@ this standalone prefix; malformed-span and reserved-prefix fixtures incorrectly
 called it reserved. The malformed span now uses `0x03`, and explicit
 standalone type-6 fixtures cover recognition and installed execution.
 
+For the classic bit FIFO opcodes in Table 12-11, CCES assembly of authored
+programs places the register length of BITDEP and BITEXT in the Y field. BITDEP
+reads the data to append from X. `BFFWRP = Rn` also reads the Y field, and
+`Rn = BFFWRP` writes the result field. The standalone immediate forms take the
+length or pointer from DATA and, for a 12-bit length, DATAEX. The installed
+FIFO execution coverage is tracked separately in `isa-coverage.md`.
+
 The 1001 VISA prefix uses additional discriminator bits to separate full-width
 immediate stores, compact immediate stores/offset transfers and short transfers.
 The optional-compute marker is tested only in the families that define it;
