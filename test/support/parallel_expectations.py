@@ -10,7 +10,7 @@ from floating_expectations import encode
 from multiplier_expectations import _limb_accumulate, _limb_product
 from expectation_check import require, require_raises
 from reference import (
-    IntegerResult, Mode, ParallelResult, RegisterWrite, Unqualified, dual_alu, fixed,
+    IntegerResult, Mode, ParallelResult, RegisterWrite, dual_alu, fixed,
     floating_alu, floating_multiply, parallel_compute, register_writeback,
 )
 
@@ -23,9 +23,9 @@ DUAL = [
     ("dual saturated overflow", "fixed", 0x7FFFFFFF00, 0x0000000100, {"saturate": True},
      ParallelResult((0x7FFFFFFF00, 0x7FFFFFFE00), 0xA, 4)),
     ("dual floating cancellation", "float", 0x3F80000000, 0xBF80000000, {"mode": Mode(40)},
-     ParallelResult((0, 0x4000000000), 0x401, 1)),
+     ParallelResult((0, 0x4000000000), 0x401, 0)),
     ("dual floating overflow and zero", "float", 0x7F7FFFFFFF, 0x7F7FFFFFFF,
-     {"mode": Mode(40)}, ParallelResult((0x7F80000000, 0), 0x403, 3)),
+     {"mode": Mode(40)}, ParallelResult((0x7F80000000, 0), 0x403, 2)),
 ]
 
 PACKETS = [
@@ -57,7 +57,7 @@ PACKETS = [
     ("multiplier underflow plus dual ALU overflow and zero", "float",
      (0x0080000000, 0x3F00000000, 0x7F7FFFFFFF, 0x7F7FFFFFFF), (8, 0, 4),
      {"mode": Mode(40), "alu": "dual"},
-     ParallelResult((0, 0x7F80000000, 0), 0x503, 0x103, 0)),
+     ParallelResult((0, 0x7F80000000, 0), 0x503, 0x102, 0)),
     ("multiplier overflow plus absolute ALU invalid", "float",
      (0x7F7FFFFFFF, 0x4000000000, 0x7FC0000000, 0), (8, 0),
      {"mode": Mode(40), "alu": "abs"},
@@ -71,15 +71,15 @@ LANES = [
     ("lane-local saturation", "fixed", "add",
      (0x7FFFFFFF00, 0x0000000100), (0x0000000100, 0x0000000200), {"saturate": True},
      (IntegerResult(0x7FFFFFFF00, 2, 4), IntegerResult(0x0000000300, 0, 0))),
-    ("lane-local floating sticky predicates", "float", "add",
+    ("lane-local floating overflow versus exact cancellation", "float", "add",
      (0x7F7FFFFFFF, 0x3F80000000), (0x7F7FFFFFFF, 0xBF80000000), {"mode": Mode(40)},
-     (IntegerResult(0x7F80000000, 0x402, 2), IntegerResult(0, 0x401, 1))),
+     (IntegerResult(0x7F80000000, 0x402, 2), IntegerResult(0, 0x401, 0))),
     ("lane-local multiplier overflow versus underflow", "multiply", "mul",
      (0x7F7FFFFFFF, 0x0080000000), (0x4000000000, 0x3F00000000), {"mode": Mode(40)},
      (IntegerResult(0x7F80000000, 0x80, 0x80), IntegerResult(0, 0x100, 0x100))),
     ("lane-local ABS invalid", "float", "abs", (0x3F80000000, 0xFFC0000000), (0, 0),
      {"mode": Mode(40)}, (IntegerResult(0x3F80000000, 0x400, 0),
-                          IntegerResult(0xFFFFFFFFFF, 0x430, 0x20))),
+                          IntegerResult(0xFFFFFFFFFF, 0x420, 0x20))),
     ("distinct old lane flags survive independently", "fixed", "pass",
      (0x00000001FF, 0xFFFFFFFFFF), (0, 0), {"astat": (0xFFFF, 0), "stky": (4, 0x20)},
      (IntegerResult(0x0000000100, 0xFBC0, 4), IntegerResult(0xFFFFFFFF00, 4, 0x20))),
@@ -286,9 +286,8 @@ def floating_lattice():
                     az, an = any(value == 0 for value in outputs), any(value < 0 for value in outputs)
                     flags = 0xFFFFFC00 | int(az) | (int(an) << 2) | (int(x * y < 0) << 6)
                     flags |= 0x10 if alu == "abs" and a < 0 else 0
-                    sticky = 0x20 | int(az and alu in ("add", "sub", "avg", "dual"))
                     expected = ParallelResult((encode(x * y), *(encode(value) for value in outputs)),
-                                              flags, sticky, 0x1234)
+                                              flags, 0x20, 0x1234)
                     require(parallel_compute("float", encode(x), encode(y), encode(a), encode(b),
                                              mode=Mode(width, rounding), alu=alu, astat=0xFFFFFFFF,
                                              stky=0x20, accumulator=0x1234), expected,
@@ -306,8 +305,3 @@ def explicit_refusals():
     ]
     for call in invalid:
         require_raises(ValueError, call, 'unsupported multifunction combination accepted')
-    for call in (
-        lambda: dual_alu("float", 0x8000000000, 0x8000000000, mode=Mode(40)),
-        lambda: parallel_compute("float", 0, 0xBF80000000, 0, 0, mode=Mode(40)),
-    ):
-        require_raises(Unqualified, call, 'partial parallel result escaped an unqualified scalar result')

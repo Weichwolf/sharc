@@ -21,11 +21,11 @@ reference processor. See issue #2.
 | Fixed effects | Raw result with extension cleared, old ASTAT/STKY preservation, AF clearing, carry, saturation/overflow, AS, AOS, CACC history; compare has no data-register write |
 | Finite FP rounding | Exact rational nearest ties-to-even and toward-zero, 24-/32-bit significands, overflow to infinity or format-specific maximum finite |
 | FP value operations | ADD, SUB, average before rounding, multiply; independent value and exception metadata |
-| Qualified FP effects | ADD/SUB and absolute forms, average, negate/absolute/pass, RND, SCALB, FLOAT, MIN/MAX/CLIP/COPYSIGN, ordered compare and floating multiply; complete scalar flags/sticky results within the stated domain |
+| Qualified FP effects | ADD/SUB and absolute forms, average, negate/absolute/pass, RND, SCALB, FLOAT, MIN/MAX/CLIP/COPYSIGN, compare and floating multiply; complete scalar flags/sticky results within the stated domain |
 | MANT/LOGB effects | Raw mantissa with hidden bit, unbiased fixed exponent, instruction-specific infinity/zero/saturation results, AF/AS/AV/AI and sticky effects; explicit RND32/sentinel gaps |
 | Computational input views | Strict RND32 clears eight extension bits before arithmetic; denormal inputs become signed zeros without a new numeric underflow event |
-| Special values | Signed-zero value rules, infinities, 40-bit all-ones NaN results and invalid-operation metadata |
-| Conversion values | FLOAT always returns a 40-bit result, including with RND32 selected; explicit RND consumes extension bits and returns 32-bit precision |
+| Special values | Signed zeros and their sign flags, infinities, NaN formats and signs, unordered COMP, and the minimum-normal rounding boundary for single-function arithmetic |
+| Conversion values | FLOAT always returns a 40-bit result, including with RND32 selected; explicit RND consumes the current computational view and returns 32-bit precision |
 | FIX/TRUNC effects | Finite integer outputs and saturated overflow/infinity, scaled inputs, input precision, nearest/floor/toward-zero distinctions, exponent-based AV and pre-rounded AUS; sentinel-result flags explicitly refused |
 | Fixed multiplier | SSI/SUI/USI/UUI and fractional/rounded variants, full 80-bit multiply/MAC/MSUB, separate MR/register destinations and preserved old flags |
 | Accumulator operations | Signed/unsigned integer/fraction saturation, explicit nearest rounding, clear, all three limb reads/writes; MR1 writes extend their sign into MR2 |
@@ -86,12 +86,12 @@ They also check all 128 pointer reads and all low-byte pointer-write patterns
 with both input SF states and unrelated upper bits.
 All 65,536 short encodings are unpacked and checked by decoding the resulting
 binary32 rational and comparing it to the short format's value equation.
-Another 29,956 full scalar FP cases use an authored wire-value codebook for exact
+Another 30,008 full scalar FP cases use an authored wire-value codebook for exact
 dyadic arithmetic, textual compare history and direct mantissa/exponent field
 checks. They span both precisions and rounding settings, ALU/multiplier flag
 ownership, unary/scaled operations, all normal exponents and eight fraction
-patterns. The same checks require 5,132 explicit refusals of unqualified negative
-zero or MANT extension cases; those are not accepted results.
+patterns. The same checks require 5,080 explicit refusals at the unqualified
+MANT extension boundary.
 Another 13,072 multifunction cases compare the composed reference against
 sign-bit overflow identities, independently rounded fixed averages, five-limb
 products/accumulations and the exact floating wire-value codebook. Authored
@@ -145,26 +145,16 @@ instruction family and execution mode.
 `Unqualified` prevents the generator from silently supplying a guessed expectation.
 Currently explicit refusals include:
 
-- Nearest rounding of a nonzero value in the one-ULP interval immediately below
-  the smallest normal. The manual says to flush a post-rounded denormal, but the
-  current analysis has not established the rounding boundary there. Ordinary IEEE
-  gradual underflow is not assumed. Toward-zero underflow and values farther below
-  the boundary already have exact signed-zero expectations.
-- The extension byte of a canonical NaN in a RND32 result, and RND32 classification
-  when the only NaN payload bits are in that byte. Forty-bit NaN values are modeled;
-  these 32-bit details require further evidence.
 - Complete FIX/TRUNC flags when the result is the all-ones floating sentinel
   (NaN input, or unsaturated infinity/overflow). The sentinel value is documented;
   its AN effect is not established by the fixed-point result wording. Saturated
   infinities and finite integer results already have complete scalar expectations.
-- Floating AN/MN for negative-zero or NaN results. Instructions whose AN is
-  explicitly cleared, such as absolute sum/difference, already have complete
-  expectations where the other fields are qualified.
-- Unordered floating compare, LOGB's NaN sentinel, and MANT with RND32 selected
+- LOGB's NaN sentinel, and MANT with RND32 selected
   and nonzero extension input. MANT's exact-output wording and the general input
   precision rule need stronger evidence to resolve that input boundary.
 - Inexact FPACK rounding, its complete upper result storage and status effects;
-  ordinary RECIPS/RSQRTS ROM entries and RECIPS AN for a negative NaN input.
+  ordinary RECIPS/RSQRTS ROM entries, their RND32 invalid/extension-only NaN
+  cases and RECIPS AN for a negative NaN input.
 - SZ for a negative BTST position and sign extension of a zero-length field.
 - FIFO operations with a prohibited length, overfull/invalid pointer, or insufficient
   capacity/data. The manual defines SV but leaves the resulting data/pointer
@@ -179,45 +169,60 @@ composition do not close those architectural gaps.
 The explicit FIX/TRUNC distinction on 11-37 must not be replaced by a shared host
 integer cast. No partial flag mask is used to claim a complete instruction result.
 
-Normal-range rounding validation does not prove the unqualified underflow boundary,
-seed tables, instruction semantics, compiled native results or a supported-host
-performance result. The separately qualified initial native subset is recorded in
-`isa-coverage.md`; it does not complete this reference.
-The remaining single-function arithmetic cases are tracked in #11.
-Conversions, packing, and seed operations are tracked in #24.
+Installed-image evidence is recorded in `isa-coverage.md`. Conversions, packing
+and seed operations are tracked in #24, and combined floating execution in #25.
 
-## Unverified against a primary source
+## ADSP-21489 simulator observations
 
-The following probes remain open. The independent installed-image matrix omits
-cases where the reference declines to generate the full outcome. The single-
-function lowering currently makes these choices for the open cases:
+Analog Devices CrossCore Embedded Studio 2.12.1 for Windows, SHARC compiler
+8.16.1.0, ran 436 focused and 1,344 deterministic scalar probes on the
+ADSP-214xx Family Simulator with the ADSP-21489 target. The second set varied
+signs and significands across normal exponents and combined selected zeros,
+denormals, infinities, NaNs and arithmetic range boundaries. The corrected
+reference matched the destinations, ASTATx and writable STKYx in both sets.
+Captures covered MODE1 values `0`, `0x8000`, `0x10000` and `0x18000`
+(both widths and both rounding directions).
 
-- For RND32, classify a NaN using the raw 40-bit operand before masking its
-  extension and write the all-ones 40-bit sentinel. Appendix A defines RND32
-  precision, while sections 3-37–38 describe the general boundary and NaN result.
-- Compute AN and MN as ordered negativity, which clears them for negative zero
-  and NaN. For unordered COMP, set AI/AIS, clear AZ and AN, and shift a zero
-  into CACC. Sections 11-23–33 and 11-57 describe these flags, including
-  AI on NaN input. The CACC parenthesis in COMP contradicts its greater-than
-  wording, and the unordered comparison flags need direct evidence.
-- Round on the subnormal grid at the minimum-normal threshold, then flush
-  any remaining subnormal to signed zero. The post-rounded rule in sections
-  11-23–27 and Appendix A leaves this transition unqualified.
-- Explicit RND consumes the raw extension in Strict. FastFP32 reduces the
-  operand first, using the guest rounding direction. RND's flags then describe
-  the operation on that reduced operand, including when the operand rounded
-  to infinity.
-
-| Boundary awaiting observation | Authored probe |
+| Boundary | Observed single-function behavior |
 |---|---|
-| NaN result extension and extension-only payload under RND32 | PASS raw40 `0x7fc0000000` and `0x7f80000001`, RND32 clear/set |
-| AN/MN for NaN/negative zero and conversion sentinels | PASS negative zero; zero times -1; NaN ADD/MUL; unsaturated FIX infinity; LOGB NaN |
-| Unordered COMP | Compare ordinary and extension-only NaNs against finite values in both source positions, with nonzero CACC and both precisions |
-| Rounding just below minimum normal | Multiply `0x0080000000` by `0x3f7fffffff` in 40-bit mode and `0x3f7fffff00` in 32-bit mode |
-| FPACK inexact result, upper storage and flags | Pack half-way inputs into a nonzero destination; vary TRUNC, RND32 and SSE |
-| MANT with nonzero extension under RND32 | MANT raw40 `0x3f80000001`, RND32 clear/set |
-| Ordinary reciprocal and reciprocal-square-root seed entries | Capture every input mantissa bin and both square-root exponent parities; retain exact raw40 outputs |
-| Remaining shifter status boundaries | Zero-source OR-shift into nonzero destination; BTST position -1; sign-extended empty fields |
+| RND32 input | Clear the extension byte before classification, including for explicit RND. PASS and COMP see positive infinity for `0x7f80000001` with RND32 set. |
+| Invalid output | ALU uses a negative NaN with all fraction bits set. Multiply uses the first NaN operand's sign, or the product sign for zero times infinity. RND and RND32 outputs clear the extension byte. |
+| Sign and comparison flags | Negative zero sets AN or MN. Invalid results clear both. ABS sets AS for negative zero and clears AS for a negative NaN. Unordered COMP sets AI/AIS, clears AZ/AN, and shifts a one into CACC. |
+| Nearest rounding immediately below minimum normal | Above the midpoint the result is minimum normal without underflow. At the midpoint the multiplier returns minimum normal and sets MU/MUS. The ALU flushes the midpoint to signed zero and sets AZ/AUS. Below the midpoint both units flush to signed zero and signal underflow. |
+| Exact ALU zero | ADD/SUB, absolute sum/difference and average set AZ without a new AUS on exact zero. A nonzero underflow sets AUS. The STKY write/read control retained an already set AUS. |
+
+The exact-zero AUS observation differs from the description of AUS as a sticky
+copy of AZ in Programming Reference 2.4 sections 11-24–28 and A-22. The
+single-function implementation follows the ADSP-21489 observation for this
+boundary. AC, AV and AS on compare follow section 11-29. The CACC result
+matches a new bit of `!AZ && !AN` for ordered and unordered comparisons.
+
+The directly observed inputs and expected effects used as anchors are in
+`test/support/floating_expectations.py`. To reproduce a case, set MODE1 and
+wait one instruction, write input words through PX2/PX1, seed the destination
+through PX, write ASTATx and STKYx, and wait one instruction before executing
+the single compute. Read the destination back through PX2/PX1, then store
+ASTATx and STKYx to DM. The status observations used CACC `0xa5` and writable
+sticky bits zero except for the AUS control. STKYx read-only stack bits from
+the harness were `0x05400000`. PASS with raw `0x3f80001234` and COMP of
+greater, equal and less inputs checked raw capture, precision and CACC order.
+
+Build the authored C/assembly probe with `cc21k -proc ADSP-21489 -nwc -g`.
+Run it with `CCES_runner --target "ADSP-214xx Family Simulator" --platform
+"ADSP-214xx Simulator" --processor ADSP-21489 --core "0,probe.dxe"`. For
+a C array of output words named `observations`, add a `--datafile` value of
+`0,out,observations.dat,binary:le,observations,<word-count>,1` and start with
+an empty output destination. Each tuple holds PX2, PX1, ASTATx and STKYx
+as four little-endian words. Reconstruct raw40 as `PX2 << 8 | PX1 >> 24`.
+FastFP32 rounds finite inputs first and preserves the class and sign of NaN
+inputs, including extension-only payloads. Its expected effects come from the
+independent approximation and the qualified operations.
+
+Remaining observation targets include FIX/TRUNC sentinel flags, LOGB NaN,
+FPACK inexact storage and flags, and MANT with nonzero extension under RND32.
+The reciprocal and reciprocal-square-root seed probes need every ordinary
+mantissa bin and both square-root exponent parities. Shifter gaps include
+zero-source OR-shift, BTST position -1 and sign-extended empty fields.
 
 ## Primary observation tools
 
@@ -238,12 +243,11 @@ Floating multiplication preserves all ALU bits and updates only MN/MV/MU/MI;
 exact zero is not a new multiplier underflow event. Its overflow/underflow sticky
 bits are MVS/MUS, while MOS remains unchanged.
 
-ADD/SUB, their absolute forms, average and SCALB set AUS whenever AZ is set,
-including an exact zero. Negate, absolute, pass, RND, selection operations and
-compare leave AUS unchanged. Average clears AV and preserves AVS. Scaled FLOAT
-updates AUS/AVS, including when its explicit scale is zero; unscaled FLOAT
-preserves them. The value records still retain signed-zero encodings even when
-the corresponding full status record refuses an unqualified AN/MN.
+ADD/SUB, their absolute forms and average set AUS for nonzero underflow.
+Negate, absolute, pass, RND, selection operations and compare leave AUS
+unchanged. Average clears AV and preserves AVS. The conversion reference still
+uses the manual rule for SCALB and scaled FLOAT. Their observable status
+boundaries remain part of #24. Unscaled FLOAT preserves AUS and AVS.
 
 Ordered compare treats both zeros as equal and orders infinities normally. It
 shifts CACC independently of the numeric result, preserves other non-ALU bits,

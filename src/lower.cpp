@@ -5482,9 +5482,7 @@ std::uint32_t compute_context(const Compute &compute, ExecutionMode mode) {
   std::uint32_t mask{simd_mode};
   if (floating_compute(compute)) {
     const auto operation = static_cast<FloatingOp>(compute.opcode);
-    if (mode == ExecutionMode::strict && operation != FloatingOp::round) {
-      mask |= rounding32_mode;
-    }
+    if (mode == ExecutionMode::strict) { mask |= rounding32_mode; }
     if (mode == ExecutionMode::fast_fp32 || floating_arithmetic(operation) ||
         operation == FloatingOp::multiply || operation == FloatingOp::round) {
       mask |= truncation_mode;

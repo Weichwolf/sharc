@@ -66,10 +66,6 @@ private:
 
   [[nodiscard]] llvm::Constant *no() const { return constant(1, 0); }
 
-  [[nodiscard]] llvm::Constant *invalid_result() const {
-    return word(mode_.fast_fp32 ? canonical_nan & narrow_mask : canonical_nan);
-  }
-
   llvm::Value *flag(llvm::Value *predicate, std::uint32_t mask);
   Operand unpack(llvm::Value *raw);
   Operand operand(llvm::Value *raw);
@@ -121,11 +117,7 @@ Operand Floating::unpack(llvm::Value *raw) {
 
 Operand Floating::operand(llvm::Value *raw) {
   if (mode_.fast_fp32) { return unpack(round_single(raw).raw); }
-  if (!mode_.rnd32) { return unpack(raw); }
-  const auto full = unpack(raw);
-  // Keep NaN classification before dropping the computational extension byte.
-  return unpack(
-      ir_.CreateSelect(full.nan, word(canonical_nan), ir_.CreateAnd(raw, word(narrow_mask))));
+  return unpack(mode_.rnd32 ? ir_.CreateAnd(raw, word(narrow_mask)) : raw);
 }
 
 llvm::Value *Floating::round_shift(Shift input) {
@@ -149,7 +141,8 @@ Number Floating::round_single(llvm::Value *raw) {
   auto *finite = ir_.CreateICmpULT(original.magnitude, word(infinity));
   auto *overflow = ir_.CreateAnd(finite, ir_.CreateICmpEQ(rounded, word(infinity)));
   auto *value = ir_.CreateOr(rounded, original.sign);
-  return {.raw = ir_.CreateSelect(original.nan, invalid_result(), value),
+  // Keep the NaN class and sign when reducing FastFP32 operands.
+  return {.raw = ir_.CreateSelect(original.nan, raw, value),
           .overflow = overflow,
           .underflow = no(),
           .invalid = original.nan};
@@ -187,7 +180,13 @@ Number Floating::pack(ScaledMagnitude scaled) {
       exponent,
       ir_.CreateZExt(ir_.CreateOr(carry, ir_.CreateAnd(edge, promoted)), type(wide_bits)));
   auto *nonzero = ir_.CreateICmpNE(magnitude, word(0));
-  auto *underflow = ir_.CreateAnd(nonzero, ir_.CreateICmpSLT(adjusted, word(1)));
+  auto *subnormal = ir_.CreateICmpSLT(adjusted, word(1));
+  auto *tiny = subnormal;
+  if (!mode_.truncate) {
+    constexpr auto all_bits = ~std::uint64_t{0};
+    const auto halfway = all_bits << (wide_bits - precision);
+    tiny = ir_.CreateOr(tiny, ir_.CreateAnd(edge, ir_.CreateICmpEQ(normalized, word(halfway))));
+  }
   auto *overflow = ir_.CreateAnd(nonzero, ir_.CreateICmpSGE(adjusted, word(exponent_limit)));
   auto *fraction = ir_.CreateAnd(rounded, word((std::uint64_t{1} << (precision - 1)) - 1));
   auto *raw = ir_.CreateOr(ir_.CreateShl(adjusted, word(exponent_shift)),
@@ -196,10 +195,10 @@ Number Floating::pack(ScaledMagnitude scaled) {
   const auto finite_limit = narrow ? maximum & narrow_mask : maximum;
   auto *overflow_value = word(mode_.truncate ? finite_limit : infinity);
   raw = ir_.CreateSelect(overflow, overflow_value, raw);
-  raw = ir_.CreateSelect(ir_.CreateAnd(nonzero, ir_.CreateNot(underflow)), raw, word(0));
+  raw = ir_.CreateSelect(ir_.CreateAnd(nonzero, ir_.CreateNot(subnormal)), raw, word(0));
   return {.raw = ir_.CreateOr(raw, sign),
           .overflow = overflow,
-          .underflow = underflow,
+          .underflow = ir_.CreateAnd(nonzero, tiny),
           .invalid = no()};
 }
 
@@ -226,6 +225,8 @@ Number Floating::add(FloatingOp operation, const Operands &operands) {
   if (absolute) { sign = word(0); }
   auto *at_top = operation == FloatingOp::average ? larger : ir_.CreateAdd(larger, word(1));
   auto result = pack({.magnitude = magnitude, .exponent_at_top = at_top, .sign = sign});
+  // The ALU flushes an exact halfway underflow. The multiplier retains the rounded value.
+  result.raw = ir_.CreateSelect(result.underflow, sign, result.raw);
   auto *infinite = ir_.CreateOr(left.infinite, right.infinite);
   auto *unlike_infinities = ir_.CreateAnd(ir_.CreateAnd(left.infinite, right.infinite), opposite);
   auto *invalid = ir_.CreateOr(unlike_infinities, ir_.CreateOr(left.nan, right.nan));
@@ -249,6 +250,8 @@ Number Floating::multiply(const Operands &operands) {
   result.invalid = ir_.CreateOr(ir_.CreateAnd(infinite, zero), ir_.CreateOr(left.nan, right.nan));
   auto *finite = ir_.CreateNot(ir_.CreateOr(infinite, result.invalid));
   result.raw = ir_.CreateSelect(infinite, ir_.CreateOr(sign, word(infinity)), result.raw);
+  result.raw =
+      ir_.CreateSelect(left.nan, left.raw, ir_.CreateSelect(right.nan, right.raw, result.raw));
   result.overflow = ir_.CreateAnd(finite, result.overflow);
   result.underflow = ir_.CreateAnd(finite, result.underflow);
   return result;
@@ -289,11 +292,11 @@ FloatingEffects Floating::compare(const Operands &operands, const FloatingInputs
   auto *ordered = ir_.CreateNot(invalid);
   auto *equal = ir_.CreateAnd(ordered, ir_.CreateICmpEQ(a, b));
   auto *less = ir_.CreateAnd(ordered, ir_.CreateICmpSLT(a, b));
-  auto *greater = ir_.CreateAnd(ordered, ir_.CreateICmpSGT(a, b));
+  auto *newest = ir_.CreateNot(ir_.CreateOr(equal, less));
   auto *history =
       ir_.CreateAnd(ir_.CreateLShr(inputs.status, constant(32, 1)), constant(32, compare_history));
   auto *flags = ir_.CreateOr(constant(32, 0x400), ir_.CreateOr(flag(equal, 1), flag(less, 4)));
-  flags = ir_.CreateOr(flags, ir_.CreateOr(flag(invalid, 32), flag(greater, newest_comparison)));
+  flags = ir_.CreateOr(flags, ir_.CreateOr(flag(invalid, 32), flag(newest, newest_comparison)));
   return {.raw = nullptr,
           .status = ir_.CreateOr(
               ir_.CreateAnd(inputs.status, constant(32, ~(alu_flags | compare_history))),
@@ -310,12 +313,17 @@ Number Floating::unary(FloatingOp operation, const Operand &value) {
 
 FloatingEffects
 Floating::effects(FloatingOp operation, const Number &number, const FloatingInputs &inputs) {
-  auto *raw = ir_.CreateSelect(number.invalid, invalid_result(), number.raw);
+  const bool narrow = mode_.rnd32 || mode_.fast_fp32 || operation == FloatingOp::round;
+  const auto nan = narrow ? canonical_nan & narrow_mask : canonical_nan;
+  auto *sign = ir_.CreateAnd(number.raw, word(sign_mask));
+  llvm::Value *invalid = word(nan);
+  if (operation == FloatingOp::multiply) {
+    invalid = ir_.CreateOr(word(nan & magnitude_mask), sign);
+  }
+  auto *raw = ir_.CreateSelect(number.invalid, invalid, number.raw);
   auto *magnitude = ir_.CreateAnd(raw, word(magnitude_mask));
   auto *zero = ir_.CreateICmpEQ(magnitude, word(0));
-  auto *sign = ir_.CreateICmpNE(ir_.CreateAnd(raw, word(sign_mask)), word(0));
-  // Interpret "negative result" as ordered negativity at the unresolved zero/NaN boundary.
-  auto *negative = ir_.CreateAnd(sign, ir_.CreateNot(ir_.CreateOr(zero, number.invalid)));
+  auto *negative = ir_.CreateAnd(ir_.CreateICmpNE(sign, word(0)), ir_.CreateNot(number.invalid));
   if (operation == FloatingOp::multiply) {
     auto *flags = ir_.CreateOr(flag(negative, 0x40), flag(number.overflow, 0x80));
     flags = ir_.CreateOr(flags,
@@ -336,12 +344,13 @@ Floating::effects(FloatingOp operation, const Number &number, const FloatingInpu
   if (!average) { flags = ir_.CreateOr(flags, flag(number.overflow, 2)); }
   if (operation == FloatingOp::absolute) {
     auto *input_sign = ir_.CreateICmpNE(ir_.CreateAnd(inputs.left, word(sign_mask)), word(0));
-    flags = ir_.CreateOr(flags, flag(input_sign, 16));
+    auto *input_negative = ir_.CreateAnd(input_sign, ir_.CreateNot(number.invalid));
+    flags = ir_.CreateOr(flags, flag(input_negative, 16));
   }
   flags = ir_.CreateOr(flags, flag(number.invalid, 32));
   auto *sticky = ir_.CreateOr(inputs.sticky, flag(number.invalid, 32));
   if (!average) { sticky = ir_.CreateOr(sticky, flag(number.overflow, 2)); }
-  if (floating_arithmetic(operation)) { sticky = ir_.CreateOr(sticky, flag(zero, 1)); }
+  if (floating_arithmetic(operation)) { sticky = ir_.CreateOr(sticky, flag(number.underflow, 1)); }
   return {.raw = raw,
           .status = ir_.CreateOr(ir_.CreateAnd(inputs.status, constant(32, ~alu_flags)), flags),
           .sticky = sticky};
@@ -349,7 +358,8 @@ Floating::effects(FloatingOp operation, const Number &number, const FloatingInpu
 
 FloatingEffects Floating::emit(FloatingOp operation, const FloatingInputs &inputs) {
   if (operation == FloatingOp::round) {
-    const auto number = round_single(mode_.fast_fp32 ? operand(inputs.left).raw : inputs.left);
+    const auto number =
+        round_single(mode_.rnd32 || mode_.fast_fp32 ? operand(inputs.left).raw : inputs.left);
     return effects(operation, number, inputs);
   }
   const auto left = operand(inputs.left);

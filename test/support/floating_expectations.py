@@ -2,7 +2,7 @@
 """Full scalar FP anchors, exact dyadic arithmetic and raw-field cross-checks."""
 
 from itertools import product as cartesian_product
-from dataclasses import asdict, replace
+from dataclasses import asdict
 from fractions import Fraction
 
 from expectation_check import anchor, require, require_raises
@@ -13,8 +13,10 @@ from reference import (
 
 
 ALU = [
-    ("ADD cancellation sets AUS", "add", 0x3F80000000, 0xBF80000000, Mode(40), {},
-     IntegerResult(0, 0x401, 1)),
+    ("ADD cancellation preserves AUS", "add", 0x3F80000000, 0xBF80000000, Mode(40), {},
+     IntegerResult(0, 0x401, 0)),
+    ("SUB tiny result sets AUS", "sub", 0x0080000000, 0x0080000001, Mode(40), {},
+     IntegerResult(0x8000000000, 0x405, 1)),
     ("ADD overflow flags", "add", 0x7F7FFFFFFF, 0x7F7FFFFFFF, Mode(40), {},
      IntegerResult(0x7F80000000, 0x402, 2)),
     ("SUB negative overflow", "sub", 0xFF7FFFFFFF, 0x7F7FFFFFFF, Mode(40), {},
@@ -24,22 +26,38 @@ ALU = [
     ("absolute difference invalid clears AN", "abssub", 0x7F80000000, 0x7F80000000, Mode(40), {},
      IntegerResult(0xFFFFFFFFFF, 0x420, 0x20)),
     ("absolute sum clears negative zero", "absadd", 0x8000000000, 0x8000000000, Mode(40), {},
-     IntegerResult(0, 0x401, 1)),
+     IntegerResult(0, 0x401, 0)),
     ("average cannot overflow", "avg", 0x7F7FFFFFFF, 0x7F7FFFFFFF, Mode(40), {},
      IntegerResult(0x7F7FFFFFFF, 0x400, 0)),
+    ("average flushes midpoint below minimum normal", "avg", 0x0140000000, 0x8080000001,
+     Mode(40), {}, IntegerResult(0, 0x401, 1)),
+    ("binary32 average flushes negative midpoint", "avg", 0x8140000000, 0x0080000100,
+     Mode(32), {}, IntegerResult(0x8000000000, 0x405, 1)),
     ("PASS zero leaves AUS unchanged", "pass", 0, 0, Mode(40), {}, IntegerResult(0, 0x401, 0)),
     ("PASS denormal flush leaves AUS unchanged", "pass", 1, 0, Mode(40), {},
      IntegerResult(0, 0x401, 0)),
+    ("PASS negative zero sets AN", "pass", 0x8000000000, 0, Mode(40), {},
+     IntegerResult(0x8000000000, 0x405, 0)),
+    ("RND32 PASS treats an extension-only NaN as infinity", "pass",
+     0x7F80000001, 0, Mode(32), {}, IntegerResult(0x7F80000000, 0x400, 0)),
+    ("RND32 PASS writes a binary32 NaN", "pass", 0xFFC0000000, 0, Mode(32), {},
+     IntegerResult(0xFFFFFFFF00, 0x420, 0x20)),
     ("NEG normal", "neg", 0x3F80000000, 0, Mode(32), {},
      IntegerResult(0xBF80000000, 0x404, 0)),
     ("ABS negative zero records input sign", "abs", 0x8000000000, 0, Mode(40), {},
      IntegerResult(0, 0x411, 0)),
-    ("ABS negative NaN", "abs", 0xFFC0000000, 0, Mode(40), {},
-     IntegerResult(0xFFFFFFFFFF, 0x430, 0x20)),
+    ("ABS negative NaN clears AS", "abs", 0xFFC0000000, 0, Mode(40), {},
+     IntegerResult(0xFFFFFFFFFF, 0x420, 0x20)),
+    ("RND32 ABS sees negative infinity in an extension-only NaN", "abs", 0xFF80000001,
+     0, Mode(32), {}, IntegerResult(0x7F80000000, 0x410, 0)),
     ("RND overflow", "round", 0x7F7FFFFF80, 0, Mode(40), {},
      IntegerResult(0x7F80000000, 0x402, 2)),
-    ("RND odd tie effects", "round", 0x3F80000180, 0, Mode(32), {},
+    ("RND odd tie effects", "round", 0x3F80000180, 0, Mode(40), {},
      IntegerResult(0x3F80000200, 0x400, 0)),
+    ("RND with RND32 ignores input extension", "round", 0x3F80000180, 0, Mode(32), {},
+     IntegerResult(0x3F80000100, 0x400, 0)),
+    ("RND produces a binary32 NaN", "round", 0x7F80000001, 0, Mode(40), {},
+     IntegerResult(0xFFFFFFFF00, 0x420, 0x20)),
     ("RND toward zero effects", "round", 0xBF800001FF, 0, Mode(40, "zero"), {},
      IntegerResult(0xBF80000100, 0x404, 0)),
     ("RND zero leaves AUS unchanged", "round", 0, 0, Mode(32), {},
@@ -100,6 +118,20 @@ MULTIPLY = [
      IntegerResult(0, 0x100, 0x100)),
     ("FP multiply overflow", 0x7F7FFFFFFF, 0x4000000000, Mode(40), {},
      IntegerResult(0x7F80000000, 0x80, 0x80)),
+    ("FP multiply negative zero sets MN", 0, 0xBF80000000, Mode(40), {},
+     IntegerResult(0x8000000000, 0x40, 0)),
+    ("FP multiply NaN uses left NaN sign", 0x7FC0000000, 0xFFC0000000, Mode(40), {},
+     IntegerResult(0x7FFFFFFFFF, 0x200, 0x200)),
+    ("FP multiply NaN uses right NaN sign", 0x3F80000000, 0xFFC0000000, Mode(32), {},
+     IntegerResult(0xFFFFFFFF00, 0x200, 0x200)),
+    ("FP zero times negative infinity uses product sign", 0, 0xFF80000000, Mode(32), {},
+     IntegerResult(0xFFFFFFFF00, 0x200, 0x200)),
+    ("FP multiply midpoint promotes with underflow", 0x0080000000, 0x3F7FFFFFFF, Mode(40), {},
+     IntegerResult(0x0080000000, 0x100, 0x100)),
+    ("FP multiply just above midpoint promotes without underflow",
+     0x0080000001, 0x3F7FFFFFFE, Mode(40), {}, IntegerResult(0x0080000000, 0, 0)),
+    ("FP multiply negative binary32 midpoint promotes with underflow",
+     0x8080000000, 0x3F7FFFFF00, Mode(32), {}, IntegerResult(0x8080000000, 0x140, 0x100)),
 ]
 
 COMPARE = [
@@ -115,6 +147,10 @@ COMPARE = [
      IntegerResult(None, 0x401, 0)),
     ("extended compare input extension", 0x3F80000001, 0x3F80000000, Mode(40), {},
      IntegerResult(None, 0x80000400, 0)),
+    ("unordered compare shifts one into CACC", 0x3F80000000, 0x7F80000001,
+     Mode(40), {"astat": 0xA5000405}, IntegerResult(None, 0xD2000420, 0x20)),
+    ("RND32 compare treats extension-only NaN as infinity", 0x3F80000000, 0x7F80000001,
+     Mode(32), {"astat": 0xA5000405}, IntegerResult(None, 0x52000404, 0)),
 ]
 
 
@@ -152,7 +188,7 @@ def encode(value):
 
 
 def exact_lattice():
-    count, refusals = 0, 0
+    count = 0
     values = (-4, -2, -1, 0, 1, 2, 4)
     for width, rounding in cartesian_product((32, 40), ("nearest", "zero")):
         mode = Mode(width, rounding)
@@ -172,17 +208,13 @@ def exact_lattice():
                     if operation == "mul":
                         return floating_multiply(left, right, mode, astat=0xFFFFFFFF, stky=0x44)
                     return floating_alu(operation, left, right, mode=mode, astat=0xFFFFFFFF, stky=0x44)
-                if negative_zero:
-                    require_raises(Unqualified, run, 'unqualified negative-zero flags generated')
-                    refusals += 1
-                    continue
+                negative = value < 0 or negative_zero
+                raw = encode(value) | (0x8000000000 if negative_zero else 0)
                 if operation == "mul":
-                    flags, sticky = 0xFFFFFC3F | (int(value < 0) << 6), 0x44
+                    flags = 0xFFFFFC3F | (int(negative) << 6)
                 else:
-                    flags = 0xFFFFFFC0 | int(value == 0) | (int(value < 0) << 2)
-                    sticky = 0x44 | int(value == 0 and operation in (
-                        "add", "sub", "absadd", "abssub", "avg"))
-                require(run(), IntegerResult(encode(value), flags, sticky), (operation, x, y, mode))
+                    flags = 0xFFFFFFC0 | int(value == 0) | (int(negative) << 2)
+                require(run(), IntegerResult(raw, flags, 0x44), (operation, x, y, mode))
                 count += 1
             # History is independently assembled as a textual shift register.
             history = int(str(int(x > y)) + "10100101"[:7], 2) << 24
@@ -190,11 +222,11 @@ def exact_lattice():
             require(floating_compare(left, right, mode, astat=0xA5FFFFFF, stky=0x44),
                     IntegerResult(None, flags, 0x44), ("compare", x, y, mode))
             count += 1
-    return count, refusals
+    return count
 
 
 def unary_lattice():
-    count, refusals = 0, 0
+    count = 0
     for width, rounding in cartesian_product((32, 40), ("nearest", "zero")):
         mode = Mode(width, rounding)
         for value in (-4, -2, -1, 0, 1, 2, 4):
@@ -203,22 +235,19 @@ def unary_lattice():
                       for scale in (-2, -1, 0, 1, 2)] + [("float", None)]
             for operation, scale in cases:
                 source = ((value % 4294967296) * 256 + 255) if operation == "float" else encode(value)
-                if operation == "neg" and value == 0:
-                    require_raises(Unqualified, floating_alu, 'unqualified NEG zero flags generated',
-                                   operation, source, mode=mode)
-                    refusals += 1
-                    continue
                 output = -value if operation == "neg" else abs(value) if operation == "abs" else value
                 if scale is not None:
                     output *= Fraction(2)**scale
-                flags = 0xFFFFFFC0 | int(output == 0) | (int(output < 0) << 2)
+                negative_zero = operation == "neg" and value == 0
+                flags = 0xFFFFFFC0 | int(output == 0) | (int(output < 0 or negative_zero) << 2)
                 flags |= 0x10 if operation == "abs" and value < 0 else 0
                 sticky = 0x44 | int(output == 0 and scale is not None)
+                raw = 0x8000000000 if negative_zero else encode(output)
                 require(floating_alu(operation, source, mode=mode, scale=scale,
                                      astat=0xFFFFFFFF, stky=0x44),
-                        IntegerResult(encode(output), flags, sticky), (operation, value, mode, scale))
+                        IntegerResult(raw, flags, sticky), (operation, value, mode, scale))
                 count += 1
-    return count, refusals
+    return count
 
 
 def parts_lattice():
@@ -246,14 +275,8 @@ def parts_lattice():
 
 
 def explicit_gaps():
-    for call in (
-        lambda: floating_alu("pass", 0x8000000000, mode=Mode(40)),
-        lambda: floating_alu("add", 0x7FC0000000, mode=Mode(40)),
-        lambda: floating_multiply(0, 0xBF80000000, Mode(40)),
-        lambda: floating_compare(0x7FC0000000, 0, Mode(40)),
-        lambda: float_parts("logb", 0x7FC0000000, Mode(40)),
-    ):
-        require_raises(Unqualified, call, 'unqualified floating flags generated')
+    require_raises(Unqualified, float_parts, 'unqualified floating flags generated',
+                   "logb", 0x7FC0000000, Mode(40))
 
 
 def installed_header():
@@ -264,13 +287,14 @@ def installed_header():
               "copysign": 0x0e0000, "min": 0x0e1000, "max": 0x0e2000, "clip": 0x0e3000,
               "mul": 0x130000}
     unary = {"pass", "neg", "round", "abs"}
-    absolute = {"abs", "absadd", "abssub"}
     edges = [(0x3f800000ff, 0), (0x3f80000180, 0x3380000000),
              (0x3f80000000, 0xbf80000000), (0x3f80000000, 0x0080000000),
              (0x7f7fffffff, 0x7f7fffffff), (0x7f7fffffff, 0x4000000000),
              (0x0080000000, 0x3f00000000), (0x0080000000, 0x8080000000),
              (0x7f80000000, 0x3f80000000), (0x0000000001, 0x4000000000),
-             (0x7fc0000000, 0x3f80000000), (0x7f80000001, 0xbf80000000)]
+             (0x7fc0000000, 0x3f80000000), (0x7f80000001, 0xbf80000000),
+             (0x8000000000, 0), (0x8000000000, 0x8000000000),
+             (0x8080000000, 0x3f7fffffff), (0x0080000000, 0x3f7ffffe00)]
     # Vary significands and alignment distances near and beyond both boundaries.
     for index in range(24):
         top = (0x4a + index) << 31
@@ -285,7 +309,11 @@ def installed_header():
 
     def approximate(raw, mode):
         value = Operand(raw)
-        if value.kind in ("nan", "infinity"):
+        if value.kind == "nan":
+            # Preserve the computational NaN class and sign, including payloads
+            # that are confined to the source extension byte.
+            return 0x7fc0000000 | (raw & 0x8000000000)
+        if value.kind == "infinity":
             return raw
         return quantize(value.number(), mode, negative_zero=value.negative).raw
 
@@ -296,15 +324,6 @@ def installed_header():
             return floating_multiply(left, right, mode, astat=astat, stky=stky)
         if operation == "cmp":
             return floating_compare(left, right, mode, astat=astat, stky=stky)
-        if fast and operation in absolute:
-            inputs = (left,) if operation == "abs" else (left, right)
-            if any(Operand(raw).kind in ("nan", "infinity") for raw in inputs):
-                # The absolute forms specify AN directly. Reuse the qualified
-                # invalid flags and encode an invalid result in the binary32 view.
-                expected = floating_alu(operation, left, right, mode=Mode(40, mode.rounding),
-                                        astat=astat, stky=stky)
-                if Operand(expected.raw).kind == "nan":
-                    return replace(expected, raw=0xffffffff00)
         return floating_alu(operation, left, right, mode=mode, astat=astat, stky=stky)
 
     def array(values):
@@ -318,14 +337,11 @@ def installed_header():
                 mode = Mode(32 if fast or rnd32 else 40, "zero" if truncate else "nearest")
                 phase = index % 2
                 old_astat = (0xa500043a | phase, 0x420003c4 | (1 - phase))
-                old_stky = (0x44, 0x108)
+                old_stky = (0x44 | phase, 0x108 | (1 - phase))
                 x = (left, left ^ (1 << 39)) if operation in unary else (left, right)
                 y = (right, left)
-                try:
-                    expected = [result(operation, a, b, mode, fast, status, sticky)
-                                for a, b, status, sticky in zip(x, y, old_astat, old_stky)]
-                except Unqualified:
-                    continue
+                expected = [result(operation, a, b, mode, fast, status, sticky)
+                            for a, b, status, sticky in zip(x, y, old_astat, old_stky)]
                 controls = (fast, rnd32, truncate, operation != "cmp")
                 rows.append("{" + ", ".join((hex(field), *(str(bit).lower() for bit in controls),
                             array(x), array(y), array(old_astat), array(old_stky),

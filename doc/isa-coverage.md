@@ -557,7 +557,8 @@ computational inputs and results to binary32 with the guest rounding direction.
 Both identities use the raw register file and leave guest MODE1 visible.
 
 `test/isa/floating.cpp` runs independently authored instruction fields and
-rational expectations through installed images. It checks full register state,
+4,888 paired rational expectations, split evenly between Strict and FastFP32,
+through installed images. It checks full register state,
 arithmetic flags, comparison history, sticky flags, and progress for admitted
 blocks and partial bounds in SISD and SIMD, with alternate banks and separate
 lane predicates. A raw register move carries an extended midpoint between
@@ -567,14 +568,14 @@ CACC through an overwrite of the ordinary ALU flags. The sequence runs with upwa
 host rounding and checks the unchanged host rounding mode. The preparation
 suite round-trips the Strict artifact and checks cross-mode refusal.
 
-FastFP32's absolute forms check binary32 invalid results from ordinary and
-extension-only NaN inputs, including the documented AN/AS/AI effects. The
-original operands and guest MODE1 retain their full contents.
-
-The matrix omits cases for which the independent model refuses a full result.
-These include some signed-zero and NaN flags, RND32 NaN storage and
-classification, and the threshold just below minimum normal. See
-[numeric-reference.md](numeric-reference.md#unverified-against-a-primary-source).
+The matrix verifies negative zero and NaN flags, RND32 and explicit RND
+classification and output widths, COMP history on unordered inputs, and the
+minimum-normal boundary. It distinguishes Strict RND32 truncation from
+FastFP32 operand rounding and handles extension-only NaN inputs in each mode.
+It verifies the signed invalid result from floating multiplication. The
+original operands and guest MODE1 retain their full contents. The observed
+Strict boundaries and their reproduction procedure are recorded in
+[numeric-reference.md](numeric-reference.md#adsp-21489-simulator-observations).
 Conversions, packing, seeds, floating multifunction execution and floating
 parallel-transfer qualification remain open. Floating-workload performance
 is tracked separately from the fixed K1–K6 identities.
@@ -582,7 +583,7 @@ is tracked separately from the fixed K1–K6 identities.
 ## S2 independent expectations (complete milestone, numerical gaps retained)
 
 `test/support/reference.py` supplies a separate exact integer/rational numeric
-model. `generate_expectations.py` checks 279 numeric/conversion/accumulator/shifter
+model. `generate_expectations.py` checks 297 numeric/conversion/accumulator/shifter
 anchors, 48,768 normal-range rounding positions and 27,648 limb-based multiplier
 cases and can emit deterministic machine-readable expectations without loading
 production code. Fixed ALU records include complete
@@ -592,8 +593,8 @@ finite integer and saturated results with flags, including exponent-based AV and
 pre-rounded AUS; 10,972 signed-quotient comparisons and 1,828 required refusals
 cross-check both conversion instructions. Floating value-only records remain
 separate from new qualified complete ALU, compare, MANT/LOGB and multiply effects.
-The latter pass 29,956 independent full-result checks and 5,132 required refusals;
-unqualified negative-zero, NaN and MANT input-boundary status is not filled in.
+The latter pass 30,008 independent full-result checks and 5,080 required
+refusals for the unqualified MANT input boundary.
 Another 130,817 shifter, 15,449 bit FIFO and 65,536 short-float unpack cases use
 independent bit routing, bit lists and rational value checks. Scalar shifter
 expectations preserve unrelated flags and sticky bits. FIFO records refuse
@@ -628,10 +629,9 @@ each half has its own predicate. Authored ADD/swap expectations preserve old AZ
 selection and new ALU flags even when a swap replaces the ALU data result.
 This is expectation generation, not installed-image swap coverage.
 
-The S2 generation criterion is met; the model explicitly refuses unqualified NaN/near-underflow
-boundaries and conversion sentinel flags. Remaining exceptional floating status, computations,
-OR-shift status, complete FPACK, full conditional execution/bank composition and parallel memory
-ordering expectations are still required. See
+The S2 generation criterion is met. Remaining conversion and seed exceptions,
+OR-shift status, complete FPACK, full conditional execution/bank composition
+and parallel memory ordering expectations are still required. See
 [numeric-reference.md](numeric-reference.md) for the exact scope, source sections
 and gaps. Oracle validation is not installed-image ISA execution coverage. No
 complete numerical or profile acceptance follows from these oracle checks.
