@@ -195,6 +195,28 @@ void declarations() {
   }
 }
 
+void transitions() {
+  constexpr std::uint32_t source = 7;
+  constexpr std::uint32_t destination = 8;
+  constexpr std::uint32_t target = 0x400;
+  auto image = fixture::image(InstructionSet::isa, std::uint64_t{0});
+  auto variant = fixture::image(InstructionSet::isa, {0, 0, 0, 0, 0, 0}, target).variants.front();
+  variant.id = destination;
+  image.variants.push_back(variant);
+  const sharc::CodeTransition edge{
+      .from_variant = source, .address = target, .to_variants = {destination}};
+  image.transitions = {edge};
+  check(!Core::lower(image).bitcode().empty(), "declared out-of-variant entry was refused");
+  image.variants.back().entries = {target + 1};
+  check(refusal(image).reason == FaultReason::invalid_image,
+        "resident destination without a declared entry was accepted");
+  image.variants.back().entries = {target};
+  image.transitions.front().to_variants.push_back(destination);
+  check(refusal(image).reason == FaultReason::invalid_image, "duplicate destination was accepted");
+  image.transitions = {edge, edge};
+  check(refusal(image).reason == FaultReason::invalid_image, "duplicate transition was accepted");
+}
+
 void identities() {
   auto image = fixture::image(InstructionSet::isa, fixture::add(1, 2, 3));
   const std::string original(Core::lower(image).identity());
@@ -225,6 +247,7 @@ int main() {
     formats();
     boundaries();
     declarations();
+    transitions();
     identities();
   });
 }

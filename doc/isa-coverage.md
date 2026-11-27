@@ -459,8 +459,10 @@ code-alias writes, ambiguous/truncated layouts and missing implicit SIMD storage
 The core memory suite checks short-word SSE and SIMD stride, PM/DM aliases,
 long-word neighbor registers and broadcast, and raw 40-bit transfers. It checks
 declared callbacks for access order, refusal, yield, delay-slot continuation and
-replay, including 40-bit payloads. Forced long-word instruction encodings and
-actual code transitions remain open. See
+replay, including 40-bit payloads. The Core control suite checks prepared
+handoffs on direct, computed and delayed control flow, rejected installations,
+generation rebinding and snapshot replay. Forced long-word encodings and
+changing prepared code through a memory alias remain open. See
 [memory.md](memory.md) for the exact storage contract.
 
 Classic type 19 implements immediate MODIFY/BITREV, including distinct source

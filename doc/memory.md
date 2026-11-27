@@ -168,8 +168,7 @@ memory exceptions.
 Declared byte aliases work for reads. Potential code-alias writes are conservatively
 refused before changing bytes. Stores also require complete initialized
 instruction-view coverage of the declared code to prove its physical backing.
-Actual code transitions and unchanged code stores still require implementation
-and independent qualification.
+Changes to prepared instruction bytes and unchanged code-alias stores remain open.
 
 An uninitialized data region calls the corresponding `Io` function on the owner
 thread with the declared bus, view and resolved word address. A payload uses
@@ -183,8 +182,26 @@ has no register writeback, index update or retirement. Callback code may call
 the resolved destination after a delay slot. Execution re-entry is rejected.
 
 `set_memory` revokes bindings. A subsequent install binds the new lent storage.
+Replacing a loan with the same host address and a new generation also revokes
+the old binding. Installation validates the declared words against the current
+storage before it accepts execution.
 Snapshots restore processor state and continuation, including I registers, and
 leave consumer memory alone. No obsolete host pointer is restored with a snapshot.
+
+## Prepared code handoff
+
+`CodeTransition` names a source variant, the destination PC and the allowed
+destination variants of the same image. The PC must be a declared entry in each
+destination. An ordinary branch, return or sequential flow to a declared PC
+outside the active variant retires its completed prefix and reports
+`ExecutionState::code_transfer`. A delayed branch completes its slots and
+redirection before the handoff. Resident code continues in the active variant.
+
+The consumer selects an allowed target with `install`. A failed installation
+leaves the pending transfer and processor progress intact. A run with a positive
+budget consumes the transfer once a matching binding is installed. Snapshots
+preserve the pending target set and image identity. The consumer manages loans
+and installs the destination separately when replaying on another Core.
 
 The installed-image ISA fixtures compare full registers and padded RAM under both
 numerical identities, all sixteen index registers, both DAG banks, all data-bank

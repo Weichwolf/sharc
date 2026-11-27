@@ -164,6 +164,15 @@ struct Resume {
   std::uint32_t variant{}, address{}, entry{};
 };
 
+struct PendingTransfer {
+  std::string identity;
+  std::vector<std::uint32_t> targets;
+
+  [[nodiscard]] bool accepts(const detail::PreparedImage &image, std::uint32_t variant) const {
+    return image.identity == identity && std::ranges::find(targets, variant) != targets.end();
+  }
+};
+
 struct LoopPipeline {
   std::array<std::uint32_t, detail::loop_stack_capacity> frames{};
   std::uint64_t refill{};
@@ -443,7 +452,7 @@ struct Core::Impl {
                           ", address " + std::to_string(control[detail::memory_address]) +
                           (reason == detail::NativeExit::code_alias
                                ? ": store may alias prepared instruction storage"
-                               : ": access denied or no prepared direct normal-word binding"));
+                               : ": access denied or no prepared data binding"));
         result.fault.instruction = control[detail::fault_instruction];
         result.fault.instruction_bits = detail::full_instruction_bits;
         state.fault = result.fault;
@@ -534,6 +543,9 @@ struct Core::Impl {
   }
 
   RunResult execute(std::uint64_t instructions, std::uint64_t cycles);
+  std::optional<RunResult> open_run(bool has_budget);
+  std::optional<RunResult> native_stop(const detail::ControlWords &control, Progress progress);
+  [[nodiscard]] const CodeTransition *transfer_target() const;
 
   RunResult yield(Progress progress) noexcept {
     yield_requested = 0;
@@ -563,6 +575,7 @@ struct Core::Impl {
   std::shared_ptr<const NativeImage::Impl> installed;
   std::uint32_t variant{};
   std::optional<Resume> resume;
+  std::optional<PendingTransfer> transfer;
   std::vector<InterruptFrame> interrupt_frames;
   std::uint32_t interrupt_frame_guard{};
   detail::RegisterPointers pointers;
@@ -573,6 +586,7 @@ struct Snapshot::Impl {
   State state;
   bool yield_requested{};
   std::optional<Resume> resume;
+  std::optional<PendingTransfer> transfer;
   std::uint32_t pipeline_history{};
   std::uint64_t delayed_target{};
   LoopPipeline loops;
@@ -687,6 +701,14 @@ PreparationReport Core::install(const NativeImage &image, std::uint32_t variant)
                    impl_->state.registers.pc,
                    "native image uses a different numerical mode");
   }
+  const auto &pending = impl_->transfer;
+  if (pending && !pending->accepts(*image.impl_->image, variant)) {
+    detail::refuse(FaultReason::invalid_image,
+                   image.impl_->image->identity,
+                   variant,
+                   impl_->state.registers.pc,
+                   "installation is outside the pending code transition");
+  }
   impl_->installed.reset();
   impl_->views.clear();
   {
@@ -738,7 +760,7 @@ bool Core::interrupt_ready(const InterruptRequest &request) const noexcept {
   if (impl_->executing || !impl_->installed || state.has_fault ||
       state.instruction_set != InstructionSet::isa || (registers.mode2 & timer_enable) != 0 ||
       impl_->delayed_target != 0 || impl_->loops.blocks_interrupt_at_setup(registers) ||
-      state.progress.base_cycles < impl_->loops.interrupt_deadline ||
+      state.progress.base_cycles < impl_->loops.interrupt_deadline || impl_->transfer ||
       request.source < first_maskable || request.source == reserved ||
       request.source >= detail::interrupt_source_count ||
       (registers.mode1 & interrupt_enable) == 0 ||
@@ -848,6 +870,7 @@ void Core::reset(std::uint32_t address, InstructionSet instruction_set) {
   state.fault = {};
   impl_->yield_requested = 0;
   impl_->clear_continuation();
+  impl_->transfer.reset();
   impl_->interrupt_frames.clear();
   impl_->refresh_interrupt_frame();
 }
@@ -869,6 +892,9 @@ Registers Core::registers() const {
 
 void Core::set_registers(const Registers &registers) {
   impl_->stopped_owner();
+  if (impl_->transfer) {
+    throw std::logic_error("cannot replace registers during a pending code transition");
+  }
   constexpr unsigned data_bits = 40;
   constexpr unsigned maximum_fifo_pointer = 0x7f;
   constexpr unsigned pc_stack_bits = 26;
@@ -913,6 +939,7 @@ Snapshot Core::save() const {
                      .state = impl_->state,
                      .yield_requested = impl_->yield_requested != 0,
                      .resume = impl_->resume,
+                     .transfer = impl_->transfer,
                      .pipeline_history = impl_->pipeline_history,
                      .delayed_target = impl_->delayed_target,
                      .loops = impl_->loops,
@@ -929,6 +956,7 @@ void Core::restore(const Snapshot &snapshot) {
   impl_->state = std::move(restored.state);
   impl_->yield_requested = static_cast<std::uint8_t>(restored.yield_requested);
   impl_->resume = std::move(restored.resume);
+  impl_->transfer = std::move(restored.transfer);
   impl_->pipeline_history = restored.pipeline_history;
   impl_->delayed_target = restored.delayed_target;
   impl_->loops = restored.loops;
@@ -1020,17 +1048,72 @@ bool Core::Impl::continue_after(detail::NativeExit reason) {
   }
 }
 
-RunResult Core::Impl::execute(std::uint64_t instructions, std::uint64_t cycles) {
-  idle_owner();
+std::optional<RunResult> Core::Impl::open_run(bool has_budget) {
   if (state.has_fault) {
-    return {.progress = {}, .execution = state.execution, .has_fault = true, .fault = state.fault};
+    return RunResult{
+        .progress = {}, .execution = state.execution, .has_fault = true, .fault = state.fault};
   }
   if (state.execution == ExecutionState::sleeping) {
-    return {.progress = {}, .execution = state.execution, .has_fault = false, .fault = {}};
+    return RunResult{.progress = {}, .execution = state.execution, .has_fault = false, .fault = {}};
+  }
+  if (transfer) {
+    if (!has_budget || !installed || !transfer->accepts(*installed->image, variant)) {
+      return RunResult{.progress = {},
+                       .execution = ExecutionState::code_transfer,
+                       .has_fault = false,
+                       .fault = {}};
+    }
+    const auto pc = state.registers.pc;
+    resume = Resume{.identity = transfer->identity, .variant = variant, .address = pc, .entry = pc};
+    transfer.reset();
   }
   if (!installed) {
     return fail(FaultReason::unprepared, "execution requires an installed native image");
   }
+  return std::nullopt;
+}
+
+const CodeTransition *Core::Impl::transfer_target() const {
+  const auto pc = state.registers.pc;
+  const auto &transitions = installed->image->code.transitions;
+  const auto edge = std::ranges::find_if(transitions, [&](const auto &candidate) {
+    return candidate.from_variant == variant && candidate.address == pc;
+  });
+  if (edge == transitions.end()) { return nullptr; }
+  constexpr auto parcels_per_word = detail::full_instruction_bits / detail::short_instruction_bits;
+  const auto resident = std::ranges::any_of(installed_variant()->spans, [&](const CodeSpan &span) {
+    const auto words = span.parcels.size() / parcels_per_word;
+    return pc >= span.address && pc - span.address < words;
+  });
+  return resident ? nullptr : &*edge;
+}
+
+std::optional<RunResult> Core::Impl::native_stop(const detail::ControlWords &control,
+                                                 Progress progress) {
+  const auto reason = static_cast<detail::NativeExit>(control[detail::exit_reason]);
+  switch (reason) {
+    case detail::NativeExit::bound:
+    case detail::NativeExit::undeclared:
+    case detail::NativeExit::indirect:
+    case detail::NativeExit::returned:
+      if (control[detail::retired_instructions] != 0) {
+        if (const auto *edge = transfer_target()) {
+          transfer =
+              PendingTransfer{.identity = installed->image->identity, .targets = edge->to_variants};
+          state.execution = ExecutionState::code_transfer;
+          return RunResult{
+              .progress = progress, .execution = state.execution, .has_fault = false, .fault = {}};
+        }
+      }
+      break;
+    default: break;
+  }
+  return native_failure(control, progress);
+}
+
+RunResult Core::Impl::execute(std::uint64_t instructions, std::uint64_t cycles) {
+  idle_owner();
+  if (const auto blocked = open_run(instructions != 0 && cycles != 0)) { return *blocked; }
   const auto &image = *installed->image;
   const auto &registers = state.registers;
   Progress progress;
@@ -1069,7 +1152,7 @@ RunResult Core::Impl::execute(std::uint64_t instructions, std::uint64_t cycles) 
                     .variant = variant,
                     .address = state.registers.pc,
                     .entry = static_cast<std::uint32_t>(control[detail::resume_entry])};
-    if (const auto result = native_failure(control, progress)) { return *result; }
+    if (const auto result = native_stop(control, progress)) { return *result; }
     const auto reason = static_cast<detail::NativeExit>(control[detail::exit_reason]);
     if (!continue_after(reason) || yield_requested != 0 || progress.instructions == instructions ||
         progress.base_cycles >= cycles) {

@@ -152,6 +152,7 @@ struct CodeVariant {
 };
 
 struct CodeTransition {
+  // The destination PC must be an entry in each listed target variant.
   std::uint32_t from_variant{}, address{};
   std::vector<std::uint32_t> to_variants;
 };
