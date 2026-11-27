@@ -602,8 +602,8 @@ independently. Every admitted load updated both neighboring DAG registers and
 every admitted store wrote both distinct words. With only PEy selected, the
 type-3a transfer still used the whole pair, with the explicit register in the
 low word. Sections 6-7 through 6-10 and Table 6-1 specify the neighboring DAG
-register, including when the explicit register is odd. These probes establish
-reference behavior for subsequent installed-image tests.
+register, including when the explicit register is odd. The installed-image
+fixtures exercise both orders and check the complete register and memory state.
 
 An 81-case DM timing probe bracketed the load and a subsequent `MODIFY` with
 zero, one or two intervening NOPs. The NOP control took three, four and five

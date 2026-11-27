@@ -995,6 +995,37 @@ void predicated_wide_implicit(sharc::ExecutionMode mode, bool force, bool write)
         "PEy-only long-word packet lost its explicit store or changed a masked load");
 }
 
+void forced_dag_load_refusal(sharc::ExecutionMode mode) {
+  constexpr std::uint64_t load = 0x52c04e801612; // IF EQ R6=R1+R2, I13=DM(I1,M3)(LW).
+  constexpr std::array<std::uint64_t, 2> payloads{0x13579bdf, 0x2468ace0};
+  const std::array words{load};
+  Program program(words);
+  program.code.code.variants.front().layout.regions.back().initialized = false;
+  const auto native = fixture::compile(program.code.code, mode);
+  Peripheral device{.words = payloads, .fault_on = 2};
+  auto memory = program.code.memory();
+  memory.io = device.binding();
+  sharc::Core core(memory, mode);
+  device.core = &core;
+  auto before = initial();
+  before.mode1 = simd_bit;
+  before.pe[1].astat = 1;
+  before.pe[1].data[0][1] = 4U << word_shift;
+  before.pe[1].data[0][2] = 8U << word_shift;
+  before.dag[0][1].index = ram_address;
+  before.dag[0][3].modifier = 2;
+  before.dag[0][12].index = ram_address + 7;
+  before.dag[0][13].index = ram_address + 8;
+  fixture::install(core, native, before);
+  const auto result = core.run(1);
+  check(result.has_fault && result.fault.reason == sharc::FaultReason::access_fault &&
+            result.fault.instruction == load && result.progress == sharc::Progress{} &&
+            result.fault.detail.contains(std::to_string(ram_address + 1)) && device.calls == 2 &&
+            device.trace[0].address == ram_address && device.trace[1].address == ram_address + 1 &&
+            core.registers() == before,
+        "forced DAG load changed state or lost the ordered callback fault");
+}
+
 constexpr std::uint64_t fixed_parallel_add = 0x34c89a001401;
 constexpr std::uint64_t floating_parallel_add = 0x34c89a081401;
 
@@ -1678,6 +1709,7 @@ int main() {
       predicated_fifo_refusal(mode);
       predicated_modifier_interlock(mode);
       predicated_forced_pair(mode);
+      forced_dag_load_refusal(mode);
       for (const bool force : {false, true}) {
         for (const bool write : {false, true}) { predicated_wide_implicit(mode, force, write); }
       }

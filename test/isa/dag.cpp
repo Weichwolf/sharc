@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <sharc/core.hpp>
+#include <sharc/memory.hpp>
 #include <vector>
 
 namespace {
@@ -357,6 +358,104 @@ void register_modify_timing(sharc::ExecutionMode mode) {
     for (unsigned gap = 0; gap <= 2; ++gap) { verify_register_modify_timing(mode, reg, gap); }
   }
 }
+
+struct LoadTiming {
+  unsigned source, gap;
+  bool natural_long, forced;
+};
+
+constexpr unsigned timing_ram_address = 0x90000;
+constexpr unsigned timing_ram_id = 31;
+constexpr unsigned explicit_index = 13;
+constexpr unsigned neighbor_index = explicit_index ^ 1;
+constexpr unsigned consumer_modifier = 14;
+constexpr unsigned condition_true = 31;
+constexpr std::uint32_t new_explicit_index = 0xc4001;
+constexpr std::uint32_t new_neighbor_index = 0xc4002;
+
+void verify_dag_load_timing(sharc::Core &core, const LoadTiming &form, bool predicate) {
+  const auto bank = predicate ? 0U : 1U;
+  sharc::Registers before;
+  before.pc = fixture::code_address;
+  before.mode1 = bank << bank_bits[explicit_index];
+  before.pe[0].astat = predicate ? 1U : 0U;
+  before.dag[0][1].index = timing_ram_address;
+  before.dag[bank][explicit_index].index = primary_base;
+  before.dag[bank][neighbor_index].index = alternate_base;
+  before.dag[bank][consumer_modifier].modifier = 1;
+  core.set_registers(before);
+  const auto entry = core.save();
+  const unsigned instructions = form.gap + 2;
+  const bool interlocked =
+      form.source == explicit_index || (form.forced && form.source == neighbor_index);
+  const auto stalls = interlocked ? 2 - form.gap : 0;
+  auto expected = before;
+  if (predicate) {
+    expected.dag[bank][explicit_index].index = new_explicit_index;
+    if (form.natural_long || form.forced) {
+      expected.dag[bank][neighbor_index].index = new_neighbor_index;
+    }
+  }
+  ++expected.dag[bank][form.source].index;
+  fixture::boundary(expected, {.pc = before.pc + instructions, .clock = instructions + stalls});
+  check(fixture::completed(core.run(instructions), instructions, instructions + stalls) &&
+            core.registers() == expected,
+        "DAG load used the wrong address dependency, cycle cost or resulting register");
+  core.restore(entry);
+  check(fixture::completed(core.run_until(instructions - 1), instructions - 1, instructions - 1),
+        "DAG load did not reach the bound just before the dependent instruction");
+  const auto pending = core.save();
+  for (const bool restore : {false, true}) {
+    if (restore) { core.restore(pending); }
+    check(fixture::completed(core.run_until(instructions), 1, 1 + stalls) &&
+              core.registers() == expected,
+          "DAG dependency or consumed value changed across a bound or snapshot");
+  }
+}
+
+void dag_load_timing(sharc::ExecutionMode mode, const LoadTiming &form) {
+  constexpr std::uint64_t load = 0x52c00e800000; // IF EQ I13 = DM(I1,M3).
+  constexpr std::uint64_t force_long = 1ULL << 30;
+  const auto word = load | (form.forced ? force_long : 0);
+  std::vector words{word};
+  words.insert(words.end(), form.gap, 0);
+  words.push_back(encoding(RegisterModify{.source = form.source,
+                                          .modifier = consumer_modifier,
+                                          .destination = form.source,
+                                          .condition = condition_true}));
+  fixture::Program program(words);
+  auto data = fixture::normal_region(timing_ram_address, 2, timing_ram_id);
+  if (form.natural_long) {
+    data.view = sharc::MemoryView::long_word;
+    data.count = 1;
+    data.byte_stride = 8;
+  }
+  program.code.variants.front().layout.regions.push_back(data);
+  std::array<std::byte, 8> ram{};
+  constexpr std::uint64_t payload = (std::uint64_t{new_neighbor_index} << 32) | new_explicit_index;
+  for (unsigned byte = 0; byte < ram.size(); ++byte) {
+    ram[byte] = static_cast<std::byte>(payload >> (byte * 8));
+  }
+  const auto native = fixture::compile(program.code, mode);
+  sharc::Core core(program.memory(timing_ram_id, ram), mode);
+  (void)core.install(native, fixture::Program::variant_id);
+  const auto beginning = core.save();
+  for (const bool predicate : {false, true}) {
+    core.restore(beginning);
+    verify_dag_load_timing(core, form, predicate);
+  }
+}
+
+void dag_load_timing(sharc::ExecutionMode mode) {
+  constexpr unsigned unrelated = 14;
+  for (const auto source : {explicit_index, neighbor_index, unrelated}) {
+    for (unsigned gap = 0; gap <= 2; ++gap) {
+      dag_load_timing(mode, {.source = source, .gap = gap, .natural_long = false, .forced = false});
+      dag_load_timing(mode, {.source = source, .gap = gap, .natural_long = true, .forced = false});
+      dag_load_timing(mode, {.source = source, .gap = gap, .natural_long = false, .forced = true});
+    }
+  }
+}
 } // namespace
 
 void fixture::dag_addressing() {
@@ -365,5 +464,6 @@ void fixture::dag_addressing() {
     special_buffers(mode);
     register_modify_matrix(mode);
     register_modify_timing(mode);
+    dag_load_timing(mode);
   }
 }

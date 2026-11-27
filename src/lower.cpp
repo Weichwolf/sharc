@@ -109,6 +109,7 @@ constexpr unsigned system_register_first = 0x60;
 constexpr unsigned ureg_mask = 127, byte_mask = 255;
 constexpr unsigned history_older_mask = 0xff00;
 constexpr unsigned history_loop_setup = 1U << 16;
+constexpr unsigned history_dag_pair = 1U << 7;
 constexpr unsigned conditional_compute_type = 2;
 constexpr unsigned register_move_type = 5;
 constexpr unsigned register_modify_type = 7;
@@ -343,10 +344,18 @@ unsigned dag_number(unsigned reg) {
   return reg - 0x10;
 }
 
+bool dag_memory_read(const MemoryMove &move) {
+  return !move.write && dag_register(move.reg);
+}
+
 unsigned loaded_register(const Instruction &op) {
   if (op.type == register_move_type) { return register_move(op).destination; }
   if (op.type == immediate_move_type) {
     return static_cast<unsigned>((op.word >> immediate_register_shift) & ureg_mask);
+  }
+  if (single_memory_transfer(op.type) || conditional_memory(op)) {
+    const auto move = memory_move(op);
+    if (dag_memory_read(move)) { return move.reg; }
   }
   return 0;
 }
@@ -696,6 +705,23 @@ void validate_return(const Instruction &instruction, std::string_view identity) 
   validate_condition(instruction, identity);
 }
 
+void validate_memory_register(const Instruction &instruction, std::string_view identity) {
+  const auto move = memory_move(instruction);
+  if (data_register(move.reg)) { return; }
+  if (!dag_register(move.reg)) {
+    reject(instruction,
+           identity,
+           FaultReason::unsupported_instruction,
+           "memory transfer involving a system register is not lowered");
+  }
+  if (move.addressing != MemoryAddressing::absolute && (move.reg & 15) / 8 == move.index / 8) {
+    reject(instruction,
+           identity,
+           FaultReason::invalid_encoding,
+           "indexed memory transfer cannot use a register from its address DAG");
+  }
+}
+
 void validate_memory_move(const Instruction &instruction, std::string_view identity) {
   if (instruction.type == immediate_memory_store_type) {
     constexpr auto reserved = std::uint64_t{31} << 32;
@@ -704,13 +730,7 @@ void validate_memory_move(const Instruction &instruction, std::string_view ident
     }
     return;
   }
-  constexpr unsigned register_shift = 32;
-  const auto ureg = static_cast<unsigned>((instruction.word >> register_shift) & 0x7f);
-  if (data_register(ureg)) { return; }
-  reject(instruction,
-         identity,
-         FaultReason::unsupported_instruction,
-         "non-data-register memory transfer is not lowered");
+  validate_memory_register(instruction, identity);
 }
 
 void validate_immediate_move(const Instruction &instruction, std::string_view identity) {
@@ -792,14 +812,7 @@ void validate_conditional_memory(const Instruction &instruction, std::string_vie
   }
   validate_condition(instruction, identity);
   if (instruction.type == register_offset_memory_type) {
-    constexpr unsigned register_shift = 23;
-    const auto ureg = static_cast<unsigned>((instruction.word >> register_shift) & 0x7f);
-    if (!data_register(ureg)) {
-      reject(instruction,
-             identity,
-             FaultReason::unsupported_instruction,
-             "single-bus universal register is not lowered");
-    }
+    validate_memory_register(instruction, identity);
   }
   if (!supported_standalone_compute(instruction.compute)) {
     reject(instruction,
@@ -1029,9 +1042,16 @@ bool callback_region(const RegionLayout &layout) {
 }
 
 std::uint32_t broadcast_mode(const MemoryMove &move) {
-  if (move.write || move.addressing == MemoryAddressing::absolute) { return 0; }
+  if (move.write || dag_memory_read(move) || move.addressing == MemoryAddressing::absolute) {
+    return 0;
+  }
   if (move.index == 1) { return broadcast1_mode; }
   return move.index == 9 ? broadcast9_mode : 0;
+}
+
+bool simd_memory_pair(const MemoryMove &move, std::uint32_t context) {
+  return !dag_memory_read(move) && (context & simd_mode) != 0 &&
+         (context & broadcast_mode(move)) == 0;
 }
 
 std::uint32_t reverse_mode(unsigned index) {
@@ -1424,10 +1444,7 @@ private:
                           const MemoryOperands &operands,
                           unsigned lane);
   llvm::Value *load_word(llvm::Value *payload, llvm::Value *view);
-  void write_memory_register(Values &values,
-                             const MemoryMove &move,
-                             llvm::Value *raw,
-                             llvm::Value *enabled);
+  void write_memory_register(Values &values, unsigned reg, llvm::Value *raw, llvm::Value *enabled);
   void memory_writeback(Values &values,
                         const MemoryMove &move,
                         const MemoryOperands &operands,
@@ -1635,6 +1652,7 @@ private:
   void write_register(Values &values, unsigned reg, llvm::Value *raw, llvm::Value *selected);
   void register_instruction(Values &values, const Instruction &op, const Values &before);
   llvm::Value *pipeline_stall(const Values &values, const Instruction &op);
+  unsigned dag_access_tag(unsigned slot, bool paired = false) const;
   llvm::Value *loop_count_loaded(const Values &values);
   llvm::Value *loaded_tag(const Values &values, const Instruction &op);
   void retire_pipeline(Values &values, PipelineEffects effects);
@@ -1974,19 +1992,29 @@ void Lowering::register_instruction(Values &values, const Instruction &op, const
                  pair(y, builder_.getFalse(), 1));
 }
 
+unsigned Lowering::dag_access_tag(unsigned slot, bool paired) const {
+  const auto index = slot & 15;
+  const auto bank = (context_ & dag_bank_mode(index)) != 0 ? 1U : 0U;
+  const bool modifier = slot >= 16 && slot < 32;
+  const auto tag = 1 + (paired ? index & ~1U : index) + (bank * 16) + (modifier ? 32U : 0U);
+  return tag | (paired ? history_dag_pair : 0U);
+}
+
 llvm::Value *Lowering::loaded_tag(const Values &values, const Instruction &op) {
   if (loop_setup(op) && not_lce_.contains(next_pc(op))) {
     return builder_.getInt32(history_loop_setup);
   }
   const auto reg = loaded_register(op);
   if (!dag_register(reg)) { return builder_.getInt32(0); }
-  const auto index = reg & 15;
-  const auto bank = (context_ & dag_bank_mode(index)) != 0 ? 1U : 0U;
-  const auto tag = 1 + index + (bank * 16) + (reg >= 0x20 && reg < 0x30 ? 32U : 0U);
+  const auto slot = dag_number(reg);
+  if (single_memory_transfer(op.type) || conditional_memory(op)) {
+    // Decode reserves the encoded destination before the memory predicate is known.
+    return builder_.getInt32(dag_access_tag(slot, memory_move(op).force_long));
+  }
   auto *selected =
       op.type == immediate_move_type ? condition(values, true_condition) : condition(values, op);
   return builder_.CreateSelect(builder_.CreateExtractElement(selected, builder_.getInt32(0)),
-                               builder_.getInt32(tag),
+                               builder_.getInt32(dag_access_tag(slot)),
                                builder_.getInt32(0));
 }
 
@@ -2022,11 +2050,14 @@ llvm::Value *Lowering::pipeline_stall(const Values &values, const Instruction &o
   llvm::Value *recent_match = builder_.getFalse();
   llvm::Value *earlier_match = builder_.getFalse();
   for (const auto dependency : dependencies) {
-    const auto index = dependency & 15;
-    const auto bank = (context_ & dag_bank_mode(index)) != 0 ? 1U : 0U;
-    auto *tag = builder_.getInt32(1 + index + (bank * 16) + (dependency >= 16 ? 32U : 0U));
-    recent_match = builder_.CreateOr(recent_match, builder_.CreateICmpEQ(previous, tag));
-    earlier_match = builder_.CreateOr(earlier_match, builder_.CreateICmpEQ(earlier, tag));
+    auto *tag = builder_.getInt32(dag_access_tag(dependency));
+    auto *paired = builder_.getInt32(dag_access_tag(dependency, true));
+    const auto matches = [&](llvm::Value *history) {
+      return builder_.CreateOr(builder_.CreateICmpEQ(history, tag),
+                               builder_.CreateICmpEQ(history, paired));
+    };
+    recent_match = builder_.CreateOr(recent_match, matches(previous));
+    earlier_match = builder_.CreateOr(earlier_match, matches(earlier));
   }
   stall = builder_.CreateSelect(recent_match,
                                 builder_.getInt64(2),
@@ -2920,10 +2951,13 @@ MemoryOperands Lowering::memory_operands(const Values &values,
                                ? operands.selected[0]
                                : builder_.CreateExtractElement(selected, builder_.getInt32(1));
   }
+  if (dag_memory_read(move)) {
+    operands.selected[0] = builder_.CreateOr(operands.selected[0], operands.selected[1]);
+  }
   operands.first_enabled = operands.broadcast
                                ? builder_.CreateOr(operands.selected[0], operands.selected[1])
                                : operands.selected[0];
-  const bool simd_pair = !operands.broadcast && (context_ & simd_mode) != 0;
+  const bool simd_pair = simd_memory_pair(move, context_);
   if (!partial) {
     planned_memory_operands(op, move, simd_pair, operands);
     return operands;
@@ -3237,13 +3271,13 @@ llvm::Value *Lowering::store_word(const Values &values,
                                   unsigned lane) {
   constexpr unsigned normal_bits = 32;
   const auto &word = operands.words[lane];
-  auto *element = builder_.getInt32(move.lane ^ lane);
+  auto *element = builder_.getInt32(lane);
   auto *raw = move.immediate.has_value()
                   ? builder_.getInt64(std::uint64_t{*move.immediate} << raw_extension_bits)
-                  : builder_.CreateExtractElement(values[move.reg], element);
+                  : builder_.CreateExtractElement(read_register(values, move.reg), element);
   if (lane != 0 && operands.forced_pair != builder_.getFalse()) {
     auto *neighbor =
-        builder_.CreateExtractElement(values[move.reg ^ 1], builder_.getInt32(move.lane));
+        builder_.CreateExtractElement(read_register(values, move.reg ^ 1), builder_.getInt32(0));
     raw = builder_.CreateSelect(operands.forced_pair, neighbor, raw);
   }
   auto *normal = builder_.CreateLShr(raw, builder_.getInt64(raw_extension_bits));
@@ -3252,7 +3286,7 @@ llvm::Value *Lowering::store_word(const Values &values,
                                          builder_.getInt64Ty());
   auto *upper = normal;
   if (!move.immediate.has_value()) {
-    auto *neighbor = builder_.CreateExtractElement(values[move.reg ^ 1], element);
+    auto *neighbor = builder_.CreateExtractElement(read_register(values, move.reg ^ 1), element);
     upper = builder_.CreateLShr(neighbor, builder_.getInt64(raw_extension_bits));
   }
   auto *wide = builder_.CreateOr(normal, builder_.CreateShl(upper, builder_.getInt64(normal_bits)));
@@ -3289,16 +3323,11 @@ llvm::Value *Lowering::load_word(llvm::Value *payload, llvm::Value *view) {
 }
 
 void Lowering::write_memory_register(Values &values,
-                                     const MemoryMove &move,
+                                     unsigned reg,
                                      llvm::Value *raw,
                                      llvm::Value *enabled) {
   if (enabled == builder_.getFalse()) { return; }
-  auto *lane = builder_.getInt32(move.lane);
-  auto *old = builder_.CreateExtractElement(values[move.reg], lane);
-  values[move.reg] = builder_.CreateInsertElement(
-      values[move.reg], builder_.CreateSelect(enabled, raw, old), lane);
-  written_.insert(move.reg);
-  if (move.lane != 0) { y_written_.insert(move.reg); }
+  write_register(values, reg, pair(raw, raw, 64), pair(enabled, builder_.getFalse(), 1));
 }
 
 void Lowering::memory_writeback(Values &values,
@@ -3308,12 +3337,11 @@ void Lowering::memory_writeback(Values &values,
   if (move.write) { return; }
   auto *view = operands.words[0].view;
   auto *raw = load_word(read[0], view);
-  write_memory_register(values, move, raw, operands.selected[0]);
-  auto implicit = move;
-  implicit.lane ^= 1;
+  write_memory_register(values, move.reg, raw, operands.selected[0]);
+  const auto implicit = move.reg ^ shadow_register_first;
   if (operands.broadcast) {
     write_memory_register(values, implicit, raw, operands.selected[1]);
-  } else if (operands.paired != builder_.getFalse()) {
+  } else if (!dag_register(move.reg) && operands.paired != builder_.getFalse()) {
     auto *other_lane =
         builder_.CreateAnd(operands.paired, builder_.CreateNot(operands.forced_pair));
     write_memory_register(values, implicit, load_word(read[1], view), other_lane);
@@ -3327,14 +3355,12 @@ void Lowering::memory_writeback(Values &values,
     high = builder_.CreateSelect(operands.forced_pair, read[1], high);
   }
   auto *neighbor_raw = load_word(high, view_tag(MemoryView::normal_word));
-  auto neighbor = move;
-  neighbor.reg ^= 1;
+  const auto neighbor = move.reg ^ 1;
   write_memory_register(
       values, neighbor, neighbor_raw, builder_.CreateAnd(wide, operands.selected[0]));
   if (operands.broadcast) {
-    neighbor.lane ^= 1;
     write_memory_register(
-        values, neighbor, neighbor_raw, builder_.CreateAnd(wide, operands.selected[1]));
+        values, implicit ^ 1, neighbor_raw, builder_.CreateAnd(wide, operands.selected[1]));
   }
 }
 
@@ -5689,6 +5715,13 @@ void Lowering::load_indices() {
 
 void Lowering::load_memory_indices(const MemoryMove &move) {
   interrupt_latch_written_ |= move.force_long;
+  if (dag_register(move.reg)) {
+    for (const auto reg : {move.reg, move.reg ^ 1}) {
+      const auto slot = dag_number(reg);
+      load_dag(slot);
+      if (!move.write) { dag_written_.insert(slot); }
+    }
+  }
   if (move.addressing == MemoryAddressing::absolute) { return; }
   load_dag(move.index);
   if (move.modifier) { load_dag(16 + *move.modifier); }
@@ -5808,8 +5841,7 @@ void Lowering::plan_memory(const Instruction &op, const MemoryMove &move) {
     if (!plan_changing_memory(op, move)) { memory_admitted_ = builder_.getFalse(); }
     return;
   }
-  const bool broadcast = (context_ & broadcast_mode(move)) != 0;
-  const bool paired = move.force_long || (!broadcast && (context_ & simd_mode) != 0);
+  const bool paired = move.force_long || simd_memory_pair(move, context_);
   const unsigned transfers = paired ? 2U : 1U;
   auto &plan = memory_plan_[{op.address, move.space}];
   auto *delta = move.modifier ? dag_[16 + *move.modifier] : builder_.getInt32(move.address_operand);
@@ -6221,7 +6253,11 @@ std::uint32_t instruction_context(const Instruction &instruction, ExecutionMode 
   for (const auto &move : memory_moves(instruction)) {
     mask |= simd_mode | broadcast_mode(move);
     if (move.addressing != MemoryAddressing::absolute) { mask |= dag_bank_mode(move.index); }
-    if (!move.immediate.has_value()) { mask |= move.reg < 8 ? low_bank_mode : high_bank_mode; }
+    if (dag_register(move.reg)) {
+      mask |= dag_bank_mode(move.reg & 15);
+    } else if (!move.immediate.has_value()) {
+      mask |= (move.reg & 15) < 8 ? low_bank_mode : high_bank_mode;
+    }
     if (move.modifier) { mask |= dag_bank_mode(*move.modifier); }
     if (move.addressing == MemoryAddressing::postmodified) {
       mask |= circular_mode | reverse_mode(move.index);

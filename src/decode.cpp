@@ -208,8 +208,7 @@ MemoryMove conditional_memory_move(const Instruction &instruction) {
   const auto offset = field(address_operand_shift, 63);
   constexpr unsigned offset_sign = 32;
   return {.index = field(index_shift, 7) + dag,
-          .reg = ureg & 15,
-          .lane = ureg < 16 ? 0U : 1U,
+          .reg = ureg,
           .modifier = immediate ? std::nullopt : std::optional{field(modifier_shift, 7) + dag},
           .space = program ? MemorySpace::program : MemorySpace::data,
           .write = field(immediate ? immediate_write_shift : register_write_shift, 1) != 0,
@@ -245,8 +244,7 @@ MemoryMove memory_move(const Instruction &instruction) {
   const auto ureg = static_cast<unsigned>((instruction.word >> register_shift) & 0x7f);
   const auto index = static_cast<unsigned>((instruction.word >> index_shift) & 7);
   return {.index = absolute ? 0U : index + (program ? 8U : 0U),
-          .reg = ureg & 15,
-          .lane = ureg < 16 ? 0U : 1U,
+          .reg = ureg,
           .space = program ? MemorySpace::program : MemorySpace::data,
           .write = (instruction.word & memory_write) != 0,
           .force_long = (instruction.word & forced_long) != 0,

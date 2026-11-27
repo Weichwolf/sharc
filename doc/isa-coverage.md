@@ -13,8 +13,8 @@ is claimed.
 | Arithmetic and SIMD | PEx/PEy, fixed point, 32-/40-bit float, rounding, modes, flags and exceptions | Partial: fixed and floating arithmetic and multifunction compute, shifter and FIFO, physical banks and lane predicates |
 | Strict numerical mode (default) | Exact guest 32-/40-bit behavior, RND32, conversion exceptions and native-path identity | Partial, see [single-function floating compute](#single-function-floating-compute) |
 | FastFP32 numerical mode (opt-in) | Independent approximation expectations, rounding/flags, unchanged raw moves/integer behavior, separate translations | Partial, see [single-function floating compute](#single-function-floating-compute) |
-| Parallel operations | Old operands, memory aliases, register exchanges and ordered partial effects | Partial: raw register moves/swaps, type 1a PM/DM, and predicated single-bus data-register packets with supported compute |
-| Address generation and memory | Both DAGs, modulo/reverse addressing, PM/DM and physical view aliases | Partial: normal-word indexed transfers, shared DAG updates, circular and bit-reverse addressing, and DAG load dependencies |
+| Parallel operations | Old operands, memory aliases, register exchanges and ordered partial effects | Partial: raw register moves/swaps, type 1a PM/DM, and predicated single-bus transfers with data or DAG register operands |
+| Address generation and memory | Both DAGs, modulo/reverse addressing, PM/DM and physical view aliases | Partial: absolute and indexed transfers, physical DAG banks and long-word pairs, circular and bit-reverse addressing, and DAG load dependencies |
 | Sequencer and control | Delayed flow, DO/loop endpoints, LR, stacks, reset and interrupts | Partial: classic direct/indirect transfers, hardware DO and admitted reentry, reset, declared maskable vectors, admitted RTI and IDLE |
 | Chip-profile boundaries | ADSP-21489 memory/vector parameters and explicit I/O ownership | Partial: declared layouts, vectors and I/O. Timer and unresolved exceptions remain open |
 | JIT coherence and hosts | Self-modifying aliases, natural loops, precise exits, x86-64 and ARM64 | Partial: cached IR, native loops, precise exits and declared code-write handoffs on Linux x86-64. macOS ARM64 remains untested |
@@ -703,7 +703,21 @@ The core follows the manual for type-6 lane selection and SISD broadcast.
 See [the simulator observations](numeric-reference.md#predicated-single-bus-transfers)
 for the cases where CCES diverges.
 
-Non-data UREG transfers, remaining DAG addressing variants and silicon
+Classic 3a, 14a and 15a transfer I, M, L and B through the selected physical
+bank. `test/isa/memory.cpp` checks both buses, absolute, immediate and
+register-modified addresses, SIMD predicates, short-word extension, raw
+extended transfers, and natural and forced long-word neighbors. The forced
+pair callback test checks that a second read fault leaves both DAG registers,
+the post-modifier and the computation uncommitted. Preparation rejects an
+indexed transfer to or from a register in its addressing DAG.
+`test/isa/dag.cpp` checks two/one/zero stalls on the explicit target and the
+forced neighbor across bounds and snapshot replay. Normal and natural
+long-word loads reserve the explicit register. Forced long-word encodings
+reserve both before evaluating the predicate. Simulator timing, including
+the additional PM access clock in the probe, is recorded separately in
+[the reference notes](numeric-reference.md#dag-registers-as-memory-operands).
+
+Remaining system UREG transfers, DAG addressing variants and silicon
 confirmation of contended register writeback are tracked in #26. Remaining
 compound control forms are tracked in #27.
 

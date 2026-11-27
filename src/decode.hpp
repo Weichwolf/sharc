@@ -67,7 +67,7 @@ constexpr bool conditional_memory(const Instruction &instruction) {
 enum class MemoryAddressing : std::uint8_t { indexed_offset, absolute, postmodified };
 
 struct MemoryMove {
-  unsigned index{}, reg{}, lane{};
+  unsigned index{}, reg{};
   std::optional<unsigned> modifier = std::nullopt;
   MemorySpace space{};
   bool write{}, force_long{};

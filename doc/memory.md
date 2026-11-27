@@ -78,6 +78,18 @@ whose explicit register pair is masked. Either selected lane admits a long-word
 store from the explicit register pair. Compute and stores use the old operands,
 and an admitted load takes precedence over an aliased compute result.
 
+Classic types 3a, 14a and 15a also transfer I, M, L or B. Indexed transfers
+must use a register from the other DAG. The register operand and address use
+their independently selected physical banks. A load into a DAG register
+uses the explicit address when either PE is selected. SIMD normal- and
+short-word stores use the same DAG register for each selected word.
+Short loads apply SSE. Extended transfers use bits 39:8 for the 32-bit
+register and store with a zero extension byte. A long access transfers the
+named register and its even/odd neighbor within the same register class,
+with the named register supplying or receiving the low word. A forced
+long access uses successive normal-word addresses, including when the
+address is odd. Register writeback waits for both reads to succeed.
+
 Type 1a transfers address DM using DAG1 and PM using DAG2. Both addresses use
 their old I. The packet updates each I once using the selected signed M from the
 same DAG. CBUFEN enables circular limits and the documented I7/I15 overflow

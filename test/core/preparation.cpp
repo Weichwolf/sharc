@@ -149,6 +149,17 @@ void register_modify_encoding() {
   }
 }
 
+void dag_transfer_encoding() {
+  constexpr std::array same_address_dag{0x52c008800000ULL,  // IF EQ I1 = DM(I1,M3).
+                                        0xb33900000002ULL}; // PM(2,I9) = L9.
+  for (const auto word : same_address_dag) {
+    const auto fault = refusal(fixture::image(InstructionSet::isa, word));
+    check(fault.reason == FaultReason::invalid_encoding && fault.instruction == word &&
+              fault.address == fixture::code_address && fault.instruction_bits == full_width,
+          "an indexed transfer involving its address DAG must fail preparation");
+  }
+}
+
 void immediate_store_encoding() {
   constexpr std::uint64_t store = 0x92c0765432ab;
   constexpr unsigned first_reserved = 32;
@@ -310,6 +321,7 @@ int main() {
   return fixture::run_test([] {
     formats();
     register_modify_encoding();
+    dag_transfer_encoding();
     immediate_store_encoding();
     boundaries();
     declarations();

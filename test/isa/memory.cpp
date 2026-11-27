@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <sharc/core.hpp>
 #include <sharc/memory.hpp>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -695,6 +696,236 @@ void immediate_stores(unsigned index, sharc::ExecutionMode mode, const StoreView
           "immediate store lost a width, lane, physical DAG update or wrap effect");
   }
 }
+
+enum class DagMemoryForm : std::uint8_t { absolute, immediate, pre, post };
+
+struct DagMemoryCase {
+  DagMemoryForm form;
+  sharc::MemorySpace space;
+  sharc::MemoryView view;
+  unsigned reg, width;
+  bool force{};
+};
+
+constexpr unsigned dag_cell = 2;
+constexpr unsigned dag_capture_count = 8;
+constexpr unsigned short_sign_bit = 14;
+constexpr std::uint32_t dag_low_word = 0xf0e19a80;
+constexpr std::uint32_t dag_high_word = 0x12345678;
+constexpr std::uint32_t dag_store_low = 0xbd868ac3;
+constexpr std::uint32_t dag_store_high = 0x36bdf0a1;
+
+std::uint64_t dag_memory_encoding(const DagMemoryCase &item, unsigned index, bool write) {
+  switch (item.form) {
+    case DagMemoryForm::absolute:
+      return (item.force ? forced_long : 0) |
+             encoding(AbsoluteMove{.space = item.space,
+                                   .write = write,
+                                   .ureg = item.reg,
+                                   .address = ram_address + dag_cell});
+    case DagMemoryForm::immediate:
+      return (item.force ? forced_long : 0) |
+             encoding(
+                 Move{.reg = item.reg, .index = index, .write = write, .displacement = dag_cell});
+    case DagMemoryForm::pre:
+    case DagMemoryForm::post: {
+      // IF EQ ... (I1,M3) or (M3,I1), with I9 and M11 on the program bus.
+      constexpr std::uint64_t indexed_transfer = 0x42c000000000;
+      constexpr std::uint64_t postmodify = 1ULL << 44;
+      constexpr std::uint64_t long_override = 1ULL << 30;
+      constexpr unsigned ureg_shift = 23;
+      return indexed_transfer | (item.form == DagMemoryForm::post ? postmodify : 0) |
+             (item.space == sharc::MemorySpace::program ? across_buses : 0) |
+             (write ? store_direction : 0) | (item.force ? long_override : 0) |
+             (std::uint64_t{item.reg} << ureg_shift);
+    }
+  }
+  std::unreachable();
+}
+
+std::uint32_t &dag_operand(sharc::Registers &state, unsigned bank, unsigned reg) {
+  constexpr unsigned group_shift = 4;
+  constexpr std::array fields{&sharc::AddressGenerator::index,
+                              &sharc::AddressGenerator::modifier,
+                              &sharc::AddressGenerator::length,
+                              &sharc::AddressGenerator::base};
+  return state.dag[bank][reg & 15].*fields[(reg >> group_shift) - 1];
+}
+
+void put_dag_word(std::vector<std::byte> &ram,
+                  unsigned index,
+                  const DagMemoryCase &item,
+                  std::uint64_t word) {
+  for (unsigned byte = 0; byte < item.width; ++byte) {
+    ram[offset + (index * immediate_stride) + byte] =
+        static_cast<std::byte>(word >> (byte * byte_bits));
+  }
+}
+
+std::vector<std::byte> dag_memory_seed(const DagMemoryCase &item) {
+  std::vector<std::byte> ram(offset + (dag_capture_count * immediate_stride), padding);
+  if (item.view == sharc::MemoryView::long_word) {
+    constexpr std::uint64_t word = (std::uint64_t{dag_high_word} << 32) | dag_low_word;
+    put_dag_word(ram, dag_cell, item, word);
+  } else if (item.view == sharc::MemoryView::extended) {
+    constexpr std::uint64_t word = (std::uint64_t{dag_low_word} << byte_bits) | 0xaf;
+    put_dag_word(ram, dag_cell, item, word);
+  } else {
+    put_dag_word(ram, dag_cell, item, dag_low_word);
+    const auto step = item.view == sharc::MemoryView::short_word ? 2U : 1U;
+    put_dag_word(ram, dag_cell + step, item, dag_high_word);
+  }
+  return ram;
+}
+
+void expect_dag_store(std::vector<std::byte> &ram, const DagMemoryCase &item, unsigned active) {
+  if (active == 0) { return; }
+  if (item.view == sharc::MemoryView::long_word) {
+    constexpr std::uint64_t word = (std::uint64_t{dag_store_high} << 32) | dag_store_low;
+    put_dag_word(ram, dag_cell, item, word);
+  } else if (item.force) {
+    put_dag_word(ram, dag_cell, item, dag_store_low);
+    put_dag_word(ram, dag_cell + 1, item, dag_store_high);
+  } else if (item.view == sharc::MemoryView::extended) {
+    put_dag_word(ram, dag_cell, item, std::uint64_t{dag_store_low} << byte_bits);
+  } else {
+    const auto step = item.view == sharc::MemoryView::short_word ? 2U : 1U;
+    if ((active & 1) != 0) { put_dag_word(ram, dag_cell, item, dag_store_low); }
+    if ((active & 2) != 0) { put_dag_word(ram, dag_cell + step, item, dag_store_low); }
+  }
+}
+
+void expect_dag_load(sharc::Registers &state, const DagMemoryCase &item, unsigned bank) {
+  auto loaded = dag_low_word;
+  if (item.view == sharc::MemoryView::short_word) {
+    constexpr std::uint32_t short_signed = 0xffff9a80;
+    constexpr std::uint32_t short_unsigned = 0x9a80;
+    loaded = (state.mode1 & (1U << short_sign_bit)) != 0 ? short_signed : short_unsigned;
+  }
+  dag_operand(state, bank, item.reg) = loaded;
+  if (item.force || item.view == sharc::MemoryView::long_word) {
+    dag_operand(state, bank, item.reg ^ 1) = dag_high_word;
+  }
+}
+
+struct DagMemoryControls {
+  unsigned index, flags, predicates;
+  bool write;
+};
+
+sharc::Registers dag_memory_state(const DagMemoryCase &item, const DagMemoryControls &controls) {
+  const auto address_bank = controls.flags & 1;
+  const auto register_bank = (controls.flags >> 1) & 1;
+  const auto simd = (controls.flags >> 2) & 1;
+  const auto modifiers = (controls.flags >> 3) & 1;
+  const auto broadcast =
+      item.space == sharc::MemorySpace::program ? broadcast9_bit : broadcast1_bit;
+  const auto mode = (address_bank << dag_bank_bits[controls.index]) |
+                    (register_bank << dag_bank_bits[item.reg & 15]) | (simd << simd_bit) |
+                    (modifiers << broadcast) | (modifiers << short_sign_bit);
+  auto state = initial({.index = controls.index, .mode = mode});
+  if (controls.write) { state.pc += 2; }
+  auto &address = state.dag[address_bank][controls.index];
+  address.index = ram_address + (item.form == DagMemoryForm::post ? dag_cell : 0);
+  address.length = 0;
+  state.dag[address_bank][controls.index + 2].modifier = dag_cell;
+  state.pe[0].astat = old_status[0] | (controls.predicates & 1);
+  state.pe[1].astat = old_status[1] | (controls.predicates >> 1);
+  dag_operand(state, register_bank, item.reg) = dag_store_low;
+  dag_operand(state, register_bank, item.reg ^ 1) = dag_store_high;
+  return state;
+}
+
+void verify_dag_memory_case(sharc::Core &core,
+                            std::vector<std::byte> &ram,
+                            const sharc::Snapshot &beginning,
+                            const DagMemoryCase &item,
+                            const DagMemoryControls &controls) {
+  const auto before = dag_memory_state(item, controls);
+  const auto lanes = (before.mode1 & (1U << simd_bit)) != 0 ? 3U : 1U;
+  const auto active = controls.predicates & lanes;
+  auto expected = before;
+  const auto seed = dag_memory_seed(item);
+  auto expected_ram = seed;
+  if (controls.write) {
+    expect_dag_store(expected_ram, item, active);
+  } else if (active != 0) {
+    expect_dag_load(expected, item, (controls.flags >> 1) & 1);
+  }
+  if (item.form == DagMemoryForm::post && active != 0) {
+    expected.dag[controls.flags & 1][controls.index].index += dag_cell;
+  }
+  for (const bool bound : {false, true}) {
+    core.restore(beginning);
+    core.set_registers(before);
+    std::ranges::copy(seed, ram.begin());
+    const auto count = bound ? 1U : 2U;
+    const auto report = bound ? core.run_until(count) : core.run(count);
+    fixture::boundary(expected, {.pc = before.pc + count, .clock = count});
+    check(fixture::completed(report, count, count) && core.registers() == expected &&
+              ram == expected_ram,
+          "DAG memory transfer disagreed on bank, addressing, predicate, width or register pair");
+  }
+}
+
+void dag_memory_access(const DagMemoryCase &item, sharc::ExecutionMode mode) {
+  const auto index = item.space == sharc::MemorySpace::program ? 9U : 1U;
+  const std::array program_words{dag_memory_encoding(item, index, false),
+                                 std::uint64_t{0},
+                                 dag_memory_encoding(item, index, true),
+                                 std::uint64_t{0}};
+  fixture::Program program(program_words);
+  auto &variant = program.code.variants.front();
+  variant.entries.push_back(fixture::code_address + 2);
+  variant.layout.regions.push_back({.space = item.space,
+                                    .view = item.view,
+                                    .first = ram_address,
+                                    .count = dag_capture_count,
+                                    .storage_id = ram_id,
+                                    .byte_offset = offset,
+                                    .byte_stride = immediate_stride,
+                                    .initialized = true});
+  const auto native = fixture::compile(program.code, mode);
+  auto ram = dag_memory_seed(item);
+  sharc::Core core(program.memory(ram_id, ram), mode);
+  fixture::install(
+      core,
+      native,
+      dag_memory_state(item, {.index = index, .flags = 0, .predicates = 3, .write = false}));
+  const auto beginning = core.save();
+  const bool conditional = item.form == DagMemoryForm::pre || item.form == DagMemoryForm::post;
+  for (unsigned flags = 0; flags < 16; ++flags) {
+    for (unsigned predicates = conditional ? 0U : 3U; predicates < 4; ++predicates) {
+      for (const bool write : {false, true}) {
+        verify_dag_memory_case(
+            core,
+            ram,
+            beginning,
+            item,
+            {.index = index, .flags = flags, .predicates = predicates, .write = write});
+      }
+    }
+  }
+}
+
+void dag_memory_access(sharc::ExecutionMode mode) {
+  using enum DagMemoryForm;
+  using enum sharc::MemorySpace;
+  using enum sharc::MemoryView;
+  constexpr std::array cases{
+      DagMemoryCase{.form = absolute, .space = data, .view = normal_word, .reg = 0x1d, .width = 4},
+      DagMemoryCase{.form = absolute, .space = program, .view = extended, .reg = 0x4d, .width = 5},
+      DagMemoryCase{.form = immediate, .space = data, .view = short_word, .reg = 0x3d, .width = 2},
+      DagMemoryCase{
+          .form = immediate, .space = program, .view = long_word, .reg = 0x45, .width = 8},
+      DagMemoryCase{.form = pre, .space = data, .view = normal_word, .reg = 0x2d, .width = 4},
+      DagMemoryCase{.form = pre, .space = program, .view = short_word, .reg = 0x35, .width = 2},
+      DagMemoryCase{
+          .form = post, .space = data, .view = normal_word, .reg = 0x4c, .width = 4, .force = true},
+      DagMemoryCase{.form = post, .space = program, .view = long_word, .reg = 0x15, .width = 8},
+  };
+  for (const auto &item : cases) { dag_memory_access(item, mode); }
+}
 } // namespace
 
 namespace fixture {
@@ -707,6 +938,7 @@ void memory_access() {
     absolute_transfers(sharc::MemorySpace::program, mode);
     predicated_packets(mode);
     predicated_short_lane(mode);
+    dag_memory_access(mode);
     for (const auto space : {sharc::MemorySpace::data, sharc::MemorySpace::program}) {
       for (const bool indexed : {false, true}) {
         for (const bool odd : {false, true}) {
