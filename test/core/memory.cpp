@@ -332,6 +332,12 @@ void layout_validation() {
   fixture::throws<sharc::PreparationError>([&] { (void)sharc::Core::lower(program.code.code); },
                                            "ambiguous data layout accepted");
   regions.pop_back();
+  const auto instruction = regions.front();
+  regions.push_back(instruction);
+  regions.back().initialized = false;
+  fixture::throws<sharc::PreparationError>([&] { (void)sharc::Core::lower(program.code.code); },
+                                           "overlapping direct and callback code layouts accepted");
+  regions.pop_back();
   regions.back().count = std::uint64_t{1} << 32;
   fixture::throws<sharc::PreparationError>([&] { (void)sharc::Core::lower(program.code.code); },
                                            "wrapping memory layout accepted");
@@ -687,19 +693,25 @@ bool read_store(void * /*owner*/,
   return true;
 }
 
-void refused_code_store(bool declared_alias) {
+enum class CodeStorage : std::uint8_t { aliased, callback, undeclared };
+
+void refused_code_store(CodeStorage storage) {
   const std::array words{store_r0};
   Program program(words);
   auto &regions = program.code.code.variants[0].layout.regions;
   auto memory = program.memory();
   auto registers = initial();
-  if (declared_alias) {
+  if (storage == CodeStorage::aliased) {
     regions.back().storage_id = fixture::Program::storage_id;
     regions.back().count = 1;
     constexpr std::uint64_t raw = 0x12345678ab;
     registers.pe[0].data[0][0] = raw;
   } else {
-    regions.erase(regions.begin());
+    if (storage == CodeStorage::callback) {
+      regions.front().initialized = false;
+    } else {
+      regions.erase(regions.begin());
+    }
     memory.io.read = read_store;
   }
   const auto original = program.code.bytes;
@@ -711,8 +723,8 @@ void refused_code_store(bool declared_alias) {
             result.fault.detail.contains("instruction storage") &&
             result.progress == sharc::Progress{} && core.registers() == registers &&
             program.code.bytes == original && program.ram == initial_ram,
-        declared_alias ? "store through a declared code alias changed state"
-                       : "store ran without a declared physical code-storage dependency");
+        storage == CodeStorage::aliased ? "store through a declared code alias changed state"
+                                        : "store ran without proven physical code storage");
 }
 } // namespace
 
@@ -726,7 +738,7 @@ int main() {
     changing_complete_space();
 #endif
     rebound_snapshot();
-    refused_code_store(true);
+    refused_code_store(CodeStorage::aliased);
     code_alias_read();
     layout_validation();
     ordinary_region_alias();
@@ -739,6 +751,7 @@ int main() {
     parallel_broadcast();
     parallel_interlock();
     hidden_storage_alias();
-    refused_code_store(false);
+    refused_code_store(CodeStorage::callback);
+    refused_code_store(CodeStorage::undeclared);
   });
 }

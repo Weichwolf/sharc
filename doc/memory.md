@@ -9,9 +9,9 @@ sections 2-6–2-7, 4-110, 6-10–6-31, 7-36–7-40, 9-7–9-9, 9-56–9-59 and
 ## Layout and storage
 
 A region in the instruction's program or data address space selects the view and
-permissions. Data-view regions in the same space must not overlap; an instruction
-view may alias a data view. Zero-length regions contribute no addresses. A region
-must fit the 32-bit address space.
+permissions. Data views must be disjoint within each space, as must instruction
+views. An instruction view may alias a data view. Zero-length regions contribute
+no addresses. A region must fit the 32-bit address space.
 
 For the implemented normal-word view, each value is an unsigned 32-bit number
 stored in four little-endian bytes. The address selects
@@ -156,9 +156,9 @@ store. These are preparation/access boundaries, not a complete model of hardware
 memory exceptions.
 
 Declared byte aliases work for reads. Potential code-alias writes are conservatively
-refused before changing bytes. Stores also require complete instruction-view
-coverage of the declared code, so opaque instruction callbacks cannot hide an
-unknown alias. Actual code transitions, unchanged code stores and
+refused before changing bytes. Stores also require complete initialized
+instruction-view coverage of the declared code to prove its physical backing.
+Actual code transitions, unchanged code stores and
 all other memory views still require implementation and independent qualification.
 `Io` currently supports installation-time instruction reads; runtime data access
 through callbacks is not implemented by this increment.

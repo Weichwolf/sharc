@@ -73,7 +73,7 @@ bool code_storage_declared(const CodeVariant &variant) {
       auto next = cursor;
       for (const auto &layout : variant.layout.regions) {
         if (layout.space == MemorySpace::program && layout.view == MemoryView::instruction &&
-            layout.first <= cursor) {
+            layout.initialized && layout.first <= cursor) {
           next = std::max(next, std::uint64_t{layout.first} + layout.count);
         }
       }
@@ -127,15 +127,15 @@ void validate_memory_layout(const CodeVariant &variant, std::string_view identit
              a.first,
              "memory layout exceeds address space");
     }
-    if (a.view == MemoryView::instruction || a.count == 0) { continue; }
+    const bool instruction = a.view == MemoryView::instruction;
     for (std::size_t j = i + 1; j < regions.size(); ++j) {
       const auto &b = regions[j];
-      if (b.view != MemoryView::instruction && overlaps(a, b)) {
+      if (instruction == (b.view == MemoryView::instruction) && overlaps(a, b)) {
         refuse(FaultReason::invalid_image,
                identity,
                variant.id,
                a.first,
-               "ambiguous data memory views");
+               instruction ? "ambiguous instruction memory views" : "ambiguous data memory views");
       }
     }
   }
