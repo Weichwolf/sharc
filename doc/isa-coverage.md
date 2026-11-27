@@ -696,8 +696,8 @@ writes, register and immediate pre-indexing and post-modification, circular
 wrap, SISD and SIMD predicates, separate data and DAG banks, broadcast and
 explicit S registers. Computation and stores use the old operands. Loads
 write back after compute and take priority when they share its destination.
-The memory tests also check an implicit-only short-word load, a selected
-forced normal-word pair in one PE, the pre-index modifier interlock, selected
+The memory tests also check an implicit-only short-word load, long-word loads
+and stores with one lane selected, the pre-index modifier interlock, selected
 I/O callbacks, ordered refusal and precise FIFO faults before a parallel store.
 The core follows the manual for type-6 lane selection and SISD broadcast.
 See [the simulator observations](numeric-reference.md#predicated-single-bus-transfers)

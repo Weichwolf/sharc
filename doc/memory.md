@@ -72,10 +72,11 @@ callback or store check. The explicit address's declared view determines the
 stride even when only the complementary transfer is active. If that view is
 absent, the checked path can infer it from a unique normal word at offset one
 or short word at offset two. Two matching views are ambiguous and cause an
-explicit memory refusal. After at least one selected transfer completes and the
-packet has no fault, post-modification updates the shared index once. Compute
-and stores use the old operands, and an admitted load takes precedence over an
-aliased compute result.
+explicit memory refusal. A fault-free post-modifying packet updates the shared
+index once if either predicate is true, including an implicit-only wide read
+whose explicit register pair is masked. Either selected lane admits a long-word
+store from the explicit register pair. Compute and stores use the old operands,
+and an admitted load takes precedence over an aliased compute result.
 
 Type 1a transfers address DM using DAG1 and PM using DAG2. Both addresses use
 their old I. The packet updates each I once using the selected signed M from the

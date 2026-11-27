@@ -956,6 +956,45 @@ void predicated_forced_pair(sharc::ExecutionMode mode) {
         "selected forced-long packet lost its same-PE pair or retired the masked lane");
 }
 
+void predicated_wide_implicit(sharc::ExecutionMode mode, bool force, bool write) {
+  // IF EQ R6 = R1 + R2, R5 = DM(I1,M3), or the corresponding store.
+  constexpr std::uint64_t load = 0x52c002801612;
+  constexpr std::uint64_t lw_bit = 1ULL << 30;
+  constexpr std::uint64_t store_bit = 1ULL << 31;
+  constexpr std::uint64_t low = 0x4433221100;
+  constexpr std::uint64_t high = 0x8877665500;
+  const std::array words{load | (force ? lw_bit : 0) | (write ? store_bit : 0)};
+  Program program(words);
+  auto &layout = program.code.code.variants[0].layout.regions.back();
+  if (!force) {
+    layout.view = sharc::MemoryView::long_word;
+    layout.count = 1;
+    layout.byte_stride = initial_ram.size();
+  }
+  layout.readable = write;
+  const auto native = fixture::compile(program.code.code, mode);
+  sharc::Core core(program.memory(), mode);
+  auto expected = initial();
+  expected.mode1 = simd_bit;
+  expected.pe[1].astat = 1;
+  expected.pe[1].data[0][1] = 3U << word_shift;
+  expected.pe[1].data[0][2] = 4U << word_shift;
+  expected.pe[0].data[0][5] = high;
+  expected.pe[0].data[0][4] = low;
+  expected.dag[0][1].index = ram_address;
+  expected.dag[0][3].modifier = 2;
+  fixture::install(core, native, expected);
+  expected.pe[1].data[0][6] = 7U << word_shift;
+  expected.pe[1].astat = 0;
+  expected.dag[0][1].index += 2;
+  fixture::boundary(expected, {.pc = expected.pc + 1, .clock = 1});
+  auto expected_ram = initial_ram;
+  if (write) { std::ranges::rotate(expected_ram, expected_ram.begin() + 4); }
+  check(fixture::completed(core.run(1), 1, 1) && core.registers() == expected &&
+            program.ram == expected_ram,
+        "PEy-only long-word packet lost its explicit store or changed a masked load");
+}
+
 constexpr std::uint64_t fixed_parallel_add = 0x34c89a001401;
 constexpr std::uint64_t floating_parallel_add = 0x34c89a081401;
 
@@ -1639,6 +1678,9 @@ int main() {
       predicated_fifo_refusal(mode);
       predicated_modifier_interlock(mode);
       predicated_forced_pair(mode);
+      for (const bool force : {false, true}) {
+        for (const bool write : {false, true}) { predicated_wide_implicit(mode, force, write); }
+      }
       parallel_io(mode, floating_parallel_add);
       parallel_refusal(mode, floating_parallel_add);
       parallel_fifo_refusal(mode);

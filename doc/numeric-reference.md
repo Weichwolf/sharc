@@ -574,6 +574,56 @@ EQ flag was true. The core follows the documented broadcast examples in
 sections 9-16, 9-21 and 9-27: the admitted PEx read loads both files in SISD
 and compute runs on PEx. The differing simulator cases are unverified on silicon.
 
+Eighty more type-3a probes used a natural long-word address or forced `(LW)`
+at an aligned normal-word address, with independently initialized register
+pairs on both PEs. A load updated the explicit pair only when PEx was
+selected. A store used the explicit pair when either predicate was true,
+including a PEy-only selection. A post-modifying packet advanced I once
+when either predicate was true, including a load with only PEy selected and
+no register writeback. This agrees with the post-modify predicate rule on
+page 4-103 and the explicit long-word data pair on pages 6-8 to 6-9.
+
+## DAG registers as memory operands
+
+The CCES 2.12.1 ADSP-21489 functional simulator matched 164 normal-word and 32
+short-word observations for classic types 3a, 14a and 15a. The probes use both
+buses, both PE modes, all four DAG register classes for normal words, and
+opposite DAGs for indexed forms. A load takes the explicit word when either
+predicate is true in SIMD, including when only PEy is selected. A normal- or
+short-word store sources both selected words from the same DAG register, with
+the usual one- or two-address stride. Read broadcast does not change the DAG
+destination. Type 3a post-modifies its address index once when either SIMD
+predicate is true. Programming Reference 2.4, section 4-106, specifies the
+OR predicate for a memory-to-DAG move.
+
+Another 112 probes used long-word addresses or `(LW)` at aligned normal-word
+addresses. They initialized the neighboring register and upper memory word
+independently. Every admitted load updated both neighboring DAG registers and
+every admitted store wrote both distinct words. With only PEy selected, the
+type-3a transfer still used the whole pair, with the explicit register in the
+low word. Sections 6-7 through 6-10 and Table 6-1 specify the neighboring DAG
+register, including when the explicit register is odd. These probes establish
+reference behavior for subsequent installed-image tests.
+
+An 81-case DM timing probe bracketed the load and a subsequent `MODIFY` with
+zero, one or two intervening NOPs. The NOP control took three, four and five
+clocks. A normal-word load followed by use of the explicit I register took
+five clocks at each spacing. An unrelated I register matched the control.
+A natural long-word load wrote both registers and interlocked only the
+explicit register. Forced `(LW)` interlocked both registers, including when
+the explicitly named register was odd. The forced form still interlocked
+both registers with a false predicate, while preserving their old values.
+A separate 81-case PM timing probe, using a dependent DM read in place of
+`MODIFY`, showed the same relative dependency pattern and an extra clock on
+the unrelated-index control for a PM load. A further 54 DM probes confirmed
+that a false type-3a predicate reserves the explicitly named DAG register
+even without `(LW)`. Short-word loads use MODE1.SSE to select zero or sign
+extension and interlock the explicit register. At a short address with
+`(LW)` the simulator loaded both neighboring registers and interlocked both,
+the same width discrepancy as the indexed data-register probes. Section 6-8
+limits the override to normal-word addressing. These are functional-simulator
+observations. Silicon timing remains unverified.
+
 ## Register MODIFY and DAG interlocks
 
 In 64 authored type-7a probes, the CCES 2.12.1 ADSP-21489 functional simulator

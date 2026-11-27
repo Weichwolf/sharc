@@ -1365,6 +1365,10 @@ private:
                                  const MemoryMove &move,
                                  bool partial,
                                  llvm::Value *selected = nullptr);
+  void planned_memory_operands(const Instruction &op,
+                               const MemoryMove &move,
+                               bool simd_pair,
+                               MemoryOperands &operands);
   llvm::Value *memory_view(MemorySpace space, llvm::Value *address);
   void resolve_masked_explicit(const Values &values,
                                const Instruction &op,
@@ -2849,7 +2853,7 @@ void Lowering::memory_instruction(Values &values, const Instruction &op, bool pa
   memory_writeback(values, move, operands, read);
   if (move.force_long) { observe_memory_alignment(values, operands); }
   if (move.addressing == MemoryAddressing::postmodified) {
-    postmodify_memory(values, move, builder_.CreateOr(operands.first_enabled, operands.paired));
+    postmodify_memory(values, move, builder_.CreateOr(operands.selected[0], operands.selected[1]));
   }
 }
 
@@ -2921,15 +2925,7 @@ MemoryOperands Lowering::memory_operands(const Values &values,
                                : operands.selected[0];
   const bool simd_pair = !operands.broadcast && (context_ & simd_mode) != 0;
   if (!partial) {
-    const auto &plan = memory_plan_.at({op.address, move.space});
-    auto *view = view_tag(MemoryView::normal_word);
-    operands.words[0] = {
-        .address = address, .host = planned_pointer(plan, address, 0), .view = view};
-    memory_pair(move, simd_pair, operands);
-    if (operands.paired != builder_.getFalse()) {
-      auto &second = operands.words[1];
-      second.host = planned_pointer(plan, second.address, 1);
-    }
+    planned_memory_operands(op, move, simd_pair, operands);
     return operands;
   }
   if (runtime_io_ && std::ranges::any_of(variant_.layout.regions, [&](const auto &layout) {
@@ -2968,6 +2964,24 @@ MemoryOperands Lowering::memory_operands(const Values &values,
         builder_.getInt8(0));
   }
   return operands;
+}
+
+void Lowering::planned_memory_operands(const Instruction &op,
+                                       const MemoryMove &move,
+                                       bool simd_pair,
+                                       MemoryOperands &operands) {
+  const auto &plan = memory_plan_.at({op.address, move.space});
+  auto &first = operands.words[0];
+  first.host = planned_pointer(plan, first.address, 0);
+  first.view = view_tag(MemoryView::normal_word);
+  if (move.write && move.force_long) {
+    operands.first_enabled = builder_.CreateOr(operands.first_enabled, operands.selected[1]);
+  }
+  memory_pair(move, simd_pair, operands);
+  if (operands.paired != builder_.getFalse()) {
+    auto &second = operands.words[1];
+    second.host = planned_pointer(plan, second.address, 1);
+  }
 }
 
 llvm::Value *Lowering::check_code_store(const Values &values,
@@ -3041,6 +3055,15 @@ void Lowering::resolve_masked_explicit(const Values &values,
     auto *inferred = builder_.CreateSelect(
         short_match, view_tag(MemoryView::short_word), view_tag(MemoryView::normal_word));
     first.view = builder_.CreateSelect(missing, inferred, first.view);
+  }
+  if (move.write) {
+    auto *wide = builder_.CreateICmpEQ(first.view, view_tag(MemoryView::long_word));
+    if (move.force_long) {
+      wide = builder_.CreateOr(
+          wide, builder_.CreateICmpEQ(first.view, view_tag(MemoryView::normal_word)));
+    }
+    operands.first_enabled =
+        builder_.CreateOr(operands.first_enabled, builder_.CreateAnd(wide, operands.selected[1]));
   }
   first.host = optional_memory(
       operands.first_enabled,
