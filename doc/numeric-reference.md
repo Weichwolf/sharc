@@ -340,6 +340,21 @@ Another 12 paired simulator probes combine the butterfly with a type 5a raw
 register move. They confirm that the move reads the old subtraction destination,
 wins the shared product destination, and follows the separate lane predicates.
 
+PRM 2.4, pages 2-6 and 2-7, gives DAG1 priority for competing register writes
+and illustrates a type 1a packet with compute and two loads into one register.
+The native fixtures follow its DM-first register priority. Memory arbitration
+is separate. Pages 7-20 and 7-21 put a contended PM access in the next bus cycle.
+
+Four floating SIMD probes with one shared memory block confirmed the old
+operands, both rounding widths, the two lane status values and the DAG updates.
+They returned the PM load in the common destination. A further 12 probes tested
+fixed and floating compute in SISD and SIMD with the DM/PM address pairs
+`0xc4000`/`0xc4002`, `0xc4000`/`0xe4000` and `0xe4000`/`0xc4000`. Load distinct
+word pairs into the memory locations, then issue `F6 = F4 + F1` (or fixed ADD)
+with `R4 = DM(I2,M3)` and `R4 = PM(I10,M11)` in the same instruction. Capture
+both lanes after a NOP. The functional simulator selected PM in all 12 cases,
+including the separate blocks. Register writeback on silicon remains unverified.
+
 ## Numeric conditions and predicated lanes
 
 The formulae in table 4-37 on 4-93 include overbars that are absent from ordinary

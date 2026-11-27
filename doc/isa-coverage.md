@@ -124,8 +124,7 @@ multiply or accumulate with ADD, SUB or AVG, plus the multiply/ADD/SUB
 butterfly. Installed-image expectations check both lanes and numerical modes,
 accumulator limbs, separate ALU and multiplier flags, old operands and ALU
 write priority over the multiplier. The suite also checks per-lane predicate
-suppression and rejection of a tied pair of ALU destinations. Floating
-multifunction packets remain open.
+suppression and rejection of a tied pair of ALU destinations.
 
 Classic type 1a pairs normal-word PM and DM loads/stores with supported fixed
 compute. Installed images exercise all four direction pairs, old operands,
@@ -626,9 +625,16 @@ refusal preserves RAM and retires only the preceding instruction.
 `test/core/hostfault.cpp` checks the committed store prefix and fault metadata
 for Direct protected accesses paired with floating compute.
 
+The same-destination dual-load fixture follows the documented DAG1 writeback
+priority. The CCES functional simulator selects the PM value with both shared
+and separate internal memory blocks. Silicon confirmation of the conflicting
+loads remains open. Both reference observations are recorded in
+[numeric-reference.md](numeric-reference.md#parallel-arithmetic-and-lane-expectations).
+
 General classic single-bus compute-and-memory forms (types 3a and 4a),
-forced long-word forms and the remaining DAG addressing variants are tracked
-in #26. Remaining compound control forms are tracked in #27.
+forced long-word forms, the remaining DAG addressing variants and silicon
+confirmation of contended register writeback are tracked in #26. Remaining
+compound control forms are tracked in #27.
 
 ## S2 independent expectations (complete milestone, numerical gaps retained)
 
