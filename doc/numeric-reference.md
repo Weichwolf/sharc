@@ -541,6 +541,22 @@ address as a long-word row access. The core follows section 6-8, which applies
 the qualifier to normal-word accesses, and retains the short view width and
 lane stride.
 
+## Predicated single-bus transfers
+
+The CCES 2.12.1 ADSP-21489 functional simulator ran 184 authored normal-word
+packets with `IF EQ`, across PM and DM, SISD and SIMD, independent PEx/PEy
+flags, and selected broadcast reads. All 144 type-3 and type-4 results matched
+independent lane selection for both compute and transfer. A post-modified
+index advanced once if either lane was selected. Pre-modified accesses used
+the offset and preserved the index.
+
+In type 6, the simulator selected the immediate rotation result independently
+in each PE. With exactly one lane selected in SIMD, it still loaded or stored
+both lanes, including both broadcast destinations. This accounts for 12 of
+40 type-6 probes. The index still advanced once if either lane was selected.
+Programming Reference 2.4, section 9-26, specifies independent selection for
+the entire type-6 instruction. The discrepancy remains unverified on silicon.
+
 ## Register MODIFY and DAG interlocks
 
 In 64 authored type-7a probes, the CCES 2.12.1 ADSP-21489 functional simulator
