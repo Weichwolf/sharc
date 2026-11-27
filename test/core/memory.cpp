@@ -736,18 +736,22 @@ void delayed_io() {
         "delayed I/O yield lost the prepared destination continuation");
 }
 
-void parallel_io() {
-  constexpr std::uint64_t packet = 0x34c89a001401; // DM store, PM load and ADD.
+constexpr std::uint64_t fixed_parallel_add = 0x34c89a001401;
+constexpr std::uint64_t floating_parallel_add = 0x34c89a081401;
+
+void parallel_io(sharc::ExecutionMode mode, std::uint64_t packet) {
+  // DM stores R4, PM loads R4, and the ALU also writes R4.
   const std::array words{packet, fixture::immediate(1, 9)};
   ParallelProgram program(words, ram_address, 2);
   auto &regions = program.code.code.variants[0].layout.regions;
   for (auto &region : std::span(regions).subspan(1)) { region.initialized = false; }
-  const auto native = sharc::Core::compile(program.code.code);
+  const auto native = fixture::compile(program.code.code, mode);
+  const bool floating = packet == floating_parallel_add;
   for (const bool reject : {false, true}) {
     Peripheral peripheral{.yield_on = reject ? 0U : 1U, .fault_on = reject ? 4U : 0U};
     auto memory = program.code.memory();
     memory.io = peripheral.binding();
-    sharc::Core core(memory);
+    sharc::Core core(memory, mode);
     peripheral.core = &core;
     auto expected = initial();
     expected.mode1 = simd_bit;
@@ -756,9 +760,13 @@ void parallel_io() {
     expected.dag[0][3].modifier = 2;
     expected.dag[0][11].modifier = 2;
     constexpr std::array<std::uint64_t, 2> stored{11, 12};
+    constexpr std::array<std::uint64_t, 2> operands{0x3f80000000, 0xbf80000000};
+    constexpr std::array<std::uint32_t, 2> floating_flags{0x400, 0x404};
+    constexpr std::uint32_t fixed_zero = 1;
     constexpr unsigned extension_byte = 0xff;
     for (unsigned lane = 0; lane < stored.size(); ++lane) {
       expected.pe[lane].data[0][4] = (stored[lane] << word_shift) | extension_byte;
+      if (floating) { expected.pe[lane].data[0][0] = operands[lane]; }
     }
     fixture::install(core, native, expected);
     const auto result = core.run(2);
@@ -781,15 +789,14 @@ void parallel_io() {
     } else {
       for (unsigned lane = 0; lane < stored.size(); ++lane) {
         expected.pe[lane].data[0][4] = stored[lane] << word_shift;
+        expected.pe[lane].astat = floating ? floating_flags[lane] : fixed_zero;
       }
       expected.dag[0][2].index += 2;
       expected.dag[0][10].index += 2;
       fixture::boundary(expected, {.pc = expected.pc + 1, .clock = 1});
       check(result.execution == sharc::ExecutionState::yielded &&
                 result.progress == sharc::Progress{.instructions = 1, .base_cycles = 1} &&
-                core.registers().pc == expected.pc && core.registers().dag == expected.dag &&
-                core.registers().pe[0].data == expected.pe[0].data &&
-                core.registers().pe[1].data == expected.pe[1].data,
+                core.registers() == expected,
             "yield in the first lane interrupted the memory packet");
     }
   }
@@ -856,14 +863,61 @@ void parallel_writeback() {
   }
 }
 
-void parallel_refusal() {
-  constexpr std::uint64_t packet = 0x34c89a001401; // DM store, PM load and ADD.
+void floating_parallel_writeback() {
+  // F6 = F4 + F1, with DM and PM both loading F4.
+  constexpr std::array words{std::uint64_t{0x24c89a081641}};
+  constexpr std::array<std::uint32_t, 4> loaded{31, 32, 41, 42};
+  constexpr std::array<std::uint64_t, 2> left{0x3f80000080, 0xbf80000080};
+  constexpr std::array<std::uint64_t, 2> right{0x3380000000, 0xb380000000};
+  constexpr std::array<std::uint64_t, 2> extended{0x3f80000100, 0xbf80000100};
+  constexpr std::array<std::uint64_t, 2> single{0x3f80000000, 0xbf80000000};
+  constexpr std::array<std::uint32_t, 2> flags{0xa5000400, 0xa5000404};
+  constexpr std::uint32_t history = 0xa5000000;
+  ParallelProgram program(words, ram_address, loaded.size());
+  for (const auto mode : fixture::numeric_modes) {
+    const auto native = fixture::compile(program.code.code, mode);
+    std::array<std::byte, word_bytes * loaded.size()> ram{};
+    for (std::size_t index = 0; index < loaded.size(); ++index) {
+      fixture::put_word(ram.data() + (word_bytes * index), loaded[index]);
+    }
+    const auto untouched = ram;
+    sharc::Core core(program.code.memory(ram_id, ram), mode);
+    auto expected = initial();
+    expected.mode1 = simd_bit;
+    expected.dag[0][2].index = ram_address;
+    expected.dag[0][10].index = ram_address + 2;
+    expected.dag[0][3].modifier = 2;
+    expected.dag[0][11].modifier = 2;
+    for (std::size_t lane = 0; lane < expected.pe.size(); ++lane) {
+      auto &pe = expected.pe[lane];
+      pe.data[0][1] = right[lane];
+      pe.data[0][4] = left[lane];
+      pe.astat = history;
+    }
+    fixture::install(core, native, expected);
+    const auto result = core.run_until(1);
+    const auto &rounded = mode == sharc::ExecutionMode::strict ? extended : single;
+    for (std::size_t lane = 0; lane < expected.pe.size(); ++lane) {
+      auto &pe = expected.pe[lane];
+      pe.data[0][4] = std::uint64_t{loaded[lane]} << word_shift;
+      pe.data[0][6] = rounded[lane];
+      pe.astat = flags[lane];
+    }
+    expected.dag[0][2].index += 2;
+    expected.dag[0][10].index += 2;
+    fixture::boundary(expected, {.pc = expected.pc + 1, .clock = 1});
+    check(fixture::completed(result, 1, 1) && core.registers() == expected && ram == untouched,
+          "floating packet lost old operands, rounding, bus priority or DAG updates");
+  }
+}
+
+void parallel_refusal(sharc::ExecutionMode mode, std::uint64_t packet) {
   const std::array words{fixture::immediate(2, 5), packet};
   ParallelProgram program(words, ram_address, 2);
   program.code.code.variants[0].layout.regions.back().count = 1;
   auto ram = initial_ram;
-  const auto native = sharc::Core::compile(program.code.code);
-  sharc::Core core(program.code.memory(ram_id, ram));
+  const auto native = fixture::compile(program.code.code, mode);
+  sharc::Core core(program.code.memory(ram_id, ram), mode);
   auto expected = initial();
   expected.mode1 = simd_bit;
   expected.dag[0][2].index = ram_address;
@@ -1321,9 +1375,14 @@ int main() {
     extended_io();
     runtime_io();
     delayed_io();
-    parallel_io();
+    parallel_io(sharc::ExecutionMode::strict, fixed_parallel_add);
     parallel_writeback();
-    parallel_refusal();
+    floating_parallel_writeback();
+    parallel_refusal(sharc::ExecutionMode::strict, fixed_parallel_add);
+    for (const auto mode : fixture::numeric_modes) {
+      parallel_io(mode, floating_parallel_add);
+      parallel_refusal(mode, floating_parallel_add);
+    }
     parallel_circular(ram_address, ram_address);
     parallel_circular(std::numeric_limits<std::uint32_t>::max() - 3, 0);
     parallel_reverse();

@@ -124,8 +124,7 @@ multiply or accumulate with ADD, SUB or AVG, plus the multiply/ADD/SUB
 butterfly. Installed-image expectations check both lanes and numerical modes,
 accumulator limbs, separate ALU and multiplier flags, old operands and ALU
 write priority over the multiplier. The suite also checks per-lane predicate
-suppression and rejection of a tied pair of ALU destinations. Floating
-multifunction packets remain open.
+suppression and rejection of a tied pair of ALU destinations.
 
 Classic type 1a pairs normal-word PM and DM loads/stores with supported fixed
 compute. Installed images exercise all four direction pairs, old operands,
@@ -402,10 +401,11 @@ ALU computation. Both effects read the old operands and predicates; admitted URE
 writes take priority over ALU data while the ALU flags and sticky effects survive.
 Complementary data destinations use their own lane predicates; a shared DAG
 destination uses PEx only. This follows PRM 2.4 tables 4-39/4-44 and the discussion
-on 4-102–4-103; the type-5 example on 9-24 instead describes an AND predicate.
-That inconsistency remains unverified on a primary implementation and prevents
-claiming full Strict qualification for this case. Immediate type 17 also writes
-S0–S15 and all DAG fields; raw transfers do not round in FastFP32.
+on 4-102–4-103. The type-5 example on 9-24 describes an AND predicate. The
+functional simulator confirms independent lane admission for the raw data move
+paired with a floating butterfly below. Full Strict qualification of other
+type-5 combinations remains open. Immediate type 17 also writes S0–S15 and all
+DAG fields. Raw transfers retain their extension bytes in FastFP32.
 
 DAG loads retain two recent physical-register dependency tags across owner
 bounds, native transfers and snapshots. Address generation after I/B/L loads of
@@ -591,9 +591,50 @@ FUNPACK cover short subnormals, inexact packing, clipping and shifter flags.
 RECIPS and RSQRTS exercise both endpoints of every observed seed bin,
 with signed and exceptional inputs and unchanged inactive lanes. Preparation
 tests also load an artifact containing a seed table.
-Floating multifunction execution and floating parallel-transfer qualification
-remain open.
 Floating-workload performance is tracked separately from the fixed K1–K6 identities.
+
+## Floating dual and multifunction compute
+
+Classic compute lowers the dual floating ADD/SUB and the floating product
+paired with ADD, SUB, scaled FLOAT, scaled FIX, average, ABS, MAX, or MIN.
+The floating butterfly issues the product, sum and difference together.
+Each operation consumes old operands and retains its scalar rounding and
+exception rules. Dual ALU flags and sticky effects are combined. The product
+owns the multiplier flags and leaves the accumulator unchanged.
+
+An aliased ALU destination takes precedence over a binary multifunction
+product. In the floating butterfly the sum wins over the product, and the
+product wins over the difference. All operations still contribute flags.
+Identical sum and difference destinations are explicitly refused. The ADI
+assembler diagnoses that encoding as ambiguous. The supporting simulator
+observations are in [numeric-reference.md](numeric-reference.md#parallel-arithmetic-and-lane-expectations).
+
+`test/isa/floating.cpp` runs 1,008 paired expectations through installed
+images, evenly split between Strict and FastFP32. The matrix checks raw
+destinations, untouched accumulator and register state, lane-local ASTAT and
+STKY, rounding directions, SISD, SIMD, alternate banks and each lane's
+predicated admission. It checks one- and two-instruction bounds with snapshot
+replay. A separate type 5a case pairs the butterfly with a raw register move,
+checking the move's old source, the shared destination and both lane predicates.
+
+`test/core/memory.cpp` checks floating compute with a type 1a dual transfer in
+both numerical modes. It verifies PM/DM alias order, old extended operands,
+the numerical modes' distinct rounding points, register and DAG writeback,
+and callback yield and failure after earlier bus effects. A declaration
+refusal preserves RAM and retires only the preceding instruction.
+`test/core/hostfault.cpp` checks the committed store prefix and fault metadata
+for Direct protected accesses paired with floating compute.
+
+The same-destination dual-load fixture follows the documented DAG1 writeback
+priority. The CCES functional simulator selects the PM value with both shared
+and separate internal memory blocks. Silicon confirmation of the conflicting
+loads remains open. Both reference observations are recorded in
+[numeric-reference.md](numeric-reference.md#parallel-arithmetic-and-lane-expectations).
+
+General classic single-bus compute-and-memory forms (types 3a and 4a),
+forced long-word forms, the remaining DAG addressing variants and silicon
+confirmation of contended register writeback are tracked in #26. Remaining
+compound control forms are tracked in #27.
 
 ## S2 independent expectations (complete milestone, numerical gaps retained)
 

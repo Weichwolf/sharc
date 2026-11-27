@@ -273,6 +273,15 @@ def operand(raw: int, mode: Mode) -> Operand:
     return Operand(raw)
 
 
+def binary32_operand(raw: int, mode: Mode) -> int:
+    value = Operand(raw)
+    if value.kind == "nan":
+        return 0x7fc0000000 | (raw & SIGN)
+    if value.kind == "infinity":
+        return raw
+    return quantize(value.number(), Mode(32, mode.rounding), negative_zero=value.negative).raw
+
+
 def quantize(value: Fraction, mode: Mode, *, negative_zero: bool = False,
              scale: int = 0) -> FloatingResult:
     """Round a rational times 2**scale within the qualified numeric domain.
@@ -957,7 +966,8 @@ def parallel_compute(kind: str, multiply_left: int, multiply_right: int,
                      multiplier: str = "mul", modifier: str = "SSFR",
                      accumulator: int = 0, destination: str = "register",
                      mode: Mode | None = None, saturate: bool = False,
-                     truncate: bool = False, astat: int = 0, stky: int = 0) -> ParallelResult:
+                     truncate: bool = False, astat: int = 0, stky: int = 0,
+                     fast_fp32: bool = False) -> ParallelResult:
     """Normalized multifunction arithmetic, not register selection or an executor.
 
     All four inputs and flags are old values. The ALU sees neither the newly
@@ -981,15 +991,25 @@ def parallel_compute(kind: str, multiply_left: int, multiply_right: int,
     elif kind == "float":
         if mode is None or multiplier != "mul" or destination != "register":
             raise ValueError("floating multifunction requires Mode and a register multiply")
+        if fast_fp32:
+            mode = Mode(32, mode.rounding)
+            multiply_left = binary32_operand(multiply_left, mode)
+            multiply_right = binary32_operand(multiply_right, mode)
+            if alu != "float":
+                alu_left = binary32_operand(alu_left, mode)
+            if alu not in ("fix", "float"):
+                alu_right = binary32_operand(alu_right, mode)
         product = floating_multiply(multiply_left, multiply_right, mode, astat=astat, stky=stky)
         if alu == "dual":
             combined = dual_alu(kind, alu_left, alu_right, mode=mode, astat=astat, stky=stky)
         elif alu == "fix":
             combined = fixed_from_float("fix", alu_left, mode, scale=signed(raw_word(alu_right)),
                                         saturate=saturate, astat=astat, stky=stky)
-        elif alu in ("add", "sub", "avg", "float", "abs", "min", "max"):
-            combined = floating_alu(alu, alu_left, alu_right, mode=mode, astat=astat, stky=stky,
-                                    scale=signed(raw_word(alu_right)) if alu == "float" else None)
+        elif alu == "float":
+            combined = fixed_float_effects(alu_left, mode, scale=signed(raw_word(alu_right)),
+                                           precision=32 if fast_fp32 else 40, astat=astat, stky=stky)
+        elif alu in ("add", "sub", "avg", "abs", "min", "max"):
+            combined = floating_alu(alu, alu_left, alu_right, mode=mode, astat=astat, stky=stky)
         else:
             raise ValueError("unsupported floating multifunction ALU operation")
     else:

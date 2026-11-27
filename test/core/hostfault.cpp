@@ -202,10 +202,11 @@ void terminal_access(sharc::ExecutionMode mode, Case item) {
   nonresumable(core, native, memory, snapshot);
 }
 
-void parallel_terminal_access(sharc::ExecutionMode mode) {
+void parallel_terminal_access(sharc::ExecutionMode mode, std::uint64_t compute) {
   // DM(I2,M2) = R0, PM(I10,M10) = R1.
-  constexpr std::uint64_t packet = 0x34a090800000;
-  constexpr std::array program_words{packet};
+  constexpr std::uint64_t stores = 0x34a090800000;
+  const auto packet = stores | compute;
+  const std::array program_words{packet};
   constexpr std::uint32_t pm_id = ram_id + 1;
   const Space dm;
   const Space pm;
@@ -238,7 +239,7 @@ void parallel_terminal_access(sharc::ExecutionMode mode) {
               result.fault.instruction_bits == instruction_bits &&
               result.fault.detail.contains(deny_dm ? "space 1" : "space 0") &&
               result.fault.detail.contains("word address " + std::to_string(ram_address)) &&
-              result.progress == sharc::Progress{} &&
+              result.progress == sharc::Progress{} && core.registers() == registers &&
               dm.get(ram_address) == (deny_dm ? expected_word : raw_x >> raw_shift) &&
               pm.get(ram_address) == expected_word,
           "parallel protected store lost bus order or host fault attribution: " +
@@ -538,7 +539,9 @@ int main() {
     for (const auto mode : fixture::numeric_modes) {
       effect_order(mode, false);
       effect_order(mode, true);
-      parallel_terminal_access(mode);
+      constexpr std::uint64_t floating_add_f2 = 0x081201;
+      parallel_terminal_access(mode, 0);
+      parallel_terminal_access(mode, floating_add_f2);
       cross_unit_fault(mode);
       constant_wrapping(mode, MemoryMode::exact);
       constant_wrapping(mode, MemoryMode::direct);

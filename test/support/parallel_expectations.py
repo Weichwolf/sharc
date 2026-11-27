@@ -10,7 +10,7 @@ from floating_expectations import encode
 from multiplier_expectations import _limb_accumulate, _limb_product
 from expectation_check import require, require_raises
 from reference import (
-    IntegerResult, Mode, ParallelResult, RegisterWrite, dual_alu, fixed,
+    IntegerResult, Mode, ParallelResult, RegisterWrite, binary32_operand, dual_alu, fixed,
     floating_alu, floating_multiply, parallel_compute, register_writeback,
 )
 
@@ -209,6 +209,84 @@ struct MultifunctionCase {
 };
 inline constexpr std::array multifunction_cases{
 """ + ",\n".join(rows) + "\n};\n"
+
+
+def floating_header():
+    """Complete results of the published floating compute fields at raw register boundaries."""
+    shapes = [(0x0f808c, "dual-only", (0, 8))]
+    shapes += [(0x400800 | (opcode << 16), operation, (0, 8))
+               for opcode, operation in enumerate(("add", "sub", "float", "fix", "avg",
+                                                   "abs", "max", "min"), 0x18)]
+    shapes += [(0x740800, "dual", (0, 8, 4)), (0x588800, "add", (8, 8)),
+               (0x748800, "dual", (8, 8, 4)), (0x744800, "dual", (4, 8, 4)),
+               (0x700800, "dual", (0, 8, 0))]
+    ordinary = (0x3f80000180, 0x3fc0000000, 0x3f80000000, 0x3380000000)
+    special = (0x0080000000, 0x3f7fffffff, 0x7f7fffffff, 0x7f7fffffff)
+    conversions = {"float": (0x0100000357, 0x0000000200),
+                   "fix": (0xbfc0000000, 0xffffffff34)}
+    exceptional = (0x7f80000001, 0xbf80000000, 0xffc0000000, 0x8000000000)
+    inputs = (ordinary, special, exceptional)
+    registers = (0, 4, 8, 12)
+    rows = []
+
+    def values(items):
+        return "{" + ", ".join(hex(item) for item in items) + "}"
+
+    for field, alu, outputs in shapes:
+        for fast, flags, banks, selected in cartesian_product(
+                (False, True), (0, 0x8000, 0x10000, 0x1a000),
+                (0, 0x200000, 0x200480), (None, 0, 1)):
+            mode1 = flags | banks
+            mode = Mode(32 if fast or flags & 0x10000 else 40,
+                        "zero" if flags & 0x8000 else "nearest")
+            conditional = selected is not None
+            lanes = []
+            for lane in range(2):
+                args = inputs[(lane + int(conditional)) % len(inputs)]
+                if alu in conversions:
+                    args = (*args[:2], *conversions[alu])
+                    if lane == 1:
+                        args = (*args[:2], *exceptional[2:]) if alu == "fix" else (
+                            *args[:2], 0x100, 0x8000)
+                status = (0xa50003fe, 0x420007fe)[lane] | int(lane == selected)
+                sticky = (0x10, 0x204)[lane]
+                result = dict(zip(registers, args, strict=True))
+                active = (lane == 0 or banks & 0x200000) and (not conditional or status & 1)
+                if active:
+                    opts = dict(mode=mode, astat=status, stky=sticky)
+                    if alu == "dual-only":
+                        operands = tuple(binary32_operand(raw, mode) for raw in args[2:]) if fast else args[2:]
+                        effect = dual_alu("float", *operands, **opts)
+                    else:
+                        effect = parallel_compute("float", *args, alu=alu, fast_fp32=fast,
+                                                  saturate=bool(flags & 0x2000), **opts)
+                    result.update(zip(outputs, effect.raw, strict=True))
+                    if alu == "dual" and outputs[0] == outputs[2]:
+                        result[outputs[0]] = effect.raw[0]
+                    after_status, after_sticky = effect.astat, effect.stky
+                else:
+                    after_status, after_sticky = status, sticky
+                final = values(result[reg] for reg in registers[:3])
+                lanes.append("{" + ", ".join((values(args), final, hex(status), hex(sticky),
+                                               hex(after_status), hex(after_sticky))) + "}")
+            header = 0x010000000000 if conditional else 0x013e00000000
+            rows.append("{" + ", ".join((hex(header | field), hex(mode1), str(fast).lower(),
+                                        "{{" + ", ".join(lanes) + "}}")) + "}")
+
+    return """
+struct FloatingPacketLane {
+  std::array<std::uint64_t, 4> inputs;
+  std::array<std::uint64_t, 3> result;
+  std::uint32_t old_astat, old_stky, astat, stky;
+};
+struct FloatingPacket {
+  std::uint64_t word;
+  std::uint32_t mode1;
+  bool fast;
+  std::array<FloatingPacketLane, 2> lanes;
+};
+inline constexpr std::array<FloatingPacket, """ + str(len(rows)) + """> floating_packets{{
+""" + ",\n".join(rows) + "\n}};\n"
 
 
 def _fixed_alu(operation, x, y, saturate, truncate):

@@ -163,8 +163,133 @@ void floating() {
     }
   }
 }
+
+void verify_packet(sharc::Core &core,
+                   const fixture::FloatingPacket &packet,
+                   std::uint32_t address) {
+  constexpr std::array registers{0U, 4U, 8U, 12U};
+  constexpr std::array accumulators{sharc::Accumulator{.low = 0x12345678},
+                                    sharc::Accumulator{.middle = 0x87654321}};
+  const auto bank = [&](unsigned reg) {
+    return (packet.mode1 & (reg < 8 ? alternate_low : alternate_high)) != 0 ? 1U : 0U;
+  };
+  sharc::Registers initial;
+  initial.pc = address;
+  initial.mode1 = packet.mode1;
+  for (std::size_t index = 0; index < initial.pe.size(); ++index) {
+    const auto &reference = packet.lanes[index];
+    auto &pe = initial.pe[index];
+    for (auto &data : pe.data) { data.fill(raw_seed); }
+    pe.multiplier = accumulators;
+    for (std::size_t source = 0; source < registers.size(); ++source) {
+      const auto reg = registers[source];
+      pe.data[bank(reg)][reg] = reference.inputs[source];
+    }
+    pe.astat = reference.old_astat;
+    pe.stky = reference.old_stky;
+  }
+  auto expected = initial;
+  for (std::size_t index = 0; index < expected.pe.size(); ++index) {
+    const auto &reference = packet.lanes[index];
+    auto &pe = expected.pe[index];
+    for (std::size_t destination = 0; destination < reference.result.size(); ++destination) {
+      const auto reg = registers[destination];
+      pe.data[bank(reg)][reg] = reference.result[destination];
+    }
+    pe.astat = reference.astat;
+    pe.stky = reference.stky;
+  }
+  core.set_registers(initial);
+  const auto start = core.save();
+  for (const auto instructions : {1U, 2U}) {
+    core.restore(start);
+    fixture::boundary(expected, {.pc = address + instructions, .clock = instructions});
+    if (!fixture::completed(core.run(instructions), instructions, instructions) ||
+        core.registers() != expected) {
+      std::ostringstream detail;
+      detail << std::hex << "floating packet=0x" << packet.word << " MODE1=0x" << packet.mode1
+             << " FastFP32=" << packet.fast;
+      fixture::check(false, detail.str());
+    }
+  }
+}
+
+void floating_register_move() {
+  // IF EQ F0 = F0 * F4, F8 = F8 + F12, F4 = F8 - F12, R0 = R4.
+  constexpr std::uint64_t word = 0x704000740800;
+  constexpr std::uint64_t one = 0x3f80000000;
+  constexpr std::uint64_t two = 0x4000000000;
+  constexpr std::uint64_t three = 0x4040000000;
+  constexpr std::uint64_t four = 0x4080000000;
+  constexpr std::uint64_t five = 0x40a0000000;
+  constexpr std::uint64_t extension = 0x40;
+  constexpr std::uint32_t floating_flag = 0x400;
+  fixture::Program program(std::array{word});
+  for (const auto mode : fixture::numeric_modes) {
+    const auto native = fixture::compile(program.code, mode);
+    sharc::Core core(program.memory(), mode);
+    (void)core.install(native, fixture::Program::variant_id);
+    for (const auto selected : {0U, 1U}) {
+      sharc::Registers before;
+      before.pc = fixture::code_address;
+      before.mode1 = simd_mode | alternate_low;
+      for (auto &pe : before.pe) {
+        pe.data[1][0] = two;
+        pe.data[1][4] = three | extension;
+        pe.data[0][8] = four;
+        pe.data[0][12] = one;
+      }
+      before.pe[selected].astat = zero_flag;
+      core.set_registers(before);
+      auto expected = before;
+      auto &pe = expected.pe[selected];
+      pe.data[1][0] = three | extension;
+      pe.data[1][4] = three;
+      pe.data[0][8] = five;
+      pe.astat = floating_flag;
+      fixture::boundary(expected, {.pc = before.pc + 1, .clock = 1});
+      fixture::check(fixture::completed(core.run(1), 1, 1) && core.registers() == expected,
+                     "parallel UREG move lost its old raw source, predicate or write priority");
+    }
+  }
+}
+
+void floating_packets() {
+  constexpr std::array tied_outputs{std::uint64_t{0x013e000f888c}, std::uint64_t{0x013e00780800}};
+  for (const auto word : tied_outputs) {
+    const auto fault = fixture::refusal(fixture::image(sharc::InstructionSet::isa, word),
+                                        "duplicate floating ALU destinations were admitted");
+    fixture::check(fault.reason == sharc::FaultReason::unsupported_instruction &&
+                       fault.detail.contains("duplicate dual-ALU output"),
+                   "duplicate floating ALU destinations lost their priority diagnostic");
+  }
+  fixture::Program program(std::array{std::uint64_t{0}});
+  auto &variant = program.code.variants.front();
+  std::map<std::uint64_t, std::uint32_t> entries;
+  for (const auto &packet : fixture::floating_packets) {
+    const auto offset = static_cast<std::uint32_t>(entries.size() + 1) * entry_stride;
+    const auto address = fixture::code_address + offset;
+    if (!entries.try_emplace(packet.word, address).second) { continue; }
+    program.add_span(address, std::array{packet.word, std::uint64_t{0}});
+    variant.entries.push_back(address);
+  }
+  for (const auto mode : fixture::numeric_modes) {
+    const auto native = fixture::compile(program.code, mode);
+    sharc::Core core(program.memory(), mode);
+    (void)core.install(native, fixture::Program::variant_id);
+    for (const auto &packet : fixture::floating_packets) {
+      if (packet.fast == (mode == sharc::ExecutionMode::fast_fp32)) {
+        verify_packet(core, packet, entries.at(packet.word));
+      }
+    }
+  }
+}
 } // namespace
 
 int main() {
-  return fixture::run_test(floating);
+  return fixture::run_test([] {
+    floating();
+    floating_packets();
+    floating_register_move();
+  });
 }

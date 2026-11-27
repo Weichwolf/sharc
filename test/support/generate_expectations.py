@@ -282,7 +282,8 @@ def floating_header(path):
 #include <array>
 #include <cstdint>
 namespace fixture {
-""" + floating_expectations.installed_header() + "} // namespace fixture\n")
+""" + floating_expectations.installed_header() + parallel_expectations.floating_header() +
+                    "} // namespace fixture\n")
 
 
 def main():

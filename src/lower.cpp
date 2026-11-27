@@ -111,6 +111,9 @@ constexpr unsigned mr_limb_bits = 32;
 constexpr unsigned mr_guard_bits = 16;
 constexpr unsigned mr_guard_shift = 2 * mr_limb_bits;
 constexpr unsigned float_multiply_opcode = 0x30;
+constexpr unsigned float_dual_opcode = 0xf0;
+constexpr unsigned float_multifunction_start = 0x18;
+constexpr unsigned float_butterfly_opcode = 7;
 constexpr unsigned clear_mrf_opcode = 0x14;
 constexpr unsigned round_mr_opcode = 0x18;
 constexpr unsigned product_opcode = 0x40;
@@ -162,11 +165,36 @@ bool floating_compute(const Compute &compute) {
            compute.opcode == static_cast<unsigned>(FloatingOp::unpack_short)));
 }
 
+bool floating_dual(const Compute &compute) {
+  return compute.kind == ComputeKind::dual_alu && compute.opcode == float_dual_opcode;
+}
+
+bool floating_multifunction(const Compute &compute) {
+  return (compute.kind == ComputeKind::multiply_alu &&
+          compute.opcode >= float_multifunction_start) ||
+         (compute.kind == ComputeKind::multiply_dual_alu &&
+          compute.opcode == float_butterfly_opcode);
+}
+
 bool fixed_multifunction(const Compute &compute) {
-  constexpr unsigned first_floating_packet = 0x18;
   constexpr unsigned fixed_butterfly = 6;
-  return (compute.kind == ComputeKind::multiply_alu && compute.opcode < first_floating_packet) ||
+  return (compute.kind == ComputeKind::multiply_alu &&
+          compute.opcode < float_multifunction_start) ||
          (compute.kind == ComputeKind::multiply_dual_alu && compute.opcode == fixed_butterfly);
+}
+
+FloatingOp floating_multifunction_alu(const Compute &compute) {
+  constexpr std::array operations{FloatingOp::add,
+                                  FloatingOp::subtract,
+                                  FloatingOp::float_scaled,
+                                  FloatingOp::fix_scaled,
+                                  FloatingOp::average,
+                                  FloatingOp::absolute,
+                                  FloatingOp::maximum,
+                                  FloatingOp::minimum};
+  return compute.kind == ComputeKind::multiply_dual_alu
+             ? FloatingOp::add
+             : operations[compute.opcode - float_multifunction_start];
 }
 
 std::uint8_t multifunction_product_opcode(const Compute &compute) {
@@ -190,8 +218,8 @@ unsigned multifunction_alu_opcode(const Compute &compute) {
 
 bool supported_compute(const Compute &compute) {
   return compute.kind == ComputeKind::none || fixed_multiplier(compute) ||
-         floating_compute(compute) || fixed_multifunction(compute) ||
-         compute.kind == ComputeKind::mr_transfer ||
+         floating_compute(compute) || floating_dual(compute) || floating_multifunction(compute) ||
+         fixed_multifunction(compute) || compute.kind == ComputeKind::mr_transfer ||
          (compute.kind == ComputeKind::alu &&
           std::ranges::find(fixed_operations, compute.opcode) != fixed_operations.end()) ||
          ((compute.kind == ComputeKind::shifter || compute.kind == ComputeKind::shift_immediate) &&
@@ -662,12 +690,10 @@ void validate_immediate_shift(const Instruction &instruction, std::string_view i
 
 void validate_compute_writeback(const Instruction &instruction, std::string_view identity) {
   const auto &compute = instruction.compute;
-  const bool tied_alu = compute.kind == ComputeKind::dual_alu &&
-                        compute.opcode == alu::dual_add_subtract &&
-                        compute.outputs[0] == compute.outputs[1];
-  const bool tied_multifunction = compute.kind == ComputeKind::multiply_dual_alu &&
-                                  fixed_multifunction(compute) &&
-                                  compute.outputs[1] == compute.outputs[2];
+  const bool tied_alu =
+      compute.kind == ComputeKind::dual_alu && compute.outputs[0] == compute.outputs[1];
+  const bool tied_multifunction =
+      compute.kind == ComputeKind::multiply_dual_alu && compute.outputs[1] == compute.outputs[2];
   if (tied_alu || tied_multifunction) {
     reject(instruction,
            identity,
@@ -1121,6 +1147,7 @@ private:
   llvm::Value *condition(const Values &values, unsigned code);
   llvm::Value *condition(const Values &values, const Instruction &op);
   Arithmetic arithmetic(const Values &values, const Compute &compute, unsigned opcode);
+  Arithmetic floating(const Values &before, const Compute &compute, FloatingOp operation);
   Arithmetic multiplier(Values &values, const Compute &compute, llvm::Value *selected);
   Arithmetic multifunction(Values &values,
                            const Values &before,
@@ -2056,25 +2083,50 @@ Lowering::move_accumulator(Values &values, const Compute &compute, llvm::Value *
           .sticky = values[sticky_value]};
 }
 
+Arithmetic Lowering::floating(const Values &before, const Compute &compute, FloatingOp operation) {
+  const auto effect = emit_floating(builder_,
+                                    operation,
+                                    {.rnd32 = (context_ & rounding32_mode) != 0,
+                                     .truncate = (context_ & truncation_mode) != 0,
+                                     .fast_fp32 = execution_mode_ == ExecutionMode::fast_fp32,
+                                     .saturate = (context_ & saturation_mode) != 0},
+                                    {.left = before[compute.inputs[0]],
+                                     .right = before[compute.inputs[1]],
+                                     .status = before[status_value],
+                                     .sticky = before[sticky_value]});
+  return {.raw = effect.raw, .status = effect.status, .sticky = effect.sticky};
+}
+
 Arithmetic Lowering::multifunction(Values &values,
                                    const Values &before,
                                    const Compute &compute,
                                    llvm::Value *selected) {
-  auto multiply = compute;
-  multiply.opcode = multifunction_product_opcode(compute);
-  const auto multiplied = multiplier(values, multiply, selected);
+  const bool is_floating = floating_multifunction(compute);
+  Arithmetic multiplied;
+  if (is_floating) {
+    multiplied = floating(before, compute, FloatingOp::multiply);
+  } else {
+    auto multiply = compute;
+    multiply.opcode = multifunction_product_opcode(compute);
+    multiplied = multiplier(values, multiply, selected);
+  }
   if (multiplied.raw != nullptr) {
     write_register(values, compute.outputs[0], multiplied.raw, selected);
   }
   auto alu_inputs = compute;
   alu_inputs.inputs[0] = compute.inputs[2];
   alu_inputs.inputs[1] = compute.inputs[3];
-  auto result = arithmetic(before, alu_inputs, multifunction_alu_opcode(compute));
+  auto result = is_floating ? floating(before, alu_inputs, floating_multifunction_alu(compute))
+                            : arithmetic(before, alu_inputs, multifunction_alu_opcode(compute));
   // ALU writeback outranks the multiplier on a shared register (2-5).
   write_register(values, compute.outputs[1], result.raw, selected);
   if (compute.kind == ComputeKind::multiply_dual_alu) {
-    const auto difference = arithmetic(before, alu_inputs, alu::subtract);
-    write_register(values, compute.outputs[2], difference.raw, selected);
+    const auto difference = is_floating ? floating(before, alu_inputs, FloatingOp::subtract)
+                                        : arithmetic(before, alu_inputs, alu::subtract);
+    // ADSP-21489 floating butterfly gives the product priority over the subtraction.
+    if (!is_floating || compute.outputs[0] != compute.outputs[2]) {
+      write_register(values, compute.outputs[2], difference.raw, selected);
+    }
     result.status = builder_.CreateOr(result.status, difference.status);
     result.sticky = builder_.CreateOr(result.sticky, difference.sticky);
   }
@@ -2092,20 +2144,13 @@ void Lowering::compute_instruction(Values &values,
                                    llvm::Value *selected) {
   Arithmetic result;
   if (floating_compute(compute)) {
-    const auto floating = emit_floating(builder_,
-                                        static_cast<FloatingOp>(compute.opcode),
-                                        {.rnd32 = (context_ & rounding32_mode) != 0,
-                                         .truncate = (context_ & truncation_mode) != 0,
-                                         .fast_fp32 = execution_mode_ == ExecutionMode::fast_fp32,
-                                         .saturate = (context_ & saturation_mode) != 0},
-                                        {.left = before[compute.inputs[0]],
-                                         .right = before[compute.inputs[1]],
-                                         .status = before[status_value],
-                                         .sticky = before[sticky_value]});
-    result = {.raw = floating.raw, .status = floating.status, .sticky = floating.sticky};
+    result = floating(before, compute, static_cast<FloatingOp>(compute.opcode));
   } else if (compute.kind == ComputeKind::dual_alu) {
-    result = arithmetic(before, compute, alu::add);
-    const auto difference = arithmetic(before, compute, alu::subtract);
+    const bool is_floating = floating_dual(compute);
+    result = is_floating ? floating(before, compute, FloatingOp::add)
+                         : arithmetic(before, compute, alu::add);
+    const auto difference = is_floating ? floating(before, compute, FloatingOp::subtract)
+                                        : arithmetic(before, compute, alu::subtract);
     result.status = builder_.CreateOr(result.status, difference.status);
     result.sticky = builder_.CreateOr(result.sticky, difference.sticky);
     write_register(values, compute.outputs[1], difference.raw, selected);
@@ -2113,7 +2158,7 @@ void Lowering::compute_instruction(Values &values,
     result = rotation(before, compute);
   } else if (fixed_multiplier(compute)) {
     result = multiplier(values, compute, selected);
-  } else if (fixed_multifunction(compute)) {
+  } else if (fixed_multifunction(compute) || floating_multifunction(compute)) {
     result = multifunction(values, before, compute, selected);
   } else if (compute.kind == ComputeKind::mr_transfer) {
     result = move_accumulator(values, compute, selected);
@@ -5481,24 +5526,35 @@ std::uint32_t register_context(const Instruction &instruction) {
   return mask;
 }
 
+std::uint32_t single_floating_context(const Compute &compute, ExecutionMode mode) {
+  const auto operation = static_cast<FloatingOp>(compute.opcode);
+  std::uint32_t mask{};
+  if (mode == ExecutionMode::strict && compute.kind != ComputeKind::shifter &&
+      operation != FloatingOp::float_fixed && operation != FloatingOp::float_scaled) {
+    mask |= rounding32_mode;
+  }
+  if (operation == FloatingOp::exponent || fixed_conversion(operation)) { mask |= saturation_mode; }
+  if ((mode == ExecutionMode::fast_fp32 && operation != FloatingOp::unpack_short) ||
+      floating_arithmetic(operation) || operation == FloatingOp::fix ||
+      operation == FloatingOp::fix_scaled || operation == FloatingOp::multiply ||
+      operation == FloatingOp::round || operation == FloatingOp::float_scaled ||
+      operation == FloatingOp::scale) {
+    mask |= truncation_mode;
+  }
+  return mask;
+}
+
 std::uint32_t compute_context(const Compute &compute, ExecutionMode mode) {
   if (compute.kind == ComputeKind::none) { return 0; }
   std::uint32_t mask{simd_mode};
   if (floating_compute(compute)) {
-    const auto operation = static_cast<FloatingOp>(compute.opcode);
-    if (mode == ExecutionMode::strict && compute.kind != ComputeKind::shifter &&
-        operation != FloatingOp::float_fixed && operation != FloatingOp::float_scaled) {
-      mask |= rounding32_mode;
-    }
-    if (operation == FloatingOp::exponent || fixed_conversion(operation)) {
+    mask |= single_floating_context(compute, mode);
+  } else if (floating_dual(compute) || floating_multifunction(compute)) {
+    if (mode == ExecutionMode::strict) { mask |= rounding32_mode; }
+    mask |= truncation_mode;
+    if (floating_multifunction(compute) &&
+        floating_multifunction_alu(compute) == FloatingOp::fix_scaled) {
       mask |= saturation_mode;
-    }
-    if ((mode == ExecutionMode::fast_fp32 && operation != FloatingOp::unpack_short) ||
-        floating_arithmetic(operation) || operation == FloatingOp::fix ||
-        operation == FloatingOp::fix_scaled || operation == FloatingOp::multiply ||
-        operation == FloatingOp::round || operation == FloatingOp::float_scaled ||
-        operation == FloatingOp::scale) {
-      mask |= truncation_mode;
     }
   } else if (fixed_multiplier(compute) || compute.kind == ComputeKind::mr_transfer) {
     mask |= multiplier_swap_mode;
