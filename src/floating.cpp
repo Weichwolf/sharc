@@ -69,14 +69,16 @@ private:
   llvm::Value *flag(llvm::Value *predicate, std::uint32_t mask);
   Operand unpack(llvm::Value *raw);
   Operand operand(llvm::Value *raw);
+  llvm::Value *fixed_operand(llvm::Value *raw);
   Number round_single(llvm::Value *raw);
   llvm::Value *round_shift(Shift input);
   llvm::Value *significand(const Operand &value);
   llvm::Value *shift_right_jam(Shift input);
   llvm::Value *ordered_key(const Operand &value);
-  Number pack(ScaledMagnitude scaled);
+  Number pack(ScaledMagnitude scaled, bool narrow);
   Number add(FloatingOp operation, const Operands &operands);
   Number multiply(const Operands &operands);
+  Number from_fixed(FloatingOp operation, const FloatingInputs &inputs);
   Number select(FloatingOp operation, const Operands &operands);
   FloatingEffects compare(const Operands &operands, const FloatingInputs &inputs);
   Number unary(FloatingOp operation, const Operand &value);
@@ -118,6 +120,11 @@ Operand Floating::unpack(llvm::Value *raw) {
 Operand Floating::operand(llvm::Value *raw) {
   if (mode_.fast_fp32) { return unpack(round_single(raw).raw); }
   return unpack(mode_.rnd32 ? ir_.CreateAnd(raw, word(narrow_mask)) : raw);
+}
+
+llvm::Value *Floating::fixed_operand(llvm::Value *raw) {
+  auto *fixed = ir_.CreateTrunc(ir_.CreateLShr(raw, word(extension_bits)), type(32));
+  return ir_.CreateSExt(fixed, type(wide_bits));
 }
 
 llvm::Value *Floating::round_shift(Shift input) {
@@ -162,9 +169,8 @@ llvm::Value *Floating::shift_right_jam(Shift input) {
   return ir_.CreateOr(shifted, ir_.CreateZExt(lost, type(wide_bits)));
 }
 
-Number Floating::pack(ScaledMagnitude scaled) {
+Number Floating::pack(ScaledMagnitude scaled, bool narrow) {
   const auto [magnitude, exponent_at_top, sign] = scaled;
-  const bool narrow = mode_.rnd32 || mode_.fast_fp32;
   const auto precision = narrow ? single_precision : extended_precision;
   auto *leading =
       ir_.CreateIntrinsic(llvm::Intrinsic::ctlz, {type(wide_bits)}, {magnitude, ir_.getFalse()});
@@ -224,7 +230,8 @@ Number Floating::add(FloatingOp operation, const Operands &operands) {
       ir_.CreateICmpNE(magnitude, word(0)), sign, ir_.CreateAnd(left.sign, right_sign));
   if (absolute) { sign = word(0); }
   auto *at_top = operation == FloatingOp::average ? larger : ir_.CreateAdd(larger, word(1));
-  auto result = pack({.magnitude = magnitude, .exponent_at_top = at_top, .sign = sign});
+  auto result = pack({.magnitude = magnitude, .exponent_at_top = at_top, .sign = sign},
+                     mode_.rnd32 || mode_.fast_fp32);
   // The ALU flushes an exact halfway underflow. The multiplier retains the rounded value.
   result.raw = ir_.CreateSelect(result.underflow, sign, result.raw);
   auto *infinite = ir_.CreateOr(left.infinite, right.infinite);
@@ -244,7 +251,8 @@ Number Floating::multiply(const Operands &operands) {
   constexpr unsigned product_exponent_bias = 126;
   auto *at_top =
       ir_.CreateSub(ir_.CreateAdd(left.exponent, right.exponent), word(product_exponent_bias));
-  auto result = pack({.magnitude = magnitude, .exponent_at_top = at_top, .sign = sign});
+  auto result = pack({.magnitude = magnitude, .exponent_at_top = at_top, .sign = sign},
+                     mode_.rnd32 || mode_.fast_fp32);
   auto *infinite = ir_.CreateOr(left.infinite, right.infinite);
   auto *zero = ir_.CreateOr(left.zero, right.zero);
   result.invalid = ir_.CreateOr(ir_.CreateAnd(infinite, zero), ir_.CreateOr(left.nan, right.nan));
@@ -254,6 +262,23 @@ Number Floating::multiply(const Operands &operands) {
       ir_.CreateSelect(left.nan, left.raw, ir_.CreateSelect(right.nan, right.raw, result.raw));
   result.overflow = ir_.CreateAnd(finite, result.overflow);
   result.underflow = ir_.CreateAnd(finite, result.underflow);
+  return result;
+}
+
+Number Floating::from_fixed(FloatingOp operation, const FloatingInputs &inputs) {
+  auto *fixed = fixed_operand(inputs.left);
+  auto *negative = ir_.CreateICmpSLT(fixed, word(0));
+  auto *magnitude = ir_.CreateSelect(negative, ir_.CreateNeg(fixed), fixed);
+  auto *sign = ir_.CreateSelect(negative, word(sign_mask), word(0));
+  constexpr unsigned exponent_bias = 127;
+  llvm::Value *at_top = word(exponent_bias + wide_bits - 1);
+  if (operation == FloatingOp::float_scaled) {
+    at_top = ir_.CreateAdd(at_top, fixed_operand(inputs.right));
+  }
+  // Strict FLOAT returns an extended result at either RND32 setting.
+  auto result =
+      pack({.magnitude = magnitude, .exponent_at_top = at_top, .sign = sign}, mode_.fast_fp32);
+  result.raw = ir_.CreateSelect(result.underflow, sign, result.raw);
   return result;
 }
 
@@ -350,13 +375,18 @@ Floating::effects(FloatingOp operation, const Number &number, const FloatingInpu
   flags = ir_.CreateOr(flags, flag(number.invalid, 32));
   auto *sticky = ir_.CreateOr(inputs.sticky, flag(number.invalid, 32));
   if (!average) { sticky = ir_.CreateOr(sticky, flag(number.overflow, 2)); }
-  if (floating_arithmetic(operation)) { sticky = ir_.CreateOr(sticky, flag(number.underflow, 1)); }
+  if (floating_arithmetic(operation) || operation == FloatingOp::float_scaled) {
+    sticky = ir_.CreateOr(sticky, flag(number.underflow, 1));
+  }
   return {.raw = raw,
           .status = ir_.CreateOr(ir_.CreateAnd(inputs.status, constant(32, ~alu_flags)), flags),
           .sticky = sticky};
 }
 
 FloatingEffects Floating::emit(FloatingOp operation, const FloatingInputs &inputs) {
+  if (operation == FloatingOp::float_fixed || operation == FloatingOp::float_scaled) {
+    return effects(operation, from_fixed(operation, inputs), inputs);
+  }
   if (operation == FloatingOp::round) {
     const auto number =
         round_single(mode_.rnd32 || mode_.fast_fp32 ? operand(inputs.left).raw : inputs.left);
@@ -395,6 +425,8 @@ bool floating_alu(std::uint8_t opcode) {
     case FloatingOp::negate:
     case FloatingOp::round:
     case FloatingOp::absolute:
+    case FloatingOp::float_fixed:
+    case FloatingOp::float_scaled:
     case FloatingOp::copy_sign:
     case FloatingOp::minimum:
     case FloatingOp::maximum:

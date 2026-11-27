@@ -232,6 +232,24 @@ The reciprocal and reciprocal-square-root seed probes need every ordinary
 mantissa bin and both square-root exponent parities. Shifter gaps include
 zero-source OR-shift, BTST position -1 and sign-extended empty fields.
 
+## Floating conversion and seed observations
+
+The first ADSP-21489 conversion batch contained 432 authored cases for eight
+MODE1 configurations. All 48 cases for FLOAT and scaled FLOAT matched the
+independent model after distinguishing exact zero from nonzero underflow.
+Strict FLOAT retains 40-bit precision with RND32 set. Scaled FLOAT sets
+AUS when a nonzero result underflows and preserves it when the input is zero.
+Its signed scale includes the full fixed 32-bit range. FastFP32 rounds the
+floating result to binary32 using the guest rounding direction.
+
+A separate sweep checked 1,024 RECIPS and RSQRTS lookups in both widths and
+rounding modes. It covered the 128 RECIPS indices and both groups of 64
+RSQRTS indices. For each index the fraction matched across lower and upper
+bin endpoints and different input exponents. The result exponents matched
+`-e - 1` for RECIPS and `-floor(e/2) - 1` for RSQRTS, where `e` is the
+unbiased source exponent. Seed lowering and installed-image qualification
+remain open under #24.
+
 ## Primary observation tools
 
 The remaining exceptional and seed details require primary observations or
@@ -254,8 +272,8 @@ bits are MVS/MUS, while MOS remains unchanged.
 ADD/SUB, their absolute forms and average set AUS for nonzero underflow.
 Negate, absolute, pass, RND, selection operations and compare leave AUS
 unchanged. Average clears AV and preserves AVS. The conversion reference still
-uses the manual rule for SCALB and scaled FLOAT. Their observable status
-boundaries remain part of #24. Unscaled FLOAT preserves AUS and AVS.
+uses the manual rule for SCALB. Scaled FLOAT sets AUS on nonzero underflow
+and AVS on overflow. Unscaled FLOAT preserves both sticky bits.
 
 Ordered compare treats both zeros as equal and orders infinities normally. It
 shifts CACC independently of the numeric result, preserves other non-ALU bits,

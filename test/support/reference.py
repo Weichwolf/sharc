@@ -360,9 +360,13 @@ def floating(operation: str, left: int, right: int, mode: Mode) -> FloatingResul
     return result
 
 
-def float_from_fixed(raw: int, mode: Mode, *, scale: int = 0) -> FloatingResult:
+def float_from_fixed(raw: int, mode: Mode, *, scale: int = 0,
+                     precision: int = 40) -> FloatingResult:
     # FLOAT's 40-bit boundary is independent of MODE1.RND32 (11-39).
-    return quantize(Fraction(signed(raw_word(raw))), Mode(40, mode.rounding), scale=scale)
+    result = quantize(Fraction(signed(raw_word(raw))), Mode(precision, mode.rounding), scale=scale)
+    if result.underflow:
+        return FloatingResult(result.raw & SIGN, underflow=True)
+    return result
 
 
 def float_round(raw: int, mode: Mode) -> FloatingResult:
@@ -398,6 +402,13 @@ def _floating_effects(result: FloatingResult, astat: int, stky: int, *,
     return IntegerResult(x.raw, (astat & ~ALU_FLAGS) | flags, stky | sticky)
 
 
+def fixed_float_effects(raw: int, mode: Mode, *, scale: int | None = None,
+                        precision: int = 40, astat: int = 0, stky: int = 0) -> IntegerResult:
+    result = float_from_fixed(raw, mode, scale=0 if scale is None else scale, precision=precision)
+    return _floating_effects(result, astat, stky, zero_sticky=result.underflow,
+                             overflow_sticky=scale is not None)
+
+
 def floating_alu(operation: str, left: int, right: int = 0, *, mode: Mode,
                  scale: int | None = None, astat: int = 0, stky: int = 0) -> IntegerResult:
     """Qualified full scalar ALU effects; no partial status masks are returned."""
@@ -416,8 +427,7 @@ def floating_alu(operation: str, left: int, right: int = 0, *, mode: Mode,
             result = FloatingResult(result.raw & ~SIGN, result.overflow, result.underflow)
         zero_sticky, overflow_sticky = result.underflow, operation != "avg"
     elif operation == "float":
-        result = float_from_fixed(left, mode, scale=0 if scale is None else scale)
-        zero_sticky = overflow_sticky = scale is not None
+        return fixed_float_effects(left, mode, scale=scale, astat=astat, stky=stky)
     elif operation == "round":
         result = float_round(left, mode)
     elif operation in ("neg", "abs", "pass", "scale", "min", "max", "clip", "copysign"):

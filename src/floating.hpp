@@ -17,6 +17,8 @@ enum class FloatingOp : std::uint8_t {
   negate = 0xa2,
   round = 0xa5,
   absolute = 0xb0,
+  float_fixed = 0xca,
+  float_scaled = 0xda,
   copy_sign = 0xe0,
   minimum = 0xe1,
   maximum = 0xe2,

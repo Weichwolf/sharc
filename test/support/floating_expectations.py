@@ -7,8 +7,8 @@ from fractions import Fraction
 
 from expectation_check import anchor, require, require_raises
 from reference import (
-    IntegerResult, Mode, Operand, Unqualified, float_parts, floating_alu, floating_compare,
-    floating_multiply, quantize,
+    IntegerResult, Mode, Operand, Unqualified, fixed_float_effects, float_parts, floating_alu,
+    floating_compare, floating_multiply, quantize, raw_word, signed,
 )
 
 
@@ -70,10 +70,16 @@ ALU = [
      {"scale": -0x80000000}, IntegerResult(0x7F80000000, 0x400, 0)),
     ("unscaled FLOAT zero preserves AUS", "float", 0, 0, Mode(32), {},
      IntegerResult(0, 0x401, 0)),
-    ("explicit scale zero FLOAT updates AUS", "float", 0, 0, Mode(32), {"scale": 0},
-     IntegerResult(0, 0x401, 1)),
+    ("scaled FLOAT exact zero preserves AUS", "float", 0x42, 0, Mode(32), {"scale": 0},
+     IntegerResult(0, 0x401, 0)),
     ("FLOAT always uses full precision", "float", 0x0100000100, 0, Mode(32), {},
      IntegerResult(0x4B80000080, 0x400, 0)),
+    ("scaled FLOAT preserves the sign of underflow", "float", 0xFFFFFFFF00, 0,
+     Mode(40), {"scale": -127}, IntegerResult(0x8000000000, 0x405, 1)),
+    ("scaled FLOAT overflow truncates to the extended finite limit", "float", 0x100, 0,
+     Mode(32, "zero"), {"scale": 128}, IntegerResult(0x7F7FFFFFFF, 0x402, 2)),
+    ("scaled FLOAT accepts minimum signed scale", "float", 0x100, 0,
+     Mode(40), {"scale": -(1 << 31)}, IntegerResult(0, 0x401, 1)),
     ("MIN orders negative infinity", "min", 0xFF80000000, 0xBF80000000, Mode(40), {},
      IntegerResult(0xFF80000000, 0x404, 0)),
     ("MAX opposite zeros selects positive", "max", 0x8000000000, 0, Mode(40), {},
@@ -241,7 +247,7 @@ def unary_lattice():
                 negative_zero = operation == "neg" and value == 0
                 flags = 0xFFFFFFC0 | int(output == 0) | (int(output < 0 or negative_zero) << 2)
                 flags |= 0x10 if operation == "abs" and value < 0 else 0
-                sticky = 0x44 | int(output == 0 and scale is not None)
+                sticky = 0x44 | int(output == 0 and operation == "scale")
                 raw = 0x8000000000 if negative_zero else encode(output)
                 require(floating_alu(operation, source, mode=mode, scale=scale,
                                      astat=0xFFFFFFFF, stky=0x44),
@@ -284,9 +290,10 @@ def installed_header():
     fields = {"add": 0x081000, "sub": 0x082000, "avg": 0x089000, "cmp": 0x08a000,
               "absadd": 0x091000, "abssub": 0x092000, "pass": 0x0a1000,
               "neg": 0x0a2000, "round": 0x0a5000, "abs": 0x0b0000,
+              "float": 0x0ca000, "float-scaled": 0x0da000,
               "copysign": 0x0e0000, "min": 0x0e1000, "max": 0x0e2000, "clip": 0x0e3000,
               "mul": 0x130000}
-    unary = {"pass", "neg", "round", "abs"}
+    unary = {"pass", "neg", "round", "abs", "float"}
     edges = [(0x3f800000ff, 0), (0x3f80000180, 0x3380000000),
              (0x3f80000000, 0xbf80000000), (0x3f80000000, 0x0080000000),
              (0x7f7fffffff, 0x7f7fffffff), (0x7f7fffffff, 0x4000000000),
@@ -306,6 +313,18 @@ def installed_header():
                            if name == operation] for operation in fields}
     anchors["mul"] = [(left, right) for _, left, right, _, _, _ in MULTIPLY]
     anchors["cmp"] = [(left, right) for _, left, right, _, _, _ in COMPARE]
+    anchors["float-scaled"] = [
+        (left, (options["scale"] & 0xffffffff) << 8)
+        for _, name, left, _, _, options, _ in ALU if name == "float" and "scale" in options
+    ]
+    fixed_edges = [
+        (0, 0),
+        (0x0100000157, 0xffffff8100),
+        (0x0100000357, 0x0000000200),
+        (0x7fffffffef, 0x7fffffff00),
+        (0x8000000042, 0x8000000000),
+        (0xfeffffff57, 0x0000008000),
+    ]
 
     def approximate(raw, mode):
         value = Operand(raw)
@@ -318,6 +337,10 @@ def installed_header():
         return quantize(value.number(), mode, negative_zero=value.negative).raw
 
     def result(operation, left, right, mode, fast, astat, stky):
+        if operation in ("float", "float-scaled"):
+            scale = signed(raw_word(right)) if operation == "float-scaled" else None
+            return fixed_float_effects(left, mode, scale=scale, precision=32 if fast else 40,
+                                       astat=astat, stky=stky)
         if fast:
             left, right = approximate(left, mode), approximate(right, mode)
         if operation == "mul":
@@ -331,7 +354,8 @@ def installed_header():
 
     rows = []
     for operation, field in fields.items():
-        pairs = [(x, 0) for x, _ in edges] if operation in unary else edges
+        inputs = fixed_edges if operation in ("float", "float-scaled") else edges
+        pairs = [(x, 0) for x, _ in inputs] if operation in unary else inputs
         for index, (left, right) in enumerate(dict.fromkeys(anchors[operation] + pairs)):
             for fast, rnd32, truncate in cartesian_product((False, True), repeat=3):
                 mode = Mode(32 if fast or rnd32 else 40, "zero" if truncate else "nearest")
