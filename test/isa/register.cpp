@@ -20,6 +20,7 @@ constexpr unsigned shadow_first = 0x50, true_condition = 31, i8_code = 0x18;
 constexpr unsigned px = 0x6b, px1 = 0x6c, px2 = 0x6d;
 constexpr std::array ustat{0x70U, 0x71U, 0x7eU, 0x7fU};
 constexpr unsigned lcntr_code = 0x68;
+constexpr unsigned emuclk_code = 0x69, emuclk2_code = 0x6a;
 constexpr unsigned mode1_code = 0x72, astat_x_code = 0x76, astat_y_code = 0x77;
 constexpr unsigned stky_x_code = 0x78, stky_y_code = 0x79, irptl_code = 0x7a;
 constexpr std::array lane_status_codes{astat_x_code, astat_y_code, stky_x_code, stky_y_code};
@@ -373,6 +374,74 @@ void read_latched_dag_overflow() {
     check(fixture::completed(report, words.size(), words.size()) && actual.irptl == expected &&
               actual.pe[0].data[0][4] == (std::uint64_t{expected} << 8),
           "IRPTL read missed a DAG overflow in the same native grant");
+  }
+}
+
+void emulation_clock_wrap() {
+  constexpr std::uint64_t seed = 0x12345678fffffffe;
+  constexpr std::uint32_t low = 0xfffffffe;
+  constexpr std::uint32_t high = 0x12345678;
+  constexpr std::uint32_t high_after_wrap = high + 1;
+  constexpr std::uint64_t px_word = 0x1234567912345679;
+  for (const auto reg : {emuclk_code, emuclk2_code}) {
+    const auto code = fixture::image(sharc::InstructionSet::isa, fixture::immediate(reg, 0));
+    const auto fault = fixture::refusal(code, "user-space EMUCLK write was lowered");
+    check(fault.reason == sharc::FaultReason::unsupported_instruction,
+          "EMUCLK write lost its explicit refusal");
+  }
+  const std::array words{encoding({.source = emuclk_code, .destination = 4}, true_condition),
+                         encoding({.source = emuclk2_code, .destination = 5}, true_condition),
+                         encoding({.source = emuclk_code, .destination = 6}, true_condition),
+                         encoding({.source = emuclk2_code, .destination = 7}, true_condition),
+                         encoding({.source = emuclk2_code, .destination = px}, true_condition)};
+  fixture::Program program(words);
+  for (const auto mode : fixture::numeric_modes) {
+    const auto native = fixture::compile(program.code, mode);
+    sharc::Core core(program.memory(), mode);
+    sharc::Core replay(program.memory(), mode);
+    auto expected = initial(4);
+    expected.emuclk = seed;
+    fixture::install(core, native, expected);
+    (void)replay.install(native, fixture::Program::variant_id);
+    const auto beginning = core.save();
+    check(fixture::completed(core.run(2), 2, 2), "clock prefix did not retire");
+    replay.restore(core.save());
+    check(fixture::completed(replay.run(3), 3, 3), "clock replay did not retire");
+    for (auto &pe : expected.pe) {
+      pe.data[0][4] = std::uint64_t{low} << 8;
+      pe.data[0][5] = std::uint64_t{high} << 8;
+      pe.data[0][6] = 0;
+      pe.data[0][7] = std::uint64_t{high_after_wrap} << 8;
+    }
+    expected.px = px_word;
+    fixture::boundary(expected, {.pc = base + 5, .clock = seed + 5});
+    check(replay.registers() == expected, "clock halves lost the carry or SIMD projection");
+    core.restore(beginning);
+    check(fixture::completed(core.run(words.size()), words.size(), words.size()) &&
+              core.registers() == expected,
+          "continuous clock reads differed from the snapshot replay");
+  }
+}
+
+void emulation_clock_short_loop() {
+  constexpr std::uint64_t count_three_do_one = 0x0c0003000001;
+  constexpr std::uint64_t seed = 0x8abcde00;
+  const std::array words{encoding({.source = emuclk_code, .destination = 4}, true_condition),
+                         count_three_do_one,
+                         encoding({.source = emuclk_code, .destination = 5}, true_condition),
+                         encoding({.source = emuclk_code, .destination = 6}, true_condition)};
+  fixture::Program program(words);
+  for (const auto mode : fixture::numeric_modes) {
+    const auto native = fixture::compile(program.code, mode);
+    sharc::Core core(program.memory(), mode);
+    auto before = initial(0);
+    before.emuclk = seed;
+    fixture::install(core, native, before);
+    const auto report = core.run(6);
+    const auto data = core.registers().pe[0].data[0];
+    check(fixture::completed(report, 6, 10) && data[4] == (seed << 8) &&
+              data[5] == ((seed + 5) << 8) && data[6] == ((seed + 9) << 8),
+          "clock read in a short DO lost a turn or refill cycle");
   }
 }
 
@@ -1198,6 +1267,8 @@ void register_transfers() {
   loop_preload_moves();
   sticky_status_moves();
   read_latched_dag_overflow();
+  emulation_clock_wrap();
+  emulation_clock_short_loop();
   combined_px_moves();
   combined_px_aliases();
   parallel_priority();

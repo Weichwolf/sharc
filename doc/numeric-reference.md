@@ -892,6 +892,23 @@ that the manual assigns to PEx. For the defined writable fields the core uses th
 replacement behavior, including zero to clear and one to set. The differing
 mask and software set of arithmetic sticky bits await silicon confirmation.
 
+## Emulation clock reads
+
+In 18 authored probes the CCES 2.12.1 ADSP-21489 functional simulator sampled
+EMUCLK at the execute cycle. Consecutive register reads differed by one.
+An indexed store sampled after two address interlocks when its I register
+was loaded by the preceding instruction. A register transfer paired with
+ADD took the same sample as a plain transfer. In a three-turn, one-word DO,
+the last body read and first successor read measured offsets five and nine
+from the preceding clock read. Native fixtures also seed the counter near a
+low-word rollover and verify EMUCLK2 and replay across a stopped boundary.
+
+The core uses its emulation clock backing plus retired cycles from the
+current native call and the sampled instruction's stalls. It keeps each
+clock observation at an exact execution boundary so a batched loop or
+straight-line grant cannot omit cycles from the sample. Programming
+Reference 2.4, pp. 8-14 and A-31, assigns writes to emulation space.
+
 ## Fixed multiplier details
 
 The raw accumulator has 80 bits. Inputs use the upper 32 bits of each data

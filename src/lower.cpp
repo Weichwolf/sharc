@@ -108,6 +108,7 @@ constexpr unsigned shadow_register_first = 0x50;
 constexpr unsigned system_register_first = 0x60;
 constexpr unsigned px_register = 0x6b;
 constexpr unsigned px1_register = 0x6c, px2_register = 0x6d;
+constexpr unsigned emuclk_register = 0x69, emuclk2_register = 0x6a;
 constexpr unsigned ustat1_register = 0x70, ustat3_register = 0x7e;
 enum class ControlRegister : std::uint8_t {
   lcntr = 0x68,
@@ -396,6 +397,10 @@ bool lane_status_register(unsigned reg) {
   return astat_register(reg) || stky_register(reg);
 }
 
+bool clock_register(unsigned reg) {
+  return reg == emuclk_register || reg == emuclk2_register;
+}
+
 bool writable_ureg(unsigned reg) {
   return ordinary_ureg(reg) || reg == px_register || reg == lcntr_register ||
          lane_status_register(reg);
@@ -417,7 +422,7 @@ std::optional<std::size_t> scalar_control_slot(unsigned reg) {
 }
 
 bool readable_control_register(unsigned reg) {
-  return lane_status_register(reg) || scalar_control_slot(reg).has_value();
+  return lane_status_register(reg) || clock_register(reg) || scalar_control_slot(reg).has_value();
 }
 
 std::size_t user_status_slot(unsigned reg) {
@@ -727,6 +732,15 @@ unsigned source_register(const Instruction &op) {
   if (op.type == register_move_type) { return register_move(op).source; }
   if (register_count(op)) { return count_register(op); }
   return 0;
+}
+
+bool reads_emuclk(const Instruction &op) {
+  if (clock_register(source_register(op))) { return true; }
+  if (single_memory_transfer(op.type) || conditional_memory(op)) {
+    const auto move = memory_move(op);
+    return move.write && clock_register(move.reg);
+  }
+  return false;
 }
 
 void validate_loop(const Instruction &op, std::string_view identity) {
@@ -1833,6 +1847,7 @@ private:
   void write_lane_status(Values &values, unsigned reg, llvm::Value *words, llvm::Value *selected);
   void register_instruction(Values &values, const Instruction &op, const Values &before);
   llvm::Value *pipeline_stall(const Values &values, const Instruction &op);
+  llvm::Value *elapsed_cycles(const Values &values);
   unsigned dag_access_tag(unsigned slot, bool paired = false) const;
   llvm::Value *loop_count_loaded(const Values &values);
   llvm::Value *loaded_tag(const Values &values, const Instruction &op);
@@ -1884,9 +1899,11 @@ private:
   std::map<std::uint32_t, LoopShape> hardware_grants_, short_bodies_;
   std::set<std::uint32_t> short_successors_;
   std::set<std::uint32_t> loop_setups_;
+  std::set<std::uint32_t> clock_reads_;
   std::vector<Node> admission_, fast_entry_, fast_, partial_;
   std::map<std::pair<std::uint32_t, MemorySpace>, MemoryPlan> memory_plan_;
   llvm::Value *memory_admitted_{};
+  llvm::Value *clock_sample_{};
   std::set<unsigned> written_;
   std::set<unsigned> y_written_;
   std::array<bool, accumulator_banks> accumulator_written_{};
@@ -2217,6 +2234,14 @@ llvm::Value *Lowering::read_register(const Values &values, unsigned reg) {
   if (lane_status_register(reg)) {
     auto *words = values[astat_register(reg) ? status_value : sticky_value];
     return raw_words((reg & 1) != 0 ? builder_.CreateShuffleVector(words, {1, 0}) : words);
+  }
+  if (clock_register(reg)) {
+    constexpr unsigned word_bits = 32;
+    auto *clock = reg == emuclk2_register
+                      ? builder_.CreateLShr(clock_sample_, builder_.getInt64(word_bits))
+                      : clock_sample_;
+    auto *word = builder_.CreateTrunc(clock, builder_.getInt32Ty());
+    return raw_words(pair(word, word, 32));
   }
   if (const auto slot = scalar_control_slot(reg)) {
     auto *word = *slot == interrupt_latch_slot && (stack_written_ || interrupt_latch_written_)
@@ -3018,6 +3043,12 @@ llvm::Value *Lowering::compute_condition(const Values &values, const Instruction
 
 void Lowering::instruction(Values &values, const Instruction &op, bool partial) {
   values[astat_written_value] = builder_.getFalse();
+  if (clock_reads_.contains(op.address)) {
+    // Clock readers run after the preceding instructions have been charged.
+    // Their own decode and address stalls precede the sampled execute cycle.
+    auto *clock = builder_.CreateAdd(load(64, clock_slot), elapsed_cycles(values));
+    clock_sample_ = builder_.CreateAdd(clock, pipeline_stall(values, op));
+  }
   if (loop_setup(op)) {
     loop_push(values, op, partial);
     values[hazard_value] = builder_.getIntN(hazard_bits, 0);
@@ -3753,7 +3784,8 @@ llvm::Value *Lowering::store_word(const Values &values,
         short_word, cell, builder_.CreateSelect(packed_word, packed, normal));
   }
   auto *element = builder_.getInt32(lane);
-  const auto wide_peer = scalar_control_slot(move.reg).has_value() ? move.reg : move.reg ^ 1;
+  const bool unpaired = clock_register(move.reg) || scalar_control_slot(move.reg).has_value();
+  const auto wide_peer = unpaired ? move.reg : move.reg ^ 1;
   auto *raw = move.immediate.has_value()
                   ? builder_.getInt64(std::uint64_t{*move.immediate} << raw_extension_bits)
                   : builder_.CreateExtractElement(read_register(values, move.reg), element);
@@ -4518,14 +4550,17 @@ void Lowering::credit(Values &values, llvm::Value *count, llvm::Value *cycles, b
   values[extra_cycles_value] = builder_.getInt64(0);
 }
 
-void Lowering::block_interrupt_after_loop_sample(const Values &values, llvm::Value *clocks) {
-  if (variant_.interrupt_vectors.empty()) { return; }
+llvm::Value *Lowering::elapsed_cycles(const Values &values) {
   auto *budget = builder_.CreateGEP(
       builder_.getInt64Ty(), function_->getArg(unit_controls), builder_.getInt64(cycle_budget));
   auto *spent = builder_.CreateSub(builder_.CreateLoad(builder_.getInt64Ty(), budget),
                                    values[cycle_remaining_value]);
-  auto *now = builder_.CreateAdd(load(64, progress_cycle_slot),
-                                 builder_.CreateAdd(spent, values[cycle_overrun_value]));
+  return builder_.CreateAdd(spent, values[cycle_overrun_value]);
+}
+
+void Lowering::block_interrupt_after_loop_sample(const Values &values, llvm::Value *clocks) {
+  if (variant_.interrupt_vectors.empty()) { return; }
+  auto *now = builder_.CreateAdd(load(64, progress_cycle_slot), elapsed_cycles(values));
   if (clocks == nullptr) {
     clocks = builder_.CreateAdd(values[extra_cycles_value],
                                 builder_.getInt64(loop_interrupt_shadow_clocks));
@@ -4798,12 +4833,14 @@ bool Lowering::sequencer_boundary(std::uint32_t pc) const {
   return delay_boundary(pc) || loop_setups_.contains(pc) || loop_fetches_.contains(pc) ||
          loop_tests_.contains(pc) || hardware_ends_.contains(pc) || hardware_grants_.contains(pc) ||
          short_bodies_.contains(pc) || short_successors_.contains(pc) || aborts_.contains(pc) ||
-         overlapping_fetches_.contains(pc) || jump_refills_.contains(pc) || not_lce_.contains(pc);
+         overlapping_fetches_.contains(pc) || jump_refills_.contains(pc) || not_lce_.contains(pc) ||
+         clock_reads_.contains(pc);
 }
 
 void Lowering::plan_hardware_loops(const LoopMap &shapes) {
   for (const auto &op : instructions_) {
     if (loop_setup(op)) { loop_setups_.insert(op.address); }
+    if (reads_emuclk(op)) { clock_reads_.insert(op.address); }
   }
   const auto sample_site = [this](std::uint32_t pc) {
     // An explicitly prepared return entry may exclude the preceding CALL.
@@ -5936,7 +5973,7 @@ void Lowering::plan_hardware_grants(const LoopMap &shapes) {
                   (shape.counted() && fetch->second.counted() &&
                    overlapping_tail(shape, fetch->second))) &&
                  !modifies_index(op) && !dag_register(loaded_register(op)) && !writes_astat(op) &&
-                 !shift::fifo_transfer(op.compute);
+                 !reads_emuclk(op) && !shift::fifo_transfer(op.compute);
         })) {
       continue;
     }
@@ -6275,7 +6312,8 @@ void Lowering::plan_loops() {
     for (std::size_t i = start; i < end; ++i) {
       linear = linear && instructions_[i].address + 1 == instructions_[i + 1].address &&
                !branch(instructions_[i]) && !dag_register(loaded_register(instructions_[i])) &&
-               !writes_astat(instructions_[i]) && !shift::fifo_transfer(instructions_[i].compute);
+               !writes_astat(instructions_[i]) && !reads_emuclk(instructions_[i]) &&
+               !shift::fifo_transfer(instructions_[i].compute);
     }
     if (!linear) { continue; }
     const bool stall = conditional && (condition_hazard(instructions_[end - 1]) &

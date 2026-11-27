@@ -772,10 +772,14 @@ STKYx/y support the same explicit forms. Their tests cover independent lane
 writes, read-only sequencer flags, priority over a parallel compute result,
 readback and `BIT TST` immediately after a write, and a refused second read
 of a forced long load.
+EMUCLK and EMUCLK2 are program-readable sources for type 5a and for stores
+in types 3a, 14a and 15a. Fixtures check both halves across rollover, SIMD,
+snapshot replay, a post-modifying store after a DAG interlock, and execute
+timing inside a short DO. See [emulation clock reads](numeric-reference.md#emulation-clock-reads).
 Other system-register writes and their pipeline effects, dynamic sequencer
 register reads and unresolved event semantics remain open. See
 [the simulator probes](numeric-reference.md#control-register-read-operands)
-and the observations on [loop preload](numeric-reference.md#loop-preload-writes)
+and the observations on [loop preload](numeric-reference.md#loop-preload-writes),
 [arithmetic status writes](numeric-reference.md#explicit-arithmetic-status-writes)
 and [sticky status writes](numeric-reference.md#explicit-sticky-status-writes).
 

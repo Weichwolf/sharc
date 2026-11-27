@@ -1284,6 +1284,65 @@ void control_memory_access(sharc::ExecutionMode mode) {
   }
 }
 
+void store_emulation_clock(sharc::ExecutionMode mode) {
+  constexpr std::uint64_t read_r4 = 0x76be82000000;
+  constexpr std::uint64_t read_r5 = 0x76be82800000;
+  constexpr unsigned i1 = 0x11;
+  constexpr unsigned emuclk = 0x69;
+  constexpr unsigned emuclk2 = 0x6a;
+  constexpr std::uint64_t seed = 0x12345678fffffffc;
+  constexpr std::uint32_t seed_low = 0xfffffffc;
+  constexpr std::uint32_t new_high = 0x12345679;
+  constexpr RegisterMemoryCase item{.form = RegisterMemoryForm::post,
+                                    .space = sharc::MemorySpace::data,
+                                    .view = sharc::MemoryView::normal_word,
+                                    .reg = emuclk,
+                                    .width = 4};
+  constexpr unsigned index = 1;
+  constexpr unsigned wide_cell = dag_cell + 2;
+  const auto wide = encoding(AbsoluteMove{.space = item.space,
+                                          .write = true,
+                                          .ureg = emuclk2,
+                                          .address = ram_address + wide_cell}) |
+                    forced_long;
+  const std::array words{read_r4,
+                         fixture::immediate(i1, ram_address + dag_cell),
+                         register_memory_encoding(item, index, true),
+                         read_r5,
+                         wide};
+  fixture::Program program(words);
+  program.code.variants.front().layout.regions.push_back({.space = item.space,
+                                                          .first = ram_address,
+                                                          .count = dag_capture_count,
+                                                          .storage_id = ram_id,
+                                                          .byte_offset = offset,
+                                                          .byte_stride = immediate_stride,
+                                                          .initialized = true});
+  auto ram = register_memory_seed(item);
+  auto expected_ram = ram;
+  put_register_word(expected_ram, dag_cell, item, 0);
+  put_register_word(expected_ram, wide_cell, item, new_high);
+  put_register_word(expected_ram, wide_cell + 1, item, new_high);
+  const auto native = fixture::compile(program.code, mode);
+  sharc::Core core(program.memory(ram_id, ram), mode);
+  sharc::Registers expected;
+  expected.pc = fixture::code_address;
+  expected.emuclk = seed;
+  expected.pe[0].astat = 1;
+  expected.dag[0][3].modifier = 1;
+  fixture::install(core, native, expected);
+  expected.pe[0].data[0][4] = std::uint64_t{seed_low} << byte_bits;
+  expected.pe[0].data[0][5] = 1U << byte_bits;
+  expected.dag[0][1].index = ram_address + dag_cell + 1;
+  constexpr auto cycles = words.size() + 2;
+  fixture::boundary(expected,
+                    {.pc = fixture::code_address + static_cast<std::uint32_t>(words.size()),
+                     .clock = seed + cycles});
+  check(fixture::completed(core.run(words.size()), words.size(), cycles) &&
+            core.registers() == expected && ram == expected_ram,
+        "EMUCLK stores lost their execute clock, DAG stall, or long replication");
+}
+
 void store_live_alu_status(sharc::ExecutionMode mode) {
   constexpr RegisterMemoryCase item{.form = RegisterMemoryForm::absolute,
                                     .space = sharc::MemorySpace::data,
@@ -1396,6 +1455,7 @@ void memory_access() {
     system_memory_access(mode);
     loop_preload_memory(mode);
     control_memory_access(mode);
+    store_emulation_clock(mode);
     store_live_alu_status(mode);
     for (const auto space : {sharc::MemorySpace::data, sharc::MemorySpace::program}) {
       for (const bool indexed : {false, true}) {
