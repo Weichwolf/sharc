@@ -721,6 +721,25 @@ by installed-image tests. Silicon confirmation remains open. Combined-PX
 moves to or from its own halves still require reference or silicon evidence
 and remain refused during preparation.
 
+## USTAT bit operations
+
+The CCES 2.12.1 ADSP-21489 functional simulator matched 160 authored classic
+type-18a probes covering every USTAT selector, SET, CLR, TGL, TST and XOR,
+mask values including zero and all ones, and SISD and SIMD. The probes checked
+all four USTATs, ASTATx/y and an immediate TF-dependent register transfer.
+TST sets BTF when the mask is a subset of the old word. XOR sets BTF when
+the whole word matches. Both clear BTF on a failed test. A mutation keeps
+the old flags. In SIMD, the explicit USTAT supplies the PEx operation and
+its paired register supplies PEy, including with USTAT2 or USTAT4 named.
+
+An initial 54 EMUCLK probes and a 192-case branch matrix included NOP
+controls, zero or one intervening NOP and both processing modes. An adjacent
+TF or NOT TF jump gained one cycle after TST or XOR in both the taken and
+fall-through cases. EQ and NE matched their controls, as did unconditional
+jumps and jumps following SET, CLR or TGL. The lowered pipeline carries that
+BTF dependency through the owner boundary and uses it when accounting for
+a native loop. Silicon timing remains open.
+
 ## Register MODIFY and DAG interlocks
 
 In 64 authored type-7a probes, the CCES 2.12.1 ADSP-21489 functional simulator

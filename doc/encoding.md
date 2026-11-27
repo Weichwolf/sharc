@@ -50,6 +50,13 @@ this standalone prefix; malformed-span and reserved-prefix fixtures incorrectly
 called it reserved. The malformed span now uses `0x03`, and explicit
 standalone type-6 fixtures cover recognition and installed execution.
 
+Classic type 18a uses prefix `0x14`, BOP in bits 39:37, the SREG selector
+in bits 35:32 and a 32-bit immediate. BOP values 0, 1, 2, 4 and 5 select
+SET, CLR, TGL, TST and XOR respectively. Bit 36 and BOP values 3, 6 and 7
+are reserved. The low four bits of the SREG-column UREG code select the
+operand, including 0, 1, 14 and 15 for USTAT1–4. See Programming Reference
+2.4, sections 10-1, 10-24 and 10-31.
+
 For the classic bit FIFO opcodes in Table 12-11, CCES assembly of authored
 programs places the register length of BITDEP and BITEXT in the Y field. BITDEP
 reads the data to append from X. `BFFWRP = Rn` also reads the Y field, and

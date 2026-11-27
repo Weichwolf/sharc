@@ -414,6 +414,15 @@ paired with a floating butterfly below. Full Strict qualification of other
 type-5 combinations remains open. Immediate type 17 also writes S0–S15 and all
 DAG fields. Raw transfers retain their extension bytes in FastFP32.
 
+Classic type 18a implements BIT SET, CLR, TGL, TST and XOR for USTAT1–4.
+SISD changes the named register or PEx BTF. SIMD uses the named register
+for PEx and its peer for PEy. TST checks all selected bits, and XOR compares
+the entire word. Both set or clear only the corresponding BTF. The installed
+ISA tests check complete state, both numerical modes and each named/peer
+direction. They also exercise TF and NOT TF predicated transfers, an adjacent
+conditional branch's interlock, snapshot replay and a batched backward branch.
+Other SREG operands and their architectural effects are tracked in #27.
+
 DAG loads retain two recent physical-register dependency tags across owner
 bounds, native transfers and snapshots. Address generation after I/B/L loads of
 the same index stalls two cycles, or one with an intervening unrelated cycle;

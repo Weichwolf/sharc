@@ -96,19 +96,19 @@ interrupt vectors omit this tracking.
 
 `State` adds cumulative instruction/base-cycle progress, instruction set, execution
 state and a latched fault. `Snapshot` is an immutable owning copy of the current
-state, yield request, prepared continuation identity/entry/address and preceding-compute
-history, tagged with the numerical mode. That history preserves the conditional
-branch interlock across run bounds and snapshots. Non-delayed CALL/RTS also retain
+state, yield request, prepared continuation identity/entry/address and pipeline
+history, tagged with the numerical mode. That history preserves conditional
+branch interlocks across run bounds and snapshots. Non-delayed CALL/RTS also retain
 every PC-stack cell, including popped entries; changing a return cell while
 stopped is observed by the guarded native return. Restore replaces that
 state, including clearing a later fault. It does not replace consumer memory or
 bindings. `set_registers` preserves hidden continuation when PC is unchanged;
 replacing PC starts a fresh declared entry and clears its pipeline history.
-Snapshots retain the preceding-compute interlock, two recent physical DAG
-register-load tags and a taken classic delayed transfer's destination and slot
-phase. Cross-Core replay preserves the destination even when a slot changes a
-contributing DAG register. Mode-register writes and declared code transfers
-still need execution and snapshot qualification.
+Snapshots retain the preceding instruction's compute or BTF dependency, two
+recent physical DAG register-load tags and a taken classic delayed transfer's
+destination and slot phase. Cross-Core replay preserves the destination even
+when a slot changes a contributing DAG register. Mode-register writes and
+declared code transfers still need execution and snapshot qualification.
 
 For admitted DO forms, snapshots retain the PC-stack ownership of each
 hardware loop frame and its fetch decision. They also retain the pending

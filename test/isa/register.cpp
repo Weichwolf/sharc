@@ -376,6 +376,218 @@ void system_immediates() {
   verify_immediates({ustat[0], ustat[1], ustat[2], ustat[3], px1, px2, px});
 }
 
+enum class UserBitAction : std::uint8_t { set, clear, toggle, test, compare };
+
+struct UserBit {
+  UserBitAction action;
+  unsigned port;
+  std::uint32_t mask;
+};
+
+constexpr std::uint32_t btf = 1U << 18;
+constexpr unsigned tf_condition = 13, not_tf_condition = 29;
+
+std::uint64_t bit_word(UserBit bit) {
+  constexpr std::uint64_t prefix = 0x140000000000;
+  constexpr unsigned operation_shift = 37;
+  constexpr unsigned register_shift = 32;
+  constexpr std::array operations{0U, 1U, 2U, 4U, 5U};
+  constexpr std::array ports{0U, 1U, 14U, 15U};
+  return prefix |
+         (std::uint64_t{operations[static_cast<unsigned>(bit.action)]} << operation_shift) |
+         (std::uint64_t{ports[bit.port]} << register_shift) | bit.mask;
+}
+
+void expected_user_bits(sharc::Registers &state, UserBit bit, unsigned lanes) {
+  using enum UserBitAction;
+  for (unsigned lane = 0; lane < lanes; ++lane) {
+    auto &word = state.ustat[bit.port ^ lane];
+    auto &astat = state.pe[lane].astat;
+    switch (bit.action) {
+      case set: word |= bit.mask; break;
+      case clear: word &= ~bit.mask; break;
+      case toggle: word ^= bit.mask; break;
+      case test: astat = (astat & ~btf) | ((bit.mask & ~word) == 0 ? btf : 0); break;
+      case compare: astat = (astat & ~btf) | (word == bit.mask ? btf : 0); break;
+    }
+  }
+}
+
+void user_status_bits() {
+  using enum UserBitAction;
+  constexpr std::array<std::uint32_t, 4> masks{0, 0xf1000000, 0xf1946aef, 0xffffffff};
+  constexpr std::uint32_t old_status = 0xa3000040;
+  for (unsigned port = 0; port < ustat.size(); ++port) {
+    std::vector<UserBit> operations;
+    std::vector<std::uint64_t> words;
+    for (const auto action : {test, compare, set, clear, toggle}) {
+      for (const auto mask : masks) {
+        operations.push_back({.action = action, .port = port, .mask = mask});
+        words.push_back(bit_word(operations.back()));
+      }
+    }
+    fixture::Program program(words);
+    for (const auto mode : fixture::numeric_modes) {
+      const auto native = fixture::compile(program.code, mode);
+      sharc::Core core(program.memory(), mode);
+      (void)core.install(native, fixture::Program::variant_id);
+      for (unsigned configuration = 0; configuration < 8; ++configuration) {
+        auto expected = initial(configuration);
+        for (unsigned lane = 0; lane < 2; ++lane) {
+          expected.pe[lane].astat |= old_status | (((configuration >> lane) & 1) * btf);
+        }
+        core.set_registers(expected);
+        const auto beginning = core.save();
+        const auto lanes = (configuration & 4) != 0 ? 2U : 1U;
+        for (unsigned count = 1; count <= words.size(); ++count) {
+          expected_user_bits(expected, operations[count - 1], lanes);
+          advance(expected);
+          core.restore(beginning);
+          check(fixture::completed(core.run(count), count, count) && core.registers() == expected,
+                "USTAT bit operation changed the wrong mask, lane or architectural flag");
+        }
+      }
+    }
+  }
+}
+
+void bit_flag_moves(sharc::ExecutionMode mode) {
+  constexpr auto test = UserBit{.action = UserBitAction::test, .port = 3, .mask = 1};
+  constexpr unsigned r4 = 4;
+  constexpr unsigned r5 = 5;
+  constexpr unsigned r6 = 6;
+  constexpr unsigned r7 = 7;
+  const std::array words{bit_word(test),
+                         encoding({.source = r5, .destination = r4}, tf_condition),
+                         encoding({.source = r7, .destination = r6}, not_tf_condition)};
+  fixture::Program program(words);
+  const auto native = fixture::compile(program.code, mode);
+  sharc::Core core(program.memory(), mode);
+  (void)core.install(native, fixture::Program::variant_id);
+  for (unsigned configuration = 0; configuration < 8; ++configuration) {
+    auto expected = initial(configuration);
+    for (unsigned lane = 0; lane < 2; ++lane) {
+      expected.ustat[test.port ^ lane] = (configuration >> lane) & 1;
+    }
+    core.set_registers(expected);
+    const unsigned lanes = (configuration & 4) != 0 ? 2 : 1;
+    expected_user_bits(expected, test, lanes);
+    for (unsigned lane = 0; lane < lanes; ++lane) {
+      const bool matched = (configuration & (1U << lane)) != 0;
+      auto &data = expected.pe[lane].data[0];
+      data[matched ? r4 : r6] = data[matched ? r5 : r7];
+    }
+    fixture::boundary(expected, {.pc = base + 3, .clock = clock_seed + 3});
+    check(fixture::completed(core.run(3), 3, 3) && core.registers() == expected,
+          "TF or NOT TF failed to select the corresponding USTAT test lane");
+  }
+}
+
+std::uint64_t bit_branch_word(unsigned condition, std::uint32_t target) {
+  constexpr std::uint64_t jump = 0x060000000000;
+  return jump | (std::uint64_t{condition} << condition_shift) | target;
+}
+
+struct BitBranch {
+  UserBitAction action;
+  unsigned condition, gap{};
+  bool interlock{};
+};
+
+void bit_flag_branch(sharc::ExecutionMode mode, BitBranch branch) {
+  const UserBit op{.action = branch.action, .port = 0, .mask = 1};
+  constexpr auto target = base + 4;
+  std::array<std::uint64_t, 5> words{bit_word(op), 0, 0, 0, 0};
+  words[branch.gap + 1] = bit_branch_word(branch.condition, target);
+  fixture::Program program(words);
+  const auto native = fixture::compile(program.code, mode);
+  sharc::Core core(program.memory(), mode);
+  sharc::Core resumed(program.memory(), mode);
+  (void)core.install(native, fixture::Program::variant_id);
+  (void)resumed.install(native, fixture::Program::variant_id);
+  for (unsigned configuration = 0; configuration < 8; ++configuration) {
+    auto expected = initial(configuration);
+    const unsigned lanes = (configuration & 4) != 0 ? 2 : 1;
+    for (unsigned lane = 0; lane < 2; ++lane) {
+      const auto matched = (configuration >> lane) & 1;
+      expected.ustat[lane] = matched;
+      expected.pe[lane].astat = matched | (matched * btf);
+    }
+    core.set_registers(expected);
+    const auto beginning = core.save();
+    expected_user_bits(expected, op, lanes);
+    advance(expected);
+    check(fixture::completed(core.run(1), 1, 1) && core.registers() == expected,
+          "USTAT bit operation retired at the wrong boundary");
+    resumed.restore(core.save());
+    const auto mask = (1U << lanes) - 1;
+    const auto taken = (configuration & mask) == (branch.condition == not_tf_condition ? 0 : mask);
+    const auto cycles = 2U + branch.gap + unsigned{branch.interlock} + (taken ? 3U : 0U);
+    const auto count = 2U + branch.gap;
+    fixture::boundary(expected,
+                      {.pc = taken ? target : base + count, .clock = clock_seed + cycles});
+    const auto deadline = resumed.state().progress.base_cycles + count - 1;
+    check(fixture::completed(resumed.run_until(deadline), count - 1, cycles - 1) &&
+              resumed.registers() == expected,
+          "a cross-Core snapshot lost the TF branch decision or pending interlock");
+    core.restore(beginning);
+    check(fixture::completed(core.run(count), count, cycles) && core.registers() == expected,
+          "the native grant changed the condition-specific bit-test branch timing");
+  }
+}
+
+void bit_flag_loop(sharc::ExecutionMode mode) {
+  constexpr std::uint64_t jump_back_if_tf = 0x071a00fffffe;
+  const std::array words{bit_word({.action = UserBitAction::toggle, .port = 0, .mask = 1}),
+                         bit_word({.action = UserBitAction::test, .port = 0, .mask = 1}),
+                         jump_back_if_tf,
+                         std::uint64_t{0}};
+  fixture::Program program(words);
+  const auto native = fixture::compile(program.code, mode);
+  sharc::Core core(program.memory(), mode);
+  auto expected = initial(0);
+  expected.ustat[0] = 0;
+  fixture::install(core, native, expected);
+  constexpr unsigned retirements = 7;
+  constexpr unsigned cycles = 12;
+  fixture::boundary(expected, {.pc = base + 4, .clock = clock_seed + cycles});
+  check(fixture::completed(core.run(retirements), retirements, cycles) &&
+            core.registers() == expected,
+        "batched bit-test loop lost an interlock or the terminating pass");
+}
+
+void bit_flag_consumers() {
+  using enum UserBitAction;
+  constexpr std::array cases{
+      BitBranch{.action = test, .condition = tf_condition, .interlock = true},
+      BitBranch{.action = test, .condition = not_tf_condition, .interlock = true},
+      BitBranch{.action = compare, .condition = tf_condition, .interlock = true},
+      BitBranch{.action = test, .condition = tf_condition, .gap = 1},
+      BitBranch{.action = test, .condition = 0},
+      BitBranch{.action = set, .condition = tf_condition}};
+  for (const auto mode : fixture::numeric_modes) {
+    bit_flag_moves(mode);
+    for (const auto branch : cases) { bit_flag_branch(mode, branch); }
+    bit_flag_loop(mode);
+  }
+}
+
+void user_status_bit_refusals() {
+  constexpr std::array reserved{
+      0x146000000001ULL, 0x14c000000001ULL, 0x14e000000001ULL, 0x141000000001ULL};
+  for (const auto word : reserved) {
+    const auto fault = fixture::refusal(fixture::image(sharc::InstructionSet::isa, word),
+                                        "reserved Type 18a field was accepted");
+    check(fault.reason == sharc::FaultReason::invalid_encoding && fault.instruction == word,
+          "reserved Type 18a field lost its encoding refusal");
+  }
+  constexpr std::uint64_t mode1_bit_set = 0x140200000001;
+  const auto fault = fixture::refusal(fixture::image(sharc::InstructionSet::isa, mode1_bit_set),
+                                      "unimplemented mode-register side effects were admitted");
+  check(fault.reason == sharc::FaultReason::unsupported_instruction,
+        "a legal system bit field must be distinguished from a reserved encoding");
+}
+
 constexpr std::uint32_t dependency_ram = 0x90000, dependency_ram_id = 11;
 constexpr std::uint32_t dependency_word = 0x89abcdef;
 
@@ -599,6 +811,9 @@ void register_transfers() {
   parallel_priority();
   for (unsigned quarter = 0; quarter < 4; ++quarter) { immediate_registers(quarter); }
   system_immediates();
+  user_status_bits();
+  bit_flag_consumers();
+  user_status_bit_refusals();
   dependencies();
   two_pending_loads();
   refused_register_fields();
