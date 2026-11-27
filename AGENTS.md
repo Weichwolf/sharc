@@ -57,6 +57,10 @@ doc/architecture.md; they were paid for on cpu12 and dsp56300.
 
 - German with the user; English code, comments, docs, commits and issues. C++23,
   LLVM 19, CMake/Ninja, warnings as errors, clang-format, clang-tidy clean.
+- Run builds and lint with `nice -n 10`. Run only one SHARC execution process
+  per host at a time, including tests, benchmarks and standalone SHARC probes.
+  Use `ctest -j1` and wait for each SHARC process to finish before starting the
+  next one.
 - Commit reviewed increments and push them to origin/main (Weichwolf/sharc).
   No force pushes or backup branches.
 - This repository is public. Nothing from private repositories enters it: no
